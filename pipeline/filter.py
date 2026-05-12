@@ -35,12 +35,25 @@ SKILLS_HEADER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Terms YAKE often surfaces from resumes that match every job description and
-# add no signal. Dropped after extraction.
+# Generic resume-filler that matches almost every job description and adds no
+# discriminator signal. Used two ways: (1) drop any single-token keyword that
+# IS one of these, (2) drop any multi-token n-gram whose tokens are ALL in here.
+# So "experience building" is dropped, but "building rest apis" is kept.
 RESUME_NOISE = {
-    "experience", "experienced", "team", "teams", "work", "worked", "working",
-    "year", "years", "ability", "able", "responsibilities", "responsible",
+    "experience", "experienced", "experiences",
+    "team", "teams", "work", "worked", "working", "works",
+    "year", "years", "ability", "able", "abilities",
+    "responsibilities", "responsible", "responsibility",
     "project", "projects", "summary", "education", "skills", "skill",
+    "support", "supporting", "supported",
+    "workflow", "workflows",
+    "professional", "professionally",
+    "building", "build", "builds", "built",
+    "help", "helping", "helped",
+    "various", "multiple", "including", "include", "includes",
+    "develop", "developing", "developed", "develops",
+    "use", "used", "using", "uses",
+    "new", "different",
 }
 
 
@@ -66,19 +79,50 @@ def find_skills_section(text: str) -> str:
     return text[m.start(): m.end() + end_offset]
 
 
+def extract_skills_section_tokens(skills_chunk: str) -> set[str]:
+    """Split the Skills section on common delimiters (commas, bullets, pipes,
+    newlines, category labels) to get atomic skill tokens. These are explicit
+    user claims and reliably catch discriminators YAKE may miss (e.g. "flutter",
+    "java" — single resume mentions that don't rank in top-N statistically)."""
+    if not skills_chunk:
+        return set()
+    body = skills_chunk.split("\n", 1)[1] if "\n" in skills_chunk else skills_chunk
+    tokens: set[str] = set()
+    for raw in re.split(r"[,;|•●◦\n]+", body):
+        part = re.sub(r"^[A-Za-z &/]+:\s*", "", raw.strip())  # strip "Languages:" labels
+        part = re.sub(r"^[*\-]\s*", "", part).strip().lower()
+        if 2 <= len(part) <= 30 and not part.isdigit() and part not in RESUME_NOISE:
+            tokens.add(part)
+    return tokens
+
+
+def _is_all_noise(kw: str) -> bool:
+    """True if every whitespace-separated token in kw is in RESUME_NOISE."""
+    parts = kw.split()
+    return bool(parts) and all(p in RESUME_NOISE for p in parts)
+
+
 def extract_keywords(resume_text: str) -> dict[str, int]:
-    """YAKE 1–3 gram extraction with skills-section boost."""
-    extractor = yake.KeywordExtractor(lan="en", n=3, top=50, dedupLim=0.9)
+    """YAKE 1–3 gram extraction + direct Skills-section token extraction."""
+    extractor = yake.KeywordExtractor(lan="en", n=3, top=75, dedupLim=0.85)
     pairs = extractor.extract_keywords(resume_text)
-    skills_chunk = find_skills_section(resume_text).lower()
+    skills_chunk = find_skills_section(resume_text)
+    skills_chunk_lower = skills_chunk.lower()
+    skills_tokens = extract_skills_section_tokens(skills_chunk)
 
     keywords: dict[str, int] = {}
+
     for kw, _score in pairs:
         kw_norm = kw.strip().lower()
-        if len(kw_norm) < 2 or kw_norm in RESUME_NOISE:
+        if len(kw_norm) < 2 or _is_all_noise(kw_norm):
             continue
-        weight = SCORE_SKILLS_BOOST if kw_norm in skills_chunk else SCORE_BASE
+        weight = SCORE_SKILLS_BOOST if kw_norm in skills_chunk_lower else SCORE_BASE
         keywords[kw_norm] = max(keywords.get(kw_norm, 0), weight)
+
+    # Skills-section atomic tokens — explicit user claims, always skills-boost.
+    for tok in skills_tokens:
+        keywords[tok] = max(keywords.get(tok, 0), SCORE_SKILLS_BOOST)
+
     return keywords
 
 
