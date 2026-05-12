@@ -1,20 +1,101 @@
 # Copied to ./config/search.yml by setup. Edit that file, not this one.
+# Reference: https://github.com/speedyapply/JobSpy
 
 search:
-  # JobSpy search terms. Reference: https://github.com/speedyapply/JobSpy
+  # ── Required ─────────────────────────────────────────────────────────────────
+
+  # One or more terms to search. Each term is scraped independently and results
+  # are merged + deduped before writing output/jobs.csv.
   search_terms:
     - "registered nurse"
     # - "marketing coordinator"
-    # - "line cook"
     # - "software engineer"
+
+  # Boards to scrape. Options: linkedin, zip_recruiter, indeed, glassdoor,
+  # google, bayt, bdjobs. Default (if omitted): all boards.
   sites:
     - indeed
     - linkedin
     - glassdoor
-  location: "Toronto, ON"
-  country_indeed: "Canada"
+
+  # Number of results to retrieve *per site per search term*.
   results_wanted: 50
+
+  # ── Location ─────────────────────────────────────────────────────────────────
+
+  location: "Toronto, ON"
+
+  # Country filter for Indeed and Glassdoor.
+  # See JobSpy docs for the full country list.
+  country_indeed: "Canada"
+
+  # Search radius in miles. Default: 50.
+  # distance: 50
+
+  # ── Job type & remote ────────────────────────────────────────────────────────
+  # ⚠ INDEED LIMITATION: only ONE of the following groups may be set per search:
+  #   Group A — hours_old
+  #   Group B — job_type and/or is_remote
+  #   Group C — easy_apply
+  # Setting more than one group will raise an error before scraping starts.
+
+  # Options: fulltime, parttime, internship, contract
+  # job_type: fulltime
+
+  # true = remote only, false = in-person only, omit = all.
+  # is_remote: true
+
+  # Filter to jobs with one-click apply (hosted on the board).
+  # Note: LinkedIn easy apply filter no longer works.
+  # easy_apply: false
+
+  # How old job postings can be (hours). ZipRecruiter & Glassdoor round up to
+  # next day. Mutually exclusive with job_type/is_remote and easy_apply on
+  # Indeed; mutually exclusive with easy_apply on LinkedIn (see above).
   hours_old: 168  # past week
+
+  # ── Google Jobs ──────────────────────────────────────────────────────────────
+  # google_search_term is the *only* supported filter for Google Jobs.
+  # All other filters (location, job_type, etc.) are ignored by Google.
+  # google_search_term: "registered nurse Toronto"
+
+  # ── LinkedIn-specific ────────────────────────────────────────────────────────
+  # ⚠ LINKEDIN LIMITATION: only ONE of the following may be set per search:
+  #   hours_old  OR  easy_apply
+
+  # Fetch full description + direct URL for LinkedIn results.
+  # Increases requests by O(n) — use sparingly on large result sets.
+  # linkedin_fetch_description: false
+
+  # Restrict LinkedIn results to specific company IDs (list of ints).
+  # linkedin_company_ids:
+  #   - 1441
+
+  # ── Advanced ─────────────────────────────────────────────────────────────────
+
+  # Pagination start offset (e.g. 25 starts from the 25th result).
+  # offset: 0
+
+  # Description format. Options: markdown, html. Default: markdown.
+  # description_format: markdown
+
+  # Convert wages to annual salary where possible.
+  # enforce_annual_salary: false
+
+  # Override the default User-Agent (may be outdated in older JobSpy versions).
+  # user_agent: "Mozilla/5.0 ..."
+
+  # Proxy list. Each entry: "user:pass@host:port" or "localhost".
+  # Scrapers round-robin through the list.
+  # proxies:
+  #   - "user:pass@proxy.example.com:8080"
+
+  # Path to a CA certificate file (for proxies that require it).
+  # ca_cert: "/path/to/ca.crt"
+
+  # Verbosity: 0 = errors only, 1 = errors + warnings, 2 = all (default: 2).
+  # verbose: 1
+
 
 filter:
   # Role titles you're actually pursuing. Strongest positive signal — a job
@@ -24,11 +105,10 @@ filter:
     - "registered nurse"
     - "RN"
     # - "marketing coordinator"
-    # - "marketing associate"
+    # - "software engineer"
 
   # Job titles to HARD-EXCLUDE. Any job whose title contains one of these is
-  # dropped entirely. Common uses: seniority ("senior", "staff"), function
-  # ("manager", "sales"), or modality ("travel" if you want local only).
+  # dropped entirely. Matched against job title only (not description).
   negative_titles:
     - "senior"
     - "manager"
@@ -40,7 +120,7 @@ filter:
   #   "epic emr": 3
   #   "BLS": 2
 
-  # Minimum score to keep. Defaults assume base weight=1, skills-section boost=2,
-  # title-match=5. A min_score of 5 means roughly: one target_titles match OR
-  # several resume-keyword hits. Raise to be pickier, lower to see more.
+  # Minimum score to keep. With YAKE defaults (base weight=1, skills-section
+  # boost=2, title-match=5), a score of 5 means roughly one target_titles hit
+  # OR several resume-keyword matches. Raise to be pickier, lower to see more.
   min_score: 5
