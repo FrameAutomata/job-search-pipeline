@@ -1,0 +1,46 @@
+# Copied to ./config/search.yml by setup. Edit that file, not this one.
+
+search:
+  # JobSpy search terms. Reference: https://github.com/speedyapply/JobSpy
+  search_terms:
+    - "registered nurse"
+    # - "marketing coordinator"
+    # - "line cook"
+    # - "software engineer"
+  sites:
+    - indeed
+    - linkedin
+    - glassdoor
+  location: "Toronto, ON"
+  country_indeed: "Canada"
+  results_wanted: 50
+  hours_old: 168  # past week
+
+filter:
+  # Role titles you're actually pursuing. Strongest positive signal — a job
+  # title containing any of these gets a large score bonus (+5 each match).
+  # Works for any field. List 2–5 phrasings of the same role.
+  target_titles:
+    - "registered nurse"
+    - "RN"
+    # - "marketing coordinator"
+    # - "marketing associate"
+
+  # Job titles to HARD-EXCLUDE. Any job whose title contains one of these is
+  # dropped entirely. Common uses: seniority ("senior", "staff"), function
+  # ("manager", "sales"), or modality ("travel" if you want local only).
+  negative_titles:
+    - "senior"
+    - "manager"
+    # - "travel"
+
+  # Optional manual weight overrides — merged on top of resume-extracted keywords.
+  # Use to boost a niche term YAKE missed, or add a keyword not in your resume.
+  # keyword_overrides:
+  #   "epic emr": 3
+  #   "BLS": 2
+
+  # Minimum score to keep. Defaults assume base weight=1, skills-section boost=2,
+  # title-match=5. A min_score of 5 means roughly: one target_titles match OR
+  # several resume-keyword hits. Raise to be pickier, lower to see more.
+  min_score: 5

@@ -1,0 +1,5 @@
+python-jobspy
+pdfplumber
+pyyaml
+python-dotenv
+yake

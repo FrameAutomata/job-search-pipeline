@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node (career-ops uses node — installed locally by setup script)
+node_modules/
+
+# Local env / secrets
+.env
+.env.local
+
+# User-specific config (the .example.yml is committed)
+config/search.yml
+
+# Pipeline outputs
+output/
+
+# Setup logs
+setup.log
+
+# career-ops install (cloned by setup script, not vendored)
+career-ops/
+
+# User resumes
+resumes/
+*.pdf
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
