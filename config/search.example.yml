@@ -1,103 +1,157 @@
 # Copied to ./config/search.yml by setup. Edit that file, not this one.
 # Reference: https://github.com/speedyapply/JobSpy
+#
+# ── Multi-pass scraping ───────────────────────────────────────────────────────
+# `searches` is a list of independent search passes. Each pass is scraped in
+# full, then all results are merged and deduped by job_url before writing
+# output/jobs.csv. Use multiple passes to work around Indeed/LinkedIn
+# group-exclusivity constraints (see below).
+#
+# Single-pass shorthand (backwards-compatible):
+#   search:          ← singular key, same fields, no `name` required
+#     search_terms: [...]
+#     ...
 
-search:
-  # ── Required ─────────────────────────────────────────────────────────────────
+searches:
 
-  # One or more terms to search. Each term is scraped independently and results
-  # are merged + deduped before writing output/jobs.csv.
-  search_terms:
-    - "registered nurse"
-    # - "marketing coordinator"
-    # - "software engineer"
+  # ── Pass 1: recent local ────────────────────────────────────────────────────
+  - name: "recent local"   # label shown in [scrape] log output
 
-  # Boards to scrape. Options: linkedin, zip_recruiter, indeed, glassdoor,
-  # google, bayt, bdjobs. Default (if omitted): all boards.
-  sites:
-    - indeed
-    - linkedin
-    - glassdoor
+    # ── Required ───────────────────────────────────────────────────────────────
 
-  # Number of results to retrieve *per site per search term*.
-  results_wanted: 50
+    # One or more terms to search. Each term is scraped independently within
+    # this pass; results are merged + deduped across all passes at the end.
+    search_terms:
+      - "registered nurse"
+      # - "marketing coordinator"
+      # - "software engineer"
 
-  # ── Location ─────────────────────────────────────────────────────────────────
+    # Boards to scrape. Options: linkedin, zip_recruiter, indeed, glassdoor,
+    # google, bayt, bdjobs. Default (if omitted): all boards.
+    sites:
+      - indeed
+      - linkedin
+      - glassdoor
 
-  location: "Toronto, ON"
+    # Number of results to retrieve *per site per search term*.
+    results_wanted: 50
 
-  # Country filter for Indeed and Glassdoor.
-  # See JobSpy docs for the full country list.
-  country_indeed: "Canada"
+    # ── Location ───────────────────────────────────────────────────────────────
 
-  # Search radius in miles. Default: 50.
-  # distance: 50
+    location: "Toronto, ON"
 
-  # ── Job type & remote ────────────────────────────────────────────────────────
-  # ⚠ INDEED LIMITATION: only ONE of the following groups may be set per search:
-  #   Group A — hours_old
-  #   Group B — job_type and/or is_remote
-  #   Group C — easy_apply
-  # Setting more than one group will raise an error before scraping starts.
+    # Country filter for Indeed and Glassdoor.
+    # See JobSpy docs for the full country list.
+    country_indeed: "Canada"
 
-  # Options: fulltime, parttime, internship, contract
-  # job_type: fulltime
+    # Search radius in miles. Default: 50.
+    # distance: 50
 
-  # true = remote only, false = in-person only, omit = all.
-  # is_remote: true
+    # ── Job type & remote ──────────────────────────────────────────────────────
+    # ⚠ INDEED LIMITATION: only ONE of the following groups may be set per pass:
+    #   Group A — hours_old
+    #   Group B — job_type and/or is_remote
+    #   Group C — easy_apply
+    # Use separate passes (see Pass 2 / Pass 3 below) for the other groups.
+    #
+    # ⚠ LINKEDIN LIMITATION: only ONE of the following may be set per pass:
+    #   hours_old  OR  easy_apply
 
-  # Filter to jobs with one-click apply (hosted on the board).
-  # Note: LinkedIn easy apply filter no longer works.
-  # easy_apply: false
+    # Options: fulltime, parttime, internship, contract
+    # job_type: fulltime
 
-  # How old job postings can be (hours). ZipRecruiter & Glassdoor round up to
-  # next day. Mutually exclusive with job_type/is_remote and easy_apply on
-  # Indeed; mutually exclusive with easy_apply on LinkedIn (see above).
-  hours_old: 168  # past week
+    # true = remote only, false = in-person only, omit = all.
+    # is_remote: true
 
-  # ── Google Jobs ──────────────────────────────────────────────────────────────
-  # google_search_term is the *only* supported filter for Google Jobs.
-  # All other filters (location, job_type, etc.) are ignored by Google.
-  # google_search_term: "registered nurse Toronto"
+    # Filter to jobs with one-click apply (hosted on the board).
+    # Note: LinkedIn easy apply filter no longer works.
+    # easy_apply: false
 
-  # ── LinkedIn-specific ────────────────────────────────────────────────────────
-  # ⚠ LINKEDIN LIMITATION: only ONE of the following may be set per search:
-  #   hours_old  OR  easy_apply
+    # How old job postings can be (hours). ZipRecruiter & Glassdoor round up to
+    # next day. Mutually exclusive with job_type/is_remote and easy_apply on
+    # Indeed; mutually exclusive with easy_apply on LinkedIn (see above).
+    hours_old: 168  # past week
 
-  # Fetch full description + direct URL for LinkedIn results.
-  # Increases requests by O(n) — use sparingly on large result sets.
-  # linkedin_fetch_description: false
+    # ── Google Jobs ────────────────────────────────────────────────────────────
+    # google_search_term is the *only* supported filter for Google Jobs.
+    # All other filters (location, job_type, etc.) are ignored by Google.
+    # google_search_term: "registered nurse Toronto"
 
-  # Restrict LinkedIn results to specific company IDs (list of ints).
-  # linkedin_company_ids:
-  #   - 1441
+    # ── LinkedIn-specific ──────────────────────────────────────────────────────
 
-  # ── Advanced ─────────────────────────────────────────────────────────────────
+    # Fetch full description + direct URL for LinkedIn results.
+    # Increases requests by O(n) — use sparingly on large result sets.
+    # linkedin_fetch_description: false
 
-  # Pagination start offset (e.g. 25 starts from the 25th result).
-  # offset: 0
+    # Restrict LinkedIn results to specific company IDs (list of ints).
+    # linkedin_company_ids:
+    #   - 1441
 
-  # Description format. Options: markdown, html. Default: markdown.
-  # description_format: markdown
+    # ── Advanced ───────────────────────────────────────────────────────────────
 
-  # Convert wages to annual salary where possible.
-  # enforce_annual_salary: false
+    # Pagination start offset (e.g. 25 starts from the 25th result).
+    # offset: 0
 
-  # Override the default User-Agent (may be outdated in older JobSpy versions).
-  # user_agent: "Mozilla/5.0 ..."
+    # Description format. Options: markdown, html. Default: markdown.
+    # description_format: markdown
 
-  # Proxy list. Each entry: "user:pass@host:port" or "localhost".
-  # Scrapers round-robin through the list.
-  # proxies:
-  #   - "user:pass@proxy.example.com:8080"
+    # Convert wages to annual salary where possible.
+    # enforce_annual_salary: false
 
-  # Path to a CA certificate file (for proxies that require it).
-  # ca_cert: "/path/to/ca.crt"
+    # Override the default User-Agent (may be outdated in older JobSpy versions).
+    # user_agent: "Mozilla/5.0 ..."
 
-  # Verbosity: 0 = errors only, 1 = errors + warnings, 2 = all (default: 2).
-  # verbose: 1
+    # Proxy list. Each entry: "user:pass@host:port" or "localhost".
+    # Scrapers round-robin through the list.
+    # proxies:
+    #   - "user:pass@proxy.example.com:8080"
+
+    # Path to a CA certificate file (for proxies that require it).
+    # ca_cert: "/path/to/ca.crt"
+
+    # Verbosity: 0 = errors only, 1 = errors + warnings, 2 = all (default: 2).
+    # verbose: 1
+
+
+  # ── Pass 2: remote US ───────────────────────────────────────────────────────
+  # Separate pass required because is_remote (Group B) and hours_old (Group A)
+  # are mutually exclusive on Indeed.
+  - name: "remote US"
+    search_terms:
+      - "registered nurse"
+    sites:
+      - indeed
+      - linkedin
+    location: "United States"
+    country_indeed: "USA"
+    results_wanted: 50
+    is_remote: true
+
+
+  # ── Pass 3: easy apply ──────────────────────────────────────────────────────
+  # Separate pass required because easy_apply (Group C) is mutually exclusive
+  # with hours_old (Group A) and is_remote (Group B) on Indeed, and mutually
+  # exclusive with hours_old on LinkedIn.
+  # Note: LinkedIn's easy_apply filter no longer works on their end.
+  - name: "easy apply"
+    search_terms:
+      - "registered nurse"
+    sites:
+      - indeed
+      - linkedin
+    location: "Toronto, ON"
+    country_indeed: "Canada"
+    results_wanted: 50
+    easy_apply: true
 
 
 filter:
+  # Drop jobs older than this many hours, measured against date_posted.
+  # Useful for passes (e.g. is_remote) that can't use hours_old on the scraper
+  # side due to Indeed/LinkedIn group-exclusivity constraints. Jobs with a
+  # missing or unparseable date_posted are kept regardless.
+  # max_age_hours: 168  # past week
+
   # Role titles you're actually pursuing. Strongest positive signal — a job
   # title containing any of these gets a large score bonus (+5 each match).
   # Works for any field. List 2–5 phrasings of the same role.

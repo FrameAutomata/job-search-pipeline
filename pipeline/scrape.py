@@ -33,9 +33,13 @@ OPTIONAL_PARAMS = [
 ]
 
 
-def load_config(path: Path) -> dict:
+def load_searches(path: Path) -> list[dict]:
+    """Return a list of search configs. Supports `searches:` (list) and legacy `search:` (single)."""
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    if "searches" in raw:
+        return raw["searches"]
+    return [raw["search"]]
 
 
 def validate_limitations(cfg: dict) -> None:
@@ -76,24 +80,24 @@ def validate_limitations(cfg: dict) -> None:
 
 
 def run(config_path: Path) -> Path:
-    cfg = load_config(config_path)["search"]
+    searches = load_searches(config_path)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    validate_limitations(cfg)
-
-    # Build optional kwargs — only pass keys that are explicitly set.
-    optional = {k: cfg[k] for k in OPTIONAL_PARAMS if cfg.get(k) is not None}
-
     all_rows = []
-    for term in cfg["search_terms"]:
-        print(f"[scrape] searching: {term!r}")
-        df = scrape_jobs(
-            site_name=cfg["sites"],
-            search_term=term,
-            results_wanted=cfg.get("results_wanted", 50),
-            **optional,
-        )
-        all_rows.append(df)
+    for cfg in searches:
+        name = cfg.get("name", "pass")
+        validate_limitations(cfg)
+        optional = {k: cfg[k] for k in OPTIONAL_PARAMS if cfg.get(k) is not None}
+
+        for term in cfg["search_terms"]:
+            print(f"[scrape] [{name}] searching: {term!r}")
+            df = scrape_jobs(
+                site_name=cfg["sites"],
+                search_term=term,
+                results_wanted=cfg.get("results_wanted", 50),
+                **optional,
+            )
+            all_rows.append(df)
 
     import pandas as pd
     combined = pd.concat(all_rows, ignore_index=True) if all_rows else None
