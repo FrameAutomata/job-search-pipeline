@@ -47,6 +47,16 @@ The filter is **domain-agnostic**: drop your resume PDF, list a few `target_titl
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.12 (jobspy pins `numpy==1.26.3`, which has no Python 3.13 wheel; setup scripts auto-select 3.12 via `py -3.12` / `python3.12`)
 - Node.js 18+ (career-ops)
 - An AI CLI for career-ops evaluation (Claude Code, Gemini CLI, OpenCode, etc.)
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE) for the full text.
+
+Copyright (C) 2026 FrameAutomata
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+Note: this repository contains only the orchestrator. [JobSpy](https://github.com/speedyapply/JobSpy) (MIT) and [career-ops](https://github.com/santifer/career-ops) (MIT) are fetched at setup time as separate works under their own licenses.
