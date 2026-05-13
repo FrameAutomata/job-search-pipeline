@@ -8,6 +8,7 @@ import csv
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pdfplumber
@@ -126,6 +127,17 @@ def extract_keywords(resume_text: str) -> dict[str, int]:
     return keywords
 
 
+def parse_date_posted(val: str) -> datetime | None:
+    if not val or val.strip().lower() in ("", "none", "nan", "nat"):
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(val.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def score_job(
     row: dict,
     keywords: dict[str, int],
@@ -162,6 +174,8 @@ def run(config_path: Path) -> Path:
     target_titles = fcfg.get("target_titles") or []
     negative_titles = fcfg.get("negative_titles") or []
     overrides = fcfg.get("keyword_overrides") or {}
+    max_age_hours = fcfg.get("max_age_hours")
+    cutoff = datetime.now() - timedelta(hours=max_age_hours) if max_age_hours else None
 
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
@@ -190,8 +204,14 @@ def run(config_path: Path) -> Path:
 
     jobs = []
     excluded = 0
+    too_old = 0
     with open(JOBS_PATH, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
+            if cutoff:
+                posted = parse_date_posted(row.get("date_posted") or "")
+                if posted is not None and posted < cutoff:
+                    too_old += 1
+                    continue
             result = score_job(row, keywords, target_titles, negative_titles)
             if result is None:
                 excluded += 1
@@ -207,7 +227,7 @@ def run(config_path: Path) -> Path:
     if not relevant:
         print(
             f"[filter] no jobs scored >= {min_score} "
-            f"(of {len(jobs)} scored, {excluded} negative-excluded)"
+            f"(of {len(jobs)} scored, {excluded} negative-excluded, {too_old} too old)"
         )
         OUTPUT_PATH.write_text("", encoding="utf-8")
         return OUTPUT_PATH
@@ -226,7 +246,7 @@ def run(config_path: Path) -> Path:
 
     print(
         f"[filter] kept {len(relevant)} of {len(jobs)} "
-        f"({excluded} negative-excluded) -> {OUTPUT_PATH}"
+        f"({excluded} negative-excluded, {too_old} too old) -> {OUTPUT_PATH}"
     )
     return OUTPUT_PATH
 

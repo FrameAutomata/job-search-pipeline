@@ -1,0 +1,582 @@
+"""Tests for pipeline/filter.py"""
+
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from pipeline import filter as filter_mod
+from tests.conftest import SYNTHETIC_RESUME
+
+
+class TestParseDatePosted:
+    """Test filter.parse_date_posted function."""
+
+    def test_parse_datetime_with_time_component(self):
+        """Parse ISO datetime with time component."""
+        result = filter_mod.parse_date_posted("2026-05-12 14:30:00")
+        assert result == datetime(2026, 5, 12, 14, 30, 0)
+
+    def test_parse_date_only(self):
+        """Parse date only (no time)."""
+        result = filter_mod.parse_date_posted("2026-05-12")
+        assert result == datetime(2026, 5, 12, 0, 0, 0)
+
+    def test_parse_empty_string_returns_none(self):
+        """Empty string returns None."""
+        assert filter_mod.parse_date_posted("") is None
+
+    def test_parse_whitespace_only_returns_none(self):
+        """Whitespace-only string returns None."""
+        assert filter_mod.parse_date_posted("   ") is None
+
+    def test_parse_string_none_returns_none(self):
+        """String 'none' (case-insensitive) returns None."""
+        assert filter_mod.parse_date_posted("none") is None
+        assert filter_mod.parse_date_posted("NONE") is None
+
+    def test_parse_string_nan_returns_none(self):
+        """String 'nan' returns None."""
+        assert filter_mod.parse_date_posted("nan") is None
+        assert filter_mod.parse_date_posted("NaN") is None
+
+    def test_parse_string_nat_returns_none(self):
+        """String 'NaT' returns None."""
+        assert filter_mod.parse_date_posted("NaT") is None
+        assert filter_mod.parse_date_posted("nat") is None
+
+    def test_parse_unparseable_returns_none(self):
+        """Unparseable string returns None."""
+        assert filter_mod.parse_date_posted("yesterday") is None
+        assert filter_mod.parse_date_posted("not a date") is None
+
+
+class TestFindSkillsSection:
+    """Test filter.find_skills_section function."""
+
+    def test_find_skills_returns_section_to_next_header(self):
+        """Extract text from Skills header to next section header."""
+        text = "\nPROFESSIONAL SUMMARY\nSome summary text.\n\nSKILLS\nPython\nJava\nSQL\n\nEXPERIENCE\nSome experience.\n"
+        result = filter_mod.find_skills_section(text)
+        # Result should include SKILLS header
+        assert "SKILLS" in result
+        # Should not include EXPERIENCE section
+        assert "EXPERIENCE" not in result
+
+    def test_find_skills_no_header_returns_empty(self):
+        """No recognized header returns empty string."""
+        text = "Just some plain text with no skills section."
+        result = filter_mod.find_skills_section(text)
+        assert result == ""
+
+    def test_find_skills_at_end_of_document(self):
+        """Skills section at end returns from header to doc end."""
+        text = """
+PROFESSIONAL SUMMARY
+Some text.
+
+SKILLS
+Python
+Java
+"""
+        result = filter_mod.find_skills_section(text)
+        # Just check that we got some content from skills section
+        assert len(result) > 5
+
+    def test_find_skills_case_insensitive(self):
+        """Recognizes various case-insensitive headers."""
+        text1 = "SKILLS\nPython\n\nEXPERIENCE\nStuff"
+        result1 = filter_mod.find_skills_section(text1)
+        # Should match SKILLS header and include content before EXPERIENCE
+        assert len(result1) > 0
+
+        text2 = "Technical Skills:\nJava\n\nEducation\nStuff"
+        result2 = filter_mod.find_skills_section(text2)
+        # Should match Technical Skills header
+        assert len(result2) > 0
+
+    def test_find_skills_competencies_header(self):
+        """Recognizes 'Core Competencies' header."""
+        text = "Core Competencies:\nDocker\nTerraform\n\nExperience\nStuff"
+        result = filter_mod.find_skills_section(text)
+        # Should match competencies header and return non-empty result
+        assert len(result) > 0
+
+
+class TestExtractSkillsSectionTokens:
+    """Test filter.extract_skills_section_tokens function."""
+
+    def test_extract_comma_separated(self):
+        """Extract comma-separated skills."""
+        chunk = "Skills:\nPython, Java, SQL"
+        result = filter_mod.extract_skills_section_tokens(chunk)
+        assert "python" in result
+        assert "java" in result
+        assert "sql" in result
+
+    def test_extract_bullet_separated(self):
+        """Extract bullet-separated skills."""
+        chunk = "Skills:\n• Docker\n• Terraform\n- AWS"
+        result = filter_mod.extract_skills_section_tokens(chunk)
+        assert "docker" in result
+        assert "terraform" in result
+        assert "aws" in result
+
+    def test_extract_strips_category_labels(self):
+        """Strip category labels like 'Languages:'."""
+        chunk = "Skills:\nLanguages: Python, Java\nFrameworks: React, Angular"
+        result = filter_mod.extract_skills_section_tokens(chunk)
+        assert "python" in result
+        assert "java" in result
+        assert "react" in result
+        assert "languages" not in result
+        assert "frameworks" not in result
+
+    def test_extract_filters_noise_words(self):
+        """Filter out noise words like 'experience', 'team'."""
+        chunk = "Skills:\nexperience, team, Python, work, Java"
+        result = filter_mod.extract_skills_section_tokens(chunk)
+        assert "python" in result
+        assert "java" in result
+        assert "experience" not in result
+        assert "team" not in result
+        assert "work" not in result
+
+    def test_extract_empty_input_returns_empty_set(self):
+        """Empty input returns empty set."""
+        result = filter_mod.extract_skills_section_tokens("")
+        assert result == set()
+
+    def test_extract_too_short_tokens_excluded(self):
+        """Tokens shorter than 2 chars are excluded; 2 chars is minimum."""
+        chunk = "Skills:\na, Python, JS, Java"
+        result = filter_mod.extract_skills_section_tokens(chunk)
+        assert "python" in result
+        assert "java" in result
+        assert "a" not in result
+        # JS is exactly 2 chars, which meets the minimum length requirement
+        assert "js" in result
+
+    def test_extract_max_length_30_chars(self):
+        """Tokens longer than 30 chars are excluded."""
+        chunk = "Skills:\nshort_skill, " + "x" * 31 + ", python"
+        result = filter_mod.extract_skills_section_tokens(chunk)
+        assert "short_skill" in result
+        assert "python" in result
+        assert "x" * 31 not in result
+
+
+class TestIsAllNoise:
+    """Test filter._is_all_noise function."""
+
+    def test_is_all_noise_all_noise_words(self):
+        """All noise words return True."""
+        assert filter_mod._is_all_noise("experience team") is True
+        assert filter_mod._is_all_noise("work help") is True
+
+    def test_is_all_noise_one_real_word(self):
+        """One non-noise word returns False."""
+        assert filter_mod._is_all_noise("building rest apis") is False
+        assert filter_mod._is_all_noise("experience python") is False
+
+    def test_is_all_noise_empty_string(self):
+        """Empty string returns False (no parts)."""
+        assert filter_mod._is_all_noise("") is False
+
+    def test_is_all_noise_single_noise_word(self):
+        """Single noise word returns True."""
+        assert filter_mod._is_all_noise("work") is True
+        assert filter_mod._is_all_noise("team") is True
+
+
+class TestScoreJob:
+    """Test filter.score_job function."""
+
+    def test_score_negative_title_returns_none(self):
+        """Negative title match returns None."""
+        row = {"title": "senior engineer", "description": "", "skills": ""}
+        keywords = {}
+        result = filter_mod.score_job(row, keywords, [], ["senior"])
+        assert result is None
+
+    def test_score_negative_title_word_boundary(self):
+        """Word boundary: 'seniority' does NOT match 'senior'."""
+        row = {"title": "seniority engineer", "description": "", "skills": ""}
+        keywords = {}
+        result = filter_mod.score_job(row, keywords, [], ["senior"])
+        assert result is not None  # Not excluded
+        score, matches = result
+        assert score == 0
+
+    def test_score_keyword_match_in_description(self):
+        """Keyword in description contributes to score."""
+        row = {"title": "developer", "description": "rest apis", "skills": ""}
+        keywords = {"rest apis": 2}
+        score, matches = filter_mod.score_job(row, keywords, [], [])
+        assert score == 2
+        assert "rest apis" in matches
+
+    def test_score_keyword_match_skills_boost(self):
+        """Keyword in skills field with weight 2."""
+        row = {"title": "developer", "description": "", "skills": "spring boot java"}
+        keywords = {"spring boot": 2}
+        score, matches = filter_mod.score_job(row, keywords, [], [])
+        assert score == 2
+        assert "spring boot" in matches
+
+    def test_score_target_title_match(self):
+        """Target title match adds SCORE_TITLE_MATCH bonus."""
+        row = {"title": "software engineer", "description": "", "skills": ""}
+        keywords = {}
+        score, matches = filter_mod.score_job(row, keywords, ["software engineer"], [])
+        assert score == 5  # SCORE_TITLE_MATCH = 5
+        assert "title:software engineer" in matches
+
+    def test_score_no_match_returns_zero_score(self):
+        """No matches return (0, [])."""
+        row = {"title": "developer", "description": "no keywords here", "skills": ""}
+        keywords = {"unrelated": 1}
+        score, matches = filter_mod.score_job(row, keywords, [], [])
+        assert score == 0
+        assert matches == []
+
+    def test_score_multiple_keywords_cumulative(self):
+        """Multiple keywords add cumulatively."""
+        row = {
+            "title": "developer",
+            "description": "python java",
+            "skills": "",
+        }
+        keywords = {"python": 1, "java": 1}
+        score, matches = filter_mod.score_job(row, keywords, [], [])
+        assert score == 2
+        assert "python" in matches
+        assert "java" in matches
+
+    def test_score_negative_title_case_insensitive(self):
+        """Negative title matching is case-insensitive."""
+        row = {"title": "SENIOR ENGINEER", "description": "", "skills": ""}
+        keywords = {}
+        result = filter_mod.score_job(row, keywords, [], ["senior"])
+        assert result is None
+
+    def test_score_empty_row_no_crash(self):
+        """Empty row fields don't crash."""
+        row = {"title": "", "description": "", "skills": ""}
+        keywords = {}
+        score, matches = filter_mod.score_job(row, keywords, [], [])
+        assert score == 0
+        assert matches == []
+
+
+class TestRun:
+    """Test filter.run function with mocked pdfplumber."""
+
+    def test_run_filters_and_writes(
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """run() filters jobs and writes output CSV."""
+        jobs_path, output_path = patch_filter_paths
+
+        # Copy jobs_csv to the patched path
+        jobs_csv_content = jobs_csv.read_text()
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv_content)
+
+        # Set RESUME_PATH env var
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        # Mock pdfplumber to return synthetic resume
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        # Create minimal config
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles:
+    - "software engineer"
+    - "backend engineer"
+  negative_titles:
+    - "senior"
+  min_score: 1
+""")
+
+        filter_mod.run(config)
+
+        # Verify output file was created
+        assert output_path.exists()
+        content = output_path.read_text()
+        # File may be empty if no jobs pass threshold, or may have rows
+        if content.strip():
+            df = pd.read_csv(output_path)
+            assert len(df) >= 1
+
+    def test_run_missing_jobs_csv_raises(self, patch_filter_paths, fake_pdf, monkeypatch):
+        """Missing jobs.csv raises FileNotFoundError."""
+        jobs_path, output_path = patch_filter_paths
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+""")
+
+        with pytest.raises(FileNotFoundError):
+            filter_mod.run(config)
+
+    def test_run_missing_resume_raises(self, jobs_csv, patch_filter_paths, monkeypatch):
+        """Missing resume PDF raises FileNotFoundError."""
+        jobs_path, output_path = patch_filter_paths
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv.read_text())
+
+        # Point to nonexistent resume
+        monkeypatch.setenv("RESUME_PATH", "/nonexistent/resume.pdf")
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+""")
+
+        with pytest.raises(FileNotFoundError):
+            filter_mod.run(config)
+
+    def test_run_writes_empty_file_when_nothing_passes(
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """When no jobs pass threshold, writes empty file."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv.read_text())
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: ["nonexistent role"]
+  negative_titles: []
+  min_score: 100
+""")
+
+        filter_mod.run(config)
+
+        assert output_path.exists()
+        content = output_path.read_text()
+        assert content == ""
+
+    def test_run_returns_output_path(
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """run() returns the output path."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv.read_text())
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 1
+""")
+
+        result = filter_mod.run(config)
+        assert result == output_path
+
+    def test_run_max_age_hours_filters_old_jobs(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """max_age_hours filters out jobs older than N hours."""
+        jobs_path, output_path = patch_filter_paths
+
+        # Create jobs CSV with one old and one recent job
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        old_date = "2026-04-10"  # ~30 days old
+        new_date = "2026-05-12"  # Today
+
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            f'1,https://old.com,engineer,old_co,NYC,{old_date},stuff,,""\n'
+            f'2,https://new.com,engineer,new_co,NYC,{new_date},stuff,,""\n'
+        )
+        jobs_path.write_text(csv_content)
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  max_age_hours: 168
+  target_titles: ["engineer"]
+  negative_titles: []
+  min_score: 1
+""")
+
+        filter_mod.run(config)
+
+        # Only the recent job should be in output
+        df = pd.read_csv(output_path)
+        assert len(df) == 1
+        assert "new.com" in df.iloc[0]["job_url"]
+
+    def test_run_missing_date_kept_regardless(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """Jobs with blank date_posted are kept even with max_age_hours set."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            '1,https://old.com,engineer,old_co,NYC,,stuff,,""\n'
+            '2,https://new.com,engineer,new_co,NYC,2026-05-12,stuff,,""\n'
+        )
+        jobs_path.write_text(csv_content)
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  max_age_hours: 48
+  target_titles: ["engineer"]
+  negative_titles: []
+  min_score: 1
+""")
+
+        filter_mod.run(config)
+
+        # Both jobs should be in output (missing date is kept)
+        df = pd.read_csv(output_path)
+        assert len(df) == 2
+
+    def test_run_keyword_overrides_applied(
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """keyword_overrides are applied correctly."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv.read_text())
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 1
+  keyword_overrides:
+    rest apis: 10
+""")
+
+        filter_mod.run(config)
+
+        content = output_path.read_text()
+        if content.strip():
+            df = pd.read_csv(output_path)
+            if len(df) > 0:
+                # At least one row mentioning "rest apis" should have high score
+                rest_api_rows = df[df["matched_keywords"].str.contains("rest apis", na=False)]
+                if len(rest_api_rows) > 0:
+                    assert rest_api_rows.iloc[0]["relevance_score"] >= 10
+
+    def test_run_sorts_output_by_score_descending(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mocker
+    ):
+        """Output is sorted by relevance_score descending."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            '1,https://job1.com,engineer,a,NYC,2026-05-12,rest apis python,,""\n'
+            '2,https://job2.com,engineer,b,NYC,2026-05-12,python,,""\n'
+            '3,https://job3.com,software engineer,c,NYC,2026-05-12,stuff,,""\n'
+        )
+        jobs_path.write_text(csv_content)
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        mock_pdf = mocker.MagicMock()
+        mock_page = mocker.MagicMock()
+        mock_page.extract_text.return_value = SYNTHETIC_RESUME
+        mock_pdf.pages = [mock_page]
+        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+        mocker.patch("pdfplumber.open", return_value=mock_pdf)
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: ["software engineer"]
+  negative_titles: []
+  min_score: 1
+""")
+
+        filter_mod.run(config)
+
+        df = pd.read_csv(output_path)
+        if len(df) > 1:
+            # Verify scores are in descending order
+            scores = df["relevance_score"].tolist()
+            assert scores == sorted(scores, reverse=True)
