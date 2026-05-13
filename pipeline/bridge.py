@@ -11,7 +11,7 @@ import csv
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -65,9 +65,16 @@ def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
     pipe = career_ops / PIPELINE_MD
     pipe.parent.mkdir(parents=True, exist_ok=True)
 
-    block = "\n" + "\n".join(
-        f"- [ ] {o['url']} | {o['company']} | {o['title']}" for o in offers
-    ) + "\n"
+    def format_offer(o: dict) -> str:
+        """Format offer as checkbox link with optional collapsible description."""
+        lines = [f"- [ ] {o['url']} | {o['company']} | {o['title']}"]
+        if o.get("description"):
+            # Escape HTML special chars in description for safety
+            desc = o["description"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            lines.append(f"  <details><summary>Description</summary>\n\n  {desc}\n\n  </details>")
+        return "\n".join(lines)
+
+    block = "\n" + "\n".join(format_offer(o) for o in offers) + "\n"
 
     if not pipe.exists():
         pipe.write_text(f"# Pipeline\n\n## Pendientes\n{block}\n", encoding="utf-8")
@@ -129,11 +136,32 @@ def run(career_ops_path: Path) -> int:
                 continue
             seen_urls.add(url)
             seen_roles.add(key)
-            new_offers.append({"url": url, "title": title, "company": company})
+
+            description = (row.get("description") or "").strip()
+            date_posted_str = (row.get("date_posted") or "").strip()
+
+            new_offers.append({
+                "url": url,
+                "title": title,
+                "company": company,
+                "description": description,
+                "date_posted": date_posted_str,
+            })
 
     if not new_offers:
         print("[bridge] no new offers to add (all duplicates)")
         return 0
+
+    # Sort by date_posted descending (newest first), fallback to empty string for missing dates
+    def sort_key(offer: dict) -> tuple:
+        date_str = offer.get("date_posted") or ""
+        try:
+            return (0, datetime.strptime(date_str, "%Y-%m-%d"))
+        except (ValueError, TypeError):
+            # Unparseable or missing dates sort to end
+            return (1, datetime.min)
+
+    new_offers.sort(key=sort_key, reverse=True)
 
     today = date.today().isoformat()
     append_to_pipeline(career_ops_path, new_offers)

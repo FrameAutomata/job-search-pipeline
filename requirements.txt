@@ -3,3 +3,4 @@ pdfplumber
 pyyaml
 python-dotenv
 yake
+plyer

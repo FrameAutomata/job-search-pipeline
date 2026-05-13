@@ -242,7 +242,7 @@ class TestAppendToPipeline:
     def test_append_format_is_correct(self, career_ops_dir):
         """Format matches exactly."""
         offers = [
-            {"url": "http://example.com", "company": "Acme", "title": "Dev"}
+            {"url": "http://example.com", "company": "Acme", "title": "Dev", "description": ""}
         ]
 
         bridge_mod.append_to_pipeline(career_ops_dir, offers)
@@ -250,6 +250,46 @@ class TestAppendToPipeline:
         pipeline = career_ops_dir / "data" / "pipeline.md"
         content = pipeline.read_text()
         assert "- [ ] http://example.com | Acme | Dev" in content
+
+    def test_append_includes_description_as_collapsible(self, career_ops_dir):
+        """Job description is included as a <details> section."""
+        offers = [
+            {
+                "url": "http://example.com",
+                "company": "Acme",
+                "title": "Dev",
+                "description": "Build backend services using Python and Django.",
+            }
+        ]
+
+        bridge_mod.append_to_pipeline(career_ops_dir, offers)
+
+        pipeline = career_ops_dir / "data" / "pipeline.md"
+        content = pipeline.read_text()
+        assert "<details><summary>Description</summary>" in content
+        assert "Build backend services using Python and Django." in content
+        assert "</details>" in content
+
+    def test_append_escapes_html_in_description(self, career_ops_dir):
+        """HTML special characters in description are escaped."""
+        offers = [
+            {
+                "url": "http://example.com",
+                "company": "Acme",
+                "title": "Dev",
+                "description": "Work with <script> and & symbols",
+            }
+        ]
+
+        bridge_mod.append_to_pipeline(career_ops_dir, offers)
+
+        pipeline = career_ops_dir / "data" / "pipeline.md"
+        content = pipeline.read_text()
+        # Should be escaped
+        assert "&lt;script&gt;" in content
+        assert "&amp;" in content
+        # Raw versions should not appear
+        assert "<script>" not in content
 
 
 class TestAppendToScanHistory:
@@ -464,8 +504,8 @@ class TestRun:
         """Both pipeline.md and scan-history.tsv are written."""
         filtered = tmp_path / "filtered_jobs.csv"
         filtered.write_text(
-            "title,company,job_url\n"
-            "engineer,acme,https://job1.com\n"
+            "title,company,job_url,description,date_posted\n"
+            "engineer,acme,https://job1.com,build apis,2026-05-12\n"
         )
 
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
@@ -479,3 +519,28 @@ class TestRun:
         assert hist.exists()
         assert "https://job1.com" in pipeline.read_text()
         assert "https://job1.com" in hist.read_text()
+
+    def test_run_sorts_by_date_posted_newest_first(self, career_ops_dir, monkeypatch, tmp_path):
+        """Offers are sorted by date_posted descending (newest first)."""
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text(
+            "title,company,job_url,description,date_posted\n"
+            "engineer,acme,https://job1.com,old job,2026-05-10\n"
+            "developer,globex,https://job2.com,recent job,2026-05-12\n"
+            "analyst,initech,https://job3.com,mid job,2026-05-11\n"
+        )
+
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+
+        bridge_mod.run(career_ops_dir)
+
+        pipeline = career_ops_dir / "data" / "pipeline.md"
+        content = pipeline.read_text()
+
+        # Find positions of each URL in the content
+        job1_idx = content.find("https://job1.com")
+        job2_idx = content.find("https://job2.com")
+        job3_idx = content.find("https://job3.com")
+
+        # Newest (job2) should come first, oldest (job1) last
+        assert job2_idx < job3_idx < job1_idx
