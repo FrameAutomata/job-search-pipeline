@@ -80,8 +80,9 @@ searches:
     # ── LinkedIn-specific ──────────────────────────────────────────────────────
 
     # Fetch full description + direct URL for LinkedIn results.
-    # Increases requests by O(n) — use sparingly on large result sets.
-    # linkedin_fetch_description: false
+    # Increases requests by O(n) but essential for getting job descriptions.
+    # Set to true to populate descriptions in the pipeline.
+    linkedin_fetch_description: true
 
     # Restrict LinkedIn results to specific company IDs (list of ints).
     # linkedin_company_ids:
