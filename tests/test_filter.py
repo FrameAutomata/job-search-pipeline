@@ -471,7 +471,7 @@ filter:
         csv_content = (
             "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
             '1,https://old.com,engineer,old_co,NYC,,stuff,,""\n'
-            '2,https://new.com,engineer,new_co,NYC,2026-05-12,stuff,,""\n'
+            '2,https://new.com,engineer,new_co,NYC,2026-05-13,stuff,,""\n'
         )
         jobs_path.write_text(csv_content)
 
