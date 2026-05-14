@@ -314,8 +314,12 @@ function parseResumeInfo(resumeText) {
   const githubMatch = resumeText.match(/github\.com\/([a-zA-Z0-9-]+)/i);
   if (githubMatch) info.github = `github.com/${githubMatch[1]}`;
 
+  // Try to extract location (look for patterns like "City, State")
+  const locationMatch = resumeText.match(/\|?\s*([A-Z][a-z]+,\s*[A-Z]{2})/);
+  if (locationMatch) info.location = locationMatch[1];
+
   // Try to extract first line as name (often the first line)
-  const firstLine = resumeText.split('\n')[0].trim();
+  const firstLine = resumeText.trim().split('\n')[0].trim();
   if (firstLine && firstLine.length < 100 && !firstLine.includes('@')) {
     info.name = firstLine;
   }
@@ -717,8 +721,8 @@ function generateCV(resumeText, info) {
     skills: '',
   };
 
-  // Simple section extraction by regex
-  const sectionRegex = /^#+\s*(summary|professional summary|experience|projects|education|skills|certifications?)/im;
+  // Match both markdown headers and all-caps section headers
+  const sectionRegex = /(?:^#+\s*|^)((?:PROFESSIONAL\s+)?SUMMARY|EXPERIENCE|PROJECTS?|(?:PROJECTS\s+&\s+OUTSIDE\s+)?EXPERIENCE|EDUCATION|SKILLS|CERTIFICATIONS?)\s*\n/im;
   const splits = resumeText.split(sectionRegex);
 
   for (let i = 0; i < splits.length - 1; i += 2) {
