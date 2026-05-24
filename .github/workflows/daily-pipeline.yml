@@ -73,18 +73,17 @@ jobs:
           if [ -d career-ops-data ]; then
             mkdir -p career-ops/data career-ops/batch/jds career-ops/batch/tracker-additions \
                      career-ops/reports career-ops/config career-ops/modes
-            [ -f career-ops-data/cv.md ]                     && cp career-ops-data/cv.md career-ops/
-            [ -f career-ops-data/article-digest.md ]          && cp career-ops-data/article-digest.md career-ops/
-            [ -f career-ops-data/config/profile.yml ]         && cp career-ops-data/config/profile.yml career-ops/config/
-            [ -f career-ops-data/modes/_profile.md ]          && cp career-ops-data/modes/_profile.md career-ops/modes/
-            [ -f career-ops-data/data/applications.md ]       && cp career-ops-data/data/applications.md career-ops/data/
-            [ -f career-ops-data/data/scan-history.tsv ]      && cp career-ops-data/data/scan-history.tsv career-ops/data/
-            [ -f career-ops-data/data/pipeline.md ]           && cp career-ops-data/data/pipeline.md career-ops/data/
-            [ -f career-ops-data/batch/batch-input.tsv ]      && cp career-ops-data/batch/batch-input.tsv career-ops/batch/
-            [ -f career-ops-data/batch/batch-api-state.json ] && cp career-ops-data/batch/batch-api-state.json career-ops/batch/
-            [ -d career-ops-data/reports ]          && cp -r career-ops-data/reports/. career-ops/reports/
-            [ -d career-ops-data/batch/tracker-additions ] && \
-              cp -r career-ops-data/batch/tracker-additions/. career-ops/batch/tracker-additions/
+            if [ -f career-ops-data/cv.md ];                     then cp career-ops-data/cv.md career-ops/; fi
+            if [ -f career-ops-data/article-digest.md ];          then cp career-ops-data/article-digest.md career-ops/; fi
+            if [ -f career-ops-data/config/profile.yml ];         then cp career-ops-data/config/profile.yml career-ops/config/; fi
+            if [ -f career-ops-data/modes/_profile.md ];          then cp career-ops-data/modes/_profile.md career-ops/modes/; fi
+            if [ -f career-ops-data/data/applications.md ];       then cp career-ops-data/data/applications.md career-ops/data/; fi
+            if [ -f career-ops-data/data/scan-history.tsv ];      then cp career-ops-data/data/scan-history.tsv career-ops/data/; fi
+            if [ -f career-ops-data/data/pipeline.md ];           then cp career-ops-data/data/pipeline.md career-ops/data/; fi
+            if [ -f career-ops-data/batch/batch-input.tsv ];      then cp career-ops-data/batch/batch-input.tsv career-ops/batch/; fi
+            if [ -f career-ops-data/batch/batch-api-state.json ]; then cp career-ops-data/batch/batch-api-state.json career-ops/batch/; fi
+            if [ -d career-ops-data/reports ];                    then cp -r career-ops-data/reports/. career-ops/reports/; fi
+            if [ -d career-ops-data/batch/tracker-additions ];    then cp -r career-ops-data/batch/tracker-additions/. career-ops/batch/tracker-additions/; fi
           else
             echo "WARNING: career-ops-data/ not found — see CLAUDE.md for setup instructions"
           fi
@@ -105,14 +104,13 @@ jobs:
       - name: Save career-ops output data
         run: |
           mkdir -p career-ops-data/data career-ops-data/batch/tracker-additions career-ops-data/reports
-          [ -f career-ops/data/scan-history.tsv ]       && cp career-ops/data/scan-history.tsv career-ops-data/data/
-          [ -f career-ops/data/applications.md ]         && cp career-ops/data/applications.md career-ops-data/data/
-          [ -f career-ops/data/pipeline.md ]             && cp career-ops/data/pipeline.md career-ops-data/data/
-          [ -f career-ops/batch/batch-input.tsv ]        && cp career-ops/batch/batch-input.tsv career-ops-data/batch/
-          [ -f career-ops/batch/batch-api-state.json ]   && cp career-ops/batch/batch-api-state.json career-ops-data/batch/
-          [ -d career-ops/batch/tracker-additions ] && \
-            cp -r career-ops/batch/tracker-additions/. career-ops-data/batch/tracker-additions/
-          [ -d career-ops/reports ] && cp -r career-ops/reports/. career-ops-data/reports/
+          if [ -f career-ops/data/scan-history.tsv ];     then cp career-ops/data/scan-history.tsv career-ops-data/data/; fi
+          if [ -f career-ops/data/applications.md ];       then cp career-ops/data/applications.md career-ops-data/data/; fi
+          if [ -f career-ops/data/pipeline.md ];           then cp career-ops/data/pipeline.md career-ops-data/data/; fi
+          if [ -f career-ops/batch/batch-input.tsv ];      then cp career-ops/batch/batch-input.tsv career-ops-data/batch/; fi
+          if [ -f career-ops/batch/batch-api-state.json ]; then cp career-ops/batch/batch-api-state.json career-ops-data/batch/; fi
+          if [ -d career-ops/batch/tracker-additions ];    then cp -r career-ops/batch/tracker-additions/. career-ops-data/batch/tracker-additions/; fi
+          if [ -d career-ops/reports ];                    then cp -r career-ops/reports/. career-ops-data/reports/; fi
 
       - name: Commit and push results
         run: |
