@@ -59,11 +59,14 @@ A local, fully automated pipeline that runs the complete job-search loop end to 
 
 1. **Scrape** — [JobSpy](https://github.com/speedyapply/JobSpy) pulls postings from Indeed, LinkedIn, Glassdoor, ZipRecruiter, etc. into `output/jobs.csv`.
 2. **Filter** — keywords are extracted *from your resume* (YAKE statistical extraction — works for nursing, marketing, trades, finance, tech, any field). Each job is scored by keyword + target-title matches; negative titles hard-exclude. Output: `output/filtered_jobs.csv`.
-3. **Screen** *(opt-in)* — HTTP liveness check drops expired postings; local Ollama fit scoring drops semantic mismatches before they reach evaluation.
-4. **Bridge** — surviving postings are appended to [career-ops](https://github.com/santifer/career-ops)'s `data/pipeline.md` queue, deduped against its history.
+3. **Screen** *(opt-in)* — for jobs that survived the filter, runs an HTTP liveness check (drops expired/filled postings), backfills the LinkedIn description from the same fetched page (so `linkedin_fetch_description: false` is safe at scrape time), and dedupes against `scan-history.tsv` *before* the fetch so previously-seen URLs cost nothing.
+4. **Bridge** — surviving postings are appended to [career-ops](https://github.com/santifer/career-ops)'s `data/pipeline.md` queue. Second dedup pass against scan-history, pipeline.md, and `company::role` pairs in applications.md.
 5. **Batch prep** — writes the evaluation queue (`batch/batch-input.tsv`) and caches job descriptions (`batch/jds/{id}.txt`) for the evaluator.
 
-Evaluation is handled by career-ops using the agent CLI of your choice. Run `--batch` to evaluate automatically using a local model via OpenCode + Ollama (no API cost), or `--deep-eval` to use Claude via your Claude Max subscription.
+Evaluation has three paths, pick whichever fits:
+- `--batch` — interactive agent CLI (Claude Code / OpenCode / Gemini CLI / Qwen / your choice). Generates PDFs, can WebSearch in real time.
+- `--evaluate-batch` — synchronous parallel API calls (auto-detects Gemini / Groq / OpenAI / Anthropic / Ollama). Immediate results. Used by the cloud workflows.
+- `--submit-batch` + `--retrieve-batch` — async Anthropic Messages Batch API (~24 h, 50% cheaper, system prompt cached with `cache_control: ephemeral` for ~90% input-token savings).
 
 ## Quickstart
 
@@ -71,9 +74,10 @@ Evaluation is handled by career-ops using the agent CLI of your choice. Run `--b
 # Windows
 git clone <this repo>
 cd job-search-pipeline
-.\setup.ps1           # creates venv, installs deps, clones career-ops, runs profile setup
-# Edit config\search.yml, then:
-.\run.ps1 --batch     # scrape → filter → bridge → evaluate with local LLM
+.\setup.ps1                  # creates venv, installs deps, clones career-ops, runs profile setup
+# Edit config\search.yml, then pick an evaluation mode:
+.\run.ps1 --batch            # interactive CLI agent (default: claude)
+.\run.ps1 --evaluate-batch   # API-driven (free Gemini if GEMINI_API_KEY set)
 ```
 
 ```bash
@@ -81,11 +85,10 @@ cd job-search-pipeline
 git clone <this repo>
 cd job-search-pipeline
 ./setup.sh
-# Edit config/search.yml, then:
-./run.sh --batch      # scrape → filter → bridge → evaluate with local LLM
+./run.sh --evaluate-batch
 ```
 
-See [QUICKSTART.md](QUICKSTART.md) for a detailed walkthrough.
+For unattended cloud runs, see [Using this template](#using-this-template) above. See [QUICKSTART.md](QUICKSTART.md) for a detailed walkthrough.
 
 ## Configuration
 
@@ -98,55 +101,62 @@ See [QUICKSTART.md](QUICKSTART.md) for a detailed walkthrough.
 | `CAREER_OPS_PATH` | `./career-ops` | Path to career-ops directory |
 | `RESUME_PATH` | auto-detected | Path to your resume PDF |
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
-| `BATCH_CLI` | `opencode` | CLI used by `--batch` |
-| `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model used by `--batch` |
+| `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
+| `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides auto-detection) |
+| `BATCH_MODEL` | per-provider default | Model override for `--evaluate-batch` / `--submit-batch` |
+| `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model used when `BATCH_CLI=opencode` |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys; the first one set wins auto-detection |
 
 ## Screening (opt-in)
 
-Add a `screen:` block to `config/search.yml` to filter out dead postings and poor fits before they reach evaluation:
+Add a `screen:` block to `config/search.yml` to drop dead postings and backfill missing descriptions before bridge:
 
 ```yaml
 screen:
   liveness: true           # drop 404/410 and "position filled" pages
   liveness_timeout: 8      # seconds per request
-
-  ollama_fit: true         # drop semantic mismatches via local LLM
-  ollama_model: qwen2.5:32b
-  ollama_threshold: 3.5    # drop jobs scoring below this (1–5 scale)
-  ollama_url: http://localhost:11434
-  profile: >               # brief candidate summary for the scorer
-    Mid-level software engineer, TypeScript, React, Node.js, AWS.
 ```
 
-Both checks are disabled by default. When all are off, the screen stage adds zero latency.
+What the screen step does when `liveness: true`:
+- **Pre-screen dedup**: drops URLs already in `scan-history.tsv` / `pipeline.md` / `applications.md` *before* fetching. With 100-result scrapes on a daily cadence ~80% of rows are repeats — this is the biggest cost saving.
+- **Liveness check**: HTTP GET per remaining URL; drops 404/410, "no longer available" / "position filled" pages, listing pages, etc.
+- **Description backfill**: extracts the JD from the same fetched page (LinkedIn / Indeed / Glassdoor selectors + `<body>` fallback). Lets you set `linkedin_fetch_description: false` and skip thousands of sequential per-job fetches during scrape.
+- **Dead URL recording**: URLs that fail liveness get written to `scan-history.tsv` with status `screened-dead` so future runs skip them at the pre-screen step too.
+
+When `liveness: false` the screen stage is a no-op (no dedup, no fetches, no backfill — bridge still does its own dedup pass).
 
 ## Evaluation flags
 
 ```powershell
-.\run.ps1 --batch       # evaluate with local LLM (OpenCode + Ollama, no API cost)
-.\run.ps1 --deep-eval   # evaluate with Claude via batch-runner.sh (Claude Max)
+.\run.ps1 --batch                              # interactive: agent CLI per BATCH_CLI (default: claude)
+.\run.ps1 --evaluate-batch                     # sync API: auto-detected provider, ~3 parallel workers
+.\run.ps1 --evaluate-batch --batch-provider gemini --batch-concurrency 5
+.\run.ps1 --submit-batch                       # async Anthropic Batch API (~24 h, 50% off)
+.\run.ps1 --retrieve-batch                     # poll + retrieve completed batch results
 ```
 
-`--batch` invokes `career-ops/batch/batch-runner.sh` using the CLI set by `BATCH_CLI` (default: `claude`). Set `OLLAMA_MODEL` to pass a model override. Supported CLIs: `claude`, `opencode`, `gemini`, `qwen`. State is tracked in `career-ops/batch/batch-state.tsv`, so runs are safe to interrupt and resume.
+`--evaluate-batch`, `--submit-batch`, and `--retrieve-batch` are mutually exclusive (argparse rejects more than one). `--batch` is the interactive CLI agent path and isn't mutually exclusive with the others; it just runs after the pipeline.
+
+`--only-pass "name1,name2"` (works with any of the above) selects which entries in `searches:` actually run. Case-insensitive match against the `name:` field. The cloud workflows use this to split passes — `daily-pipeline.yml` runs `"recent DFW,remote US"`, `easy-apply-pipeline.yml` runs `"easy apply"`.
 
 ## Skipping steps
 
 ```bash
 ./run.sh --skip-scrape         # reuse output/jobs.csv
 ./run.sh --skip-filter         # reuse output/filtered_jobs.csv
-./run.sh --skip-screen         # skip liveness + fit scoring
+./run.sh --skip-screen         # skip liveness + description backfill (skips pre-screen dedup too)
 ./run.sh --skip-bridge         # don't push to career-ops
 ./run.sh --skip-batch-prep     # don't update the evaluation queue
 
 # Re-run only evaluation on an existing queue
-./run.sh --skip-scrape --skip-filter --skip-screen --skip-bridge --skip-batch-prep --batch
+./run.sh --skip-scrape --skip-filter --skip-screen --skip-bridge --skip-batch-prep --evaluate-batch
 ```
 
 ## Requirements
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, which has no Python 3.13 wheel; setup scripts auto-select 3.12 via `py -3.12` / `python3.12`)
 - Node.js 18+ (career-ops and profile setup)
-- The agent CLI of your choice for `--batch` / `--deep-eval` — whichever you have installed:
+- The agent CLI of your choice for `--batch` — whichever you have installed:
   - `claude` (default): [Claude Code](https://claude.ai/code)
   - `opencode`: [OpenCode](https://opencode.ai)
   - `gemini`: [Gemini CLI](https://github.com/google-gemini/gemini-cli)

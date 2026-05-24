@@ -31,11 +31,17 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 ./run.ps1 --submit-batch         # + submit to Anthropic Batch API (async, ~24 h, 50% cheaper)
 ./run.ps1 --retrieve-batch       # poll and retrieve completed Batch API results
 
+# Select specific search passes by name (case-insensitive, comma-separated)
+./run.ps1 --evaluate-batch --only-pass "easy apply"
+./run.ps1 --evaluate-batch --only-pass "recent DFW,remote US"
+
 # Skip stages when re-running
 ./run.ps1 --skip-scrape --skip-filter --batch
 ./run.ps1 --skip-scrape --skip-filter --evaluate-batch
 ./run.ps1 --skip-scrape --skip-filter --submit-batch
 ```
+
+The three evaluation flags (`--evaluate-batch`, `--submit-batch`, `--retrieve-batch`) are mutually exclusive — argparse rejects more than one.
 
 ```bash
 # macOS/Linux
@@ -192,9 +198,9 @@ Submits evaluations to the [Anthropic Messages Batch API](https://docs.anthropic
 ```
 
 **How it works**:
-1. `batch_submit.py` reads `batch-input.tsv`, inlines `cv.md` + `profile.yml` + `_profile.md` + `article-digest.md` into a system prompt, and submits one Batch API request per job.
-2. Pre-assigns report numbers and tracker numbers before submission so parallel jobs don't conflict.
-3. Saves state to `career-ops/batch/batch-api-state.json` (batch_id + per-job metadata).
+1. `batch_submit.py` reads `batch-input.tsv`, inlines `cv.md` + `profile.yml` + `_profile.md` + `article-digest.md` into a system prompt, and submits one Batch API request per job. The system block is sent with `cache_control: {"type": "ephemeral"}` (Anthropic prompt caching) so the large shared context is paid once per batch — ~90% input-token savings on cached portions.
+2. Pre-assigns report numbers and tracker numbers (via `assign_job_numbers` in `_batch_common.py`) so the same helper is used by `--evaluate-batch` and parallel writes don't conflict.
+3. Saves state to `career-ops/batch/batch-api-state.json` (batch_id + per-job metadata) using atomic writes (`atomic_write_text` → `os.replace`).
 4. `batch_retrieve.py` polls the batch status and — when complete — parses XML-tagged responses, writes `reports/*.md` and `batch/tracker-additions/*.tsv`, then runs `node merge-tracker.mjs`.
 
 **Batch mode limitations** (vs interactive `--batch`):
