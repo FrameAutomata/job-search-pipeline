@@ -184,14 +184,20 @@ def run(config_path: Path) -> Path:
     resume_path = Path(resume_env)
     if not resume_path.is_absolute():
         resume_path = (ROOT / resume_path).resolve()
-    if not resume_path.exists():
+
+    resume_txt = resume_path.with_suffix(".txt")
+    if resume_txt.exists():
+        print(f"[filter] loading resume text from {resume_txt.name}")
+        resume_text = resume_txt.read_text(encoding="utf-8")
+    elif resume_path.exists():
+        print(f"[filter] extracting keywords from {resume_path.name}")
+        resume_text = extract_resume_text(resume_path)
+    else:
         raise FileNotFoundError(
-            f"Resume PDF not found at {resume_path}. "
-            "Drop your resume there or set RESUME_PATH in .env."
+            f"Resume not found at {resume_path} (or {resume_txt.name}). "
+            "Drop your resume PDF there or set RESUME_PATH in .env."
         )
 
-    print(f"[filter] extracting keywords from {resume_path.name}")
-    resume_text = extract_resume_text(resume_path)
     if not resume_text.strip():
         print("[filter] WARNING: no text extracted from resume — is it a scanned PDF?")
     keywords = extract_keywords(resume_text)

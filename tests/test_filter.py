@@ -1,6 +1,6 @@
 """Tests for pipeline/filter.py"""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -423,10 +423,9 @@ filter:
         """max_age_hours filters out jobs older than N hours."""
         jobs_path, output_path = patch_filter_paths
 
-        # Create jobs CSV with one old and one recent job
         jobs_path.parent.mkdir(parents=True, exist_ok=True)
-        old_date = "2026-04-10"  # ~30 days old
-        new_date = "2026-05-12"  # Today
+        old_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        new_date = datetime.now().strftime("%Y-%m-%d")
 
         csv_content = (
             "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
@@ -468,10 +467,11 @@ filter:
         jobs_path, output_path = patch_filter_paths
 
         jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        recent_date = datetime.now().strftime("%Y-%m-%d")
         csv_content = (
             "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
             '1,https://old.com,engineer,old_co,NYC,,stuff,,""\n'
-            '2,https://new.com,engineer,new_co,NYC,2026-05-13,stuff,,""\n'
+            f'2,https://new.com,engineer,new_co,NYC,{recent_date},stuff,,""\n'
         )
         jobs_path.write_text(csv_content)
 

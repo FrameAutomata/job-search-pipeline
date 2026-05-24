@@ -17,13 +17,18 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 Write-Host "==> Cloning career-ops (if missing)"
 $careerOps = "$root\career-ops"
 if (-not (Test-Path $careerOps)) {
-    git clone https://github.com/santifer/career-ops "$careerOps"
+    git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops-1 "$careerOps"
 } else {
     Write-Host "    career-ops already present, skipping clone"
 }
 
 Write-Host "==> Installing career-ops node deps"
 Push-Location $careerOps
+npm install
+Pop-Location
+
+Write-Host "==> Installing pipeline node deps (yaml, pdf-parse)"
+Push-Location $root
 npm install
 Pop-Location
 
@@ -34,7 +39,5 @@ if (-not (Test-Path "$root\resumes")) { New-Item -ItemType Directory "$root\resu
 if (-not (Test-Path "$root\output")) { New-Item -ItemType Directory "$root\output" | Out-Null }
 
 Write-Host ""
-Write-Host "Setup complete. Next steps:"
-Write-Host "  1. Drop your resume PDF into .\resumes\ and update RESUME_PATH in .env"
-Write-Host "  2. Edit .\config\search.yml (search terms, keywords, threshold)"
-Write-Host "  3. Run:  .\run.ps1"
+Write-Host "==> Running profile setup"
+node "$root\setup-profile.mjs"

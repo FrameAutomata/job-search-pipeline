@@ -525,12 +525,9 @@ async function promptForCareerNarrative(autoMode, _info, criteria) {
     narrative.dealBreakers = ['Legacy codebases only (no greenfield)', 'Startup with <10 people'];
   }
 
-  // Location preferences
+  // Location preferences — preferred already captured in role criteria
   console.log('\n🌍 Location Policy:');
-  const locationPrefInput = await prompt(
-    'What\'s your preferred work location? (e.g., "Remote preferred", "Dallas-based", "US-based")\n→ '
-  );
-  narrative.locationPolicy.preferred = locationPrefInput || 'Remote preferred';
+  narrative.locationPolicy.preferred = criteria.locationFlexibility || 'Remote preferred';
 
   const locationFlexInput = await prompt(
     'What flexibility do you have? (e.g., "Occasional travel OK", "1-2 weeks/month on-site possible")\n→ '
@@ -916,8 +913,20 @@ function updateSearchConfig(targetRoles, negativeRoles) {
     }
   }
 
-  // Update target_titles (remove duplicates)
-  config.filter.target_titles = [...new Set(searchTitles)];
+  const dedupedTitles = [...new Set(searchTitles)];
+
+  // Update search_terms in every scrape pass (preserves all other pass settings)
+  const passes = config.searches
+    ? config.searches
+    : config.search
+    ? [config.search]
+    : [];
+  for (const pass of passes) {
+    pass.search_terms = dedupedTitles;
+  }
+
+  // Update filter titles
+  config.filter.target_titles = dedupedTitles;
 
   // Update negative_titles
   if (negativeRoles && negativeRoles.length > 0) {

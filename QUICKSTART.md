@@ -1,268 +1,201 @@
 # Quick Start — Job Search Pipeline
 
-Scrape jobs, filter them, and feed them into career-ops for evaluation via CLI.
+---
+
+## What this does
+
+Scrapes job boards, filters results against your resume, optionally pre-screens for liveness and fit, then feeds surviving jobs into [career-ops](https://github.com/santifer/career-ops) for AI-powered evaluation. Everything after setup is a single command.
 
 ---
 
-## What This Repository Does
+## Prerequisites
 
-This is a **job scraper + filter** that prepares jobs for evaluation through the [career-ops CLI system](https://github.com/santifer/career-ops).
-
-The workflow:
-1. **Scrape** jobs from job boards into `career-ops/data/pipeline.md`
-2. **Filter** by your target roles via `config/search.yml`
-3. **Invoke career-ops CLI** to score and evaluate high-fit roles
-4. **Track applications** in `career-ops/data/applications.md`
-
-This repo does NOT contain the evaluation logic — that lives in career-ops.
+- Python 3.12
+- Node.js 18+
+- [Ollama](https://ollama.com) (for local evaluation and optional screening)
+- [OpenCode](https://opencode.ai) (for `--batch` evaluation)
+- A resume PDF
 
 ---
 
-## Setup (One-Time)
+## Setup (one-time)
 
-### 1. Install Dependencies
+```powershell
+# Windows
+.\setup.ps1
 
-```bash
-npm install
+# macOS / Linux
+./setup.sh
 ```
 
-This installs:
-- `yaml` — Parse your YAML config
-- `pdf-parse` — Extract text from resume PDFs
+The setup script:
+1. Creates a Python virtual environment and installs dependencies
+2. Clones career-ops into `./career-ops/`
+3. Copies `config/search.example.yml` → `config/search.yml`
+4. Runs `setup-profile.mjs` to generate your candidate profile
 
-### 2. Generate Your Profile
+During profile setup you'll be asked for your resume path, target roles, location, and compensation expectations. This creates:
+- `career-ops/config/profile.yml` — your candidate profile
+- `career-ops/cv.md` — your CV in markdown
+- `career-ops/modes/_profile.md` — your career narrative and deal-breakers
 
-```bash
-node setup-profile.mjs
-```
+To re-run profile setup at any time: `node setup-profile.mjs`
 
-**What it does:**
-- Reads your resume (PDF or text)
-- Extracts: name, email, phone, location, LinkedIn, GitHub
-- Syncs `config/search.yml` target roles with your profile archetypes
-- Creates:
-  - `career-ops/config/profile.yml` — Your canonical profile
-  - `career-ops/cv.md` — Your CV in markdown
-  - `career-ops/modes/_profile.md` — Your career narrative & deal-breakers
+---
 
-**What you'll see:**
-```
-🚀 Career-Ops Profile Setup
+## Configure your search
 
-📚 Loading career-ops context...
-👤 Setting up profile for: Thomas Thirlwall
+Edit `config/search.yml`:
 
-📋 Target roles:
-   Primary: Software Engineer, DevOps Engineer
-   Secondary: Full Stack, Backend, Frontend, Mobile
+```yaml
+searches:
+  - name: "my search"
+    search_terms:
+      - "software engineer"
+    sites: [linkedin, indeed, glassdoor]
+    location: "Dallas, TX"
+    results_wanted: 50
+    hours_old: 168
 
-✅ Profile saved: career-ops/config/profile.yml
-✅ CV saved: career-ops/cv.md
-✅ Narrative saved: career-ops/modes/_profile.md
-```
-
-**Options:**
-```bash
-node setup-profile.mjs --resume path/to/resume.pdf  # Specify resume
-node setup-profile.mjs --force                       # Overwrite existing
-```
-
-### 3. Verify Setup
-
-Check these files exist:
-```bash
-ls career-ops/config/profile.yml
-ls career-ops/cv.md
-ls career-ops/modes/_profile.md
+filter:
+  target_titles:
+    - "software engineer"
+    - "backend engineer"
+  negative_titles:
+    - "senior"
+    - "staff"
+  min_score: 5
 ```
 
 ---
 
-## Regular Workflow
+## Run the pipeline
 
-### Step 1: Scrape Jobs
+```powershell
+# Windows — full pipeline + local LLM evaluation
+.\run.ps1 --batch
 
-Use your scraper to populate `career-ops/data/pipeline.md`:
-
-```
-# Pipeline
-
-## Pendientes
-
-- [ ] {URL} | {Source} | {Title}
-  <details><summary>Description</summary>
-  {Job description HTML/text}
-  </details>
+# macOS / Linux
+./run.sh --batch
 ```
 
-Each job is a markdown checklist item with URL, source, and full description.
+This runs five stages in sequence:
 
-### Step 2: Invoke career-ops via CLI
+| Stage | What it does |
+|-------|-------------|
+| Scrape | Hits job boards, writes `output/jobs.csv` |
+| Filter | Scores by keyword + title match, writes `output/filtered_jobs.csv` |
+| Screen | *(opt-in)* Drops expired postings and poor fits via local LLM |
+| Bridge | Pushes new jobs into `career-ops/data/pipeline.md`, deduped |
+| Batch prep | Writes `career-ops/batch/batch-input.tsv` and `batch/jds/{id}.txt` |
 
-Score and evaluate jobs using the career-ops CLI:
+Then `--batch` evaluates the queue using OpenCode + your local Ollama model. Each job gets a full A–G career-ops evaluation (report + tracker line).
 
-```bash
-# Score all jobs (replace with your CLI command)
-claude -p "I have 463 jobs to batch-score. Here's the pipeline:
+Results:
+- Reports → `career-ops/reports/{num}-{company}-{date}-local.md`
+- Tracker lines → `career-ops/batch/tracker-additions/{id}.tsv`
+- Merge into your application tracker: run `/career-ops` in career-ops
 
-$(cat career-ops/data/pipeline.md)
+---
 
-Use my profile at career-ops/config/profile.yml and narrative at career-ops/modes/_profile.md to score these 1-5 based on role fit, seniority level, location preference, and tech stack match. Output a markdown table sorted by score (descending) with columns: Score | Title | Company | URL."
+## Evaluation options
+
+```powershell
+# Local model (free, no API cost) — default
+.\run.ps1 --batch
+
+# Claude via Claude Max subscription (full career-ops evaluation)
+.\run.ps1 --deep-eval
+
+# Both on the same run (local first, then Claude for anything it missed)
+.\run.ps1 --batch
+.\run.ps1 --deep-eval
 ```
 
-Or using other CLIs:
-```bash
-# Opencode (Codex)
-opencode run "..."
+### Changing the local model
 
-# Gemini
-gemini -p "..."
+Set `OLLAMA_MODEL` in `.env`:
 
-# Copilot
-copilot -p "..."
+```
+OLLAMA_MODEL=qwen2.5:32b
 ```
 
-### Step 3: Identify High-Scoring Roles
+Then pull it: `ollama pull qwen2.5:32b`
 
-The CLI will output jobs sorted by score. Roles scoring 4.0+ are worth full evaluation.
+For best quality on 8 GB VRAM + 16 GB RAM: `qwen2.5:32b` (~20 GB, partially CPU-offloaded). For fully GPU-resident: `gemma3:12b` (~7.3 GB).
 
-### Step 4: Evaluate Selected Roles
+---
 
-For each role you want to apply to, invoke career-ops evaluation mode:
+## Optional: pre-screening
 
-```bash
-claude -p "Please evaluate this job for me using the career-ops framework (A-G blocks):
+Add a `screen:` block to `config/search.yml` to filter out dead postings and poor fits *before* they reach evaluation:
 
-**Job Title:** {title}
-**Company:** {company}
-**URL:** {url}
-**Description:** {job description}
+```yaml
+screen:
+  liveness: true            # HTTP check — drops 404/410 and "position filled" pages
+  liveness_timeout: 8       # seconds per request
 
-My profile: 
-$(cat career-ops/config/profile.yml)
-
-My CV:
-$(cat career-ops/cv.md)
-
-My narrative:
-$(cat career-ops/modes/_profile.md)
-
-Provide a detailed evaluation covering: Role match, CV alignment, seniority fit, compensation, customization potential, interview prep needs, and posting legitimacy."
+  ollama_fit: true          # semantic fit check via local LLM
+  ollama_model: qwen2.5:32b
+  ollama_threshold: 3.5     # drop jobs scoring below this (1–5 scale)
+  ollama_url: http://localhost:11434
+  profile: >                # brief candidate summary for the scorer
+    Mid-level software engineer, TypeScript, React, Node.js, AWS.
 ```
 
-The CLI will return a detailed report you can save to `career-ops/reports/{number}-{company-slug}-{date}.md`.
+Both checks are off by default. When disabled the stage adds zero latency.
 
-### Step 5: Track Applications
+---
 
-Update `career-ops/data/applications.md` as you apply:
+## Skip flags
 
-```markdown
-| # | Date | Company | Role | Status | Score | PDF | Report | Notes |
-|---|------|---------|------|--------|-------|-----|--------|-------|
-| 1 | 2026-05-14 | Crossing Hurdles | Software Engineer (Fullstack - React, Node.js) | Applied | 4.7 | ✅ | [1](reports/001-crossing-hurdles-2026-05-14.md) | Strong remote match |
+```powershell
+.\run.ps1 --skip-scrape           # reuse existing output/jobs.csv
+.\run.ps1 --skip-filter           # reuse existing output/filtered_jobs.csv
+.\run.ps1 --skip-screen           # skip liveness + fit scoring
+.\run.ps1 --skip-bridge           # don't push to career-ops
+.\run.ps1 --skip-batch-prep       # don't update the evaluation queue
+
+# Re-run evaluation only (skip the full pipeline)
+.\run.ps1 --skip-scrape --skip-filter --skip-screen --skip-bridge --skip-batch-prep --batch
 ```
 
 ---
 
-## Customizing Your Profile
-
-After initial setup, edit these files to improve targeting:
-
-**`career-ops/config/profile.yml`**
-- Your target roles and seniority levels
-- Compensation expectations
-- Location flexibility
-- Visa/sponsorship needs
-
-**`career-ops/modes/_profile.md`**
-- Your narrative for each archetype
-- Deal-breakers (manager roles, on-site, senior roles, etc.)
-- Location scoring policy
-- Negotiation scripts
-
-**`career-ops/cv.md`**
-- Skills, experience, projects
-- Proof points with metrics
-- Education
-
-Changes take effect immediately on next CLI invocation.
-
----
-
-## File Structure
+## Key files
 
 ```
 job-search-pipeline/
-├── QUICKSTART.md                    # This file
-├── package.json                     # Dependencies
-├── setup-profile.mjs                # Profile generation script
-├── config/
-│   └── search.yml.example           # Job scraper config template
-│   └── search.yml                   # (generated, not committed)
-├── career-ops/
-│   ├── config/
-│   │   └── profile.yml              # Your profile (generated)
-│   ├── cv.md                        # Your CV (generated)
-│   ├── modes/
-│   │   ├── _profile.md              # Your narrative (generated)
-│   │   └── [career-ops modes...]    # System files (auto-updated)
-│   ├── data/
-│   │   ├── pipeline.md              # Jobs to evaluate
-│   │   ├── applications.md          # Application tracker
-│   │   └── [session outputs...]     # Temporary scoring results
-│   ├── reports/                     # Evaluation reports (saved manually)
-│   └── output/                      # Generated PDFs (saved manually)
-└── resumes/                         # Your resume (optional)
+├── config/search.yml            # Search terms, filter rules, screen settings
+├── .env                         # Paths and model overrides
+├── output/
+│   ├── jobs.csv                 # Raw scrape output
+│   └── filtered_jobs.csv        # After filter (and screen if enabled)
+└── career-ops/
+    ├── config/profile.yml       # Your candidate profile
+    ├── cv.md                    # Your CV
+    ├── modes/_profile.md        # Career narrative and deal-breakers
+    ├── data/
+    │   ├── pipeline.md          # Jobs queued for evaluation
+    │   ├── scan-history.tsv     # Dedup history
+    │   └── applications.md      # Your application tracker
+    ├── batch/
+    │   ├── batch-input.tsv      # Evaluation queue
+    │   ├── batch-state.tsv      # Evaluation progress (resumable)
+    │   ├── jds/                 # Cached job descriptions
+    │   ├── logs/                # Per-job worker logs
+    │   └── tracker-additions/   # Pending tracker lines
+    └── reports/                 # Full A–G evaluation reports
 ```
 
 ---
 
-## Tips
+## Environment variables
 
-**Q: What should I use this for vs. career-ops directly?**
-
-- **This repo:** Scraping, filtering, organizing jobs into pipeline.md
-- **career-ops:** Evaluating individual roles (scoring, reports, applications, interviews)
-- **Together:** Scrape → Filter → Evaluate via CLI
-
-**Q: Where do I put my resume?**
-
-Place it at `resumes/resume.pdf` or set `RESUME_PATH` in `.env`:
-
-```bash
-echo "RESUME_PATH=path/to/your/resume.pdf" >> .env
-```
-
-**Q: How do I update my profile after setup?**
-
-Edit `career-ops/config/profile.yml` and `career-ops/modes/_profile.md` directly. Changes apply immediately to next CLI invocation.
-
-**Q: Should I commit scored-jobs files?**
-
-No — they're session-specific and gitignored. Commit only:
-- `career-ops/config/profile.yml` (once generated)
-- `career-ops/cv.md` (once generated)
-- `career-ops/modes/_profile.md` (once generated)
-- `career-ops/data/applications.md` (your tracker — update as you apply)
-
-**Q: Can I use different CLIs (Claude, Gemini, Copilot, etc.)?**
-
-Yes — the pipeline doesn't depend on any specific CLI. You can switch between them per invocation. See career-ops/AGENTS.md for multi-CLI patterns.
-
----
-
-## Next Steps
-
-1. Run `node setup-profile.mjs` to generate your profile
-2. Review `career-ops/config/profile.yml` and `career-ops/modes/_profile.md`
-3. Adjust target roles or deal-breakers as needed
-4. Use your job scraper to populate `career-ops/data/pipeline.md`
-5. Invoke career-ops CLI to score and evaluate
-
----
-
-## Resources
-
-- **Career-ops system:** See `career-ops/AGENTS.md` for full documentation
-- **Job scraping:** Implement your scraper or use existing tools (ScraperJS, Puppeteer, etc.)
-- **CLI options:** Try Claude, Opencode, Gemini, Copilot, Qwen — they all work
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CAREER_OPS_PATH` | `./career-ops` | Path to career-ops directory |
+| `RESUME_PATH` | auto-detected | Path to your resume PDF |
+| `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
+| `BATCH_CLI` | `opencode` | CLI used by `--batch` |
+| `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model for `--batch` and screen |

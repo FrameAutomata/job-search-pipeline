@@ -179,3 +179,17 @@ filter:
   # boost=2, title-match=5), a score of 5 means roughly one target_titles hit
   # OR several resume-keyword matches. Raise to be pickier, lower to see more.
   min_score: 5
+
+
+# ── Screening (runs after filter, before bridge) ─────────────────────────────
+# Opt-in HTTP liveness check. When disabled (or `screen:` is absent), the
+# stage is a no-op and adds zero latency to the pipeline.
+#
+# Checks: status code (404/410 = expired), URL error params, body patterns
+# (e.g. "position has been filled"), and apply-control presence.
+# "uncertain" (content present but no apply button) is treated as live —
+# sites like LinkedIn require login to render the apply button.
+#
+# screen:
+#   liveness: false
+#   liveness_timeout: 8          # per-request timeout in seconds

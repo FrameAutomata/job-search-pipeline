@@ -1,0 +1,101 @@
+name: Retrieve Batch Results
+
+# Polls the Anthropic Batch API for completed job evaluations and commits
+# the reports + updated tracker back to the repo.
+#
+# Runs ~12 h after the daily pipeline so the batch has time to complete.
+# Can also be triggered manually at any time.
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # midnight UTC = 7 PM CDT (12 h after submission)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Clone career-ops fork
+        run: |
+          git clone --depth 1 --branch dev/batch-local-llm \
+            https://github.com/FrameAutomata/career-ops-1 career-ops
+
+      - name: Install career-ops Node deps
+        run: npm install --prefix career-ops
+
+      - name: Restore career-ops user data
+        run: |
+          if [ ! -d career-ops-data ]; then
+            echo "ERROR: career-ops-data/ not found — cannot retrieve"
+            exit 1
+          fi
+          mkdir -p career-ops/data career-ops/batch/jds career-ops/batch/tracker-additions \
+                   career-ops/reports career-ops/config career-ops/modes
+          [ -f career-ops-data/cv.md ]                  && cp career-ops-data/cv.md career-ops/
+          [ -f career-ops-data/article-digest.md ]       && cp career-ops-data/article-digest.md career-ops/
+          [ -f career-ops-data/config/profile.yml ]      && cp career-ops-data/config/profile.yml career-ops/config/
+          [ -f career-ops-data/modes/_profile.md ]       && cp career-ops-data/modes/_profile.md career-ops/modes/
+          [ -f career-ops-data/data/applications.md ]    && cp career-ops-data/data/applications.md career-ops/data/
+          [ -f career-ops-data/data/scan-history.tsv ]   && cp career-ops-data/data/scan-history.tsv career-ops/data/
+          [ -f career-ops-data/batch/batch-input.tsv ]   && cp career-ops-data/batch/batch-input.tsv career-ops/batch/
+          [ -f career-ops-data/batch/batch-api-state.json ] && cp career-ops-data/batch/batch-api-state.json career-ops/batch/
+          if [ -d career-ops-data/reports ]; then
+            cp -r career-ops-data/reports/. career-ops/reports/
+          fi
+          if [ -d career-ops-data/batch/tracker-additions ]; then
+            cp -r career-ops-data/batch/tracker-additions/. career-ops/batch/tracker-additions/
+          fi
+
+      - name: Retrieve batch results
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python orchestrate.py --retrieve-batch
+
+      - name: Save career-ops output data
+        run: |
+          mkdir -p career-ops-data/data career-ops-data/batch/tracker-additions career-ops-data/reports
+          [ -f career-ops/data/applications.md ]        && cp career-ops/data/applications.md career-ops-data/data/
+          [ -f career-ops/batch/batch-api-state.json ]  && cp career-ops/batch/batch-api-state.json career-ops-data/batch/
+          if [ -d career-ops/batch/tracker-additions ]; then
+            cp -r career-ops/batch/tracker-additions/. career-ops-data/batch/tracker-additions/
+          fi
+          if [ -d career-ops/reports ]; then
+            cp -r career-ops/reports/. career-ops-data/reports/
+          fi
+
+      - name: Commit and push reports
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add career-ops-data/
+          if git diff --staged --quiet; then
+            echo "No new results to commit (batch may still be in progress)"
+          else
+            COUNT=$(git diff --staged --name-only | grep 'reports/' | wc -l | tr -d ' ')
+            git commit -m "chore: batch results — ${COUNT} evaluation(s) $(date -u +%Y-%m-%d)"
+            git push
+          fi
