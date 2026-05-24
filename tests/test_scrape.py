@@ -10,6 +10,50 @@ import pytest
 from pipeline import scrape as scrape_mod
 
 
+class TestFilterPasses:
+    """Test scrape.filter_passes — picks the searches whose names match."""
+
+    SEARCHES = [
+        {"name": "recent DFW", "search_terms": ["a"], "sites": ["indeed"]},
+        {"name": "remote US",  "search_terms": ["b"], "sites": ["indeed"]},
+        {"name": "easy apply", "search_terms": ["c"], "sites": ["indeed"]},
+    ]
+
+    def test_none_returns_all(self):
+        assert scrape_mod.filter_passes(self.SEARCHES, None) is self.SEARCHES
+
+    def test_empty_list_returns_all(self):
+        # An empty selection should not silently drop everything — it's the
+        # same as "no filter requested".
+        assert scrape_mod.filter_passes(self.SEARCHES, []) is self.SEARCHES
+
+    def test_blank_strings_treated_as_no_filter(self):
+        assert scrape_mod.filter_passes(self.SEARCHES, ["", "   "]) is self.SEARCHES
+
+    def test_single_match(self):
+        result = scrape_mod.filter_passes(self.SEARCHES, ["easy apply"])
+        assert len(result) == 1
+        assert result[0]["name"] == "easy apply"
+
+    def test_multi_match_preserves_input_order(self):
+        # Output should preserve original search order, regardless of selector order.
+        result = scrape_mod.filter_passes(self.SEARCHES, ["remote US", "recent DFW"])
+        assert [r["name"] for r in result] == ["recent DFW", "remote US"]
+
+    def test_match_is_case_insensitive(self):
+        result = scrape_mod.filter_passes(self.SEARCHES, ["EASY APPLY"])
+        assert len(result) == 1
+        assert result[0]["name"] == "easy apply"
+
+    def test_match_trims_whitespace(self):
+        result = scrape_mod.filter_passes(self.SEARCHES, ["  easy apply  "])
+        assert len(result) == 1
+
+    def test_no_match_raises(self):
+        with pytest.raises(ValueError, match="matched no searches"):
+            scrape_mod.filter_passes(self.SEARCHES, ["does not exist"])
+
+
 class TestLoadSearches:
     """Test scrape.load_searches function."""
 

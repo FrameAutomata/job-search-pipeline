@@ -10,7 +10,7 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | ------------ | --------------------------- | ------------------------------------------------------------------------- |
 | Scrape       | `pipeline/scrape.py`        | `config/search.yml` → `output/jobs.csv`                                   |
 | Filter       | `pipeline/filter.py`        | `output/jobs.csv` → `output/filtered_jobs.csv`                            |
-| Screen       | `pipeline/screen.py`        | `filtered_jobs.csv` → filtered in-place (optional liveness check)         |
+| Screen       | `pipeline/screen.py`        | `filtered_jobs.csv` → filtered in-place + backfills missing descriptions  |
 | Bridge       | `pipeline/bridge.py`        | `filtered_jobs.csv` → `career-ops/data/pipeline.md` + `scan-history.tsv`  |
 | Batch prep   | `pipeline/batch_prep.py`    | bridge output → `career-ops/batch/batch-input.tsv` + `batch/jds/*.txt`    |
 | Batch evaluate | `pipeline/batch_evaluate.py` | `batch-input.tsv` → parallel LLM evaluation → `reports/*.md` + `tracker-additions/*.tsv` |
@@ -65,7 +65,7 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | `career-ops/batch/batch-api-state.json` | Anthropic Batch API state — job metadata, batch_id, per-job status                              |
 | `career-ops/config/profile.yml`         | Candidate profile (created by setup-profile.mjs)                                                |
 | `career-ops/batch/batch-runner.sh`      | Interactive batch evaluator — `--cli claude\|opencode\|gemini\|qwen`, `--model`, `--skip-pdf`   |
-| `career-ops-data/`                      | Committed copy of career-ops user data — synced by GitHub Actions workflows                     |
+| GHA Cache (key `pipeline-state-v1`)     | Per-fork runtime state (scan-history, applications.md, batch state). Never committed.            |
 
 ---
 
@@ -81,7 +81,7 @@ searches:
     hours_old: 168 # mutually exclusive with job_type/is_remote/easy_apply on Indeed
     is_remote: true
     easy_apply: false
-    linkedin_fetch_description: true # required for description scoring
+    linkedin_fetch_description: false # see "Description backfill" below
 
 filter:
   target_titles: ["Senior Software Engineer", "Staff Engineer"] # +5 score bonus
@@ -92,11 +92,13 @@ filter:
     "react native": 3 # boost terms YAKE missed
 
 screen:
-  liveness: true # HTTP check — drops filled/expired listings
+  liveness: true # HTTP check — drops filled/expired listings; also backfills descriptions
   liveness_timeout: 8
 ```
 
 **JobSpy constraint**: On Indeed/Glassdoor, `hours_old` is mutually exclusive with `job_type`, `is_remote`, and `easy_apply`. Split into separate search passes to use both filters.
+
+**Description backfill**: `linkedin_fetch_description: true` makes JobSpy fetch each LinkedIn JD individually during scrape — a sequential per-job HTTP request that easily takes 30+ minutes on 1000 results. Keep it **false**. The screen stage already fetches each surviving job's page for the liveness check, so it extracts the JD from the same response (site-specific selectors for LinkedIn/Indeed/Glassdoor, plus a generic `<body>` fallback). Net effect: we pay ~dozens of fetches per run for the jobs that actually survive filtering, not thousands.
 
 ---
 
@@ -113,13 +115,17 @@ Keywords are extracted from `resumes/resume.pdf` (no hardcoded vocab):
 
 ## Deduplication
 
-Bridge skips jobs already seen in any of:
+Two-stage dedup against the same sources:
 
-- `career-ops/data/scan-history.tsv`
+- `career-ops/data/scan-history.tsv` (append-only, statuses: `added`, `screened-dead`)
 - `career-ops/data/pipeline.md`
 - `career-ops/data/applications.md`
 
-Also deduplicates `company::role` pairs from `applications.md`.
+**Stage 1 — pre-screen** ([pipeline/screen.py](pipeline/screen.py)): drops URLs already in any of the above *before* HTTP fetches. With 100-result scrapes on a daily cadence ~80% of rows are repeats, so this is the biggest cost saving in the pipeline. Also writes URLs that fail liveness back to `scan-history.tsv` with status `screened-dead` so future runs skip them too.
+
+**Stage 2 — bridge** ([pipeline/bridge.py](pipeline/bridge.py)): catches anything that slipped through (e.g. when liveness is off) and also dedupes `company::role` pairs against `applications.md` so reposted listings under the same role don't get re-evaluated.
+
+`scan-history.tsv` persists across GitHub Actions runs via the workflow's [pipeline state cache](#cloud-automation-github-actions). The first scheduled run creates the cache; from run #2 onward, dedup is active. Cache is per-fork and never committed to git, so dedup state is private even if your fork is public.
 
 ---
 
@@ -204,50 +210,58 @@ Submits evaluations to the [Anthropic Messages Batch API](https://docs.anthropic
 
 ## Cloud automation (GitHub Actions)
 
-Two workflows run automatically to keep your pipeline running without your computer:
+> **Privacy first**: every cloud workflow refuses to run unless your fork is private. The Actions tab of a public repo exposes workflow run history, schedule cadence, and durations — all of which reveal active job searching. See the privacy notice at the top of [README.md](README.md).
+
+Four workflows make up the cloud automation:
 
 | Workflow | Schedule | What it does |
 |----------|----------|--------------|
-| `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Scrape → filter → bridge → evaluate batch (auto-detected provider) → commit results |
-| `retrieve-batch.yml` | Midnight UTC (7 PM CDT) | Poll Anthropic async batch → write reports → commit (only needed with `--submit-batch`) |
+| `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs the `"recent DFW"` + `"remote US"` passes via `--only-pass`. Scrape → filter → screen → bridge → evaluate. |
+| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs the `"easy apply"` pass. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. |
+| `retrieve-batch.yml` | Midnight UTC (7 PM CDT) | Polls Anthropic async batch → writes reports → uploads artifacts (only needed with `--submit-batch`). |
+| `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a user-supplied base64 blob. Use after editing the tracker locally. |
+
+**Storage model — no user data is ever committed:**
+
+- **Setup data** (CV, profile, search config) → repository **Secrets** (encrypted at rest, not visible to forkers)
+- **Runtime state** (scan-history, applications.md, pipeline.md, batch state, cached JDs) → **`actions/cache@v4`** keyed `pipeline-state-v1`. Per-fork, restored at workflow start, saved at workflow end. Invisible to anyone but the fork owner.
+- **Outputs** (reports, tracker snapshot) → **`actions/upload-artifact@v4`**. Downloadable from the Actions tab for 90 days.
+
+**`--only-pass` flag**: `orchestrate.py` accepts `--only-pass "name1,name2"` to select which entries in `searches:` run (case-insensitive match against `name:`). Omit to run all passes.
 
 **Setup** (one-time):
 
-1. **Fork this repo** on GitHub — secrets and workflow runs are per-fork, so each user needs their own copy. Clone your fork locally.
+1. **Fork this repo** on GitHub. Then **Settings → General → Change repository visibility → Make private**. Workflows hard-stop if the repo is public.
 
-2. **Create `career-ops-data/`** directory in the repo root — this holds your career-ops user data committed to git:
+2. **Add GitHub Secrets** (Settings → Secrets and variables → Actions → New repository secret):
 
-   ```
-   career-ops-data/
-     cv.md                        ← your CV (required)
-     config/profile.yml           ← your profile (required)
-     modes/_profile.md            ← your customizations (optional)
-     article-digest.md            ← your proof points (optional)
-     data/applications.md         ← tracker (auto-updated by workflow)
-     data/scan-history.tsv        ← dedup history (auto-updated)
-   ```
-
-   Copy your existing files from `career-ops/`:
-   ```bash
-   mkdir -p career-ops-data/data career-ops-data/config career-ops-data/modes
-   cp career-ops/cv.md career-ops-data/
-   cp career-ops/config/profile.yml career-ops-data/config/
-   cp career-ops/modes/_profile.md career-ops-data/modes/  # if it exists
-   cp career-ops/article-digest.md career-ops-data/  # if it exists
-   ```
-
-3. **Add GitHub Secrets** (your fork → Settings → Secrets and variables → Actions):
+   Required:
+   - `CV_MD_B64` — `base64 -w0 path/to/cv.md`
+   - `PROFILE_YML_B64` — `base64 -w0 path/to/profile.yml`
    - `SEARCH_CONFIG_B64` — `base64 -w0 config/search.yml`
-   - `RESUME_TXT_B64` — extracted resume text: `python -c "import pdfplumber; ..."` then `base64 -w0 resumes/resume.txt`
-   - At least one provider API key (workflow auto-detects the first one found):
+   - `RESUME_TXT_B64` — `base64 -w0 resumes/resume.txt` (run setup locally to generate the .txt)
+   - At least one LLM provider key:
      - `GEMINI_API_KEY` — free tier, recommended; get one at aistudio.google.com
      - `GROQ_API_KEY` — free tier with fast open-source models
      - `OPENAI_API_KEY` — OpenAI
      - `ANTHROPIC_API_KEY` — Anthropic (also required for `--submit-batch` async path)
 
-4. **Commit** `career-ops-data/` and push to your fork. The workflows will trigger on schedule.
+   Optional:
+   - `PROFILE_MD_B64` — `base64 -w0 modes/_profile.md`
+   - `ARTICLE_DIGEST_B64` — `base64 -w0 article-digest.md`
 
-5. **Read results**: evaluation reports appear in `career-ops-data/reports/` after `daily-pipeline.yml` runs. Pull your fork to see them locally.
+3. **Enable Actions** (Actions tab → enable workflows). Workflows run on their schedules.
+
+4. **Read results**: Actions tab → click the run → download the `pipeline-output-*` artifact. Extract to see `reports/*.md` and `applications.md`.
+
+5. **Edit `applications.md`** (to mark roles as Applied / Rejected / etc.):
+   1. Download the latest artifact (above) and extract `applications.md`.
+   2. Edit it locally.
+   3. `base64 -w0 applications.md` and copy the output.
+   4. Actions → "Edit Tracker" → Run workflow → paste the base64 → Run.
+   5. The next pipeline run will see the updated statuses.
+
+**Cache eviction**: GitHub Actions Cache evicts entries after 7 days of inactivity. A daily-running workflow keeps it warm, so this only bites if you pause the workflow for >7 days. Worst case after eviction: dedup starts empty, some jobs get re-evaluated once. Recoverable.
 
 ---
 

@@ -4,16 +4,24 @@ Reads career-ops context files and inlines them into the system prompt.
 Each job gets an independent message request. Results arrive async (up to 24 h).
 Poll for completion with pipeline/batch_retrieve.py.
 
+The system prompt is sent as a cacheable block (`cache_control: ephemeral`) so
+the large CV+profile context is paid for once and reused across every job in
+the batch — typically a 90%+ discount on those tokens.
+
 State persisted in career-ops/batch/batch-api-state.json.
 """
 
+import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline._batch_common import (
+    MAX_TOKENS,
+    assign_job_numbers,
+    atomic_write_text,
     build_system_prompt,
     build_user_message,
     load_pending,
@@ -24,6 +32,13 @@ from pipeline._batch_common import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _system_block(prompt: str) -> list[dict]:
+    """Wrap the system prompt as a single cacheable block. The Anthropic API
+    accepts either a string or a list of content blocks for `system`; the list
+    form is required to attach cache_control."""
+    return [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}]
 
 
 def run(career_ops: Path, model: str | None = None, dry_run: bool = False) -> int:
@@ -65,52 +80,26 @@ def run(career_ops: Path, model: str | None = None, dry_run: bool = False) -> in
     report_counter = max_report_num(reports_dir, state)
     tracker_counter = max_tracker_num(applications_md, state)
 
+    jobs = assign_job_numbers(pending, state, report_counter, tracker_counter, career_ops)
+
+    system_block = _system_block(system_prompt)
     batch_requests: list[dict] = []
-    job_meta: dict[str, dict] = {}
-
-    for row in pending:
-        jid = str(row["id"]).strip()
-        url = (row.get("url") or "").strip()
-        company = (row.get("source") or "").strip()
-        role = (row.get("notes") or "").strip()
-
-        report_counter += 1
-        tracker_counter += 1
-        report_num = f"{report_counter:03d}"
-
-        msg_meta = {
-            "id": jid,
-            "url": url,
-            "company": company,
-            "role": role,
-            "report_num": report_num,
-            "tracker_num": tracker_counter,
-            "jd_text": read_text(career_ops / "batch" / "jds" / f"{jid}.txt"),
-        }
+    for meta in jobs:
+        jid = meta["id"]
+        state["jobs"][jid]["custom_id"] = f"job-{jid}"
         batch_requests.append({
             "custom_id": f"job-{jid}",
             "params": {
                 "model": model,
-                "max_tokens": 8192,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": build_user_message(msg_meta, today)}],
+                "max_tokens": MAX_TOKENS,
+                "system": system_block,
+                "messages": [{"role": "user", "content": build_user_message(meta, today)}],
             },
         })
 
-        job_meta[jid] = {
-            "id": jid,
-            "url": url,
-            "company": company,
-            "role": role,
-            "report_num": report_num,
-            "tracker_num": tracker_counter,
-            "custom_id": f"job-{jid}",
-            "status": "pending",
-        }
-
     if dry_run:
         print(f"[batch-submit] dry-run: would submit {len(batch_requests)} request(s) via {model}")
-        for meta in job_meta.values():
+        for meta in jobs:
             print(f"  [{meta['id']}] {meta['company'] or '?'} / {meta['role'] or '?'} -> report {meta['report_num']}")
         return len(batch_requests)
 
@@ -132,28 +121,27 @@ def run(career_ops: Path, model: str | None = None, dry_run: bool = False) -> in
     print(f"[batch-submit] status: {batch.processing_status}")
 
     state["batch_id"] = batch.id
-    state["submitted_at"] = datetime.utcnow().isoformat() + "Z"
+    state["submitted_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     state["model"] = model
     state["status"] = "in_progress"
-    if "jobs" not in state:
-        state["jobs"] = {}
-    state["jobs"].update(job_meta)
 
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
     print(f"[batch-submit] state saved -> {state_path}")
     print("[batch-submit] run with --retrieve-batch once the batch is complete (up to 24 h)")
 
     return len(batch_requests)
 
 
+def _parse_argv(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Submit pending jobs to the Anthropic Batch API.")
+    ap.add_argument("--model", default=None, help="overrides BATCH_MODEL env var")
+    ap.add_argument("--dry-run", action="store_true")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
+    args = _parse_argv(sys.argv[1:])
     career_ops_path = Path(os.environ.get("CAREER_OPS_PATH", ROOT / "career-ops")).resolve()
-    dry = "--dry-run" in sys.argv
-    model_arg = None
-    for i, a in enumerate(sys.argv):
-        if a == "--model" and i + 1 < len(sys.argv):
-            model_arg = sys.argv[i + 1]
-    sys.exit(0 if run(career_ops_path, model=model_arg, dry_run=dry) >= 0 else 1)
+    sys.exit(0 if run(career_ops_path, model=args.model, dry_run=args.dry_run) >= 0 else 1)

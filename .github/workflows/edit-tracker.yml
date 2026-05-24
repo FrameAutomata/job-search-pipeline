@@ -1,0 +1,127 @@
+name: Edit Tracker
+
+# Manual workflow to edit applications.md without committing it to the repo.
+#
+# Typical flow:
+#   1. Go to Actions → Daily Job Pipeline → latest run → "pipeline-output-*"
+#      artifact → download → extract applications.md
+#   2. Edit the file locally (mark "Applied", "Rejected", update notes, etc.)
+#   3. base64-encode it:    base64 -w0 applications.md > applications.b64
+#   4. Run this workflow → paste the base64 string into the input → Run
+#
+# The workflow writes the new applications.md into the pipeline state cache so
+# the next scheduled pipeline run sees the updated statuses (and dedup against
+# applications.md continues working).
+#
+# We accept base64 because GitHub Actions inputs don't accept multi-line text
+# reliably and applications.md easily has multi-line table cells.
+
+on:
+  workflow_dispatch:
+    inputs:
+      applications_md_b64:
+        description: "Base64-encoded new applications.md (use `base64 -w0 applications.md`)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Don't race a scheduled pipeline run that's also saving the same cache.
+concurrency:
+  group: pipeline-state
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check repo visibility and template status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IS_TEMPLATE=$(gh api repos/${{ github.repository }} --jq .is_template)
+          VIS=$(gh api repos/${{ github.repository }} --jq .visibility)
+          echo "is_template=$IS_TEMPLATE visibility=$VIS"
+          if [ "$IS_TEMPLATE" = "true" ]; then
+            echo "Template repository — manual runs no-op here."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$VIS" != "private" ]; then
+            echo "::error::This workflow only runs in PRIVATE repositories."
+            exit 1
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+  apply-edit:
+    needs: preflight
+    if: needs.preflight.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Restore pipeline state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            career-ops/data/scan-history.tsv
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
+          key: pipeline-state-v1-${{ github.run_id }}
+          restore-keys: |
+            pipeline-state-v1-
+
+      - name: Decode and validate new applications.md
+        env:
+          APPLICATIONS_MD_B64: ${{ inputs.applications_md_b64 }}
+        run: |
+          mkdir -p career-ops/data
+          # Decode straight to file. base64 -d will fail loudly on garbage input.
+          echo "$APPLICATIONS_MD_B64" | base64 -d > career-ops/data/applications.md.new
+
+          # Smell check: must start with the tracker header. Refuses to overwrite
+          # if the input doesn't look like applications.md — protects against
+          # accidentally pasting the wrong file.
+          if ! head -n 1 career-ops/data/applications.md.new | grep -q "Applications Tracker"; then
+            echo "::error::Decoded file does not start with '# Applications Tracker' — refusing to overwrite. Did you paste the wrong file?"
+            head -n 3 career-ops/data/applications.md.new
+            exit 1
+          fi
+
+          # Atomic swap.
+          mv career-ops/data/applications.md.new career-ops/data/applications.md
+
+          echo "New applications.md installed:"
+          wc -l career-ops/data/applications.md
+          head -n 5 career-ops/data/applications.md
+
+      - name: Save pipeline state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            career-ops/data/scan-history.tsv
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
+          key: pipeline-state-v1-${{ github.run_id }}
+
+      - name: Upload new applications.md as artifact (verification)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: applications-md-${{ github.run_id }}
+          path: career-ops/data/applications.md
+          if-no-files-found: error
+          retention-days: 30

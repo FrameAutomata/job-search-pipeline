@@ -1,4 +1,4 @@
-"""Screen filtered_jobs.csv for liveness before bridge.
+"""Screen filtered_jobs.csv for liveness AND backfill missing job descriptions.
 
 Runs between filter and bridge. Controlled by the `screen:` section in
 config/search.yml.
@@ -7,15 +7,25 @@ config/search.yml.
     liveness: false          # HTTP liveness check (default: false)
     liveness_timeout: 8      # per-request timeout in seconds (default: 8)
 
-Liveness logic is a Python port of career-ops/liveness-core.mjs.
-When disabled (or `screen:` is absent) the stage is a no-op.
+When liveness is on, the same HTTP response is also mined for a job
+description. Any job row whose `description` column is empty (typical for
+LinkedIn when `linkedin_fetch_description: false` in the scrape config) gets
+populated from the page body before bridge runs. This lets us scrape LinkedIn
+without paying for a per-job description fetch on thousands of jobs that get
+filtered out — we only fetch for the ~dozens that survive scoring.
+
+Liveness logic is a Python port of career-ops/liveness-core.mjs. When
+disabled (or `screen:` is absent) the stage is a no-op.
 """
 
 import csv
+import html
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -66,6 +76,69 @@ _APPLY = [
 _MIN_CONTENT_CHARS = 300
 
 
+# ── Description extraction ──────────────────────────────────────────────────
+
+# Job descriptions get inlined into the LLM system prompt; an 8 KB ceiling
+# keeps prompt size predictable without truncating realistic JDs.
+_MAX_DESCRIPTION_CHARS = 8000
+
+# Site-specific JD containers, tried before falling back to body extraction.
+# Each pattern captures the inner HTML of the description block.
+_SITE_DESCRIPTION_PATTERNS = [
+    # LinkedIn guest job page — `show-more-less-html__markup` wraps the JD.
+    re.compile(
+        r'<div[^>]*class="[^"]*show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>',
+        re.DOTALL | re.IGNORECASE,
+    ),
+    # Indeed full-page JD container.
+    re.compile(
+        r'<div[^>]*id="jobDescriptionText"[^>]*>(.*?)</div>',
+        re.DOTALL | re.IGNORECASE,
+    ),
+    # Glassdoor JD container.
+    re.compile(
+        r'<div[^>]*class="[^"]*jobDescriptionContent[^"]*"[^>]*>(.*?)</div>',
+        re.DOTALL | re.IGNORECASE,
+    ),
+]
+
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+_BODY_RE = re.compile(r"<body[^>]*>(.*?)</body>", re.DOTALL | re.IGNORECASE)
+
+
+def _clean_html(s: str) -> str:
+    """Strip scripts/styles + all HTML tags, decode entities, collapse whitespace."""
+    s = _SCRIPT_STYLE_RE.sub(" ", s)
+    s = _HTML_TAG_RE.sub(" ", s)
+    s = html.unescape(s)
+    return _WHITESPACE_RE.sub(" ", s).strip()
+
+
+def extract_description(html_body: str) -> str:
+    """Pull the visible job description text from a fetched page.
+
+    Tries site-specific selectors (LinkedIn, Indeed, Glassdoor) first because
+    they isolate the actual JD from page chrome. Falls back to the whole
+    `<body>` so unknown sites still produce *something* usable."""
+    if not html_body:
+        return ""
+    for pat in _SITE_DESCRIPTION_PATTERNS:
+        m = pat.search(html_body)
+        if m:
+            cleaned = _clean_html(m.group(1))
+            if cleaned:
+                return cleaned[:_MAX_DESCRIPTION_CHARS]
+    body = _BODY_RE.search(html_body)
+    if body:
+        cleaned = _clean_html(body.group(1))
+        return cleaned[:_MAX_DESCRIPTION_CHARS]
+    return _clean_html(html_body)[:_MAX_DESCRIPTION_CHARS]
+
+
+# ── Liveness check ──────────────────────────────────────────────────────────
+
 def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]:
     """Return (result, reason): result is 'active', 'expired', or 'uncertain'."""
     if status in (404, 410):
@@ -85,20 +158,53 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     return "uncertain", "content present, no apply control"
 
 
-def check_liveness(url: str, timeout: int = 8) -> tuple[str, str]:
+_MAX_REDIRECTS = 5
+
+
+def fetch_and_classify(url: str, timeout: int = 8) -> tuple[str, str, str]:
+    """Fetch the page and return (liveness_result, reason, html_body).
+
+    The body is returned so the caller can also mine it for the job
+    description without paying for a second HTTP request."""
     import requests  # transitive dep via python-jobspy
 
     try:
-        resp = requests.get(
+        session = requests.Session()
+        session.max_redirects = _MAX_REDIRECTS
+        resp = session.get(
             url, headers={"User-Agent": _UA}, timeout=timeout, allow_redirects=True
         )
-        return classify_liveness(resp.status_code, str(resp.url), resp.text)
+        final_scheme = urlparse(str(resp.url)).scheme.lower()
+        if final_scheme not in ("http", "https"):
+            return "uncertain", f"unexpected scheme after redirect: {final_scheme}", ""
+        result, reason = classify_liveness(resp.status_code, str(resp.url), resp.text)
+        return result, reason, resp.text
     except Exception as exc:
-        return "uncertain", f"request error: {exc}"
+        return "uncertain", f"request error: {exc}", ""
 
 
-def run(config_path: Path) -> int:
-    """Screen filtered_jobs.csv in-place. Returns number of jobs dropped."""
+def check_liveness(url: str, timeout: int = 8) -> tuple[str, str]:
+    """Back-compat wrapper that returns just (result, reason). Existing tests
+    and external callers use this; the description-backfill path calls
+    `fetch_and_classify` directly to also receive the page body."""
+    result, reason, _ = fetch_and_classify(url, timeout)
+    return result, reason
+
+
+# ── Main entry point ────────────────────────────────────────────────────────
+
+def run(config_path: Path, career_ops_path: Path | None = None) -> int:
+    """Screen filtered_jobs.csv in-place. Returns number of jobs dropped.
+
+    If `career_ops_path` is provided, the run also:
+      1. Loads URLs already known (scan-history.tsv + pipeline.md + applications.md)
+         and drops them *before* any HTTP fetches. With 100-result scrapes
+         on a daily cadence ~80% of rows are repeats — skipping them here is
+         the biggest cost saving in the pipeline.
+      2. Records URLs that fail the liveness check back to scan-history.tsv
+         with status `screened-dead`, so future runs skip them too instead of
+         re-fetching a guaranteed-dead URL each day.
+    """
     import yaml
     from dotenv import load_dotenv
 
@@ -127,25 +233,67 @@ def run(config_path: Path) -> int:
     if not jobs:
         return 0
 
-    def _check(job: dict) -> tuple[str, str]:
+    # `description` may not be in fieldnames if the filter was run with a
+    # minimal CSV. Ensure it's present so we can write back any backfills.
+    if "description" not in fieldnames:
+        fieldnames = list(fieldnames) + ["description"]
+
+    # Early dedup against scan-history / pipeline / applications — these URLs
+    # have been seen before, so an HTTP fetch and description extract would be
+    # wasted work that bridge would discard anyway.
+    skipped_seen = 0
+    if career_ops_path is not None and career_ops_path.exists():
+        # Local import to avoid a top-level cycle if bridge ever pulls from screen.
+        from pipeline.bridge import load_seen_urls
+        seen_urls = load_seen_urls(career_ops_path)
+        if seen_urls:
+            before = len(jobs)
+            jobs = [j for j in jobs if (j.get("job_url") or "").strip() not in seen_urls]
+            skipped_seen = before - len(jobs)
+            if skipped_seen:
+                print(f"[screen] skipping {skipped_seen} already-seen URL(s)", flush=True)
+
+    if not jobs:
+        # Everything was already seen — overwrite filtered_jobs.csv with header only.
+        with open(FILTERED_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+        print(f"[screen] all {skipped_seen} job(s) already seen — nothing new to screen")
+        return 0
+
+    def _check(job: dict) -> tuple[dict, str, str, str]:
         url = (job.get("job_url") or "").strip()
         if not url:
-            return "uncertain", ""
-        return check_liveness(url, liveness_timeout)
+            return job, "uncertain", "", ""
+        result, reason, body = fetch_and_classify(url, liveness_timeout)
+        return job, result, reason, body
 
     kept: list[dict] = []
+    dead_entries: list[dict] = []
     dropped = 0
+    backfilled = 0
 
-    max_workers = min(8, len(jobs))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        checks = list(pool.map(_check, jobs))
-
-    for job, (result, reason) in zip(jobs, checks):
-        title = (job.get("title") or "?")[:60]
-        if result == "expired":
-            dropped += 1
-            print(f"  SKIP {title} -- liveness: {reason}")
-        else:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_check, job) for job in jobs]
+        for future in as_completed(futures):
+            job, result, reason, body = future.result()
+            title = (job.get("title") or "?")[:60]
+            if result == "expired":
+                dropped += 1
+                print(f"  SKIP {title} -- liveness: {reason}", flush=True)
+                url = (job.get("job_url") or "").strip()
+                if url:
+                    dead_entries.append({
+                        "url": url,
+                        "title": (job.get("title") or "").strip(),
+                        "company": (job.get("company") or "").strip(),
+                    })
+                continue
+            # Backfill missing description from the page body we already fetched.
+            if not (job.get("description") or "").strip() and body:
+                extracted = extract_description(body)
+                if extracted:
+                    job["description"] = extracted
+                    backfilled += 1
             kept.append(job)
 
     with open(FILTERED_PATH, "w", newline="", encoding="utf-8") as f:
@@ -153,7 +301,18 @@ def run(config_path: Path) -> int:
         writer.writeheader()
         writer.writerows(kept)
 
-    print(f"[screen] kept {len(kept)}, dropped {dropped} of {len(jobs)}")
+    # Record dead URLs so we don't re-fetch them next run. Done after the pool
+    # completes so we hit the TSV with a single appender, not 8 concurrent ones.
+    if career_ops_path is not None and dead_entries:
+        from pipeline.bridge import append_to_scan_history
+        append_to_scan_history(
+            career_ops_path, dead_entries, date.today().isoformat(), status="screened-dead",
+        )
+
+    print(
+        f"[screen] kept {len(kept)}, dropped {dropped} of {len(jobs)} new "
+        f"(backfilled: {backfilled}, skipped-seen: {skipped_seen})"
+    )
     return dropped
 
 

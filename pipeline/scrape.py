@@ -4,6 +4,7 @@ validates mutually exclusive Indeed/LinkedIn options, and writes output/jobs.csv
 import sys
 from pathlib import Path
 
+import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
@@ -40,6 +41,25 @@ def load_searches(path: Path) -> list[dict]:
     if "searches" in raw:
         return raw["searches"]
     return [raw["search"]]
+
+
+def filter_passes(searches: list[dict], only_passes: list[str] | None) -> list[dict]:
+    """Keep only searches whose `name:` matches one of `only_passes`.
+
+    Matching is case-insensitive and whitespace-trimmed so the workflow can
+    pass arbitrary casing. Returns all searches when `only_passes` is empty."""
+    if not only_passes:
+        return searches
+    wanted = {p.strip().lower() for p in only_passes if p and p.strip()}
+    if not wanted:
+        return searches
+    selected = [s for s in searches if (s.get("name") or "").strip().lower() in wanted]
+    if not selected:
+        available = ", ".join(repr(s.get("name", "")) for s in searches)
+        raise ValueError(
+            f"--only-pass matched no searches. Wanted: {sorted(wanted)}; available: {available}"
+        )
+    return selected
 
 
 def validate_limitations(cfg: dict) -> None:
@@ -79,9 +99,13 @@ def validate_limitations(cfg: dict) -> None:
             )
 
 
-def run(config_path: Path) -> Path:
-    searches = load_searches(config_path)
+def run(config_path: Path, only_passes: list[str] | None = None) -> Path:
+    searches = filter_passes(load_searches(config_path), only_passes)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if only_passes:
+        names = ", ".join(repr(s.get("name", "")) for s in searches)
+        print(f"[scrape] running passes: {names}", flush=True)
 
     all_rows = []
     for cfg in searches:
@@ -90,7 +114,7 @@ def run(config_path: Path) -> Path:
         optional = {k: cfg[k] for k in OPTIONAL_PARAMS if cfg.get(k) is not None}
 
         for term in cfg["search_terms"]:
-            print(f"[scrape] [{name}] searching: {term!r}")
+            print(f"[scrape] [{name}] searching: {term!r}", flush=True)
             df = scrape_jobs(
                 site_name=cfg["sites"],
                 search_term=term,
@@ -99,7 +123,6 @@ def run(config_path: Path) -> Path:
             )
             all_rows.append(df)
 
-    import pandas as pd
     combined = pd.concat(all_rows, ignore_index=True) if all_rows else None
     if combined is None or combined.empty:
         print("[scrape] no jobs returned")

@@ -72,26 +72,22 @@ def jobs_csv(tmp_path):
     """Write a 5-row test jobs.csv with real column names and return its path."""
     jobs_file = tmp_path / "jobs.csv"
 
-    # Real column order from JobSpy output
-    header = "id,site,job_url,job_url_direct,title,company,location,date_posted," \
-             "job_type,salary_currency,min_amount,max_amount,interval,benefits,description," \
-             "emails,skills,is_remote\n"
+    # Real column order from JobSpy output. Eighteen columns; each row must
+    # have exactly eighteen values for headerless code (csv.DictReader is fine
+    # either way but we want fixtures that exercise the real pipeline).
+    columns = [
+        "id", "site", "job_url", "job_url_direct", "title", "company", "location",
+        "date_posted", "job_type", "salary_currency", "min_amount", "max_amount",
+        "interval", "benefits", "description", "emails", "skills", "is_remote",
+    ]
+    header = ",".join(columns) + "\n"
 
     rows = [
-        '1,indeed,https://indeed.com/job1,,,software engineer,acme,Dallas TX,2026-05-12,2026-05-11,fulltime,,,'
-        f'USD,100000,120000,yearly,,rest apis python,,""\n',
-
-        '2,indeed,https://indeed.com/job2,,,backend engineer,globex,Remote,2026-05-12,2026-05-11,fulltime,,,'
-        f'USD,90000,110000,yearly,,spring boot java,,"true"\n',
-
-        '3,indeed,https://indeed.com/job3,,,senior engineer,acme,New York,2026-05-11,2026-05-10,fulltime,,,'
-        f'USD,120000,150000,yearly,,python,""\n',
-
-        '4,linkedin,https://linkedin.com/job4,,,developer,initech,San Francisco,2026-05-01,2026-04-30,fulltime,,,'
-        f'USD,80000,100000,yearly,,javascript react,,"false"\n',
-
-        '5,glassdoor,https://glassdoor.com/job5,,,application developer,vandalay,Chicago,2026-05-12,2026-05-11,'
-        f'fulltime,,,USD,70000,90000,yearly,,postgresql sql,,""\n',
+        '1,indeed,https://indeed.com/job1,,software engineer,acme,Dallas TX,2026-05-12,fulltime,USD,100000,120000,yearly,,rest apis python,,,""\n',
+        '2,indeed,https://indeed.com/job2,,backend engineer,globex,Remote,2026-05-12,fulltime,USD,90000,110000,yearly,,spring boot java,,,"true"\n',
+        '3,indeed,https://indeed.com/job3,,senior engineer,acme,New York,2026-05-11,fulltime,USD,120000,150000,yearly,,python,,,""\n',
+        '4,linkedin,https://linkedin.com/job4,,developer,initech,San Francisco,2026-05-01,fulltime,USD,80000,100000,yearly,,javascript react,,,"false"\n',
+        '5,glassdoor,https://glassdoor.com/job5,,application developer,vandalay,Chicago,2026-05-12,fulltime,USD,70000,90000,yearly,,postgresql sql,,,""\n',
     ]
 
     jobs_file.write_text(header + "".join(rows))
@@ -157,6 +153,31 @@ def patch_filter_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(filter_mod, "OUTPUT_PATH", output_path)
 
     return jobs_path, output_path
+
+
+@pytest.fixture
+def mock_pdf_extract(mocker):
+    """Patch pdfplumber.open so the loader returns SYNTHETIC_RESUME.
+
+    Use in any test that calls filter.run() with a fake_pdf — replaces the
+    duplicated MagicMock setup that was repeated across many tests."""
+    mock_pdf = mocker.MagicMock()
+    mock_page = mocker.MagicMock()
+    mock_page.extract_text.return_value = SYNTHETIC_RESUME
+    mock_pdf.pages = [mock_page]
+    mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
+    mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
+    mocker.patch("pdfplumber.open", return_value=mock_pdf)
+    return mock_pdf
+
+
+@pytest.fixture(autouse=True)
+def _clear_keyword_cache(monkeypatch, tmp_path):
+    """Redirect filter's keyword cache to a tmp file so tests don't share
+    cached YAKE output across runs (and don't pollute the real output dir)."""
+    monkeypatch.setattr(
+        filter_mod, "KEYWORDS_CACHE_PATH", tmp_path / "_keywords.json"
+    )
 
 
 @pytest.fixture

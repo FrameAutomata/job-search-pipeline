@@ -20,12 +20,13 @@ def main() -> int:
     ap.add_argument("--skip-screen", action="store_true", help="Skip liveness and LLM fit screening")
     ap.add_argument("--skip-bridge", action="store_true", help="Don't push to career-ops")
     ap.add_argument("--skip-batch-prep", action="store_true", help="Don't write batch-input.tsv")
-    ap.add_argument("--evaluate-batch", action="store_true",
-                    help="Evaluate jobs synchronously via any LLM provider (auto-detected from env keys)")
-    ap.add_argument("--submit-batch", action="store_true",
-                    help="Submit batch-input.tsv to Anthropic Batch API (async, ~24 h, 50%% off)")
-    ap.add_argument("--retrieve-batch", action="store_true",
-                    help="Poll and retrieve completed Anthropic Batch API results (skips pipeline stages)")
+    eval_group = ap.add_mutually_exclusive_group()
+    eval_group.add_argument("--evaluate-batch", action="store_true",
+                            help="Evaluate jobs synchronously via any LLM provider (auto-detected from env keys)")
+    eval_group.add_argument("--submit-batch", action="store_true",
+                            help="Submit batch-input.tsv to Anthropic Batch API (async, ~24 h, 50%% off)")
+    eval_group.add_argument("--retrieve-batch", action="store_true",
+                            help="Poll and retrieve completed Anthropic Batch API results (skips pipeline stages)")
     ap.add_argument("--batch-provider", type=str, default=None,
                     help="LLM provider for --evaluate-batch: anthropic|gemini|openai|groq|ollama")
     ap.add_argument("--batch-model", type=str, default=None,
@@ -35,7 +36,14 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
+    ap.add_argument("--only-pass", type=str, default=None,
+                    help="Comma-separated list of search `name:` values to run "
+                         "(e.g. 'easy apply' or 'recent DFW,remote US'). Default: all passes.")
     args = ap.parse_args()
+
+    only_passes: list[str] | None = None
+    if args.only_pass:
+        only_passes = [p.strip() for p in args.only_pass.split(",") if p.strip()]
 
     def resolve(p: str | Path) -> Path:
         p = Path(p)
@@ -58,7 +66,7 @@ def main() -> int:
 
     if not args.skip_scrape:
         notify.notify("Pipeline", "Scraping job boards...")
-        scrape.run(config_path)
+        scrape.run(config_path, only_passes=only_passes)
         notify.notify("Pipeline", "Scraping complete")
 
     if not args.skip_filter:
@@ -67,7 +75,7 @@ def main() -> int:
         notify.notify("Pipeline", "Filtering complete")
 
     if not args.skip_screen:
-        screen.run(config_path)
+        screen.run(config_path, career_ops_path=career_ops)
 
     new_offers: list[dict] = []
     if not args.skip_bridge:

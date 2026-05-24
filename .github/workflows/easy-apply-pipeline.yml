@@ -1,23 +1,26 @@
-name: Retrieve Batch Results
+name: Easy Apply Job Pipeline
 
-# Polls the Anthropic Batch API for completed job evaluations. Runs ~12 h
-# after the daily pipeline so the batch has time to complete. Can also be
-# triggered manually at any time.
+# Runs the "easy apply" pass every 4 hours. Easy-apply listings churn fast
+# (fill in hours) so we re-scrape often and rely on screen-stage dedup
+# against the cached scan-history so each run only evaluates genuinely
+# new + live postings.
 #
-# Same privacy model as daily-pipeline.yml: refuses to run in a public repo,
-# state lives in cache, reports upload as artifacts.
+# Schedule offset (02/06/10/14/18/22 UTC) avoids overlap with the 12:00
+# daily-pipeline run.
+#
+# See daily-pipeline.yml for the full privacy model and secrets list.
+# This workflow refuses to run in a public repository.
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # midnight UTC = 7 PM CDT (12 h after submission)
+    - cron: '0 2,6,10,14,18,22 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # Share the same cache group as the pipeline so saves never race.
-  group: pipeline-state
+  group: easy-apply-pipeline
   cancel-in-progress: false
 
 env:
@@ -48,7 +51,7 @@ jobs:
           fi
           echo "should_run=true" >> "$GITHUB_OUTPUT"
 
-  retrieve:
+  scrape-and-evaluate:
     needs: preflight
     if: needs.preflight.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -71,6 +74,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install google-generativeai openai 2>/dev/null || true
 
       - name: Clone career-ops fork
         run: |
@@ -82,15 +86,19 @@ jobs:
 
       - name: Decode setup secrets into place
         env:
+          SEARCH_CONFIG_B64:  ${{ secrets.SEARCH_CONFIG_B64 }}
+          RESUME_TXT_B64:     ${{ secrets.RESUME_TXT_B64 }}
           CV_MD_B64:          ${{ secrets.CV_MD_B64 }}
           PROFILE_YML_B64:    ${{ secrets.PROFILE_YML_B64 }}
           PROFILE_MD_B64:     ${{ secrets.PROFILE_MD_B64 }}
           ARTICLE_DIGEST_B64: ${{ secrets.ARTICLE_DIGEST_B64 }}
         run: |
-          mkdir -p career-ops/config career-ops/modes career-ops/data \
+          mkdir -p config resumes career-ops/config career-ops/modes career-ops/data \
                    career-ops/batch/jds career-ops/batch/tracker-additions career-ops/reports
-          echo "$CV_MD_B64"        | base64 -d > career-ops/cv.md
-          echo "$PROFILE_YML_B64"  | base64 -d > career-ops/config/profile.yml
+          echo "$SEARCH_CONFIG_B64" | base64 -d > config/search.yml
+          echo "$RESUME_TXT_B64"    | base64 -d > resumes/resume.txt
+          echo "$CV_MD_B64"         | base64 -d > career-ops/cv.md
+          echo "$PROFILE_YML_B64"   | base64 -d > career-ops/config/profile.yml
           if [ -n "$PROFILE_MD_B64" ]; then
             echo "$PROFILE_MD_B64"     | base64 -d > career-ops/modes/_profile.md
           fi
@@ -112,10 +120,19 @@ jobs:
           restore-keys: |
             pipeline-state-v1-
 
-      - name: Retrieve batch results
+      - name: Run pipeline and evaluate
         env:
+          BATCH_PROVIDER:    ${{ vars.BATCH_PROVIDER || '' }}
+          BATCH_MODEL:       ${{ vars.BATCH_MODEL || '' }}
+          BATCH_CONCURRENCY: ${{ vars.BATCH_CONCURRENCY || '3' }}
+          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python -u orchestrate.py --retrieve-batch
+        run: |
+          python -u orchestrate.py --evaluate-batch \
+            --only-pass "easy apply" \
+            --batch-concurrency "$BATCH_CONCURRENCY"
 
       - name: Save pipeline state cache
         if: always()
@@ -134,10 +151,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: batch-output-${{ github.run_id }}
+          name: pipeline-output-${{ github.run_id }}
           path: |
             career-ops/reports/
             career-ops/data/applications.md
+            career-ops/data/pipeline.md
             career-ops/batch/tracker-additions/
           if-no-files-found: ignore
           retention-days: 90

@@ -1,5 +1,60 @@
 # job-search-pipeline
 
+> ## ⚠️ Privacy notice — read first
+>
+> Job-search activity is sensitive. If you are currently employed, your employer should not be able to see that you are evaluating other roles.
+>
+> This repository is a **public template**. The cloud automation refuses to run on the template itself (no-ops silently) and refuses to run on any public copy of it (hard-stops with a privacy warning). Real runs only happen in **private copies** created via GitHub's "Use this template" button. Workflow run history, commit log, and schedule cadence stay scoped to your private copy and are invisible to anyone but you.
+>
+> No user data is committed to this repository. All runtime state lives in GitHub Actions Cache (per-copy, invisible) and per-run Artifacts (downloadable from your private copy's Actions tab).
+>
+> Running the pipeline **locally** has no such concern — your data stays on your machine.
+
+## Using this template
+
+This repo is set up to be cloned into your own private copy. The public template stays as code/docs only.
+
+### Create your private copy
+
+1. On this repository's GitHub page, click **Use this template → Create a new repository**.
+2. **Set Owner to your account, give it a name (e.g. `job-search-private`), and check "Private".**
+3. Click **Create repository from template**.
+
+GitHub creates a standalone private repo with the same files. It's *not* listed as a fork of this template, so there's no cross-reference and no fork-network visibility back to your account.
+
+### Configure your private copy
+
+Inside your private copy on github.com:
+
+1. **Settings → Secrets and variables → Actions → New repository secret.** Add:
+   - `CV_MD_B64` — `base64 -w0 path/to/your/cv.md`
+   - `PROFILE_YML_B64` — `base64 -w0 path/to/your/profile.yml`
+   - `SEARCH_CONFIG_B64` — `base64 -w0 config/search.yml`
+   - `RESUME_TXT_B64` — `base64 -w0 resumes/resume.txt`
+   - At least one LLM API key: `GEMINI_API_KEY` (free tier) / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+   - Optional: `PROFILE_MD_B64`, `ARTICLE_DIGEST_B64`
+2. **Actions tab → "I understand my workflows, go ahead and enable them".**
+3. **Actions → Daily Job Pipeline → Run workflow** to do a test run before the scheduled cron fires.
+
+### Pulling updates from the template later
+
+Your private copy starts as a snapshot — it doesn't auto-track changes to this template. To pull updates:
+
+```bash
+git clone <your-private-copy-url>
+cd <your-private-copy>
+git remote add template <this-template-url>
+git fetch template
+git merge template/main   # or rebase, your call
+git push
+```
+
+Conflicts only happen if you've edited the same files locally — your data lives in cache/secrets/artifacts, not in tracked files.
+
+### For maintainers of this template
+
+If you're maintaining this template (rather than using it for a job search), no action needed — the cron triggers fire here too, but the `preflight` job detects `is_template: true` via the GitHub API and exits cleanly with `should_run=false`. The Actions tab stays clean.
+
 A local, fully automated pipeline that runs the complete job-search loop end to end:
 
 1. **Scrape** — [JobSpy](https://github.com/speedyapply/JobSpy) pulls postings from Indeed, LinkedIn, Glassdoor, ZipRecruiter, etc. into `output/jobs.csv`.

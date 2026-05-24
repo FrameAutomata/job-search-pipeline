@@ -33,3 +33,6 @@ resumes/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code local session/config (per-user, not for the repo)
+.claude/

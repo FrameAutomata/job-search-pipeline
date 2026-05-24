@@ -19,15 +19,20 @@ Requirements (install only the provider you need):
   pip install openai                     # openai / groq / ollama
 """
 
+import argparse
 import json
 import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from pipeline._batch_common import (
+    MAX_TOKENS,
+    assign_job_numbers,
+    atomic_write_text,
     build_system_prompt,
     build_user_message,
     load_pending,
@@ -50,58 +55,84 @@ PROVIDER_DEFAULTS: dict[str, str] = {
 }
 
 
-# ── Provider dispatch ────────────────────────────────────────────────────────
+# ── Provider client factories ────────────────────────────────────────────────
+# Each factory builds the SDK client once and returns a `(system, user) -> str`
+# callable. Workers reuse the same client across all jobs.
 
-def _call_anthropic(system: str, user: str, model: str) -> str:
+Caller = Callable[[str, str], str]
+
+
+def _build_anthropic_caller(model: str) -> Caller:
     import anthropic as _a
     client = _a.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    msg = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return msg.content[0].text
+
+    def call(system: str, user: str) -> str:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = msg.content[0].text if msg.content else None
+        if not text:
+            raise RuntimeError("anthropic returned empty content")
+        return text
+
+    return call
 
 
-def _call_gemini(system: str, user: str, model: str) -> str:
+def _build_gemini_caller(model: str) -> Caller:
     import google.generativeai as genai  # type: ignore[import]
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    m = genai.GenerativeModel(model_name=model, system_instruction=system)
-    resp = m.generate_content(user)
-    return resp.text
+
+    def call(system: str, user: str) -> str:
+        m = genai.GenerativeModel(model_name=model, system_instruction=system)
+        resp = m.generate_content(user)
+        text = getattr(resp, "text", None)
+        if not text:
+            raise RuntimeError("gemini returned empty content")
+        return text
+
+    return call
 
 
-def _call_openai_compat(system: str, user: str, model: str, api_key: str, base_url: str | None = None) -> str:
+def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None = None) -> Caller:
     from openai import OpenAI  # type: ignore[import]
     client = OpenAI(api_key=api_key, base_url=base_url)
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=8192,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    return resp.choices[0].message.content
+
+    def call(system: str, user: str) -> str:
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        content = resp.choices[0].message.content
+        if not content:
+            # None happens on refusals / tool-only responses. Treat as failure.
+            raise RuntimeError("provider returned empty content")
+        return content
+
+    return call
 
 
-def _call(provider: str, system: str, user: str, model: str) -> str:
+def _build_caller(provider: str, model: str) -> Caller:
     if provider == "anthropic":
-        return _call_anthropic(system, user, model)
+        return _build_anthropic_caller(model)
     if provider == "gemini":
-        return _call_gemini(system, user, model)
+        return _build_gemini_caller(model)
     if provider == "openai":
-        return _call_openai_compat(system, user, model, api_key=os.environ["OPENAI_API_KEY"])
+        return _build_openai_compat_caller(model, api_key=os.environ["OPENAI_API_KEY"])
     if provider == "groq":
-        return _call_openai_compat(
-            system, user, model,
-            api_key=os.environ["GROQ_API_KEY"],
+        return _build_openai_compat_caller(
+            model, api_key=os.environ["GROQ_API_KEY"],
             base_url="https://api.groq.com/openai/v1",
         )
     if provider == "ollama":
         base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/v1"
-        return _call_openai_compat(system, user, model, api_key="ollama", base_url=base)
+        return _build_openai_compat_caller(model, api_key="ollama", base_url=base)
     raise ValueError(f"Unknown provider: {provider!r}. Choose: {', '.join(PROVIDER_DEFAULTS)}")
 
 
@@ -139,8 +170,7 @@ def _check_provider(provider: str) -> str | None:
 def _process_one(
     job_meta: dict,
     system_prompt: str,
-    provider: str,
-    model: str,
+    caller: Caller,
     reports_dir: Path,
     tracker_dir: Path,
     today: str,
@@ -150,7 +180,7 @@ def _process_one(
     """Evaluate one job. Returns (success, job_id, error_or_None)."""
     jid = job_meta["id"]
     try:
-        response = _call(provider, system_prompt, build_user_message(job_meta, today), model)
+        response = caller(system_prompt, build_user_message(job_meta, today))
         out = write_job_result(response, job_meta, reports_dir, tracker_dir, today)
 
         with state_lock:
@@ -244,33 +274,13 @@ def run(
     reports_dir.mkdir(parents=True, exist_ok=True)
     tracker_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-assign numbers and load JDs before spawning threads
-    jobs: list[dict] = []
-    for row in pending:
-        jid = str(row["id"]).strip()
-        company = (row.get("source") or "").strip()
-        role = (row.get("notes") or "").strip()
-        report_counter += 1
-        tracker_counter += 1
-        meta = {
-            "id": jid,
-            "url": (row.get("url") or "").strip(),
-            "company": company,
-            "role": role,
-            "report_num": f"{report_counter:03d}",
-            "tracker_num": tracker_counter,
-            "jd_text": read_text(career_ops / "batch" / "jds" / f"{jid}.txt"),
-            "status": "pending",
-        }
-        jobs.append(meta)
-        state_entry = dict(meta)
-        state_entry.pop("jd_text", None)
-        state["jobs"][jid] = state_entry
+    jobs = assign_job_numbers(pending, state, report_counter, tracker_counter, career_ops)
 
     state["provider"] = provider
     state["model"] = model
     state["status"] = "in_progress"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    caller = _build_caller(provider, model)
 
     state_lock = threading.Lock()
     processed = failed = 0
@@ -279,7 +289,7 @@ def run(
         futures = {
             pool.submit(
                 _process_one,
-                meta, system_prompt, provider, model,
+                meta, system_prompt, caller,
                 reports_dir, tracker_dir, today,
                 state, state_lock,
             ): meta
@@ -297,14 +307,15 @@ def run(
                 print(f"  [{jid}] FAILED: {err_msg}")
                 failed += 1
 
-            # Persist state after each completion — snapshot under lock, write outside
+            # Atomic snapshot+write under the lock so concurrent writers can't
+            # interleave or leave a partially-written file.
             with state_lock:
                 snapshot = json.dumps(state, indent=2, ensure_ascii=False)
-            state_path.write_text(snapshot, encoding="utf-8")
+                atomic_write_text(state_path, snapshot)
 
     state["status"] = "completed"
-    state["completed_at"] = datetime.utcnow().isoformat() + "Z"
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    state["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
     print(f"[batch-eval] done — processed={processed} failed={failed}")
 
     if processed > 0:
@@ -313,19 +324,20 @@ def run(
     return processed
 
 
+def _parse_argv(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Evaluate pending jobs via a synchronous LLM provider.")
+    ap.add_argument("--provider", default=None, help="anthropic|gemini|openai|groq|ollama")
+    ap.add_argument("--model", default=None, help="overrides BATCH_MODEL env var")
+    ap.add_argument("--concurrency", type=int, default=3)
+    ap.add_argument("--dry-run", action="store_true")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
+    args = _parse_argv(sys.argv[1:])
     career_ops_path = Path(os.environ.get("CAREER_OPS_PATH", ROOT / "career-ops")).resolve()
-    provider_arg = None
-    model_arg = None
-    concurrency_arg = 3
-    dry = "--dry-run" in sys.argv
-    for i, a in enumerate(sys.argv[1:], 1):
-        if a == "--provider" and i + 1 < len(sys.argv):
-            provider_arg = sys.argv[i + 1]
-        elif a == "--model" and i + 1 < len(sys.argv):
-            model_arg = sys.argv[i + 1]
-        elif a == "--concurrency" and i + 1 < len(sys.argv):
-            concurrency_arg = int(sys.argv[i + 1])
-    sys.exit(0 if run(career_ops_path, provider_arg, model_arg, concurrency_arg, dry) >= 0 else 1)
+    sys.exit(
+        0 if run(career_ops_path, args.provider, args.model, args.concurrency, args.dry_run) >= 0 else 1
+    )
