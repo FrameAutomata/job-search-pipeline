@@ -17,7 +17,7 @@ fi
 
 echo "==> Cloning career-ops (if missing)"
 if [ ! -d "$root/career-ops" ]; then
-  git clone https://github.com/santifer/career-ops "$root/career-ops"
+  git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops-1 "$root/career-ops"
 else
   echo "    career-ops already present, skipping clone"
 fi
@@ -25,15 +25,14 @@ fi
 echo "==> Installing career-ops node deps"
 (cd "$root/career-ops" && npm install)
 
+echo "==> Installing pipeline node deps (yaml, pdf-parse)"
+(cd "$root" && npm install)
+
 echo "==> Copying example configs"
 [ -f "$root/.env" ] || cp "$root/.env.example" "$root/.env"
 [ -f "$root/config/search.yml" ] || cp "$root/config/search.example.yml" "$root/config/search.yml"
 mkdir -p "$root/resumes" "$root/output"
 
-cat <<EOF
-
-Setup complete. Next steps:
-  1. Drop your resume PDF into ./resumes/ and update RESUME_PATH in .env
-  2. Edit ./config/search.yml (search terms, keywords, threshold)
-  3. Run:  ./run.sh
-EOF
+echo ""
+echo "==> Running profile setup"
+node "$root/setup-profile.mjs"

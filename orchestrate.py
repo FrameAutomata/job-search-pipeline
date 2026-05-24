@@ -1,4 +1,4 @@
-"""Chain scrape -> filter -> bridge. Each step can be skipped with a flag."""
+"""Chain scrape -> filter -> screen -> bridge -> batch_prep. Each step can be skipped with a flag."""
 
 import argparse
 import os
@@ -10,20 +10,43 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-from pipeline import scrape, filter as filter_step, bridge, notify  # noqa: E402
+from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_submit, batch_retrieve, batch_evaluate, notify  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the job-search pipeline.")
     ap.add_argument("--skip-scrape", action="store_true", help="Reuse existing output/jobs.csv")
     ap.add_argument("--skip-filter", action="store_true", help="Reuse existing output/filtered_jobs.csv")
+    ap.add_argument("--skip-screen", action="store_true", help="Skip liveness and LLM fit screening")
     ap.add_argument("--skip-bridge", action="store_true", help="Don't push to career-ops")
+    ap.add_argument("--skip-batch-prep", action="store_true", help="Don't write batch-input.tsv")
+    ap.add_argument("--evaluate-batch", action="store_true",
+                    help="Evaluate jobs synchronously via any LLM provider (auto-detected from env keys)")
+    ap.add_argument("--submit-batch", action="store_true",
+                    help="Submit batch-input.tsv to Anthropic Batch API (async, ~24 h, 50%% off)")
+    ap.add_argument("--retrieve-batch", action="store_true",
+                    help="Poll and retrieve completed Anthropic Batch API results (skips pipeline stages)")
+    ap.add_argument("--batch-provider", type=str, default=None,
+                    help="LLM provider for --evaluate-batch: anthropic|gemini|openai|groq|ollama")
+    ap.add_argument("--batch-model", type=str, default=None,
+                    help="Model name (overrides BATCH_MODEL env var)")
+    ap.add_argument("--batch-concurrency", type=int, default=3,
+                    help="Parallel workers for --evaluate-batch (default: 3)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
     args = ap.parse_args()
 
     def resolve(p: str | Path) -> Path:
         p = Path(p)
         return p if p.is_absolute() else (ROOT / p).resolve()
+
+    career_ops = resolve(os.environ.get("CAREER_OPS_PATH", "career-ops"))
+
+    # Retrieve-only: skip all pipeline stages
+    if args.retrieve_batch:
+        batch_retrieve.run(career_ops, dry_run=args.dry_run)
+        return 0
 
     config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG", "config/search.yml"))
     if not config_path.exists():
@@ -34,22 +57,40 @@ def main() -> int:
     notify.notify("Job Search Pipeline", "Starting scrape stage...")
 
     if not args.skip_scrape:
-        notify.notify("Pipeline", "🔍 Scraping job boards...")
+        notify.notify("Pipeline", "Scraping job boards...")
         scrape.run(config_path)
-        notify.notify("Pipeline", "✅ Scraping complete")
+        notify.notify("Pipeline", "Scraping complete")
 
     if not args.skip_filter:
-        notify.notify("Pipeline", "🔎 Filtering jobs...")
+        notify.notify("Pipeline", "Filtering jobs...")
         filter_step.run(config_path)
-        notify.notify("Pipeline", "✅ Filtering complete")
+        notify.notify("Pipeline", "Filtering complete")
 
+    if not args.skip_screen:
+        screen.run(config_path)
+
+    new_offers: list[dict] = []
     if not args.skip_bridge:
-        notify.notify("Pipeline", "📝 Updating career-ops...")
-        career_ops = resolve(os.environ.get("CAREER_OPS_PATH", "career-ops"))
-        count = bridge.run(career_ops)
-        notify.notify("Pipeline", f"✅ Pipeline complete! Added {count} jobs")
-    else:
-        notify.notify("Pipeline", "✅ Pipeline complete!")
+        notify.notify("Pipeline", "Updating career-ops...")
+        new_offers = bridge.run(career_ops)
+        notify.notify("Pipeline", f"Bridge complete -- {len(new_offers)} new offers")
+
+    if not args.skip_batch_prep and new_offers:
+        batch_prep.run(career_ops, new_offers)
+
+    notify.notify("Pipeline", f"Pipeline complete! {len(new_offers)} offers queued")
+
+    if args.evaluate_batch:
+        batch_evaluate.run(
+            career_ops,
+            provider=args.batch_provider,
+            model=args.batch_model,
+            concurrency=args.batch_concurrency,
+            dry_run=args.dry_run,
+        )
+
+    if args.submit_batch:
+        batch_submit.run(career_ops, model=args.batch_model, dry_run=args.dry_run)
 
     return 0
 

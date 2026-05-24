@@ -107,10 +107,10 @@ def append_to_scan_history(career_ops: Path, offers: list[dict], today: str) -> 
             f.write(f"{o['url']}\t{today}\tjobspy\t{o['title']}\t{o['company']}\tadded\n")
 
 
-def run(career_ops_path: Path) -> int:
+def run(career_ops_path: Path) -> list[dict]:
     if not FILTERED_PATH.exists() or FILTERED_PATH.stat().st_size == 0:
         print("[bridge] no filtered_jobs.csv — run filter first (or nothing passed the threshold)")
-        return 0
+        return []
 
     if not career_ops_path.exists():
         raise FileNotFoundError(
@@ -150,7 +150,7 @@ def run(career_ops_path: Path) -> int:
 
     if not new_offers:
         print("[bridge] no new offers to add (all duplicates)")
-        return 0
+        return []
 
     # Sort by date_posted descending (newest first), fallback to empty string for missing dates
     def sort_key(offer: dict) -> tuple:
@@ -167,8 +167,7 @@ def run(career_ops_path: Path) -> int:
     append_to_pipeline(career_ops_path, new_offers)
     append_to_scan_history(career_ops_path, new_offers, today)
     print(f"[bridge] added {len(new_offers)} offers to {career_ops_path / PIPELINE_MD}")
-    print("[bridge] next: cd into career-ops and run /career-ops pipeline in your AI CLI")
-    return len(new_offers)
+    return new_offers
 
 
 if __name__ == "__main__":

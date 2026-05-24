@@ -314,8 +314,12 @@ function parseResumeInfo(resumeText) {
   const githubMatch = resumeText.match(/github\.com\/([a-zA-Z0-9-]+)/i);
   if (githubMatch) info.github = `github.com/${githubMatch[1]}`;
 
+  // Try to extract location (look for patterns like "City, State")
+  const locationMatch = resumeText.match(/\|?\s*([A-Z][a-z]+,\s*[A-Z]{2})/);
+  if (locationMatch) info.location = locationMatch[1];
+
   // Try to extract first line as name (often the first line)
-  const firstLine = resumeText.split('\n')[0].trim();
+  const firstLine = resumeText.trim().split('\n')[0].trim();
   if (firstLine && firstLine.length < 100 && !firstLine.includes('@')) {
     info.name = firstLine;
   }
@@ -521,12 +525,9 @@ async function promptForCareerNarrative(autoMode, _info, criteria) {
     narrative.dealBreakers = ['Legacy codebases only (no greenfield)', 'Startup with <10 people'];
   }
 
-  // Location preferences
+  // Location preferences — preferred already captured in role criteria
   console.log('\n🌍 Location Policy:');
-  const locationPrefInput = await prompt(
-    'What\'s your preferred work location? (e.g., "Remote preferred", "Dallas-based", "US-based")\n→ '
-  );
-  narrative.locationPolicy.preferred = locationPrefInput || 'Remote preferred';
+  narrative.locationPolicy.preferred = criteria.locationFlexibility || 'Remote preferred';
 
   const locationFlexInput = await prompt(
     'What flexibility do you have? (e.g., "Occasional travel OK", "1-2 weeks/month on-site possible")\n→ '
@@ -717,8 +718,8 @@ function generateCV(resumeText, info) {
     skills: '',
   };
 
-  // Simple section extraction by regex
-  const sectionRegex = /^#+\s*(summary|professional summary|experience|projects|education|skills|certifications?)/im;
+  // Match both markdown headers and all-caps section headers
+  const sectionRegex = /(?:^#+\s*|^)((?:PROFESSIONAL\s+)?SUMMARY|EXPERIENCE|PROJECTS?|(?:PROJECTS\s+&\s+OUTSIDE\s+)?EXPERIENCE|EDUCATION|SKILLS|CERTIFICATIONS?)\s*\n/im;
   const splits = resumeText.split(sectionRegex);
 
   for (let i = 0; i < splits.length - 1; i += 2) {
@@ -912,8 +913,20 @@ function updateSearchConfig(targetRoles, negativeRoles) {
     }
   }
 
-  // Update target_titles (remove duplicates)
-  config.filter.target_titles = [...new Set(searchTitles)];
+  const dedupedTitles = [...new Set(searchTitles)];
+
+  // Update search_terms in every scrape pass (preserves all other pass settings)
+  const passes = config.searches
+    ? config.searches
+    : config.search
+    ? [config.search]
+    : [];
+  for (const pass of passes) {
+    pass.search_terms = dedupedTitles;
+  }
+
+  // Update filter titles
+  config.filter.target_titles = dedupedTitles;
 
   // Update negative_titles
   if (negativeRoles && negativeRoles.length > 0) {

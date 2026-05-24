@@ -364,23 +364,22 @@ class TestRun:
     """Test bridge.run function."""
 
     def test_run_missing_filtered_csv_returns_zero(self, career_ops_dir, monkeypatch, tmp_path):
-        """Missing filtered_jobs.csv returns 0."""
-        # Patch FILTERED_PATH to a nonexistent file
+        """Missing filtered_jobs.csv returns empty list."""
         nonexistent = tmp_path / "nonexistent.csv"
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", nonexistent)
 
         result = bridge_mod.run(career_ops_dir)
-        assert result == 0
+        assert result == []
 
     def test_run_empty_filtered_csv_returns_zero(self, career_ops_dir, monkeypatch, tmp_path):
-        """Empty filtered_jobs.csv returns 0."""
+        """Empty filtered_jobs.csv returns empty list."""
         filtered = tmp_path / "filtered_jobs.csv"
         filtered.write_text("")
 
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        assert result == 0
+        assert result == []
 
     def test_run_missing_career_ops_raises(self, tmp_path, monkeypatch):
         """Missing career_ops_path raises FileNotFoundError."""
@@ -394,7 +393,7 @@ class TestRun:
             bridge_mod.run(nonexistent)
 
     def test_run_returns_count_of_new_offers(self, career_ops_dir, monkeypatch, tmp_path):
-        """Returns count of added offers."""
+        """Returns list of added offers."""
         filtered = tmp_path / "filtered_jobs.csv"
         filtered.write_text(
             "title,company,job_url\n"
@@ -406,7 +405,7 @@ class TestRun:
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        assert result == 3
+        assert len(result) == 3
 
     def test_run_dedupes_by_url(self, career_ops_dir, monkeypatch, tmp_path):
         """Deduplicate by URL within a single run."""
@@ -421,8 +420,7 @@ class TestRun:
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        # Only 2 unique URLs
-        assert result == 2
+        assert len(result) == 2
 
     def test_run_dedupes_by_company_role(self, career_ops_dir, monkeypatch, tmp_path):
         """Deduplicate by company::role (case-insensitive)."""
@@ -437,8 +435,7 @@ class TestRun:
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        # Only 2 unique company::title combos
-        assert result == 2
+        assert len(result) == 2
 
     def test_run_skips_urls_already_in_scan_history(self, career_ops_dir, monkeypatch, tmp_path):
         """Skip URLs already in scan-history.tsv."""
@@ -459,8 +456,7 @@ class TestRun:
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        # Only job2 is new
-        assert result == 1
+        assert len(result) == 1
 
     def test_run_skips_urls_from_pipeline_md(self, career_ops_dir, monkeypatch, tmp_path):
         """Skip URLs already in pipeline.md."""
@@ -482,8 +478,7 @@ class TestRun:
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        # Only job2 is new
-        assert result == 1
+        assert len(result) == 1
 
     def test_run_skips_rows_with_missing_url(self, career_ops_dir, monkeypatch, tmp_path):
         """Skip rows with blank job_url."""
@@ -497,8 +492,7 @@ class TestRun:
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
         result = bridge_mod.run(career_ops_dir)
-        # Only job2
-        assert result == 1
+        assert len(result) == 1
 
     def test_run_writes_to_both_pipeline_and_history(self, career_ops_dir, monkeypatch, tmp_path):
         """Both pipeline.md and scan-history.tsv are written."""
