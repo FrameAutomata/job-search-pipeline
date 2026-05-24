@@ -8,11 +8,14 @@ Mirrors scan.mjs's output format:
 The user then runs `/career-ops pipeline` in their AI CLI to evaluate the queue."""
 
 import csv
+import html
 import os
 import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
+
+from pipeline._batch_common import parse_date_posted
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -21,9 +24,51 @@ PIPELINE_MD = "data/pipeline.md"
 SCAN_HISTORY = "data/scan-history.tsv"
 APPLICATIONS_MD = "data/applications.md"
 
+# Full job descriptions can be tens of KB. We keep the structured copy in
+# career-ops/batch/jds/{id}.txt and only embed a preview in pipeline.md.
+DESCRIPTION_PREVIEW_CHARS = 500
 
-def load_seen_urls(career_ops: Path) -> set[str]:
-    seen = set()
+
+def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
+    """Walk applications.md once. Return (urls, company::role pairs)."""
+    urls: set[str] = set()
+    roles: set[str] = set()
+
+    # URLs can appear anywhere — links, table cells, raw markdown. Use the same
+    # cheap regex the original code used.
+    urls.update(re.findall(r"https?://[^\s|)]+", text))
+
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        # Markdown separator row: |---|---|...
+        if re.match(r"^\|[\s|:\-]+\|?\s*$", line):
+            continue
+        # Strip optional leading/trailing pipes before splitting so empty
+        # columns at the ends don't shift positions.
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        cols = [c.strip() for c in stripped.split("|")]
+        # Expected layout: # | Date | Company | Role | URL | Status
+        if len(cols) < 4:
+            continue
+        company, role = cols[2].lower(), cols[3].lower()
+        # Skip header row
+        if company == "company" and role == "role":
+            continue
+        if company and role:
+            roles.add(f"{company}::{role}")
+
+    return urls, roles
+
+
+def load_seen(career_ops: Path) -> tuple[set[str], set[str]]:
+    """Return (seen_urls, seen_company_roles) merged across all dedup sources."""
+    urls: set[str] = set()
+    roles: set[str] = set()
 
     hist = career_ops / SCAN_HISTORY
     if hist.exists():
@@ -32,33 +77,42 @@ def load_seen_urls(career_ops: Path) -> set[str]:
             for line in f:
                 url = line.split("\t", 1)[0].strip()
                 if url:
-                    seen.add(url)
+                    urls.add(url)
 
     pipe = career_ops / PIPELINE_MD
     if pipe.exists():
         text = pipe.read_text(encoding="utf-8")
-        seen.update(re.findall(r"- \[[ x]\] (https?://\S+)", text))
+        urls.update(re.findall(r"- \[[ x]\] (https?://\S+)", text))
 
     apps = career_ops / APPLICATIONS_MD
     if apps.exists():
         text = apps.read_text(encoding="utf-8")
-        seen.update(re.findall(r"https?://[^\s|)]+", text))
+        app_urls, app_roles = _parse_applications_md(text)
+        urls.update(app_urls)
+        roles.update(app_roles)
 
-    return seen
+    return urls, roles
+
+
+# Back-compat aliases — tests call these directly.
+def load_seen_urls(career_ops: Path) -> set[str]:
+    return load_seen(career_ops)[0]
 
 
 def load_seen_company_roles(career_ops: Path) -> set[str]:
-    seen = set()
-    apps = career_ops / APPLICATIONS_MD
-    if not apps.exists():
-        return seen
-    text = apps.read_text(encoding="utf-8")
-    # Markdown table: | # | Date | Company | Role | ...
-    for m in re.finditer(r"\|[^|]+\|[^|]+\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|", text):
-        company, role = m.group(1).strip().lower(), m.group(2).strip().lower()
-        if company and role and company != "company":
-            seen.add(f"{company}::{role}")
-    return seen
+    return load_seen(career_ops)[1]
+
+
+def _safe_description(raw: str) -> str:
+    """Truncate to a preview length and escape HTML, including stripping any
+    literal </details> tokens that would break the surrounding block."""
+    text = raw.strip()
+    if len(text) > DESCRIPTION_PREVIEW_CHARS:
+        text = text[:DESCRIPTION_PREVIEW_CHARS].rstrip() + "..."
+    # html.escape covers &, <, >, ", '. Belt-and-suspenders on </details> in
+    # case any future change loosens the escape.
+    text = html.escape(text, quote=True)
+    return text.replace("</details>", "&lt;/details&gt;")
 
 
 def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
@@ -66,11 +120,9 @@ def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
     pipe.parent.mkdir(parents=True, exist_ok=True)
 
     def format_offer(o: dict) -> str:
-        """Format offer as checkbox link with optional collapsible description."""
         lines = [f"- [ ] {o['url']} | {o['company']} | {o['title']}"]
         if o.get("description"):
-            # Escape HTML special chars in description for safety
-            desc = o["description"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            desc = _safe_description(o["description"])
             lines.append(f"  <details><summary>Description</summary>\n\n  {desc}\n\n  </details>")
         return "\n".join(lines)
 
@@ -97,14 +149,26 @@ def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
     pipe.write_text(text, encoding="utf-8")
 
 
-def append_to_scan_history(career_ops: Path, offers: list[dict], today: str) -> None:
+def append_to_scan_history(
+    career_ops: Path,
+    entries: list[dict],
+    today: str,
+    status: str = "added",
+) -> None:
+    """Append rows to scan-history.tsv.
+
+    `status` is the value written in the final column. Use the default
+    "added" for bridge's normal flow; pre-screen records use "screened-dead"
+    so future runs can skip URLs that already failed liveness.
+
+    Each entry must have `url`, `title`, `company`."""
     hist = career_ops / SCAN_HISTORY
     hist.parent.mkdir(parents=True, exist_ok=True)
     if not hist.exists():
         hist.write_text("url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n", encoding="utf-8")
     with open(hist, "a", encoding="utf-8") as f:
-        for o in offers:
-            f.write(f"{o['url']}\t{today}\tjobspy\t{o['title']}\t{o['company']}\tadded\n")
+        for e in entries:
+            f.write(f"{e['url']}\t{today}\tjobspy\t{e['title']}\t{e['company']}\t{status}\n")
 
 
 def run(career_ops_path: Path) -> list[dict]:
@@ -118,8 +182,7 @@ def run(career_ops_path: Path) -> list[dict]:
             "Run setup.ps1/setup.sh or set CAREER_OPS_PATH in .env."
         )
 
-    seen_urls = load_seen_urls(career_ops_path)
-    seen_roles = load_seen_company_roles(career_ops_path)
+    seen_urls, seen_roles = load_seen(career_ops_path)
 
     new_offers = []
     with open(FILTERED_PATH, newline="", encoding="utf-8") as f:
@@ -152,14 +215,10 @@ def run(career_ops_path: Path) -> list[dict]:
         print("[bridge] no new offers to add (all duplicates)")
         return []
 
-    # Sort by date_posted descending (newest first), fallback to empty string for missing dates
+    # Newest first; unparseable / missing dates sort to the end.
     def sort_key(offer: dict) -> tuple:
-        date_str = offer.get("date_posted") or ""
-        try:
-            return (0, datetime.strptime(date_str, "%Y-%m-%d"))
-        except (ValueError, TypeError):
-            # Unparseable or missing dates sort to end
-            return (1, datetime.min)
+        parsed = parse_date_posted(offer.get("date_posted") or "")
+        return (0, parsed) if parsed is not None else (1, datetime.min)
 
     new_offers.sort(key=sort_key, reverse=True)
 

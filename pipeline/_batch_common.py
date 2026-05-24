@@ -2,9 +2,34 @@
 
 import csv
 import json
+import os
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
+
+MAX_TOKENS = 8192
+
+
+def parse_date_posted(val: str) -> datetime | None:
+    """Parse a date_posted string. Tolerates both date and datetime forms."""
+    if not val or val.strip().lower() in ("", "none", "nan", "nat"):
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(val.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Write content atomically — write to a tmp sibling then os.replace.
+    os.replace is atomic on POSIX and Windows."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def read_text(path: Path, default: str = "") -> str:
@@ -63,17 +88,30 @@ def extract_tag(text: str, tag: str) -> str:
 
 
 def parse_json_loose(text: str) -> dict | None:
+    """Try parsing `text` as JSON. If that fails, try each balanced {...}
+    block found in the text and return the first one that parses."""
     text = text.strip()
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except (json.JSONDecodeError, ValueError):
-            pass
+    # Walk the string finding balanced { ... } blocks (depth-aware), so we
+    # don't over-capture when the response contains multiple JSON-like spans.
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return json.loads(text[start:i + 1])
+                except (json.JSONDecodeError, ValueError):
+                    start = -1
+                    continue
     return None
 
 
@@ -119,6 +157,48 @@ def build_user_message(job_meta: dict, today: str) -> str:
         f"**Role (source field):** {job_meta.get('role') or 'unknown'}\n\n"
         f"**Job Description:**\n{job_meta.get('jd_text') or '(no JD cached — infer from the URL and source fields)'}"
     )
+
+
+def assign_job_numbers(
+    pending: list[dict],
+    state: dict,
+    report_start: int,
+    tracker_start: int,
+    career_ops: Path,
+    load_jd_text: bool = True,
+) -> list[dict]:
+    """Pre-assign sequential report and tracker numbers to pending jobs.
+
+    Used by both batch_evaluate and batch_submit so number assignment stays
+    consistent across the two code paths. Mutates `state["jobs"]` to record
+    each job's metadata (excluding jd_text to keep state small)."""
+    report_counter = report_start
+    tracker_counter = tracker_start
+    if "jobs" not in state:
+        state["jobs"] = {}
+
+    jobs: list[dict] = []
+    for row in pending:
+        jid = str(row["id"]).strip()
+        report_counter += 1
+        tracker_counter += 1
+        meta = {
+            "id": jid,
+            "url": (row.get("url") or "").strip(),
+            "company": (row.get("source") or "").strip(),
+            "role": (row.get("notes") or "").strip(),
+            "report_num": f"{report_counter:03d}",
+            "tracker_num": tracker_counter,
+            "status": "pending",
+        }
+        if load_jd_text:
+            meta["jd_text"] = read_text(career_ops / "batch" / "jds" / f"{jid}.txt")
+        jobs.append(meta)
+
+        state_entry = {k: v for k, v in meta.items() if k != "jd_text"}
+        state["jobs"][jid] = state_entry
+
+    return jobs
 
 
 def load_pending(

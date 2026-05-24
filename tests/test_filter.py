@@ -274,7 +274,7 @@ class TestRun:
     """Test filter.run function with mocked pdfplumber."""
 
     def test_run_filters_and_writes(
-        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """run() filters jobs and writes output CSV."""
         jobs_path, output_path = patch_filter_paths
@@ -287,16 +287,6 @@ class TestRun:
         # Set RESUME_PATH env var
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
 
-        # Mock pdfplumber to return synthetic resume
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
-
-        # Create minimal config
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
 filter:
@@ -355,7 +345,7 @@ filter:
             filter_mod.run(config)
 
     def test_run_writes_empty_file_when_nothing_passes(
-        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """When no jobs pass threshold, writes empty file."""
         jobs_path, output_path = patch_filter_paths
@@ -364,14 +354,6 @@ filter:
         jobs_path.write_text(jobs_csv.read_text())
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
-
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
@@ -388,7 +370,7 @@ filter:
         assert content == ""
 
     def test_run_returns_output_path(
-        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """run() returns the output path."""
         jobs_path, output_path = patch_filter_paths
@@ -397,14 +379,6 @@ filter:
         jobs_path.write_text(jobs_csv.read_text())
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
-
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
@@ -418,7 +392,7 @@ filter:
         assert result == output_path
 
     def test_run_max_age_hours_filters_old_jobs(
-        self, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """max_age_hours filters out jobs older than N hours."""
         jobs_path, output_path = patch_filter_paths
@@ -435,14 +409,6 @@ filter:
         jobs_path.write_text(csv_content)
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
-
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
@@ -461,7 +427,7 @@ filter:
         assert "new.com" in df.iloc[0]["job_url"]
 
     def test_run_missing_date_kept_regardless(
-        self, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """Jobs with blank date_posted are kept even with max_age_hours set."""
         jobs_path, output_path = patch_filter_paths
@@ -476,14 +442,6 @@ filter:
         jobs_path.write_text(csv_content)
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
-
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
@@ -501,7 +459,7 @@ filter:
         assert len(df) == 2
 
     def test_run_keyword_overrides_applied(
-        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """keyword_overrides are applied correctly."""
         jobs_path, output_path = patch_filter_paths
@@ -510,14 +468,6 @@ filter:
         jobs_path.write_text(jobs_csv.read_text())
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
-
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
@@ -578,7 +528,7 @@ filter:
         assert len(df) >= 1
 
     def test_run_sorts_output_by_score_descending(
-        self, patch_filter_paths, fake_pdf, monkeypatch, mocker
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
         """Output is sorted by relevance_score descending."""
         jobs_path, output_path = patch_filter_paths
@@ -593,14 +543,6 @@ filter:
         jobs_path.write_text(csv_content)
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
-
-        mock_pdf = mocker.MagicMock()
-        mock_page = mocker.MagicMock()
-        mock_page.extract_text.return_value = SYNTHETIC_RESUME
-        mock_pdf.pages = [mock_page]
-        mock_pdf.__enter__ = mocker.MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__ = mocker.MagicMock(return_value=None)
-        mocker.patch("pdfplumber.open", return_value=mock_pdf)
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""

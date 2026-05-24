@@ -1,38 +1,83 @@
 name: Daily Job Pipeline
 
-# Scrape -> filter -> screen -> bridge -> batch-prep -> evaluate
+# Runs the "recent DFW" and "remote US" passes once a day.
+# The "easy apply" pass runs in a separate workflow (easy-apply-pipeline.yml)
+# on a 4-hour cadence — easy-apply listings churn fast.
 #
-# Provider is auto-detected from the first API key secret found (checked in order:
-# GEMINI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).
-# Override with the BATCH_PROVIDER repository variable.
+# PRIVACY MODEL — READ THIS:
+#   Job-search activity is sensitive. Public repositories expose commit history,
+#   workflow run history, schedule cadence, and any file you commit. To keep
+#   this safe for employed users:
+#     1. The TEMPLATE repository (marked "Template repository" in Settings)
+#        is detected and scheduled runs no-op silently there. The template
+#        stays public so people can browse and copy it.
+#     2. Real runs only happen in PRIVATE copies created via the "Use this
+#        template" button. The workflow hard-stops if it finds itself running
+#        in a public non-template repo.
+#     3. All runtime state lives in GitHub Actions Cache — never committed.
+#     4. Reports are uploaded as workflow Artifacts — downloadable from the
+#        Actions tab, scoped to your fork.
+#     5. Setup data (CV, profile) is stored as encrypted repository Secrets.
 #
-# Required secrets (set at least one API key):
-#   SEARCH_CONFIG_B64  — base64-encoded config/search.yml
-#   RESUME_TXT_B64     — base64-encoded resumes/resume.txt  (run setup to generate)
-#   GEMINI_API_KEY     — Google Gemini (free tier, recommended)
-#   GROQ_API_KEY       — Groq (free tier, fast open-source models)
-#   OPENAI_API_KEY     — OpenAI
-#   ANTHROPIC_API_KEY  — Anthropic (also enables --submit-batch async path)
-#
-# Required: career-ops-data/ directory committed to this repo (see CLAUDE.md)
+# Required SECRETS (Settings → Secrets and variables → Actions):
+#   CV_MD_B64          — `base64 -w0 path/to/cv.md`
+#   PROFILE_YML_B64    — `base64 -w0 path/to/profile.yml`
+#   SEARCH_CONFIG_B64  — `base64 -w0 config/search.yml`
+#   RESUME_TXT_B64     — `base64 -w0 resumes/resume.txt`
+#   (optional) PROFILE_MD_B64     — your modes/_profile.md customizations
+#   (optional) ARTICLE_DIGEST_B64 — your article-digest.md
+#   At least one LLM key: GEMINI_API_KEY / GROQ_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
 
 on:
   schedule:
     - cron: '0 12 * * *'   # noon UTC = 7 AM CDT
-  workflow_dispatch:        # manual trigger
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: '1'
 
 jobs:
+  preflight:
+    # Cheap gating job. Decides whether the real work runs. Keeps the privacy
+    # guards in one place instead of repeated as `if:` on every downstream step.
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check repo visibility and template status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IS_TEMPLATE=$(gh api repos/${{ github.repository }} --jq .is_template)
+          VIS=$(gh api repos/${{ github.repository }} --jq .visibility)
+          echo "is_template=$IS_TEMPLATE visibility=$VIS"
+          if [ "$IS_TEMPLATE" = "true" ]; then
+            echo "This is the template repository — scheduled runs no-op here. Click 'Use this template' on GitHub to create your own private copy."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$VIS" != "private" ]; then
+            echo "::error::This workflow only runs in PRIVATE repositories. Job-search activity is sensitive; the workflow run history and commit log of a public repo would expose it. Use 'Use this template' on GitHub to create a private copy, then re-run."
+            exit 1
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
   scrape-and-evaluate:
+    needs: preflight
+    if: needs.preflight.outputs.should_run == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -48,7 +93,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Install provider SDK(s) for whichever key is configured
           pip install google-generativeai openai 2>/dev/null || true
 
       - name: Clone career-ops fork
@@ -59,34 +103,45 @@ jobs:
       - name: Install career-ops Node deps
         run: npm install --prefix career-ops
 
-      - name: Decode secrets into place
+      - name: Decode setup secrets into place
         env:
-          SEARCH_CONFIG_B64: ${{ secrets.SEARCH_CONFIG_B64 }}
-          RESUME_TXT_B64: ${{ secrets.RESUME_TXT_B64 }}
+          SEARCH_CONFIG_B64:  ${{ secrets.SEARCH_CONFIG_B64 }}
+          RESUME_TXT_B64:     ${{ secrets.RESUME_TXT_B64 }}
+          CV_MD_B64:          ${{ secrets.CV_MD_B64 }}
+          PROFILE_YML_B64:    ${{ secrets.PROFILE_YML_B64 }}
+          PROFILE_MD_B64:     ${{ secrets.PROFILE_MD_B64 }}
+          ARTICLE_DIGEST_B64: ${{ secrets.ARTICLE_DIGEST_B64 }}
         run: |
-          mkdir -p config resumes
+          mkdir -p config resumes career-ops/config career-ops/modes career-ops/data \
+                   career-ops/batch/jds career-ops/batch/tracker-additions career-ops/reports
           echo "$SEARCH_CONFIG_B64" | base64 -d > config/search.yml
-          echo "$RESUME_TXT_B64"   | base64 -d > resumes/resume.txt
-
-      - name: Restore career-ops user data
-        run: |
-          if [ -d career-ops-data ]; then
-            mkdir -p career-ops/data career-ops/batch/jds career-ops/batch/tracker-additions \
-                     career-ops/reports career-ops/config career-ops/modes
-            if [ -f career-ops-data/cv.md ];                     then cp career-ops-data/cv.md career-ops/; fi
-            if [ -f career-ops-data/article-digest.md ];          then cp career-ops-data/article-digest.md career-ops/; fi
-            if [ -f career-ops-data/config/profile.yml ];         then cp career-ops-data/config/profile.yml career-ops/config/; fi
-            if [ -f career-ops-data/modes/_profile.md ];          then cp career-ops-data/modes/_profile.md career-ops/modes/; fi
-            if [ -f career-ops-data/data/applications.md ];       then cp career-ops-data/data/applications.md career-ops/data/; fi
-            if [ -f career-ops-data/data/scan-history.tsv ];      then cp career-ops-data/data/scan-history.tsv career-ops/data/; fi
-            if [ -f career-ops-data/data/pipeline.md ];           then cp career-ops-data/data/pipeline.md career-ops/data/; fi
-            if [ -f career-ops-data/batch/batch-input.tsv ];      then cp career-ops-data/batch/batch-input.tsv career-ops/batch/; fi
-            if [ -f career-ops-data/batch/batch-api-state.json ]; then cp career-ops-data/batch/batch-api-state.json career-ops/batch/; fi
-            if [ -d career-ops-data/reports ];                    then cp -r career-ops-data/reports/. career-ops/reports/; fi
-            if [ -d career-ops-data/batch/tracker-additions ];    then cp -r career-ops-data/batch/tracker-additions/. career-ops/batch/tracker-additions/; fi
-          else
-            echo "WARNING: career-ops-data/ not found — see CLAUDE.md for setup instructions"
+          echo "$RESUME_TXT_B64"    | base64 -d > resumes/resume.txt
+          echo "$CV_MD_B64"         | base64 -d > career-ops/cv.md
+          echo "$PROFILE_YML_B64"   | base64 -d > career-ops/config/profile.yml
+          if [ -n "$PROFILE_MD_B64" ]; then
+            echo "$PROFILE_MD_B64"     | base64 -d > career-ops/modes/_profile.md
           fi
+          if [ -n "$ARTICLE_DIGEST_B64" ]; then
+            echo "$ARTICLE_DIGEST_B64" | base64 -d > career-ops/article-digest.md
+          fi
+
+      # Cache holds all dynamic state. Restore the latest matching cache at the
+      # start of the run; save a fresh one keyed by run_id at the end so the
+      # next run picks it up via the prefix.
+      - name: Restore pipeline state cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            career-ops/data/scan-history.tsv
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
+          key: pipeline-state-v1-${{ github.run_id }}
+          restore-keys: |
+            pipeline-state-v1-
 
       - name: Run pipeline and evaluate
         env:
@@ -98,29 +153,32 @@ jobs:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          python orchestrate.py --evaluate-batch \
+          python -u orchestrate.py --evaluate-batch \
+            --only-pass "recent DFW,remote US" \
             --batch-concurrency "$BATCH_CONCURRENCY"
 
-      - name: Save career-ops output data
-        run: |
-          mkdir -p career-ops-data/data career-ops-data/batch/tracker-additions career-ops-data/reports
-          if [ -f career-ops/data/scan-history.tsv ];     then cp career-ops/data/scan-history.tsv career-ops-data/data/; fi
-          if [ -f career-ops/data/applications.md ];       then cp career-ops/data/applications.md career-ops-data/data/; fi
-          if [ -f career-ops/data/pipeline.md ];           then cp career-ops/data/pipeline.md career-ops-data/data/; fi
-          if [ -f career-ops/batch/batch-input.tsv ];      then cp career-ops/batch/batch-input.tsv career-ops-data/batch/; fi
-          if [ -f career-ops/batch/batch-api-state.json ]; then cp career-ops/batch/batch-api-state.json career-ops-data/batch/; fi
-          if [ -d career-ops/batch/tracker-additions ];    then cp -r career-ops/batch/tracker-additions/. career-ops-data/batch/tracker-additions/; fi
-          if [ -d career-ops/reports ];                    then cp -r career-ops/reports/. career-ops-data/reports/; fi
+      - name: Save pipeline state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            career-ops/data/scan-history.tsv
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
+          key: pipeline-state-v1-${{ github.run_id }}
 
-      - name: Commit and push results
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add career-ops-data/
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            COUNT=$(git diff --staged --name-only | grep 'reports/' | wc -l | tr -d ' ')
-            git commit -m "chore: daily pipeline — ${COUNT} evaluation(s) $(date -u +%Y-%m-%d)"
-            git push
-          fi
+      - name: Upload reports and tracker artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-output-${{ github.run_id }}
+          path: |
+            career-ops/reports/
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/tracker-additions/
+          if-no-files-found: ignore
+          retention-days: 90

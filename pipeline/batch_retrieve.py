@@ -11,10 +11,15 @@ State is read/written from career-ops/batch/batch-api-state.json.
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline._batch_common import load_state, run_merge_tracker, write_job_result
+from pipeline._batch_common import (
+    atomic_write_text,
+    load_state,
+    run_merge_tracker,
+    write_job_result,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -103,11 +108,11 @@ def run(career_ops: Path, dry_run: bool = False) -> int:
             state["jobs"][job_id]["status"] = result.result.type
             failed += 1
 
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
 
     state["status"] = "completed"
-    state["retrieved_at"] = datetime.utcnow().isoformat() + "Z"
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    state["retrieved_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
     print(f"[batch-retrieve] done — processed={processed} failed={failed}")
 
     if processed > 0:

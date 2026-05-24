@@ -5,6 +5,8 @@ extraction, works for any field) and scores each job by keyword and target-title
 matches. Negative titles hard-exclude. No hardcoded vocabulary."""
 
 import csv
+import hashlib
+import json
 import os
 import re
 import sys
@@ -21,6 +23,7 @@ load_dotenv(ROOT / ".env")
 
 JOBS_PATH = ROOT / "output" / "jobs.csv"
 OUTPUT_PATH = ROOT / "output" / "filtered_jobs.csv"
+KEYWORDS_CACHE_PATH = ROOT / "output" / "_keywords.json"
 
 SCORE_BASE = 1
 SCORE_SKILLS_BOOST = 2
@@ -127,6 +130,29 @@ def extract_keywords(resume_text: str) -> dict[str, int]:
     return keywords
 
 
+def _load_or_extract_keywords(resume_text: str, source_path: Path) -> dict[str, int]:
+    """Extract keywords, caching to output/_keywords.json keyed by resume sha.
+    Subsequent runs against the same resume skip the YAKE step entirely."""
+    digest = hashlib.sha1(resume_text.encode("utf-8")).hexdigest()
+    if KEYWORDS_CACHE_PATH.exists():
+        try:
+            cached = json.loads(KEYWORDS_CACHE_PATH.read_text(encoding="utf-8"))
+            if cached.get("sha") == digest:
+                return {k: int(v) for k, v in cached.get("keywords", {}).items()}
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+    keywords = extract_keywords(resume_text)
+    KEYWORDS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        KEYWORDS_CACHE_PATH.write_text(
+            json.dumps({"sha": digest, "source": source_path.name, "keywords": keywords}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return keywords
+
+
 def parse_date_posted(val: str) -> datetime | None:
     if not val or val.strip().lower() in ("", "none", "nan", "nat"):
         return None
@@ -138,31 +164,68 @@ def parse_date_posted(val: str) -> datetime | None:
     return None
 
 
+def _compile_alternation(terms: list[str]) -> re.Pattern | None:
+    """Compile a single \\b(?:t1|t2|...)\\b pattern, case-insensitive.
+    Returns None for an empty list so callers can short-circuit cheaply."""
+    pieces = sorted({t.lower() for t in terms if t}, key=len, reverse=True)
+    if not pieces:
+        return None
+    return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
+
+
 def score_job(
     row: dict,
     keywords: dict[str, int],
     target_titles: list[str],
     negative_titles: list[str],
 ) -> tuple[int, list[str]] | None:
+    """Convenience wrapper that compiles patterns each call.
+
+    The pipeline runs the hot loop in `run()` with patterns compiled once.
+    Tests and ad-hoc callers should use this entry point."""
+    return _score_job(
+        row,
+        keywords,
+        _compile_alternation(list(keywords.keys())),
+        _compile_alternation(target_titles),
+        _compile_alternation(negative_titles),
+        target_titles,
+    )
+
+
+def _score_job(
+    row: dict,
+    keyword_weights: dict[str, int],
+    keyword_pattern: re.Pattern | None,
+    target_pattern: re.Pattern | None,
+    negative_pattern: re.Pattern | None,
+    target_titles: list[str],
+) -> tuple[int, list[str]] | None:
+    """Score one job row using precompiled patterns. Each keyword contributes
+    its weight at most once even if it appears multiple times in the text."""
     title = (row.get("title") or "").lower()
 
-    for neg in negative_titles:
-        if re.search(r"\b" + re.escape(neg.lower()) + r"\b", title):
-            return None
+    if negative_pattern is not None and negative_pattern.search(title):
+        return None
 
-    text = " ".join((row.get(f) or "") for f in SEARCH_FIELDS).lower()
     matched: list[str] = []
     score = 0
 
-    for kw, weight in keywords.items():
-        if re.search(r"\b" + re.escape(kw) + r"\b", text):
-            matched.append(kw)
-            score += weight
+    if keyword_pattern is not None:
+        text = " ".join((row.get(f) or "") for f in SEARCH_FIELDS).lower()
+        seen: set[str] = set()
+        for hit in keyword_pattern.findall(text):
+            if hit in seen:
+                continue
+            seen.add(hit)
+            score += keyword_weights.get(hit, SCORE_BASE)
+            matched.append(hit)
 
-    for target in target_titles:
-        if re.search(r"\b" + re.escape(target.lower()) + r"\b", title):
-            matched.append(f"title:{target}")
+    if target_pattern is not None:
+        target_lookup = {t.lower(): t for t in target_titles}
+        for hit in set(target_pattern.findall(title)):
             score += SCORE_TITLE_MATCH
+            matched.append(f"title:{target_lookup.get(hit, hit)}")
 
     return score, matched
 
@@ -189,9 +252,11 @@ def run(config_path: Path) -> Path:
     if resume_txt.exists():
         print(f"[filter] loading resume text from {resume_txt.name}")
         resume_text = resume_txt.read_text(encoding="utf-8")
+        source_path = resume_txt
     elif resume_path.exists():
         print(f"[filter] extracting keywords from {resume_path.name}")
         resume_text = extract_resume_text(resume_path)
+        source_path = resume_path
     else:
         raise FileNotFoundError(
             f"Resume not found at {resume_path} (or {resume_txt.name}). "
@@ -200,13 +265,18 @@ def run(config_path: Path) -> Path:
 
     if not resume_text.strip():
         print("[filter] WARNING: no text extracted from resume — is it a scanned PDF?")
-    keywords = extract_keywords(resume_text)
+
+    keywords = _load_or_extract_keywords(resume_text, source_path)
     for kw, w in overrides.items():
         keywords[kw.lower()] = int(w)
     print(
         f"[filter] {len(keywords)} keywords extracted "
         f"(target_titles: {len(target_titles)}, negative_titles: {len(negative_titles)})"
     )
+
+    keyword_pattern = _compile_alternation(list(keywords.keys()))
+    target_pattern = _compile_alternation(target_titles)
+    negative_pattern = _compile_alternation(negative_titles)
 
     jobs = []
     excluded = 0
@@ -218,7 +288,9 @@ def run(config_path: Path) -> Path:
                 if posted is not None and posted < cutoff:
                     too_old += 1
                     continue
-            result = score_job(row, keywords, target_titles, negative_titles)
+            result = _score_job(
+                row, keywords, keyword_pattern, target_pattern, negative_pattern, target_titles,
+            )
             if result is None:
                 excluded += 1
                 continue
@@ -227,8 +299,8 @@ def run(config_path: Path) -> Path:
             row["matched_keywords"] = ", ".join(matches)
             jobs.append(row)
 
-    relevant = [j for j in jobs if int(j["relevance_score"]) >= min_score]
-    relevant.sort(key=lambda r: int(r["relevance_score"]), reverse=True)
+    relevant = [j for j in jobs if j["relevance_score"] >= min_score]
+    relevant.sort(key=lambda r: r["relevance_score"], reverse=True)
 
     if not relevant:
         print(
