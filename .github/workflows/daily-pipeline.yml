@@ -54,7 +54,7 @@ jobs:
       - name: Clone career-ops fork
         run: |
           git clone --depth 1 --branch dev/batch-local-llm \
-            https://github.com/FrameAutomata/career-ops-1 career-ops
+            https://github.com/FrameAutomata/career-ops career-ops
 
       - name: Install career-ops Node deps
         run: npm install --prefix career-ops
