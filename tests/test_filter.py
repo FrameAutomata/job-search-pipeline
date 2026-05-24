@@ -540,6 +540,43 @@ filter:
                 if len(rest_api_rows) > 0:
                     assert rest_api_rows.iloc[0]["relevance_score"] >= 10
 
+    def test_run_uses_txt_sibling_when_present(
+        self, patch_filter_paths, monkeypatch, mocker
+    ):
+        """When a .txt sibling exists beside the PDF path, it's used without calling pdfplumber."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            '1,https://job1.com,software engineer,acme,NYC,2026-05-12,python rest apis,,""\n'
+        )
+        jobs_path.write_text(csv_content)
+
+        # Create a .txt file that lives beside (but not replacing) the PDF path
+        fake_pdf = jobs_path.parent / "resume.pdf"
+        fake_pdf.write_bytes(b"%PDF-1.4")
+        resume_txt = jobs_path.parent / "resume.txt"
+        resume_txt.write_text(SYNTHETIC_RESUME, encoding="utf-8")
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        # pdfplumber should NOT be called — if it is, raise to catch the bug
+        mocker.patch("pdfplumber.open", side_effect=AssertionError("pdfplumber should not be called"))
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: ["software engineer"]
+  negative_titles: []
+  min_score: 1
+""")
+
+        filter_mod.run(config)
+        assert output_path.exists()
+        import pandas as pd
+        df = pd.read_csv(output_path)
+        assert len(df) >= 1
+
     def test_run_sorts_output_by_score_descending(
         self, patch_filter_paths, fake_pdf, monkeypatch, mocker
     ):
