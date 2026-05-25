@@ -15,7 +15,7 @@ Provider auto-detection: BATCH_PROVIDER env var, then first key found in the ord
 
 Requirements (install only the provider you need):
   pip install anthropic                  # anthropic
-  pip install google-generativeai        # gemini
+  pip install google-genai               # gemini (NOT the deprecated google-generativeai)
   pip install openai                     # openai / groq / ollama
 """
 
@@ -82,12 +82,19 @@ def _build_anthropic_caller(model: str) -> Caller:
 
 
 def _build_gemini_caller(model: str) -> Caller:
-    import google.generativeai as genai  # type: ignore[import]
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    # Uses the modern `google-genai` SDK (package: google-genai). The older
+    # `google-generativeai` package was deprecated in early 2026 — it still
+    # works but logs a FutureWarning and won't get bug fixes.
+    from google import genai  # type: ignore[import]
+    from google.genai import types  # type: ignore[import]
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     def call(system: str, user: str) -> str:
-        m = genai.GenerativeModel(model_name=model, system_instruction=system)
-        resp = m.generate_content(user)
+        resp = client.models.generate_content(
+            model=model,
+            contents=user,
+            config=types.GenerateContentConfig(system_instruction=system),
+        )
         text = getattr(resp, "text", None)
         if not text:
             raise RuntimeError("gemini returned empty content")
@@ -131,7 +138,10 @@ def _build_caller(provider: str, model: str) -> Caller:
             base_url="https://api.groq.com/openai/v1",
         )
     if provider == "ollama":
-        base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/v1"
+        # `or DEFAULT` not `get(VAR, DEFAULT)` — see BATCH_MODEL fix below for
+        # the rationale. Empty-string OLLAMA_BASE_URL would otherwise produce
+        # a bogus "/v1" base URL.
+        base = (os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/") + "/v1"
         return _build_openai_compat_caller(model, api_key="ollama", base_url=base)
     raise ValueError(f"Unknown provider: {provider!r}. Choose: {', '.join(PROVIDER_DEFAULTS)}")
 
@@ -222,7 +232,14 @@ def run(
         print(f"error: unknown provider {provider!r}. Choose: {', '.join(PROVIDER_DEFAULTS)}", file=sys.stderr)
         return 0
 
-    model = model or os.environ.get("BATCH_MODEL", PROVIDER_DEFAULTS[provider])
+    # Note: `os.environ.get("BATCH_MODEL", DEFAULT)` would NOT fall back to
+    # DEFAULT when the env var is set to an empty string — and that's exactly
+    # what the GHA workflow does when `vars.BATCH_MODEL` isn't configured
+    # (`BATCH_MODEL: ${{ vars.BATCH_MODEL || '' }}` injects ""). The empty
+    # string then propagated to the Gemini SDK and produced
+    # `GenerateContentRequest.model: unexpected model name format`. Treat
+    # both unset and empty-string as "use the per-provider default".
+    model = model or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
     today = datetime.now().strftime("%Y-%m-%d")
 
     batch_input = career_ops / "batch" / "batch-input.tsv"

@@ -43,7 +43,11 @@ def _system_block(prompt: str) -> list[dict]:
 
 def run(career_ops: Path, model: str | None = None, dry_run: bool = False) -> int:
     """Submit pending jobs to the Anthropic Batch API. Returns number of requests submitted."""
-    model = model or os.environ.get("BATCH_MODEL", "claude-sonnet-4-6")
+    # Treat empty-string env var as "use default" — the GHA workflow's
+    # `BATCH_MODEL: ${{ vars.BATCH_MODEL || '' }}` pattern injects "" when the
+    # variable isn't set, and `os.environ.get(VAR, DEFAULT)` would return ""
+    # instead of DEFAULT in that case.
+    model = model or os.environ.get("BATCH_MODEL") or "claude-sonnet-4-6"
     today = datetime.now().strftime("%Y-%m-%d")
 
     batch_input = career_ops / "batch" / "batch-input.tsv"
