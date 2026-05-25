@@ -482,6 +482,178 @@ async function promptForRoleCriteria(autoMode) {
 }
 
 // ============================================================
+// Search Settings (locations, distance, hours_old, etc.)
+// ============================================================
+
+// US state codes (50 + DC). Used to auto-infer country_indeed and to make the
+// comma-aware location parser re-join "City, ST" pairs.
+const US_STATES = new Set([
+  'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA',
+  'KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ',
+  'NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT',
+  'VA','WA','WV','WI','WY','DC',
+]);
+
+// Canadian province / territory codes.
+const CA_PROVINCES = new Set([
+  'AB','BC','MB','NB','NL','NS','ON','PE','QC','SK','NT','NU','YT',
+]);
+
+/**
+ * Parse a comma-separated location string while keeping "City, ST" pairs together.
+ *
+ * Input:  "US Remote, Dallas, TX, Fort Worth, TX"
+ * Output: ["US Remote", "Dallas, TX", "Fort Worth, TX"]
+ *
+ * Heuristic: after splitting on commas, any 2-letter uppercase token is treated
+ * as a continuation of the previous chunk (state/province code).
+ */
+function parseLocations(input) {
+  if (!input) return [];
+  const parts = input.split(',').map(s => s.trim()).filter(Boolean);
+  const out = [];
+  let i = 0;
+  while (i < parts.length) {
+    const cur = parts[i];
+    const next = parts[i + 1];
+    if (next && /^[A-Z]{2}$/.test(next)) {
+      out.push(`${cur}, ${next}`);
+      i += 2;
+    } else {
+      out.push(cur);
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/**
+ * Auto-infer JobSpy's `country_indeed` field from a free-text location.
+ * Falls back to "USA" so the workflow has a sane default — if it's wrong, the
+ * user gets a clear error from JobSpy on first run.
+ */
+function inferCountry(location) {
+  const m = location.match(/,\s*([A-Z]{2})\s*$/);
+  if (m) {
+    if (US_STATES.has(m[1])) return 'USA';
+    if (CA_PROVINCES.has(m[1])) return 'Canada';
+  }
+  if (/\b(us|usa|united states|america)\b/i.test(location)) return 'USA';
+  if (/\bcanad(a|ian)\b/i.test(location)) return 'Canada';
+  if (/\b(uk|united kingdom|britain|england|scotland|wales)\b/i.test(location)) return 'UK';
+  if (/\baustralia\b/i.test(location)) return 'Australia';
+  return 'USA';
+}
+
+/**
+ * Convert a remote location string into the JobSpy `location:` field. Remote
+ * searches use a country-level location plus `is_remote: true`.
+ */
+function inferRemoteLocation(country) {
+  switch (country) {
+    case 'Canada':    return 'Canada';
+    case 'UK':        return 'United Kingdom';
+    case 'Australia': return 'Australia';
+    default:          return 'United States';
+  }
+}
+
+/**
+ * Build the per-location structures used by updateSearchConfig.
+ * Each entry: { raw, isRemote, location, country, distance? }.
+ * Non-remote entries get a `distance` field (prompted from the user).
+ */
+async function buildLocationEntries(parsedLocations) {
+  const entries = [];
+  for (const raw of parsedLocations) {
+    const isRemote = /\bremote\b/i.test(raw);
+    const country = inferCountry(raw);
+    const entry = {
+      raw,
+      isRemote,
+      country,
+      location: isRemote ? inferRemoteLocation(country) : raw,
+    };
+    if (!isRemote) {
+      const distInput = await prompt(`   Distance from "${raw}" in miles? [50] → `);
+      const dist = parseInt(distInput, 10);
+      entry.distance = Number.isFinite(dist) && dist > 0 ? dist : 50;
+    }
+    entries.push(entry);
+  }
+  return entries;
+}
+
+async function promptForSearchSettings(autoMode) {
+  // Defaults that work without any prompting — used in --auto mode and as the
+  // fallback for empty answers in interactive mode.
+  const settings = {
+    locations: [{ raw: 'United States', isRemote: true, location: 'United States', country: 'USA' }],
+    hoursOld: 24,
+    resultsWanted: 100,
+    sites: ['indeed', 'linkedin', 'glassdoor'],
+    includeEasyApply: false,
+  };
+
+  if (autoMode) {
+    warn('Skipping search settings (auto mode). Edit config/search.yml later.');
+    return settings;
+  }
+
+  console.log('\n🔍 Search Settings');
+  console.log('='.repeat(60));
+
+  // ── Locations ──────────────────────────────────────────────────────────
+  console.log('\n📍 Locations to search (comma-separated).');
+  console.log('   "City, ST" pairs are kept together. "Remote" anywhere in a');
+  console.log('   chunk routes that pass through JobSpy\'s is_remote filter.');
+  console.log('   Examples:');
+  console.log('     Dallas, TX');
+  console.log('     US Remote, Dallas, TX, Fort Worth, TX');
+  console.log('     Toronto, ON, Montreal, QC');
+  console.log('     London, UK');
+  const locInput = await prompt('\n→ ');
+  const parsed = parseLocations(locInput);
+  if (parsed.length === 0) {
+    warn('No locations entered; defaulting to "US Remote".');
+  } else {
+    console.log(`\n   Parsed ${parsed.length} location(s): ${parsed.map(l => `"${l}"`).join(', ')}`);
+    settings.locations = await buildLocationEntries(parsed);
+  }
+
+  // ── hours_old ──────────────────────────────────────────────────────────
+  const hoursInput = await prompt(
+    '\nHow recent should results be? (24 = today, 168 = past week) [24]\n→ '
+  );
+  const hours = parseInt(hoursInput, 10);
+  if (Number.isFinite(hours) && hours > 0) settings.hoursOld = hours;
+
+  // ── results_wanted ─────────────────────────────────────────────────────
+  const resultsInput = await prompt(
+    '\nMax results per site per search term? [100]\n→ '
+  );
+  const results = parseInt(resultsInput, 10);
+  if (Number.isFinite(results) && results > 0) settings.resultsWanted = results;
+
+  // ── sites ──────────────────────────────────────────────────────────────
+  console.log('\nWhich boards? Comma-separated. Options: linkedin, indeed, glassdoor, zip_recruiter, google');
+  const sitesInput = await prompt('[linkedin, indeed, glassdoor]\n→ ');
+  if (sitesInput) {
+    const sites = sitesInput.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (sites.length > 0) settings.sites = sites;
+  }
+
+  // ── easy-apply pass ────────────────────────────────────────────────────
+  const easyInput = await prompt(
+    '\nInclude an "easy apply" pass? Runs every 4h via the cloud workflow. [y/N]\n→ '
+  );
+  settings.includeEasyApply = /^y/i.test(easyInput);
+
+  return settings;
+}
+
+
+// ============================================================
 // Prompt for Career Narrative (for _profile.md)
 // ============================================================
 
@@ -878,7 +1050,72 @@ function writeProfile(profile) {
 // Update Search Config
 // ============================================================
 
-function updateSearchConfig(targetRoles, negativeRoles) {
+/**
+ * Convert a user's target-role list into JobSpy-friendly search terms.
+ * Adds lowercase variants for "full-stack" / "fullstack" / non-senior forms
+ * so we cover the common job-board phrasings.
+ */
+function expandSearchTerms(targetRoles) {
+  const out = [];
+  for (const role of targetRoles) {
+    const lower = role.toLowerCase();
+    out.push(lower);
+    if (lower.includes('full-stack') || lower.includes('full stack')) {
+      out.push('full-stack');
+      out.push('fullstack');
+    }
+    if (lower.includes('senior')) {
+      const withoutSenior = lower.replace(/senior\s+/i, '').trim();
+      if (withoutSenior) out.push(withoutSenior);
+    }
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * Build a single JobSpy pass object from a location entry + global settings.
+ * The shape matches config/search.example.yml. JobSpy mutex rules (Indeed):
+ *   - Remote pass uses is_remote (NO hours_old — they're mutually exclusive).
+ *   - Local pass uses hours_old + distance.
+ *   - Easy-apply pass uses easy_apply (NO hours_old, NO is_remote).
+ */
+function buildPass({ name, searchTerms, sites, resultsWanted, location, country, isRemote, distance, hoursOld, easyApply }) {
+  const pass = {
+    name,
+    // Clone the arrays so the resulting YAML doesn't share references across
+    // passes — otherwise YAML.stringify emits `&a1` / `*a1` anchors that
+    // confuse users reading config/search.yml.
+    search_terms: [...searchTerms],
+    sites: [...sites],
+    results_wanted: resultsWanted,
+    location,
+    country_indeed: country,
+    // Description backfill happens in the screen stage from the same HTTP
+    // response used for liveness — see config/search.example.yml.
+    linkedin_fetch_description: false,
+  };
+  if (easyApply) {
+    pass.easy_apply = true;
+  } else if (isRemote) {
+    pass.is_remote = true;
+  } else {
+    pass.hours_old = hoursOld;
+    pass.distance = distance;
+  }
+  return pass;
+}
+
+/**
+ * Rewrite the `searches:` block of config/search.yml based on user input.
+ *
+ * Strategy:
+ *   - One scrape pass per user location (recent local, or remote variant).
+ *   - Optionally one "easy apply" pass using the first non-remote location
+ *     (or the first remote one if all are remote).
+ *   - `filter:` keeps its existing structure; we only refresh target_titles /
+ *     negative_titles. `screen:` is preserved untouched if present.
+ */
+function updateSearchConfig(targetRoles, negativeRoles, searchSettings) {
   const searchConfigPath = path.join(process.cwd(), 'config', 'search.yml');
 
   if (!fs.existsSync(searchConfigPath)) {
@@ -887,50 +1124,56 @@ function updateSearchConfig(targetRoles, negativeRoles) {
   }
 
   const content = fs.readFileSync(searchConfigPath, 'utf-8');
-  const config = YAML.parse(content);
+  const config = YAML.parse(content) || {};
 
-  // Ensure filter section exists
-  if (!config.filter) {
-    config.filter = {};
+  const searchTerms = expandSearchTerms(targetRoles);
+
+  // ── searches: ──────────────────────────────────────────────────────────
+  const { locations, hoursOld, resultsWanted, sites, includeEasyApply } = searchSettings;
+  const passes = [];
+  for (const loc of locations) {
+    passes.push(buildPass({
+      name: loc.raw,
+      searchTerms,
+      sites,
+      resultsWanted,
+      location: loc.location,
+      country: loc.country,
+      isRemote: loc.isRemote,
+      distance: loc.distance,
+      hoursOld,
+    }));
   }
-
-  // Convert role names to search-friendly lowercase titles
-  // "Senior Full-Stack Engineer" → "full stack", "full-stack"
-  // "Mobile Engineer" → "mobile engineer"
-  const searchTitles = [];
-  for (const role of targetRoles) {
-    const lower = role.toLowerCase();
-    searchTitles.push(lower);
-    // Add variants
-    if (lower.includes('full-stack') || lower.includes('full stack')) {
-      searchTitles.push('full-stack');
-      searchTitles.push('fullstack');
-    }
-    if (lower.includes('senior')) {
-      // Keep senior if explicit, but also add non-senior variant
-      const withoutSenior = lower.replace(/senior\s+/i, '').trim();
-      if (withoutSenior) searchTitles.push(withoutSenior);
-    }
+  if (includeEasyApply) {
+    // Prefer a non-remote location for the easy-apply pass so JobSpy filters
+    // by city. If all the user's locations are remote, fall back to the first.
+    const anchor = locations.find(l => !l.isRemote) || locations[0];
+    passes.push(buildPass({
+      name: 'easy apply',
+      searchTerms,
+      sites,
+      resultsWanted,
+      location: anchor.location,
+      country: anchor.country,
+      easyApply: true,
+    }));
   }
+  config.searches = passes;
+  // Remove the legacy single-pass shorthand if it was in the file.
+  delete config.search;
 
-  const dedupedTitles = [...new Set(searchTitles)];
-
-  // Update search_terms in every scrape pass (preserves all other pass settings)
-  const passes = config.searches
-    ? config.searches
-    : config.search
-    ? [config.search]
-    : [];
-  for (const pass of passes) {
-    pass.search_terms = dedupedTitles;
-  }
-
-  // Update filter titles
-  config.filter.target_titles = dedupedTitles;
-
-  // Update negative_titles
+  // ── filter: ────────────────────────────────────────────────────────────
+  if (!config.filter) config.filter = {};
+  config.filter.target_titles = searchTerms;
   if (negativeRoles && negativeRoles.length > 0) {
     config.filter.negative_titles = negativeRoles;
+  }
+
+  // ── screen: ────────────────────────────────────────────────────────────
+  // Default to liveness on for new configs. Preserves any existing screen
+  // settings the user may have customized on a re-run.
+  if (!config.screen) {
+    config.screen = { liveness: true, liveness_timeout: 8 };
   }
 
   // Write back
@@ -1028,6 +1271,10 @@ async function main() {
   // Prompt for role criteria (search + evaluation sync)
   const criteria = await promptForRoleCriteria(args.auto);
 
+  // Prompt for search settings (locations, distance, hours_old, etc.) — these
+  // drive the `searches:` block of config/search.yml.
+  const searchSettings = await promptForSearchSettings(args.auto);
+
   // Prompt for career narrative (for _profile.md)
   const narrative = await promptForCareerNarrative(args.auto, info, criteria);
 
@@ -1041,7 +1288,7 @@ async function main() {
   const profileFile = writeProfile(profile);
   const cvFile = writeCV(cv);
   const profileMdFile = writeProfileMarkdown(profileMarkdown);
-  const searchFile = updateSearchConfig(criteria.targetRoles, criteria.negativeRoles);
+  const searchFile = updateSearchConfig(criteria.targetRoles, criteria.negativeRoles, searchSettings);
 
   success(`Profile saved: ${profileFile}`);
   success(`CV saved: ${cvFile}`);
@@ -1062,8 +1309,19 @@ async function main() {
   console.log(`\n🎯 Configuration:`);
   console.log(`  - Target Roles: ${criteria.targetRoles.join(', ')}`);
   console.log(`  - Compensation: ${criteria.compensationTarget} (min: ${criteria.compensationMin})`);
-  console.log(`  - Location: ${criteria.locationFlexibility}`);
+  console.log(`  - Location preference: ${criteria.locationFlexibility}`);
   console.log(`  - Deal-breakers: ${narrative.dealBreakers.join(', ') || 'None specified'}`);
+  console.log(`\n🔍 Search Settings (written to config/search.yml):`);
+  for (const loc of searchSettings.locations) {
+    const detail = loc.isRemote
+      ? `remote → location="${loc.location}"`
+      : `local, distance=${loc.distance}mi`;
+    console.log(`  - "${loc.raw}" — ${detail} (country_indeed=${loc.country})`);
+  }
+  console.log(`  - hours_old: ${searchSettings.hoursOld}`);
+  console.log(`  - results_wanted: ${searchSettings.resultsWanted}`);
+  console.log(`  - sites: ${searchSettings.sites.join(', ')}`);
+  console.log(`  - easy-apply pass: ${searchSettings.includeEasyApply ? 'yes' : 'no'}`);
   console.log(`\n📚 Next Steps:\n`);
   console.log(`Step 1️⃣  — Review your setup:`);
   console.log(`  • Profile: ${profileFile}`);
