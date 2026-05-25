@@ -161,8 +161,8 @@ Provider auto-detection order: Gemini → Groq → OpenAI → Anthropic (first e
 
 | Provider | Env var | Default model | Free tier? |
 |---|---|---|---|
-| Gemini | `GEMINI_API_KEY` | `gemini-2.0-flash` | 1,500 req/day |
-| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Yes |
+| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Yes, but **the default is only 20 RPD on free tier** — for 100+ job runs override `BATCH_MODEL=gemma-4-26b-it` (1.5K RPD, unlimited TPM) or `gemini-3.1-flash-lite` (500 RPD). Check yours at aistudio.google.com/usage. |
+| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Yes — 30 RPM / 1000 RPD / 12K TPM (tight for our large prompts) |
 | OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` | No |
 | Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | No |
 | Ollama | `OLLAMA_BASE_URL` | `qwen2.5:32b` | Local only |

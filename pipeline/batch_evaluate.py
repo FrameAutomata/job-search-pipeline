@@ -6,7 +6,7 @@ workers. Results are written as they complete.
 Supported providers
 -------------------
   anthropic   claude-sonnet-4-6 (default)      ANTHROPIC_API_KEY
-  gemini      gemini-2.0-flash  (default)       GEMINI_API_KEY
+  gemini      gemini-2.5-flash  (default)       GEMINI_API_KEY
   openai      gpt-4o-mini       (default)       OPENAI_API_KEY
   groq        llama-3.3-70b-versatile (default) GROQ_API_KEY
   ollama      qwen2.5:32b       (default)       OLLAMA_BASE_URL (default: http://localhost:11434)
@@ -50,7 +50,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 PROVIDER_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
-    "gemini": "gemini-2.0-flash",
+    # gemini-2.5-flash, NOT gemini-2.0-flash: the 2.0 model was deprecated by
+    # Google (shutdown 2026-06-01) and its free-tier quota collapsed months
+    # ahead of that. 2.5-flash is supported and won't fail with a deprecation
+    # error — but its free-tier RPD is only ~20/day, so users running >20
+    # evaluations per day should override BATCH_MODEL to one of the
+    # higher-RPD options (gemma-4-26b-it has 1.5K RPD + unlimited TPM,
+    # gemini-3.1-flash-lite has 500 RPD). See .env.example.
+    "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
     "ollama": "qwen2.5:32b",

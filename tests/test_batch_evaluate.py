@@ -150,14 +150,14 @@ class TestModelResolution:
         assert self._resolve(monkeypatch, env_value="my-model") == "my-model"
 
     def test_unset_env_falls_back_to_provider_default(self, monkeypatch):
-        assert self._resolve(monkeypatch, env_value=None, provider="gemini") == "gemini-2.0-flash"
+        assert self._resolve(monkeypatch, env_value=None, provider="gemini") == "gemini-2.5-flash"
 
     def test_empty_string_env_falls_back_to_provider_default(self, monkeypatch):
         # Regression test: GHA workflow `${{ vars.X || '' }}` pattern injects ""
         # when X isn't set. Before the fix, this empty string overrode the
         # provider default and got sent to the API as the model name, causing
         # "GenerateContentRequest.model: unexpected model name format".
-        assert self._resolve(monkeypatch, env_value="", provider="gemini") == "gemini-2.0-flash"
+        assert self._resolve(monkeypatch, env_value="", provider="gemini") == "gemini-2.5-flash"
 
     def test_empty_string_env_falls_back_for_anthropic(self, monkeypatch):
         assert self._resolve(monkeypatch, env_value="", provider="anthropic") == "claude-sonnet-4-6"
