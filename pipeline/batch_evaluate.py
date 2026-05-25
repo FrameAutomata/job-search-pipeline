@@ -22,8 +22,10 @@ Requirements (install only the provider you need):
 import argparse
 import json
 import os
+import random
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +62,82 @@ PROVIDER_DEFAULTS: dict[str, str] = {
 # callable. Workers reuse the same client across all jobs.
 
 Caller = Callable[[str, str], str]
+
+
+# ── Rate-limit retry ────────────────────────────────────────────────────────
+# Free tiers (especially Gemini's 15 RPM / 1500 RPD) throttle aggressively
+# when the pipeline runs against hundreds of jobs. Without retry, a single
+# 429 marks a job permanently failed and we lose evaluations to transient
+# throttling. The helpers below wrap each call with exponential backoff so
+# rate-limit hiccups self-heal.
+
+# Substrings that consistently appear in rate-limit error messages across
+# the providers we support (Anthropic, OpenAI, Groq, Gemini, Ollama-via-
+# OpenAI). Match against the lowercased str(exc) so we don't need to import
+# every SDK's exception classes (and create hard import-time dependencies on
+# providers the user hasn't installed).
+_RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "429",
+    "quota",
+    "resourceexhausted",
+    "resource_exhausted",
+    "too many requests",
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Best-effort detection of provider rate-limit errors.
+
+    Checks numeric status_code/code attributes first (most reliable when the
+    SDK exposes them), then falls back to substring matching against the
+    error message."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    if status == 429 or status == "429":
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
+
+
+def _call_with_retry(
+    caller: Caller,
+    system: str,
+    user: str,
+    *,
+    max_attempts: int = 6,
+    base_delay: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """Invoke `caller(system, user)` with exponential backoff on rate-limit
+    errors. Non-rate-limit exceptions raise immediately (no retry).
+
+    Backoff: 1, 2, 4, 8, 16 seconds, each with up to 0.5s of random jitter
+    to avoid thundering-herd when multiple workers throttle simultaneously.
+    With max_attempts=6 the total worst-case wait before giving up is ~31s
+    plus 5 calls — comfortably under any reasonable per-job timeout.
+
+    `sleep` is parameterized so tests don't have to actually wait."""
+    delay = base_delay
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return caller(system, user)
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt == max_attempts:
+                raise
+            jittered = delay + random.uniform(0, 0.5)
+            print(
+                f"  rate-limited (attempt {attempt}/{max_attempts}): "
+                f"sleeping {jittered:.1f}s — {exc}",
+                flush=True,
+            )
+            sleep(jittered)
+            delay *= 2
+    # Unreachable: the for-loop above either returns or raises on the last attempt.
+    raise RuntimeError("retry loop exited without return or raise")  # pragma: no cover
 
 
 def _build_anthropic_caller(model: str) -> Caller:
@@ -190,7 +268,7 @@ def _process_one(
     """Evaluate one job. Returns (success, job_id, error_or_None)."""
     jid = job_meta["id"]
     try:
-        response = caller(system_prompt, build_user_message(job_meta, today))
+        response = _call_with_retry(caller, system_prompt, build_user_message(job_meta, today))
         out = write_job_result(response, job_meta, reports_dir, tracker_dir, today)
 
         with state_lock:
