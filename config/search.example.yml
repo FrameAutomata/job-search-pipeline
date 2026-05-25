@@ -80,9 +80,13 @@ searches:
     # ── LinkedIn-specific ──────────────────────────────────────────────────────
 
     # Fetch full description + direct URL for LinkedIn results.
-    # Increases requests by O(n) but essential for getting job descriptions.
-    # Set to true to populate descriptions in the pipeline.
-    linkedin_fetch_description: true
+    # KEEP THIS FALSE: setting it to true makes JobSpy fetch each LinkedIn JD
+    # individually during scrape — a sequential per-job HTTP request that
+    # easily takes 30+ minutes on 1000 results. The screen stage backfills
+    # missing descriptions from the same HTTP response it uses for the
+    # liveness check (site-specific selectors + <body> fallback), so we only
+    # pay ~dozens of fetches per run instead of thousands.
+    linkedin_fetch_description: false
 
     # Restrict LinkedIn results to specific company IDs (list of ints).
     # linkedin_company_ids:
@@ -182,14 +186,24 @@ filter:
 
 
 # ── Screening (runs after filter, before bridge) ─────────────────────────────
-# Opt-in HTTP liveness check. When disabled (or `screen:` is absent), the
-# stage is a no-op and adds zero latency to the pipeline.
+# HTTP liveness check + description backfill + pre-screen dedup. Enabled by
+# default — turn off only if you're running locally with --skip-screen.
 #
-# Checks: status code (404/410 = expired), URL error params, body patterns
-# (e.g. "position has been filled"), and apply-control presence.
-# "uncertain" (content present but no apply button) is treated as live —
-# sites like LinkedIn require login to render the apply button.
-#
-# screen:
-#   liveness: false
-#   liveness_timeout: 8          # per-request timeout in seconds
+# When liveness is on, the screen stage:
+#   1. Pre-screen dedup: drops URLs already in scan-history.tsv before any
+#      HTTP fetch (typical hit rate ~80% on a daily cadence — biggest cost
+#      saving in the pipeline).
+#   2. Liveness: status code (404/410 = expired), URL error params, body
+#      patterns (e.g. "position has been filled"), apply-control presence.
+#      "uncertain" (content present, no apply button) is treated as live —
+#      sites like LinkedIn require login to render the apply button.
+#   3. Description backfill: extracts the JD from the same fetched page when
+#      the row's description is empty. Lets you keep linkedin_fetch_description
+#      false during scrape and pay the per-job fetch only for surviving rows.
+#   4. Dead-URL recording: URLs that fail liveness get appended to
+#      scan-history.tsv with status `screened-dead` so future runs skip them
+#      at step (1) instead of refetching.
+
+screen:
+  liveness: true
+  liveness_timeout: 8          # per-request timeout in seconds

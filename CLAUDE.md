@@ -31,9 +31,10 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 ./run.ps1 --submit-batch         # + submit to Anthropic Batch API (async, ~24 h, 50% cheaper)
 ./run.ps1 --retrieve-batch       # poll and retrieve completed Batch API results
 
-# Select specific search passes by name (case-insensitive, comma-separated)
-./run.ps1 --evaluate-batch --only-pass "easy apply"
-./run.ps1 --evaluate-batch --only-pass "recent DFW,remote US"
+# Select specific search passes — three mutually-exclusive flags:
+./run.ps1 --evaluate-batch --only-pass "easy apply"   # explicit name match (errors on typo)
+./run.ps1 --evaluate-batch --easy-apply-only          # passes with easy_apply: true (no-ops if none)
+./run.ps1 --evaluate-batch --no-easy-apply            # passes without easy_apply: true
 
 # Skip stages when re-running
 ./run.ps1 --skip-scrape --skip-filter --batch
@@ -222,8 +223,8 @@ Four workflows make up the cloud automation:
 
 | Workflow | Schedule | What it does |
 |----------|----------|--------------|
-| `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs the `"recent DFW"` + `"remote US"` passes via `--only-pass`. Scrape → filter → screen → bridge → evaluate. |
-| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs the `"easy apply"` pass. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. |
+| `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs every pass without `easy_apply: true` via `--no-easy-apply`. Scrape → filter → screen → bridge → evaluate. |
+| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs every pass with `easy_apply: true` via `--easy-apply-only`. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. No-ops cleanly if no easy-apply passes are configured. |
 | `retrieve-batch.yml` | Midnight UTC (7 PM CDT) | Polls Anthropic async batch → writes reports → uploads artifacts (only needed with `--submit-batch`). |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a user-supplied base64 blob. Use after editing the tracker locally. |
 
@@ -233,7 +234,7 @@ Four workflows make up the cloud automation:
 - **Runtime state** (scan-history, applications.md, pipeline.md, batch state, cached JDs) → **`actions/cache@v4`** keyed `pipeline-state-v1`. Per-fork, restored at workflow start, saved at workflow end. Invisible to anyone but the fork owner.
 - **Outputs** (reports, tracker snapshot) → **`actions/upload-artifact@v4`**. Downloadable from the Actions tab for 90 days.
 
-**`--only-pass` flag**: `orchestrate.py` accepts `--only-pass "name1,name2"` to select which entries in `searches:` run (case-insensitive match against `name:`). Omit to run all passes.
+**Pass selection flags** (mutually exclusive): `--only-pass "name1,name2"` (case-insensitive name match, errors on no match), `--easy-apply-only` (passes with `easy_apply: true`, no-ops if none), `--no-easy-apply` (passes without `easy_apply: true`). The cloud workflows route by `easy_apply` field rather than name so user-renamed passes still work.
 
 **Setup** (one-time):
 

@@ -36,9 +36,14 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
-    ap.add_argument("--only-pass", type=str, default=None,
-                    help="Comma-separated list of search `name:` values to run "
-                         "(e.g. 'easy apply' or 'recent DFW,remote US'). Default: all passes.")
+    pass_group = ap.add_mutually_exclusive_group()
+    pass_group.add_argument("--only-pass", type=str, default=None,
+                            help="Comma-separated list of search `name:` values to run "
+                                 "(case-insensitive). Errors loudly on no match (typo protection).")
+    pass_group.add_argument("--easy-apply-only", action="store_true",
+                            help="Only run passes with `easy_apply: true`. No-ops if none configured.")
+    pass_group.add_argument("--no-easy-apply", action="store_true",
+                            help="Skip passes with `easy_apply: true`. Used by the daily cloud workflow.")
     args = ap.parse_args()
 
     only_passes: list[str] | None = None
@@ -66,7 +71,12 @@ def main() -> int:
 
     if not args.skip_scrape:
         notify.notify("Pipeline", "Scraping job boards...")
-        scrape.run(config_path, only_passes=only_passes)
+        scrape.run(
+            config_path,
+            only_passes=only_passes,
+            easy_apply_only=args.easy_apply_only,
+            no_easy_apply=args.no_easy_apply,
+        )
         notify.notify("Pipeline", "Scraping complete")
 
     if not args.skip_filter:

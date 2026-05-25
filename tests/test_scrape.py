@@ -54,6 +54,64 @@ class TestFilterPasses:
             scrape_mod.filter_passes(self.SEARCHES, ["does not exist"])
 
 
+class TestFilterPassesEasyApply:
+    """Test the easy_apply_only / no_easy_apply selectors used by the cloud
+    workflows. These route by JobSpy field instead of pass name so that
+    user-renamed passes don't break the workflow."""
+
+    SEARCHES = [
+        {"name": "recent local", "search_terms": ["a"], "sites": ["indeed"]},
+        {"name": "remote US",    "search_terms": ["b"], "sites": ["indeed"], "is_remote": True},
+        {"name": "easy apply",   "search_terms": ["c"], "sites": ["indeed"], "easy_apply": True},
+    ]
+
+    def test_easy_apply_only_keeps_only_true(self):
+        result = scrape_mod.filter_passes(self.SEARCHES, easy_apply_only=True)
+        assert [r["name"] for r in result] == ["easy apply"]
+
+    def test_no_easy_apply_drops_true(self):
+        result = scrape_mod.filter_passes(self.SEARCHES, no_easy_apply=True)
+        assert [r["name"] for r in result] == ["recent local", "remote US"]
+
+    def test_easy_apply_only_returns_empty_when_no_easy_apply_pass(self):
+        # Critical: workflow no-ops cleanly when user has no easy-apply pass.
+        searches = [{"name": "x", "search_terms": ["a"], "sites": ["indeed"]}]
+        result = scrape_mod.filter_passes(searches, easy_apply_only=True)
+        assert result == []
+
+    def test_no_easy_apply_returns_empty_when_only_easy_apply_pass(self):
+        searches = [{"name": "x", "easy_apply": True, "search_terms": ["a"], "sites": ["indeed"]}]
+        result = scrape_mod.filter_passes(searches, no_easy_apply=True)
+        assert result == []
+
+    def test_easy_apply_only_and_no_easy_apply_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            scrape_mod.filter_passes(
+                self.SEARCHES, easy_apply_only=True, no_easy_apply=True,
+            )
+
+    def test_easy_apply_routing_does_not_match_truthy_strings(self):
+        # Only literal Python True should match — protects against accidental
+        # `easy_apply: "true"` strings in YAML being interpreted as a flag.
+        searches = [
+            {"name": "a", "easy_apply": "true",  "search_terms": ["x"], "sites": ["indeed"]},
+            {"name": "b", "easy_apply": 1,        "search_terms": ["x"], "sites": ["indeed"]},
+            {"name": "c", "easy_apply": True,     "search_terms": ["x"], "sites": ["indeed"]},
+        ]
+        result = scrape_mod.filter_passes(searches, easy_apply_only=True)
+        assert [r["name"] for r in result] == ["c"]
+
+    def test_only_pass_combines_with_easy_apply_filter(self):
+        # If both are specified, only_pass narrows first then easy_apply filters.
+        # (--only-pass is in a mutually exclusive group at CLI level, but the
+        # underlying function supports the combination — useful for tests and
+        # ad-hoc callers.)
+        result = scrape_mod.filter_passes(
+            self.SEARCHES, only_passes=["easy apply", "remote US"], easy_apply_only=True,
+        )
+        assert [r["name"] for r in result] == ["easy apply"]
+
+
 class TestLoadSearches:
     """Test scrape.load_searches function."""
 
