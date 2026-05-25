@@ -38,12 +38,24 @@ The setup script:
 3. Copies `config/search.example.yml` → `config/search.yml`
 4. Runs `setup-profile.mjs` to generate your candidate profile
 
-During profile setup you'll be asked for your resume path, target roles, location, and compensation expectations. This creates:
+During profile setup you'll be prompted for:
+- Your resume path (auto-detected if present in `resumes/`)
+- Target roles and roles to avoid (comma-separated)
+- Compensation expectations (target / minimum)
+- **Locations to search** (comma-separated, smart-parsed for `City, ST` pairs; e.g. `"US Remote, Dallas, TX, Fort Worth, TX"` → three passes)
+- **Distance** (in miles) from each non-remote location
+- **How recent** results should be (`hours_old`, default 24)
+- **Max results** per site per search term (default 100)
+- **Which job boards** to scrape (default linkedin, indeed, glassdoor)
+- Whether to include an **easy-apply pass** (runs on a separate 4 h cloud schedule)
+
+This creates / rewrites:
 - `career-ops/config/profile.yml` — your candidate profile
 - `career-ops/cv.md` — your CV in markdown
 - `career-ops/modes/_profile.md` — your career narrative and deal-breakers
+- `config/search.yml` — `searches:` block regenerated from your location prompts; `filter:` / `screen:` blocks preserved
 
-To re-run profile setup at any time: `node setup-profile.mjs`
+To re-run profile setup at any time: `node setup-profile.mjs`. Re-running rewrites the `searches:` block from scratch.
 
 ---
 
