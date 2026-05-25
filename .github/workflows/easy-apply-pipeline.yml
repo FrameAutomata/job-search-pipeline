@@ -130,8 +130,12 @@ jobs:
           OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          # --easy-apply-only selects every pass in search.yml whose JobSpy
+          # easy_apply field is true. Routes by config field (not pass name)
+          # so user-defined pass names work without editing this YAML. If the
+          # user has no easy_apply passes configured, this is a clean no-op.
           python -u orchestrate.py --evaluate-batch \
-            --only-pass "easy apply" \
+            --easy-apply-only \
             --batch-concurrency "$BATCH_CONCURRENCY"
 
       - name: Save pipeline state cache

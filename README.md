@@ -137,7 +137,13 @@ When `liveness: false` the screen stage is a no-op (no dedup, no fetches, no bac
 
 `--evaluate-batch`, `--submit-batch`, and `--retrieve-batch` are mutually exclusive (argparse rejects more than one). `--batch` is the interactive CLI agent path and isn't mutually exclusive with the others; it just runs after the pipeline.
 
-`--only-pass "name1,name2"` (works with any of the above) selects which entries in `searches:` actually run. Case-insensitive match against the `name:` field. The cloud workflows use this to split passes — `daily-pipeline.yml` runs `"recent DFW,remote US"`, `easy-apply-pipeline.yml` runs `"easy apply"`.
+Three flags (mutually exclusive) select a subset of the `searches:` in your config:
+
+- `--only-pass "name1,name2"` — explicit case-insensitive match on the `name:` field. Errors loudly on no match (typo protection).
+- `--easy-apply-only` — only passes with `easy_apply: true`. No-ops cleanly if none configured (used by `easy-apply-pipeline.yml`).
+- `--no-easy-apply` — only passes without `easy_apply: true` (used by `daily-pipeline.yml`).
+
+The cloud workflows use the `--easy-apply-only` / `--no-easy-apply` pair, not name matching, so your pass `name:` values can be anything you like — the workflows route by the `easy_apply` JobSpy field instead.
 
 ## Skipping steps
 

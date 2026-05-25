@@ -43,23 +43,50 @@ def load_searches(path: Path) -> list[dict]:
     return [raw["search"]]
 
 
-def filter_passes(searches: list[dict], only_passes: list[str] | None) -> list[dict]:
-    """Keep only searches whose `name:` matches one of `only_passes`.
+def filter_passes(
+    searches: list[dict],
+    only_passes: list[str] | None = None,
+    *,
+    easy_apply_only: bool = False,
+    no_easy_apply: bool = False,
+) -> list[dict]:
+    """Return the subset of `searches` matching the given selectors.
 
-    Matching is case-insensitive and whitespace-trimmed so the workflow can
-    pass arbitrary casing. Returns all searches when `only_passes` is empty."""
-    if not only_passes:
-        return searches
-    wanted = {p.strip().lower() for p in only_passes if p and p.strip()}
-    if not wanted:
-        return searches
-    selected = [s for s in searches if (s.get("name") or "").strip().lower() in wanted]
-    if not selected:
-        available = ", ".join(repr(s.get("name", "")) for s in searches)
-        raise ValueError(
-            f"--only-pass matched no searches. Wanted: {sorted(wanted)}; available: {available}"
-        )
-    return selected
+    Selectors (any combination, applied as AND):
+      - `only_passes`: keep passes whose `name:` matches (case-insensitive).
+        Raises ValueError on no match — protects against `--only-pass` typos
+        from the CLI.
+      - `easy_apply_only`: keep only passes with `easy_apply: true`.
+      - `no_easy_apply`: keep only passes without `easy_apply: true`.
+
+    `easy_apply_only` and `no_easy_apply` are used by the cloud workflows to
+    route passes to the right schedule by JobSpy field rather than pass name.
+    When they filter to zero passes, this returns an empty list — the workflow
+    treats that as "nothing to do for this run" and exits cleanly. That's
+    different from `only_passes` (a CLI typo should be loud, but having no
+    easy-apply passes configured is just a valid state)."""
+    result = searches
+
+    if only_passes:
+        wanted = {p.strip().lower() for p in only_passes if p and p.strip()}
+        if wanted:
+            selected = [s for s in result if (s.get("name") or "").strip().lower() in wanted]
+            if not selected:
+                available = ", ".join(repr(s.get("name", "")) for s in result)
+                raise ValueError(
+                    f"--only-pass matched no searches. Wanted: {sorted(wanted)}; available: {available}"
+                )
+            result = selected
+
+    if easy_apply_only and no_easy_apply:
+        raise ValueError("easy_apply_only and no_easy_apply are mutually exclusive")
+
+    if easy_apply_only:
+        result = [s for s in result if s.get("easy_apply") is True]
+    elif no_easy_apply:
+        result = [s for s in result if s.get("easy_apply") is not True]
+
+    return result
 
 
 def validate_limitations(cfg: dict) -> None:
@@ -99,11 +126,33 @@ def validate_limitations(cfg: dict) -> None:
             )
 
 
-def run(config_path: Path, only_passes: list[str] | None = None) -> Path:
-    searches = filter_passes(load_searches(config_path), only_passes)
+def run(
+    config_path: Path,
+    only_passes: list[str] | None = None,
+    *,
+    easy_apply_only: bool = False,
+    no_easy_apply: bool = False,
+) -> Path:
+    searches = filter_passes(
+        load_searches(config_path),
+        only_passes,
+        easy_apply_only=easy_apply_only,
+        no_easy_apply=no_easy_apply,
+    )
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    if only_passes:
+    if not searches:
+        # No matching passes — write an empty header-only CSV so downstream
+        # stages no-op cleanly. This is the workflow-friendly path: e.g. the
+        # easy-apply workflow on a user with no easy_apply pass configured.
+        print(
+            "[scrape] no searches matched the active filters — writing empty jobs.csv",
+            flush=True,
+        )
+        OUTPUT_PATH.write_text("", encoding="utf-8")
+        return OUTPUT_PATH
+
+    if only_passes or easy_apply_only or no_easy_apply:
         names = ", ".join(repr(s.get("name", "")) for s in searches)
         print(f"[scrape] running passes: {names}", flush=True)
 

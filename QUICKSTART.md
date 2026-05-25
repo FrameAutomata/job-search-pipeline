@@ -172,14 +172,18 @@ In cloud automation, `daily-pipeline.yml` typically uses `--evaluate-batch` (imm
 
 ## Selecting specific search passes
 
-`--only-pass "name1,name2"` runs only the listed entries from `searches:` (case-insensitive match against `name:`). Useful when you have multiple passes with different cadences:
+Three mutually-exclusive flags subset the `searches:` in your config:
+
+- `--only-pass "name1,name2"` — explicit name match (case-insensitive). Errors on no match, so it catches typos like `--only-pass "easyy apply"`.
+- `--easy-apply-only` — only passes with `easy_apply: true`. Clean no-op if none configured.
+- `--no-easy-apply` — only passes without `easy_apply: true`.
 
 ```bash
 ./run.sh --evaluate-batch --only-pass "easy apply"
-./run.sh --evaluate-batch --only-pass "recent DFW,remote US"
+./run.sh --evaluate-batch --no-easy-apply
 ```
 
-The cloud workflows use this — `daily-pipeline.yml` runs the longer-form passes once daily, `easy-apply-pipeline.yml` runs the easy-apply pass every 4 h.
+The cloud workflows use the `easy_apply` routing pair — `daily-pipeline.yml` runs everything except easy-apply, `easy-apply-pipeline.yml` runs just the easy-apply pass. This means your pass `name:` values can be anything; the workflows route by the JobSpy `easy_apply` field, not by name.
 
 ---
 
@@ -204,8 +208,8 @@ The repo ships three scheduled workflows + one manual workflow. **They refuse to
 
 | Workflow | Schedule | What it does |
 |---|---|---|
-| `daily-pipeline.yml` | Noon UTC | Runs the `"recent DFW"` + `"remote US"` passes via `--only-pass`. |
-| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs the `"easy apply"` pass on its own cadence. |
+| `daily-pipeline.yml` | Noon UTC | Runs every pass without `easy_apply: true` via `--no-easy-apply`. |
+| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs every pass with `easy_apply: true` via `--easy-apply-only`. No-ops if none configured. |
 | `retrieve-batch.yml` | Midnight UTC | Polls Anthropic Batch API for the `--submit-batch` path. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a base64 blob — for status edits without committing the file. |
 
