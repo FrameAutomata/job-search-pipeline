@@ -243,7 +243,10 @@ def run(config_path: Path) -> Path:
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
 
-    resume_env = os.environ.get("RESUME_PATH", "resumes/resume.pdf")
+    # `or DEFAULT` rather than the `get(VAR, DEFAULT)` form so an explicitly
+    # empty RESUME_PATH (e.g. from a workflow `RESUME_PATH: ${{ vars.X || '' }}`
+    # pattern) falls back to the default instead of breaking with an empty path.
+    resume_env = os.environ.get("RESUME_PATH") or "resumes/resume.pdf"
     resume_path = Path(resume_env)
     if not resume_path.is_absolute():
         resume_path = (ROOT / resume_path).resolve()

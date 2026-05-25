@@ -93,7 +93,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install google-generativeai openai 2>/dev/null || true
+          pip install google-genai openai 2>/dev/null || true
 
       - name: Clone career-ops fork
         run: |

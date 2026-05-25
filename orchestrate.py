@@ -49,14 +49,18 @@ def main() -> int:
         p = Path(p)
         return p if p.is_absolute() else (ROOT / p).resolve()
 
-    career_ops = resolve(os.environ.get("CAREER_OPS_PATH", "career-ops"))
+    # `os.environ.get(VAR) or DEFAULT` instead of `get(VAR, DEFAULT)` — the
+    # latter returns "" when the env var is set to an empty string, which
+    # silently uses the CWD as the career-ops path. The `or` form treats
+    # unset and empty-string both as "use the default".
+    career_ops = resolve(os.environ.get("CAREER_OPS_PATH") or "career-ops")
 
     # Retrieve-only: skip all pipeline stages
     if args.retrieve_batch:
         batch_retrieve.run(career_ops, dry_run=args.dry_run)
         return 0
 
-    config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG", "config/search.yml"))
+    config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG") or "config/search.yml")
     if not config_path.exists():
         print(f"error: config not found at {config_path}", file=sys.stderr)
         print("hint: copy config/search.example.yml -> config/search.yml and edit", file=sys.stderr)

@@ -7,5 +7,5 @@ plyer
 anthropic
 
 # Optional — install only the provider(s) you use with --evaluate-batch:
-# pip install google-generativeai   # Gemini (free tier available)
+# pip install google-genai          # Gemini (free tier available)
 # pip install openai                # OpenAI, Groq, and Ollama (all OpenAI-compatible)

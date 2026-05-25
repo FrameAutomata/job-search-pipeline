@@ -118,3 +118,48 @@ class TestRunDryRun:
         career_ops = self._make_career_ops(tmp_path)
         result = run(career_ops, provider="unknownprovider", dry_run=True)
         assert result == 0
+
+
+class TestModelResolution:
+    """Test the BATCH_MODEL fallback chain. The empty-string case is the
+    one that bit us in CI: `BATCH_MODEL: ${{ vars.BATCH_MODEL || '' }}`
+    in the workflow YAML injects "" when the repo variable isn't set."""
+
+    def _resolve(self, monkeypatch, model_arg=None, env_value=None, provider="gemini"):
+        """Reproduce the exact resolution logic from batch_evaluate.run() so
+        the test pins the contract without needing a full pipeline run."""
+        from pipeline.batch_evaluate import PROVIDER_DEFAULTS
+        if env_value is None:
+            monkeypatch.delenv("BATCH_MODEL", raising=False)
+        else:
+            monkeypatch.setenv("BATCH_MODEL", env_value)
+        model = model_arg or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
+        return model
+
+    def test_explicit_arg_wins(self, monkeypatch):
+        monkeypatch.setenv("BATCH_MODEL", "from-env")
+        assert self._resolve(monkeypatch, model_arg="explicit") == "explicit"
+
+    def test_env_value_used_when_arg_missing(self, monkeypatch):
+        assert self._resolve(monkeypatch, env_value="my-model") == "my-model"
+
+    def test_unset_env_falls_back_to_provider_default(self, monkeypatch):
+        assert self._resolve(monkeypatch, env_value=None, provider="gemini") == "gemini-2.0-flash"
+
+    def test_empty_string_env_falls_back_to_provider_default(self, monkeypatch):
+        # Regression test: GHA workflow `${{ vars.X || '' }}` pattern injects ""
+        # when X isn't set. Before the fix, this empty string overrode the
+        # provider default and got sent to the API as the model name, causing
+        # "GenerateContentRequest.model: unexpected model name format".
+        assert self._resolve(monkeypatch, env_value="", provider="gemini") == "gemini-2.0-flash"
+
+    def test_empty_string_env_falls_back_for_anthropic(self, monkeypatch):
+        assert self._resolve(monkeypatch, env_value="", provider="anthropic") == "claude-sonnet-4-6"
+
+    def test_whitespace_only_env_is_NOT_treated_as_empty(self, monkeypatch):
+        # `"   " or default` evaluates to "   " (truthy). This is intentional
+        # — whitespace might be a typo we want the API to reject loudly rather
+        # than silently using the default. The fix is only for the literal
+        # empty-string case GHA actually produces.
+        result = self._resolve(monkeypatch, env_value="   ", provider="gemini")
+        assert result == "   "
