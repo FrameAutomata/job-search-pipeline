@@ -105,7 +105,8 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides auto-detection) |
 | `BATCH_MODEL` | per-provider default | Model override for `--evaluate-batch` / `--submit-batch` |
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model used when `BATCH_CLI=opencode` |
-| `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys; the first one set wins auto-detection |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. See [QUICKSTART](QUICKSTART.md#which-provider-should-i-pick) for picking one. |
+| `OPENAI_BASE_URL` | OpenAI's default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint. |
 
 ## Screening (opt-in)
 

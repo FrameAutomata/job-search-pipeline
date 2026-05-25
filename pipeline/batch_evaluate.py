@@ -5,18 +5,31 @@ workers. Results are written as they complete.
 
 Supported providers
 -------------------
-  anthropic   claude-sonnet-4-6 (default)      ANTHROPIC_API_KEY
-  gemini      gemini-2.5-flash  (default)       GEMINI_API_KEY
-  openai      gpt-4o-mini       (default)       OPENAI_API_KEY
-  groq        llama-3.3-70b-versatile (default) GROQ_API_KEY
-  ollama      qwen2.5:32b       (default)       OLLAMA_BASE_URL (default: http://localhost:11434)
+  anthropic    claude-sonnet-4-6 (default)             ANTHROPIC_API_KEY
+  gemini       gemini-2.5-flash  (default)             GEMINI_API_KEY
+  openai       gpt-4o-mini       (default)             OPENAI_API_KEY
+  groq         llama-3.3-70b-versatile (default)       GROQ_API_KEY
+  deepinfra    meta-llama/Llama-3.3-70B-Instruct (def) DEEPINFRA_API_KEY
+  openrouter   meta-llama/llama-3.3-70b-instruct (def) OPENROUTER_API_KEY
+  ollama       qwen2.5:32b       (default)             OLLAMA_BASE_URL (default: http://localhost:11434)
 
-Provider auto-detection: BATCH_PROVIDER env var, then first key found in the order above.
+Hosted open-model providers (deepinfra, openrouter) serve open-weight models
+like Llama 3.3 70B and DeepSeek V3 over OpenAI-compatible APIs. See
+QUICKSTART.md "Which provider should I pick?" for guidance on choosing
+between providers based on use case.
+
+Escape hatch: set OPENAI_BASE_URL to point the `openai` provider at any
+OpenAI-compatible endpoint (e.g. local vLLM server, internal proxy, a
+provider we haven't enumerated above). Use BATCH_PROVIDER=openai +
+OPENAI_API_KEY=<their-key> + OPENAI_BASE_URL=<their-url>.
+
+Provider auto-detection: BATCH_PROVIDER env var, then first key found in the
+order: gemini → groq → deepinfra → openrouter → openai → anthropic.
 
 Requirements (install only the provider you need):
   pip install anthropic                  # anthropic
   pip install google-genai               # gemini (NOT the deprecated google-generativeai)
-  pip install openai                     # openai / groq / ollama
+  pip install openai                     # openai / groq / deepinfra / openrouter / ollama
 """
 
 import argparse
@@ -60,6 +73,11 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
+    # Hosted open-weight providers serving Llama 3.3 70B by default. The
+    # model ID conventions differ across providers (capital vs lowercase),
+    # so the two entries below aren't typos. Override via BATCH_MODEL.
+    "deepinfra": "meta-llama/Llama-3.3-70B-Instruct",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct",
     "ollama": "qwen2.5:32b",
 }
 
@@ -216,11 +234,28 @@ def _build_caller(provider: str, model: str) -> Caller:
     if provider == "gemini":
         return _build_gemini_caller(model)
     if provider == "openai":
-        return _build_openai_compat_caller(model, api_key=os.environ["OPENAI_API_KEY"])
+        # OPENAI_BASE_URL escape hatch — lets users point the openai provider
+        # at any OpenAI-compatible endpoint (local vLLM, internal proxy, a
+        # provider we haven't added explicitly). Empty string handled the same
+        # way as unset.
+        base_url = os.environ.get("OPENAI_BASE_URL") or None
+        return _build_openai_compat_caller(
+            model, api_key=os.environ["OPENAI_API_KEY"], base_url=base_url,
+        )
     if provider == "groq":
         return _build_openai_compat_caller(
             model, api_key=os.environ["GROQ_API_KEY"],
             base_url="https://api.groq.com/openai/v1",
+        )
+    if provider == "deepinfra":
+        return _build_openai_compat_caller(
+            model, api_key=os.environ["DEEPINFRA_API_KEY"],
+            base_url="https://api.deepinfra.com/v1/openai",
+        )
+    if provider == "openrouter":
+        return _build_openai_compat_caller(
+            model, api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url="https://openrouter.ai/api/v1",
         )
     if provider == "ollama":
         # `or DEFAULT` not `get(VAR, DEFAULT)` — see BATCH_MODEL fix below for
@@ -233,11 +268,16 @@ def _build_caller(provider: str, model: str) -> Caller:
 
 # ── Provider validation ──────────────────────────────────────────────────────
 
-# Detection order matters: free-tier providers checked first.
+# Detection order matters when a user has multiple keys configured. We check
+# free-tier providers first (Gemini, Groq), then hosted open-model providers
+# (DeepInfra, OpenRouter), then closed-weights paid APIs (OpenAI, Anthropic).
+# Users can always override with BATCH_PROVIDER if they want a specific one.
 # ollama has no required key, so it is excluded from auto-detection.
 _PROVIDER_KEYS: dict[str, str] = {
     "gemini": "GEMINI_API_KEY",
     "groq": "GROQ_API_KEY",
+    "deepinfra": "DEEPINFRA_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
