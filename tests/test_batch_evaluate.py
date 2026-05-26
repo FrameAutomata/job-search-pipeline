@@ -291,3 +291,104 @@ class TestCallWithRetry:
             return "ok"
         _call_with_retry(fake_caller, "my-system", "my-user", sleep=lambda _: None)
         assert captured == [("my-system", "my-user")]
+
+
+class TestOpenAICompatibleProviders:
+    """Test the deepinfra/openrouter providers and the OPENAI_BASE_URL
+    escape hatch. These all route through `_build_openai_compat_caller`,
+    but with different (base_url, api_key) pairs depending on provider."""
+
+    def test_deepinfra_in_provider_defaults(self):
+        from pipeline.batch_evaluate import PROVIDER_DEFAULTS
+        assert "deepinfra" in PROVIDER_DEFAULTS
+        # Model ID should look like an HF-style path (matches DeepInfra convention)
+        assert "/" in PROVIDER_DEFAULTS["deepinfra"]
+
+    def test_openrouter_in_provider_defaults(self):
+        from pipeline.batch_evaluate import PROVIDER_DEFAULTS
+        assert "openrouter" in PROVIDER_DEFAULTS
+        assert "/" in PROVIDER_DEFAULTS["openrouter"]
+
+    def test_deepinfra_in_provider_keys_for_auto_detect(self):
+        from pipeline.batch_evaluate import _PROVIDER_KEYS
+        assert _PROVIDER_KEYS["deepinfra"] == "DEEPINFRA_API_KEY"
+
+    def test_openrouter_in_provider_keys_for_auto_detect(self):
+        from pipeline.batch_evaluate import _PROVIDER_KEYS
+        assert _PROVIDER_KEYS["openrouter"] == "OPENROUTER_API_KEY"
+
+    def test_auto_detect_picks_deepinfra_over_openai(self, monkeypatch):
+        # Detection order pins deepinfra ahead of openai. With both keys set
+        # the auto-detect picks deepinfra unless BATCH_PROVIDER overrides.
+        for key in ("BATCH_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("DEEPINFRA_API_KEY", "dkey")
+        monkeypatch.setenv("OPENAI_API_KEY", "okey")
+        assert _detect_provider() == "deepinfra"
+
+    def test_auto_detect_picks_openrouter_over_openai(self, monkeypatch):
+        for key in ("BATCH_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "ANTHROPIC_API_KEY", "DEEPINFRA_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "rkey")
+        monkeypatch.setenv("OPENAI_API_KEY", "okey")
+        assert _detect_provider() == "openrouter"
+
+    def test_check_provider_returns_error_when_deepinfra_key_missing(self, monkeypatch):
+        monkeypatch.delenv("DEEPINFRA_API_KEY", raising=False)
+        err = _check_provider("deepinfra")
+        assert err is not None
+        assert "DEEPINFRA_API_KEY" in err
+
+    def test_check_provider_returns_error_when_openrouter_key_missing(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        err = _check_provider("openrouter")
+        assert err is not None
+        assert "OPENROUTER_API_KEY" in err
+
+    def test_build_caller_for_deepinfra_uses_correct_base_url(self, monkeypatch, mocker):
+        # Stub the underlying _build_openai_compat_caller so we can capture
+        # the (api_key, base_url) it was called with without actually hitting
+        # any network or requiring the openai SDK at test time.
+        monkeypatch.setenv("DEEPINFRA_API_KEY", "test-deepinfra-key")
+        mock_build = mocker.patch.object(eval_mod, "_build_openai_compat_caller", return_value=lambda s, u: "fake")
+        eval_mod._build_caller("deepinfra", "some-model")
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs["api_key"] == "test-deepinfra-key"
+        assert kwargs["base_url"] == "https://api.deepinfra.com/v1/openai"
+        assert mock_build.call_args.args[0] == "some-model"
+
+    def test_build_caller_for_openrouter_uses_correct_base_url(self, monkeypatch, mocker):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+        mock_build = mocker.patch.object(eval_mod, "_build_openai_compat_caller", return_value=lambda s, u: "fake")
+        eval_mod._build_caller("openrouter", "some-model")
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs["api_key"] == "test-or-key"
+        assert kwargs["base_url"] == "https://openrouter.ai/api/v1"
+
+    def test_openai_base_url_escape_hatch_overrides_default(self, monkeypatch, mocker):
+        # The "openai" provider should respect OPENAI_BASE_URL when set,
+        # letting users point it at any OpenAI-compatible endpoint.
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://my.proxy.example/v1")
+        mock_build = mocker.patch.object(eval_mod, "_build_openai_compat_caller", return_value=lambda s, u: "fake")
+        eval_mod._build_caller("openai", "gpt-4o-mini")
+        assert mock_build.call_args.kwargs["base_url"] == "https://my.proxy.example/v1"
+
+    def test_openai_uses_default_base_url_when_unset(self, monkeypatch, mocker):
+        # Without OPENAI_BASE_URL, the openai provider passes base_url=None so
+        # the SDK uses its built-in default (https://api.openai.com/v1).
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        mock_build = mocker.patch.object(eval_mod, "_build_openai_compat_caller", return_value=lambda s, u: "fake")
+        eval_mod._build_caller("openai", "gpt-4o-mini")
+        assert mock_build.call_args.kwargs["base_url"] is None
+
+    def test_openai_treats_empty_base_url_as_unset(self, monkeypatch, mocker):
+        # Same defensive behavior as the BATCH_MODEL fix: GHA workflow YAML
+        # `${{ vars.X || '' }}` produces empty strings, which `or None`
+        # correctly collapses to None instead of sending "" as a URL.
+        monkeypatch.setenv("OPENAI_API_KEY", "key")
+        monkeypatch.setenv("OPENAI_BASE_URL", "")
+        mock_build = mocker.patch.object(eval_mod, "_build_openai_compat_caller", return_value=lambda s, u: "fake")
+        eval_mod._build_caller("openai", "gpt-4o-mini")
+        assert mock_build.call_args.kwargs["base_url"] is None

@@ -17,7 +17,7 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 - A resume PDF
 - At least one of:
   - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai) + [Ollama](https://ollama.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI
-  - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation): `GEMINI_API_KEY` (free tier), `GROQ_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`
+  - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
   - `ANTHROPIC_API_KEY` for `--submit-batch` / `--retrieve-batch` (async Messages Batch API, 50% cheaper)
 
 ---
@@ -157,17 +157,33 @@ State persists in `career-ops/batch/batch-state.tsv` — safe to interrupt and r
 .\run.ps1 --evaluate-batch --batch-concurrency 5        # more parallel workers
 ```
 
-Provider auto-detection order: Gemini → Groq → OpenAI → Anthropic (first env key found).
+Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. The first one with a configured API key wins. Override with `BATCH_PROVIDER`.
 
-| Provider | Env var | Default model | Free tier? |
-|---|---|---|---|
-| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Yes, but **the default is only 20 RPD on free tier** — for 100+ job runs override `BATCH_MODEL=gemma-4-26b-it` (1.5K RPD, unlimited TPM) or `gemini-3.1-flash-lite` (500 RPD). Check yours at aistudio.google.com/usage. |
-| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Yes — 30 RPM / 1000 RPD / 12K TPM (tight for our large prompts) |
-| OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` | No |
-| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | No |
-| Ollama | `OLLAMA_BASE_URL` | `qwen2.5:32b` | Local only |
+| Provider | Env var | Default model | Cost | Notes |
+|---|---|---|---|---|
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | Frontier paid | Closed-weights, established reputation for structured-output tasks. Batch API (`--submit-batch`) cuts cost ~50%. |
+| OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` | Frontier paid (mini is cheaper) | Closed-weights. `gpt-4o-mini` is competitively priced; `gpt-4o` is frontier-tier. |
+| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with per-model RPD ceilings | Check your per-model limits at aistudio.google.com/usage. Default model has a low RPD; `gemma-4-26b-it` has more headroom. |
+| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier with tight TPM ceiling | Fast inference, but the per-minute token limit binds tightly on our large prompts — best for small runs. |
+| DeepInfra | `DEEPINFRA_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct` | Pay-as-you-go (cheaper than frontier) | Hosted open-weight models. Pricing typically a fraction of frontier API rates per token. |
+| OpenRouter | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct` | Pay-as-you-go (varies by model) | Meta-aggregator — one key, switch models via `BATCH_MODEL`. Pricing varies by which backend model you select. |
+| Ollama | `OLLAMA_BASE_URL` | `qwen2.5:32b` | Free (you operate the server) | Local self-hosted. Not reachable from GHA cloud workflow without exposing the server publicly. |
 
-Override the model with `BATCH_MODEL=...` in `.env` or `--batch-model claude-haiku-4-5-20251001`.
+For current per-token pricing, check each provider's pricing page — rates change too often to enumerate here reliably.
+
+### Which provider should I pick?
+
+There are three real factors to weigh: **cost**, **output quality**, and **operational reliability** (rate limits, uptime, deprecation cadence). No single provider wins on all three; pick based on what matters most for your situation.
+
+- **Just trying things out / learning the pipeline.** Pick something with established output consistency so you can tell pipeline problems from LLM problems. Anthropic (`claude-sonnet-4-6`) or OpenAI (`gpt-4o-mini`) are good defaults — they cost money but you only need a few dollars to validate end-to-end.
+- **Free, small daily volume.** Gemini's free tier handles small runs (~20 evaluations/day on the default model, ~500/day with `BATCH_MODEL=gemini-3.1-flash-lite`, ~1500/day with `gemma-4-26b-it`). Check your specific per-model limits before relying on a number.
+- **Free, willing to navigate quotas.** Groq's free tier is fast but the TPM ceiling is tight against our large prompts. Workable for small runs, not for daily 100+ job evaluations.
+- **Active job search, cost matters at scale.** Hosted open-weight providers (DeepInfra, OpenRouter) typically run a fraction of frontier API per-token rates. Worth using after you've validated the pipeline against a frontier baseline so you know what "good output" looks like — open-weight models like Llama 3.3 70B are capable but occasionally weaker on the more nuanced report sections.
+- **A/B testing several models.** OpenRouter — single API key, dozens of backends accessible via `BATCH_MODEL`.
+- **Maximum control / data stays local.** Ollama for local runs. Or set `OPENAI_BASE_URL` to point the `openai` provider at your own vLLM / TGI / LM Studio endpoint.
+- **Already paying for frontier output, want to cut the bill.** Use Anthropic's Batch API (`--submit-batch` / `--retrieve-batch`) — same model, ~50% cost reduction in exchange for ~24 h async turnaround.
+
+Override the model with `BATCH_MODEL=...` in `.env` or `--batch-model <name>`.
 
 ### `--submit-batch` / `--retrieve-batch` — async Anthropic Batch API
 
@@ -270,4 +286,5 @@ job-search-pipeline/
 | `BATCH_MODEL` | per-provider default | Model name for `--evaluate-batch` / `--submit-batch` |
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Local model passed to `--batch` when `BATCH_CLI=opencode` |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint for `--evaluate-batch --batch-provider ollama` |
-| `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. |
+| `OPENAI_BASE_URL` | OpenAI default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint (local vLLM, custom proxy, etc.) |
