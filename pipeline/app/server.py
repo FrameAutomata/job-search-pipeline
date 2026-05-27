@@ -37,7 +37,13 @@ _active_data_dir: Path | None = None
 
 # Cloud workflow filenames (must match .github/workflows/*.yml).
 DAILY_WORKFLOW = "daily-pipeline.yml"
+EASY_APPLY_WORKFLOW = "easy-apply-pipeline.yml"
 EDIT_WORKFLOW = "edit-tracker.yml"
+
+# Both pipelines upload the same `pipeline-output-*` artifact. Refresh/push pull
+# whichever ran (successfully) most recently — the easy-apply pipeline fires
+# several times a day, so it's frequently newer than the daily one.
+PIPELINE_WORKFLOWS = [DAILY_WORKFLOW, EASY_APPLY_WORKFLOW]
 
 # Pending status changes (kanban drags) the user hasn't pushed yet, keyed by
 # tracker number → canonical status. Persisted so they survive a server
@@ -133,7 +139,7 @@ def push_status() -> JSONResponse:
 
     # Try to refresh a fresh base first (the clobber guard).
     try:
-        run = gh.latest_run(DAILY_WORKFLOW)
+        run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
         if run is not None:
             if UI_CACHE.exists():
                 shutil.rmtree(UI_CACHE)
@@ -201,14 +207,15 @@ def health() -> dict:
 
 @app.post("/api/refresh")
 def refresh() -> JSONResponse:
-    """Download the latest daily-pipeline artifact via gh and point the data
-    layer at it, so the user can pull fresh cloud results without leaving the
-    UI. Returns the run that was downloaded."""
+    """Download the most recent successful pipeline artifact (daily or
+    easy-apply, whichever ran later) via gh and point the data layer at it, so
+    the user can pull fresh cloud results without leaving the UI. Returns the
+    run that was downloaded."""
     global _active_data_dir
     try:
-        run = gh.latest_run(DAILY_WORKFLOW)
+        run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
         if run is None:
-            raise HTTPException(status_code=404, detail="No pipeline runs found yet.")
+            raise HTTPException(status_code=404, detail="No successful pipeline runs found yet.")
         # Clear any prior download so stale files can't linger.
         if UI_CACHE.exists():
             import shutil

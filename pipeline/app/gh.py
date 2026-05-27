@@ -76,6 +76,30 @@ def latest_run(workflow: str) -> dict | None:
     return runs[0] if runs else None
 
 
+def latest_successful_run(workflows: list[str], per_workflow: int = 10) -> dict | None:
+    """Most recently-created *successful* run across several workflow files.
+
+    The UI should load whichever pipeline produced fresh output last — the
+    easy-apply pipeline runs several times a day, so it's often newer than the
+    daily one. We require conclusion=success (and look back a few runs per
+    workflow) so a failed or in-progress tick never gets chosen — that run has
+    no downloadable artifact. Returns the run dict, or None if none succeeded."""
+    best = None
+    for wf in workflows:
+        out = _run([
+            "run", "list", *_repo_args(), "--workflow", wf, "--limit", str(per_workflow),
+            "--json", "databaseId,status,conclusion,createdAt,displayTitle",
+        ])
+        runs = json.loads(out or "[]")
+        ok = next((r for r in runs
+                   if r.get("status") == "completed" and r.get("conclusion") == "success"),
+                  None)
+        # createdAt is ISO-8601 UTC (…Z), so lexical comparison is chronological.
+        if ok and (best is None or ok["createdAt"] > best["createdAt"]):
+            best = ok
+    return best
+
+
 def download_artifact(run_id: int, dest: Path, name_pattern: str = "pipeline-output-*") -> Path:
     """Download a run's artifact(s) into `dest` and return the directory that
     contains the pipeline output (reports/ + data/).

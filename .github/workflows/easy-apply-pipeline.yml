@@ -6,7 +6,9 @@ name: Easy Apply Job Pipeline
 # new + live postings.
 #
 # Schedule offset (02/06/10/14/18/22 UTC) avoids overlap with the 12:00
-# daily-pipeline run.
+# daily-pipeline run. It also chains off the daily pipeline: a successful
+# daily run triggers an easy-apply pass immediately after, so the freshest
+# easy-apply listings are picked up as soon as the daily scrape completes.
 #
 # See daily-pipeline.yml for the full privacy model and secrets list.
 # This workflow refuses to run in a public repository.
@@ -15,6 +17,9 @@ on:
   schedule:
     - cron: '0 2,6,10,14,18,22 * * *'
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Daily Job Pipeline"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -53,7 +58,11 @@ jobs:
 
   scrape-and-evaluate:
     needs: preflight
-    if: needs.preflight.outputs.should_run == 'true'
+    # Run for schedule / manual dispatch always; for the daily-pipeline chain,
+    # only after a *successful* daily run (skip if it failed or was cancelled).
+    if: >-
+      needs.preflight.outputs.should_run == 'true' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
 
     steps:

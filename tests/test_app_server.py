@@ -102,7 +102,7 @@ def test_run_surfaces_gh_error(client, mocker):
 
 def test_refresh_404_when_no_runs(client, mocker):
     from pipeline.app import server
-    mocker.patch.object(server.gh, "latest_run", return_value=None)
+    mocker.patch.object(server.gh, "latest_successful_run", return_value=None)
     r = client.post("/api/refresh")
     assert r.status_code == 404
 
@@ -119,7 +119,7 @@ def test_refresh_downloads_and_repoints(client, tmp_path, mocker):
         "| 9 | 2026-05-27 | Refreshed Co | Eng | 4.9/5 | Evaluated | ❌ | [009](reports/009-x.md) | APPLY |\n",
         encoding="utf-8",
     )
-    mocker.patch.object(server.gh, "latest_run",
+    mocker.patch.object(server.gh, "latest_successful_run",
                         return_value={"databaseId": 7, "createdAt": "t", "displayTitle": "Daily"})
     mocker.patch.object(server.gh, "download_artifact", return_value=art)
     try:
@@ -174,7 +174,7 @@ def test_push_status_refreshes_applies_and_dispatches(client, tmp_path, mocker):
         "| 2 | 2026-05-28 | NewCo | Dev | 3.9/5 | Evaluated | ❌ | [002](reports/002-newco.md) | new |\n",
         encoding="utf-8",
     )
-    mocker.patch.object(server.gh, "latest_run", return_value={"databaseId": 9})
+    mocker.patch.object(server.gh, "latest_successful_run", return_value={"databaseId": 9})
     mocker.patch.object(server.gh, "download_artifact", return_value=fresh)
     trigger = mocker.patch.object(server.gh, "trigger_workflow")
 
@@ -202,7 +202,7 @@ def test_push_status_falls_back_to_local_when_refresh_fails(client, mocker):
     from pipeline.app import server
     client.post("/api/status", json={"num": "1", "status": "Interview"})
     # No runs available → refresh can't produce a fresh base.
-    mocker.patch.object(server.gh, "latest_run", return_value=None)
+    mocker.patch.object(server.gh, "latest_successful_run", return_value=None)
     trigger = mocker.patch.object(server.gh, "trigger_workflow")
 
     r = client.post("/api/push-status")
@@ -216,7 +216,7 @@ def test_push_status_falls_back_to_local_when_refresh_fails(client, mocker):
 def test_push_status_surfaces_gh_error(client, mocker):
     from pipeline.app import server
     client.post("/api/status", json={"num": "1", "status": "Applied"})
-    mocker.patch.object(server.gh, "latest_run", return_value=None)
+    mocker.patch.object(server.gh, "latest_successful_run", return_value=None)
     mocker.patch.object(server.gh, "trigger_workflow",
                         side_effect=server.gh.GhError("edit-tracker.yml not found"))
     r = client.post("/api/push-status")
