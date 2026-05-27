@@ -68,6 +68,8 @@ function renderReview() {
   const lines = [
     `Resume:        ${file ? file.name : "(none selected!)"}`,
     `Name:          ${f.name || "(default)"}`,
+    `Contact:       ${[f.email, f.phone, f.location].filter(Boolean).join(" · ") || "(none)"}`,
+    `Links:         ${[f.linkedin, f.github, f.website].filter(Boolean).join(" · ") || "(none)"}`,
     `Target roles:  ${f.target_roles || "(default: Software Engineer)"}`,
     `Avoid:         ${f.negative_roles || "(none)"}`,
     `Comp:          ${f.comp_target || "$130K-170K"} (min ${f.comp_min || "$110K"})`,
@@ -96,6 +98,41 @@ nextBtn.addEventListener("click", () => {
   showStep(current + 1);
 });
 backBtn.addEventListener("click", () => showStep(current - 1));
+
+// When a resume is chosen, parse it and autofill the About fields. Only fills
+// fields the user hasn't already typed into, so it never clobbers manual edits.
+const ABOUT_FIELDS = ["name", "email", "phone", "location", "linkedin", "github", "website"];
+const autofillNote = document.getElementById("about-autofill-note");
+
+resumeInput.addEventListener("change", async () => {
+  const file = resumeInput.files[0];
+  if (!file) return;
+  showAction("Reading your resume…", "");
+  try {
+    const fd = new FormData();
+    fd.append("resume", file);
+    const resp = await fetch("/api/onboard/parse-resume", { method: "POST", body: fd });
+    const info = await resp.json();
+    if (!resp.ok) throw new Error(info.detail || "could not read resume");
+    let filled = 0;
+    for (const k of ABOUT_FIELDS) {
+      const el = form.querySelector(`[name="${k}"]`);
+      if (el && info[k] && !el.value) { el.value = info[k]; filled++; }
+    }
+    if (autofillNote) {
+      autofillNote.hidden = false;
+      autofillNote.textContent = filled
+        ? `Autofilled ${filled} field${filled === 1 ? "" : "s"} from your resume — review them in step 2 (About).`
+        : "Couldn't auto-detect contact details; fill them in step 2 (About).";
+    }
+    showAction(
+      filled ? `Resume loaded — autofilled ${filled} About field${filled === 1 ? "" : "s"}.` : "Resume loaded.",
+      "ok"
+    );
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  }
+});
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();

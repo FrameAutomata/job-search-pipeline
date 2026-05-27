@@ -23,7 +23,7 @@
         <h2>Your resume</h2>
         <p class="hint">Upload your resume as a PDF. We extract the text for keyword
           scoring and the cloud evaluator — it never leaves your machine except as
-          an encrypted GitHub secret.</p>
+          an encrypted GitHub secret. We'll also auto-fill the About step from it.</p>
         <label>Resume (PDF)
           <input id="resume" type="file" accept="application/pdf,.pdf" required />
         </label>
@@ -39,7 +39,9 @@
           <label>Location<input name="location" placeholder="Dallas, TX" /></label>
           <label>LinkedIn (optional)<input name="linkedin" placeholder="linkedin.com/in/janedev" /></label>
           <label>GitHub (optional)<input name="github" placeholder="github.com/janedev" /></label>
+          <label>Website / portfolio (optional)<input name="website" placeholder="janedev.dev" /></label>
         </div>
+        <p class="hint" id="about-autofill-note" hidden></p>
       </section>
 
       <!-- 3. Roles & comp -->

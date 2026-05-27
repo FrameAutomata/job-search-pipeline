@@ -276,6 +276,20 @@ def onboard_status() -> JSONResponse:
     })
 
 
+@app.post("/api/onboard/parse-resume")
+async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
+    """Extract contact details from an uploaded resume PDF to autofill the
+    onboarding 'About' step. Pure local parse — no gh calls, nothing written."""
+    pdf_bytes = await resume.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="resume file is empty")
+    try:
+        text = onboard.extract_pdf_text(pdf_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"could not read PDF: {e}")
+    return JSONResponse(onboard.parse_resume_info(text))
+
+
 @app.post("/api/onboard")
 async def onboard_submit(
     resume: UploadFile = File(...),
