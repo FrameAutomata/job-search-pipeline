@@ -12,6 +12,11 @@
 
 * { box-sizing: border-box; }
 
+/* The panes set display:flex/block via #id selectors, which out-specify the
+   UA [hidden]{display:none} rule — so without this, toggling the `hidden`
+   attribute in JS wouldn't actually hide them. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -84,6 +89,46 @@ header h1 { margin: 0 0 12px; font-size: 18px; }
 main { display: flex; height: calc(100vh - 78px); }
 
 #table-pane { flex: 1; overflow: auto; }
+
+.viewtoggle { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.viewtoggle button {
+  background: var(--panel); border: none; color: var(--muted);
+  padding: 7px 12px; font-size: 14px; cursor: pointer;
+}
+.viewtoggle button.active { background: var(--accent); color: #fff; }
+
+/* ── Kanban board ──────────────────────────────────────────────────────── */
+#board-pane { flex: 1; overflow: auto; display: flex; gap: 12px; padding: 14px; align-items: flex-start; }
+.kanban-col {
+  flex: 0 0 240px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+}
+.kanban-col.dragover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.kanban-col h3 {
+  margin: 0; padding: 10px 12px; font-size: 13px;
+  border-bottom: 1px solid var(--border); color: var(--muted);
+  display: flex; justify-content: space-between;
+}
+.kanban-col .col-count { color: var(--muted); font-weight: 400; }
+.kanban-cards { padding: 8px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.kanban-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: grab;
+}
+.kanban-card:active { cursor: grabbing; }
+.kanban-card.dragging { opacity: 0.4; }
+.kanban-card.pending { border-left: 3px solid var(--warn); }
+.kanban-card .card-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.kanban-card .card-company { font-weight: 600; }
+.kanban-card .card-role { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
 table { width: 100%; border-collapse: collapse; }
 

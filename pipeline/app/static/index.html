@@ -10,12 +10,17 @@
   <header>
     <h1>Job Search — Triage</h1>
     <div class="toolbar">
+      <div class="viewtoggle">
+        <button id="view-table" class="active">Table</button>
+        <button id="view-board">Board</button>
+      </div>
       <input id="filter" type="search" placeholder="Filter by company, role, notes…" />
       <select id="status-filter">
         <option value="">All statuses</option>
       </select>
       <span id="count" class="count"></span>
       <span class="spacer"></span>
+      <button id="push-btn" title="Push status changes to the cloud tracker" hidden></button>
       <button id="refresh-btn" title="Download the latest results from GitHub">↻ Refresh</button>
       <button id="run-btn" title="Trigger a new pipeline run in the cloud">▶ Run now</button>
     </div>
@@ -40,6 +45,8 @@
         No evaluated roles yet. Run the pipeline, then refresh.
       </p>
     </section>
+
+    <section id="board-pane" hidden></section>
 
     <aside id="report-pane" hidden>
       <div class="report-head">

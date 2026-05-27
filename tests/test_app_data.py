@@ -218,6 +218,71 @@ class TestLoadJobs:
         assert result == {"rows": [], "source": "none"}
 
 
+class TestCanonicalStatus:
+    def test_canonical_passthrough(self):
+        assert data.canonical_status("Applied") == "Applied"
+        assert data.canonical_status("evaluated") == "Evaluated"
+
+    def test_spanish_aliases(self):
+        assert data.canonical_status("Evaluada") == "Evaluated"
+        assert data.canonical_status("Aplicada") == "Applied"
+        assert data.canonical_status("Rechazado") == "Rejected"
+        assert data.canonical_status("Descartada") == "Discarded"
+
+    def test_strips_markdown_bold(self):
+        assert data.canonical_status("**Applied**") == "Applied"
+
+    def test_unknown_passes_through(self):
+        assert data.canonical_status("Negotiating") == "Negotiating"
+
+    def test_status_canonical_field_on_rows(self, tmp_path):
+        f = tmp_path / "applications.md"
+        f.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-05-27 | Acme | Eng | 4.0/5 | Evaluada | ❌ | [001](reports/001-x.md) | n |\n",
+            encoding="utf-8",
+        )
+        rows = data.parse_applications(f)
+        assert rows[0]["status"] == "Evaluada"
+        assert rows[0]["status_canonical"] == "Evaluated"
+
+
+class TestSetStatusInText:
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 1 | 2026-05-27 | Acme | Eng | 4.0/5 | Evaluated | ❌ | [001](reports/001-x.md) | apply now |\n"
+        "| 2 | 2026-05-27 | Globex | Dev | 3.0/5 | Evaluated | ❌ | [002](reports/002-y.md) | maybe |\n"
+    )
+
+    @staticmethod
+    def _status_of(text, num):
+        for line in text.splitlines():
+            if line.lstrip().startswith(f"| {num} "):
+                return [c.strip() for c in line.split("|")][6]
+        return None
+
+    def test_changes_only_target_status(self):
+        out = data.set_status_in_text(self.APPS, "2", "Applied")
+        assert self._status_of(out, "2") == "Applied"
+        assert self._status_of(out, "1") == "Evaluated"
+
+    def test_preserves_other_cells_verbatim(self):
+        out = data.set_status_in_text(self.APPS, "1", "Interview")
+        assert "[001](reports/001-x.md)" in out
+        assert "apply now" in out
+        assert self._status_of(out, "1") == "Interview"
+
+    def test_unknown_num_unchanged(self):
+        assert data.set_status_in_text(self.APPS, "999", "Applied") == self.APPS
+
+    def test_header_not_editable(self):
+        # Passing "#" must not rewrite the header row's Status cell.
+        assert data.set_status_in_text(self.APPS, "#", "Applied") == self.APPS
+
+
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):
         f = tmp_path / "r.md"
