@@ -51,6 +51,8 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `orchestrate.py`                        | Main entrypoint — chains all stages, parses CLI flags                                            |
 | `run.ps1` / `run.sh`                    | Wrappers — activate venv, route `--batch` to the career-ops CLI runner                           |
+| `run-ui.ps1` / `run-ui.sh`              | Launch the local triage UI (`pipeline/app`, FastAPI on localhost) — read-only results view       |
+| `pipeline/app/`                         | Local web UI — `server.py` (FastAPI routes), `data.py` (parse applications.md + render reports), `static/` (SPA). Deps in `requirements-ui.txt`. |
 | `config/search.yml`                     | **Edit this** — searches, filters, screening config                                              |
 | `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`      |
 | `resumes/resume.pdf`                    | Resume used to extract scoring keywords                                                          |

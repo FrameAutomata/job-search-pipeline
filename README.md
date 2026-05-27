@@ -156,6 +156,25 @@ The cloud workflows use the `--easy-apply-only` / `--no-easy-apply` pair, not na
 ./run.sh --skip-scrape --skip-filter --skip-screen --skip-bridge --skip-batch-prep --evaluate-batch
 ```
 
+## Local triage UI
+
+A local web app for reading and triaging evaluation results, instead of scrolling raw markdown reports. Runs entirely on your machine (FastAPI on localhost) — nothing leaves your computer.
+
+```bash
+pip install -r requirements-ui.txt   # one-time: fastapi, uvicorn, markdown
+
+./run-ui.sh                          # serve on :8000, read ./career-ops
+./run-ui.sh --data path/to/extracted-artifact   # read a downloaded GHA artifact instead
+```
+```powershell
+.\run-ui.ps1                         # Windows
+.\run-ui.ps1 -Data path\to\extracted-artifact
+```
+
+Then open http://localhost:8000. The current version (phase 1) is **read-only triage**: a sortable, filterable table of every evaluated role (default sorted by score, high→low), click a row to read its rendered report in a side panel.
+
+Point it at either your local `career-ops/` directory (if you run the pipeline locally) or a GitHub Actions artifact you've downloaded and extracted (the artifact has the same `reports/` + `data/applications.md` layout). Later phases add a "Refresh from GitHub" button (auto-downloads the latest artifact via `gh`), a kanban status board with drag-drop write-back, and a guided onboarding flow.
+
 ## Requirements
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, which has no Python 3.13 wheel; setup scripts auto-select 3.12 via `py -3.12` / `python3.12`)
