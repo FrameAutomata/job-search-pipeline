@@ -188,7 +188,7 @@ Three workflows make up the cloud automation:
 | Workflow | Schedule | What it does |
 |----------|----------|--------------|
 | `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs every pass without `easy_apply: true` via `--no-easy-apply`. Scrape → filter → screen → bridge → evaluate. |
-| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs every pass with `easy_apply: true` via `--easy-apply-only`. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. No-ops cleanly if no easy-apply passes are configured. |
+| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC **and** right after a successful `daily-pipeline` run (`workflow_run` chain) | Runs every pass with `easy_apply: true` via `--easy-apply-only`. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. No-ops cleanly if no easy-apply passes are configured. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a user-supplied base64 blob. Use after editing the tracker locally. |
 
 **Storage model — no user data is ever committed:**
