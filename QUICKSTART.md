@@ -203,7 +203,7 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 | OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` | Frontier paid (mini is cheaper) | Closed-weights. `gpt-4o-mini` is competitively priced; `gpt-4o` is frontier-tier. |
 | Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with per-model RPD ceilings | Check your per-model limits at aistudio.google.com/usage. Default model has a low RPD; `gemma-4-26b-it` has more headroom. |
 | Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier with tight TPM ceiling | Fast inference, but the per-minute token limit binds tightly on our large prompts — best for small runs. |
-| DeepInfra | `DEEPINFRA_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct` | Pay-as-you-go (cheaper than frontier) | Hosted open-weight models. Pricing typically a fraction of frontier API rates per token. |
+| DeepInfra | `DEEPINFRA_API_KEY` | `deepseek-ai/DeepSeek-V4-Flash` | Pay-as-you-go (cheaper than frontier) | Hosted open-weight models. Pricing typically a fraction of frontier API rates per token. |
 | OpenRouter | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct` | Pay-as-you-go (varies by model) | Meta-aggregator — one key, switch models via `BATCH_MODEL`. Pricing varies by which backend model you select. |
 | Ollama | `OLLAMA_BASE_URL` | `qwen2.5:32b` | Free (you operate the server) | Local self-hosted. Not reachable from GHA cloud workflow without exposing the server publicly. |
 
