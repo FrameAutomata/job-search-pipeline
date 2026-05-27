@@ -12,6 +12,7 @@ const stepper = document.getElementById("steps");
 const backBtn = document.getElementById("back-btn");
 const nextBtn = document.getElementById("next-btn");
 const submitBtn = document.getElementById("submit-btn");
+const cancelBtn = document.getElementById("cancel-btn");
 const actionMsg = document.getElementById("action-msg");
 const resumeInput = document.getElementById("resume");
 const repoLine = document.getElementById("repo-line");
@@ -40,6 +41,9 @@ function showStep(i) {
   const last = current === steps.length - 1;
   nextBtn.hidden = last;
   submitBtn.hidden = !last;
+  // On the final step the wizard is effectively complete, so leaving means
+  // "done" rather than abandoning setup.
+  cancelBtn.textContent = last ? "Finish" : "Cancel";
   if (last) renderReview();
 }
 

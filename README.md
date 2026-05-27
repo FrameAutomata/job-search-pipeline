@@ -24,17 +24,39 @@ GitHub creates a standalone private repo with the same files. It's *not* listed 
 
 ### Configure your private copy
 
-Inside your private copy on github.com:
+You need to (a) get your profile + API key into the repo's **GitHub secrets**, and (b) **enable Actions**. The guided wizard does (a) for you; there's also a manual path.
 
-1. **Settings → Secrets and variables → Actions → New repository secret.** Add:
-   - `CV_MD_B64` — `base64 -w0 path/to/your/cv.md`
-   - `PROFILE_YML_B64` — `base64 -w0 path/to/your/profile.yml`
+**First, clone your private copy and install locally** (the wizard runs on your machine and pushes secrets to this repo):
+
+```bash
+git clone <your-private-copy-url>
+cd <your-private-copy>
+./setup.sh          # Windows: .\setup.ps1
+```
+
+#### Option A — guided wizard (recommended)
+
+1. Install the [GitHub CLI](https://cli.github.com) and run `gh auth login` (the wizard uses it to write secrets).
+2. From inside your private copy, run `./run-ui.sh` (Windows: `.\run-ui.ps1`), open http://localhost:8000, and click **⚙ Setup**.
+3. Walk through the wizard (resume → about → roles/comp → search settings → optional narrative → provider + API key → review). On submit it generates your profile and writes every required secret to *this* repo. It refuses to write to a public repo.
+
+See [Guided onboarding](#guided-onboarding-onboard) below and the [QUICKSTART setup steps](QUICKSTART.md#step-2--create-your-profile) for the full walkthrough.
+
+#### Option B — set the secrets by hand
+
+First generate the profile artifacts locally with `node setup-profile.mjs`. That writes `cv.md`, `profile.yml`, `_profile.md`, and `search.yml`, but **not** `resumes/resume.txt` — create that yourself from your resume's plain text (e.g. `pdftotext resume.pdf resumes/resume.txt`, or copy-paste the text into the file). Then in your private copy on github.com go to **Settings → Secrets and variables → Actions → New repository secret** and add:
+   - `CV_MD_B64` — `base64 -w0 career-ops/cv.md`
+   - `PROFILE_YML_B64` — `base64 -w0 career-ops/config/profile.yml`
    - `SEARCH_CONFIG_B64` — `base64 -w0 config/search.yml`
-   - `RESUME_TXT_B64` — `base64 -w0 resumes/resume.txt`
+   - `RESUME_TXT_B64` — `base64 -w0 resumes/resume.txt` (the file you created above)
    - At least one LLM API key: `GEMINI_API_KEY` (free tier) / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
-   - Optional: `PROFILE_MD_B64`, `ARTICLE_DIGEST_B64`
-2. **Actions tab → "I understand my workflows, go ahead and enable them".**
-3. **Actions → Daily Job Pipeline → Run workflow** to do a test run before the scheduled cron fires.
+   - Optional: `PROFILE_MD_B64` (`base64 -w0 career-ops/modes/_profile.md`), `ARTICLE_DIGEST_B64`
+
+#### Then, either way
+
+1. **Actions tab → "I understand my workflows, go ahead and enable them".**
+2. **Actions → Daily Job Pipeline → Run workflow** to do a test run before the scheduled cron fires. (A successful daily run also kicks off an easy-apply run immediately after, if you configured an easy-apply pass.)
+3. **Read results**: Actions tab → open the run → download the `pipeline-output-*` artifact, or use the local UI's **↻ Refresh** button to pull it without leaving the browser.
 
 ### Pulling updates from the template later
 
@@ -73,10 +95,11 @@ Evaluation has two paths, pick whichever fits:
 # Windows
 git clone <this repo>
 cd job-search-pipeline
-.\setup.ps1                  # creates venv, installs deps (incl. UI), clones career-ops
-# Edit config\search.yml, then pick an evaluation mode:
+.\setup.ps1                  # creates venv, installs deps (incl. UI), clones career-ops, copies example configs
+node setup-profile.mjs       # generate your profile from your resume (or use the UI wizard — see below)
+# setup-profile.mjs writes config\search.yml; tweak it if you like, then pick an evaluation mode:
 .\run.ps1 --batch            # interactive CLI agent (default: claude)
-.\run.ps1 --evaluate-batch   # API-driven (free Gemini if GEMINI_API_KEY set)
+.\run.ps1 --evaluate-batch   # API-driven (free Gemini if GEMINI_API_KEY set in .env)
 ```
 
 ```bash
@@ -84,8 +107,11 @@ cd job-search-pipeline
 git clone <this repo>
 cd job-search-pipeline
 ./setup.sh
+node setup-profile.mjs
 ./run.sh --evaluate-batch
 ```
+
+Profile setup is required before the first run — it produces your CV, candidate profile, and `searches:` config from your resume. You can do it in the terminal (`node setup-profile.mjs`, above) or in the browser via the **⚙ Setup** wizard ([Guided onboarding](#guided-onboarding-onboard)); the wizard additionally writes GitHub secrets for cloud runs. For `--evaluate-batch`, put at least one LLM API key in `.env` (e.g. `GEMINI_API_KEY=...`).
 
 For unattended cloud runs, see [Using this template](#using-this-template) above. See [QUICKSTART.md](QUICKSTART.md) for a detailed walkthrough.
 
@@ -180,7 +206,7 @@ Then open http://localhost:8000.
 Point it at either your local `career-ops/` directory (if you run the pipeline locally) or a GitHub Actions artifact you've downloaded and extracted (the artifact has the same `reports/` + `data/applications.md` layout).
 
 **Cloud buttons** (require the [`gh` CLI](https://cli.github.com) installed + `gh auth login`):
-- **↻ Refresh** — downloads the latest `daily-pipeline` artifact via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
+- **↻ Refresh** — downloads the most recent *successful* pipeline artifact (daily **or** easy-apply, whichever ran later) via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
 - **▶ Run now** — triggers a `daily-pipeline` run in the cloud (`gh workflow run`). It executes on GitHub; click Refresh once it finishes.
 - **⇧ Push N changes** — appears once you've made status edits on the board. Pushes them to the cloud tracker via the `edit-tracker` workflow. It first refreshes the latest tracker and applies your changes on top, so roles the pipeline added since your last refresh aren't clobbered.
 - **⚙ Setup** — opens the guided onboarding wizard (see below).
