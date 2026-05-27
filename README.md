@@ -155,6 +155,7 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model used when `BATCH_CLI=opencode` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. See [QUICKSTART](QUICKSTART.md#which-provider-should-i-pick) for picking one. |
 | `OPENAI_BASE_URL` | OpenAI's default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint. |
+| `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the UI: `ask` (choose each time), `api`, or `cli`. |
 
 ## Screening (opt-in)
 
@@ -235,6 +236,22 @@ Point it at either your local `career-ops/` directory (if you run the pipeline l
 - **⚙ Setup** — opens the guided onboarding wizard (see below).
 
 `gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override.
+
+### Running career-ops skills from the UI
+
+After the cloud pipeline has scraped and scored, open a role's report in the side panel and click **📄 Tailor résumé** to tailor your CV to that posting (a JD-matched **markdown** résumé you can drop into your own format). It runs one of two ways, and you choose per action:
+
+- **API** — a bounded, synchronous provider call (uses the LLM keys you already configured). Zero install, finishes in place, returns a downloadable `.md`. No live web research or back-and-forth.
+- **CLI** — hands you a ready-to-run command for your agent (`BATCH_CLI`, default `claude`). Interactive, can pull the live JD and refine conversationally. We never run the agent for you — it runs in your terminal, where its tools and cost are visible.
+
+The UI shows whichever paths are available (an agent CLI on your PATH, an API key, or both). Set **`SKILL_PATH_DEFAULT=api|cli`** in `.env` to skip the chooser; leave it `ask` (default) to pick each time — handy if you'd rather spend an agent-CLI membership than API credits, or use the API for batch scoring and the CLI for tailoring.
+
+**Which should I use?**
+- *API* — fast, no install, good for tailoring résumés at volume; pick this if you don't want to install an agent.
+- *CLI* — interactive with live web research; best when you want to iterate or pull the freshest JD. The **interview-prep** and live **apply** skills are CLI-only (they need a browser and live search), so install an agent CLI if you want those.
+- *Both* — API for quick tailoring, CLI for depth. Recommended for an active search.
+
+> Security: the UI is localhost-only and now refuses cross-origin state-changing requests, so a web page you have open can't trigger skill runs, cloud actions, or secret writes behind your back.
 
 ### Guided onboarding (`/onboard`)
 

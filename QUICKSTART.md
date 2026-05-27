@@ -313,3 +313,4 @@ job-search-pipeline/
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint for `--evaluate-batch --batch-provider ollama` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. |
 | `OPENAI_BASE_URL` | OpenAI default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint (local vLLM, custom proxy, etc.) |
+| `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the triage UI (résumé tailoring, etc.): `ask` (pick each time), `api` (always the provider call), or `cli` (always hand off to your agent). See the [README UI section](README.md#running-career-ops-skills-from-the-ui). |
