@@ -18,7 +18,6 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 - At least one of:
   - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai) + [Ollama](https://ollama.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI
   - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
-  - `ANTHROPIC_API_KEY` for `--submit-batch` / `--retrieve-batch` (async Messages Batch API, 50% cheaper)
 
 ---
 
@@ -94,7 +93,7 @@ screen:
 
 ## Run the pipeline
 
-Three evaluation modes, pick one:
+Two evaluation modes, pick one:
 
 ```powershell
 # Windows — interactive CLI agent (Claude Code is the default)
@@ -102,11 +101,6 @@ Three evaluation modes, pick one:
 
 # Synchronous API evaluation (auto-detects provider from env keys; Gemini free tier is fine)
 .\run.ps1 --evaluate-batch
-
-# Async Anthropic Batch API — 50% cheaper, ~24 h turnaround
-.\run.ps1 --submit-batch
-# later (or via the retrieve-batch.yml cloud workflow):
-.\run.ps1 --retrieve-batch
 ```
 
 ```bash
@@ -124,7 +118,7 @@ This runs five stages in sequence, then evaluates:
 | Bridge | Pushes new jobs into `career-ops/data/pipeline.md`, deduped against scan-history + applications.md |
 | Batch prep | Writes `career-ops/batch/batch-input.tsv` and `batch/jds/{id}.txt` |
 
-`--evaluate-batch`, `--submit-batch`, and `--retrieve-batch` are mutually exclusive (argparse rejects two at once). `--batch` is the interactive CLI path and runs after the pipeline stages.
+`--batch` is the interactive CLI path and runs after the pipeline stages; `--evaluate-batch` is the synchronous API path. They aren't mutually exclusive.
 
 Results land in:
 - Reports → `career-ops/reports/{num}-{company}-{date}.md`
@@ -161,7 +155,7 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 
 | Provider | Env var | Default model | Cost | Notes |
 |---|---|---|---|---|
-| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | Frontier paid | Closed-weights, established reputation for structured-output tasks. Batch API (`--submit-batch`) cuts cost ~50%. |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | Frontier paid | Closed-weights, established reputation for structured-output tasks. |
 | OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` | Frontier paid (mini is cheaper) | Closed-weights. `gpt-4o-mini` is competitively priced; `gpt-4o` is frontier-tier. |
 | Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with per-model RPD ceilings | Check your per-model limits at aistudio.google.com/usage. Default model has a low RPD; `gemma-4-26b-it` has more headroom. |
 | Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier with tight TPM ceiling | Fast inference, but the per-minute token limit binds tightly on our large prompts — best for small runs. |
@@ -181,20 +175,8 @@ There are three real factors to weigh: **cost**, **output quality**, and **opera
 - **Active job search, cost matters at scale.** Hosted open-weight providers (DeepInfra, OpenRouter) typically run a fraction of frontier API per-token rates. Worth using after you've validated the pipeline against a frontier baseline so you know what "good output" looks like — open-weight models like Llama 3.3 70B are capable but occasionally weaker on the more nuanced report sections.
 - **A/B testing several models.** OpenRouter — single API key, dozens of backends accessible via `BATCH_MODEL`.
 - **Maximum control / data stays local.** Ollama for local runs. Or set `OPENAI_BASE_URL` to point the `openai` provider at your own vLLM / TGI / LM Studio endpoint.
-- **Already paying for frontier output, want to cut the bill.** Use Anthropic's Batch API (`--submit-batch` / `--retrieve-batch`) — same model, ~50% cost reduction in exchange for ~24 h async turnaround.
 
 Override the model with `BATCH_MODEL=...` in `.env` or `--batch-model <name>`.
-
-### `--submit-batch` / `--retrieve-batch` — async Anthropic Batch API
-
-```powershell
-.\run.ps1 --submit-batch     # uploads requests, prints batch_id, exits
-.\run.ps1 --retrieve-batch   # polls; writes reports if the batch is done
-```
-
-50% cheaper than the standard Anthropic API. The system prompt (CV + profile + customizations) is sent as a cacheable block (`cache_control: ephemeral`) so the large shared context is paid once per batch, ~90% input-token savings. Requires `ANTHROPIC_API_KEY`. State: `career-ops/batch/batch-api-state.json`.
-
-In cloud automation, `daily-pipeline.yml` typically uses `--evaluate-batch` (immediate results); `retrieve-batch.yml` runs `--retrieve-batch` on a schedule for the async path.
 
 ---
 
@@ -238,7 +220,6 @@ The repo ships three scheduled workflows + one manual workflow. **They refuse to
 |---|---|---|
 | `daily-pipeline.yml` | Noon UTC | Runs every pass without `easy_apply: true` via `--no-easy-apply`. |
 | `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs every pass with `easy_apply: true` via `--easy-apply-only`. No-ops if none configured. |
-| `retrieve-batch.yml` | Midnight UTC | Polls Anthropic Batch API for the `--submit-batch` path. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a base64 blob — for status edits without committing the file. |
 
 All runtime state (scan-history, applications.md, batch state) lives in `actions/cache@v4`. Reports and tracker snapshots are uploaded as `actions/upload-artifact@v4` (90-day retention). No user data is ever committed.
@@ -266,7 +247,7 @@ job-search-pipeline/
     ├── batch/
     │   ├── batch-input.tsv      # Evaluation queue
     │   ├── batch-state.tsv      # Interactive --batch progress (resumable)
-    │   ├── batch-api-state.json # --submit-batch / --evaluate-batch state
+    │   ├── batch-api-state.json # --evaluate-batch state
     │   ├── jds/                 # Cached job descriptions
     │   └── tracker-additions/   # Pending tracker lines (merged by merge-tracker.mjs)
     └── reports/                 # Full A–G evaluation reports
@@ -283,7 +264,7 @@ job-search-pipeline/
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
 | `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides detection) |
-| `BATCH_MODEL` | per-provider default | Model name for `--evaluate-batch` / `--submit-batch` |
+| `BATCH_MODEL` | per-provider default | Model name for `--evaluate-batch` |
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Local model passed to `--batch` when `BATCH_CLI=opencode` |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint for `--evaluate-batch --batch-provider ollama` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. |

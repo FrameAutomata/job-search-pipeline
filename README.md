@@ -63,10 +63,9 @@ A local, fully automated pipeline that runs the complete job-search loop end to 
 4. **Bridge** — surviving postings are appended to [career-ops](https://github.com/santifer/career-ops)'s `data/pipeline.md` queue. Second dedup pass against scan-history, pipeline.md, and `company::role` pairs in applications.md.
 5. **Batch prep** — writes the evaluation queue (`batch/batch-input.tsv`) and caches job descriptions (`batch/jds/{id}.txt`) for the evaluator.
 
-Evaluation has three paths, pick whichever fits:
+Evaluation has two paths, pick whichever fits:
 - `--batch` — interactive agent CLI (Claude Code / OpenCode / Gemini CLI / Qwen / your choice). Generates PDFs, can WebSearch in real time.
-- `--evaluate-batch` — synchronous parallel API calls (auto-detects Gemini / Groq / OpenAI / Anthropic / Ollama). Immediate results. Used by the cloud workflows.
-- `--submit-batch` + `--retrieve-batch` — async Anthropic Messages Batch API (~24 h, 50% cheaper, system prompt cached with `cache_control: ephemeral` for ~90% input-token savings).
+- `--evaluate-batch` — synchronous parallel API calls (auto-detects Gemini / Groq / DeepInfra / OpenRouter / OpenAI / Anthropic / Ollama). Immediate results. Used by the cloud workflows.
 
 ## Quickstart
 
@@ -103,7 +102,7 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
 | `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides auto-detection) |
-| `BATCH_MODEL` | per-provider default | Model override for `--evaluate-batch` / `--submit-batch` |
+| `BATCH_MODEL` | per-provider default | Model override for `--evaluate-batch` |
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model used when `BATCH_CLI=opencode` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. See [QUICKSTART](QUICKSTART.md#which-provider-should-i-pick) for picking one. |
 | `OPENAI_BASE_URL` | OpenAI's default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint. |
@@ -132,11 +131,9 @@ When `liveness: false` the screen stage is a no-op (no dedup, no fetches, no bac
 .\run.ps1 --batch                              # interactive: agent CLI per BATCH_CLI (default: claude)
 .\run.ps1 --evaluate-batch                     # sync API: auto-detected provider, ~3 parallel workers
 .\run.ps1 --evaluate-batch --batch-provider gemini --batch-concurrency 5
-.\run.ps1 --submit-batch                       # async Anthropic Batch API (~24 h, 50% off)
-.\run.ps1 --retrieve-batch                     # poll + retrieve completed batch results
 ```
 
-`--evaluate-batch`, `--submit-batch`, and `--retrieve-batch` are mutually exclusive (argparse rejects more than one). `--batch` is the interactive CLI agent path and isn't mutually exclusive with the others; it just runs after the pipeline.
+`--batch` is the interactive CLI agent path; `--evaluate-batch` is the synchronous API path. They aren't mutually exclusive — `--batch` runs after the pipeline.
 
 Three flags (mutually exclusive) select a subset of the `searches:` in your config:
 

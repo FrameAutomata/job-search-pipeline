@@ -1,6 +1,6 @@
 # job-search-pipeline
 
-Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor via **JobSpy**, scores results against a resume using YAKE keyword extraction, optionally screens for liveness, then bridges surviving jobs into **career-ops** for AI-powered evaluation. Supports interactive evaluation via any agent CLI (`--batch`) or async bulk evaluation via the Anthropic Messages Batch API (`--submit-batch`/`--retrieve-batch`) at 50% cost.
+Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor via **JobSpy**, scores results against a resume using YAKE keyword extraction, optionally screens for liveness, then bridges surviving jobs into **career-ops** for AI-powered evaluation. Supports interactive evaluation via any agent CLI (`--batch`) or synchronous parallel API evaluation across any LLM provider (`--evaluate-batch`).
 
 ---
 
@@ -14,8 +14,6 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | Bridge       | `pipeline/bridge.py`        | `filtered_jobs.csv` → `career-ops/data/pipeline.md` + `scan-history.tsv`  |
 | Batch prep   | `pipeline/batch_prep.py`    | bridge output → `career-ops/batch/batch-input.tsv` + `batch/jds/*.txt`    |
 | Batch evaluate | `pipeline/batch_evaluate.py` | `batch-input.tsv` → parallel LLM evaluation → `reports/*.md` + `tracker-additions/*.tsv` |
-| Batch submit | `pipeline/batch_submit.py`  | `batch-input.tsv` + context files → Anthropic Batch API → `batch-api-state.json` |
-| Batch retrieve | `pipeline/batch_retrieve.py` | Batch API results → `reports/*.md` + `tracker-additions/*.tsv`          |
 
 `orchestrate.py` chains all stages. Each stage can be skipped independently via `--skip-<stage>`.
 
@@ -28,8 +26,6 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 ./run.ps1                        # scrape → filter → screen → bridge → batch-prep
 ./run.ps1 --batch                # + evaluate interactively via your configured CLI (default: claude)
 ./run.ps1 --evaluate-batch       # + evaluate via any LLM API (auto-detects provider from env keys)
-./run.ps1 --submit-batch         # + submit to Anthropic Batch API (async, ~24 h, 50% cheaper)
-./run.ps1 --retrieve-batch       # poll and retrieve completed Batch API results
 
 # Select specific search passes — three mutually-exclusive flags:
 ./run.ps1 --evaluate-batch --only-pass "easy apply"   # explicit name match (errors on typo)
@@ -39,17 +35,12 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 # Skip stages when re-running
 ./run.ps1 --skip-scrape --skip-filter --batch
 ./run.ps1 --skip-scrape --skip-filter --evaluate-batch
-./run.ps1 --skip-scrape --skip-filter --submit-batch
 ```
-
-The three evaluation flags (`--evaluate-batch`, `--submit-batch`, `--retrieve-batch`) are mutually exclusive — argparse rejects more than one.
 
 ```bash
 # macOS/Linux
 ./run.sh --batch
 ./run.sh --evaluate-batch
-./run.sh --submit-batch
-./run.sh --retrieve-batch
 ```
 
 ---
@@ -59,7 +50,7 @@ The three evaluation flags (`--evaluate-batch`, `--submit-batch`, `--retrieve-ba
 | File                                    | Purpose                                                                                          |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | `orchestrate.py`                        | Main entrypoint — chains all stages, parses CLI flags                                            |
-| `run.ps1` / `run.sh`                    | Wrappers — activate venv, route `--batch`, `--submit-batch`, `--retrieve-batch`                  |
+| `run.ps1` / `run.sh`                    | Wrappers — activate venv, route `--batch` to the career-ops CLI runner                           |
 | `config/search.yml`                     | **Edit this** — searches, filters, screening config                                              |
 | `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`      |
 | `resumes/resume.pdf`                    | Resume used to extract scoring keywords                                                          |
@@ -68,8 +59,8 @@ The three evaluation flags (`--evaluate-batch`, `--submit-batch`, `--retrieve-ba
 | `career-ops/data/pipeline.md`           | Pending evaluation queue (checkbox list)                                                         |
 | `career-ops/data/scan-history.tsv`      | All-time dedup record                                                                            |
 | `career-ops/batch/batch-input.tsv`      | Batch evaluation queue                                                                           |
-| `career-ops/batch/jds/*.txt`            | Cached job descriptions (inlined into Batch API prompts)                                         |
-| `career-ops/batch/batch-api-state.json` | Anthropic Batch API state — job metadata, batch_id, per-job status                              |
+| `career-ops/batch/jds/*.txt`            | Cached job descriptions (inlined into evaluation prompts)                                        |
+| `career-ops/batch/batch-api-state.json` | `--evaluate-batch` state — per-job metadata, report/tracker numbers, completion status           |
 | `career-ops/config/profile.yml`         | Candidate profile (created by setup-profile.mjs)                                                |
 | `career-ops/batch/batch-runner.sh`      | Interactive batch evaluator — `--cli claude\|opencode\|gemini\|qwen`, `--model`, `--skip-pdf`   |
 | GHA Cache (key `pipeline-state-v1`)     | Per-fork runtime state (scan-history, applications.md, batch state). Never committed.            |
@@ -186,51 +177,16 @@ Set in `.env` or as repository secrets for GitHub Actions. `BATCH_PROVIDER` over
 
 ---
 
-## Anthropic Batch API (`--submit-batch` / `--retrieve-batch`)
-
-Submits evaluations to the [Anthropic Messages Batch API](https://docs.anthropic.com/en/docs/build-with-claude/message-batches) — async bulk processing at 50% cost vs standard API pricing. Batches complete within 24 hours.
-
-**Requirements**: set `ANTHROPIC_API_KEY` in `.env` (or as an environment variable).
-
-```powershell
-# Submit all pending jobs from batch-input.tsv
-./run.ps1 --submit-batch
-
-# Or submit without running the pipeline first
-./run.ps1 --skip-scrape --skip-filter --skip-screen --skip-bridge --skip-batch-prep --submit-batch
-
-# Check and retrieve completed results
-./run.ps1 --retrieve-batch
-```
-
-**How it works**:
-1. `batch_submit.py` reads `batch-input.tsv`, inlines `cv.md` + `profile.yml` + `_profile.md` + `article-digest.md` into a system prompt, and submits one Batch API request per job. The system block is sent with `cache_control: {"type": "ephemeral"}` (Anthropic prompt caching) so the large shared context is paid once per batch — ~90% input-token savings on cached portions.
-2. Pre-assigns report numbers and tracker numbers (via `assign_job_numbers` in `_batch_common.py`) so the same helper is used by `--evaluate-batch` and parallel writes don't conflict.
-3. Saves state to `career-ops/batch/batch-api-state.json` (batch_id + per-job metadata) using atomic writes (`atomic_write_text` → `os.replace`).
-4. `batch_retrieve.py` polls the batch status and — when complete — parses XML-tagged responses, writes `reports/*.md` and `batch/tracker-additions/*.tsv`, then runs `node merge-tracker.mjs`.
-
-**Batch mode limitations** (vs interactive `--batch`):
-- No PDF generation (no file system access in Messages API)
-- No real-time WebSearch — salary/company data from training knowledge (labeled as estimates)
-- No Playwright liveness verification — freshness marked "unverified (batch mode)"
-
-**Model selection** (set `BATCH_MODEL` in `.env`):
-- `claude-sonnet-4-6` — default; recommended for the A-G reasoning quality (~$1.50/M input at batch price)
-- `claude-haiku-4-5-20251001` — cheaper (~$0.40/M) but shallower reasoning on complex evaluation blocks
-
----
-
 ## Cloud automation (GitHub Actions)
 
 > **Privacy first**: every cloud workflow refuses to run unless your fork is private. The Actions tab of a public repo exposes workflow run history, schedule cadence, and durations — all of which reveal active job searching. See the privacy notice at the top of [README.md](README.md).
 
-Four workflows make up the cloud automation:
+Three workflows make up the cloud automation:
 
 | Workflow | Schedule | What it does |
 |----------|----------|--------------|
 | `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs every pass without `easy_apply: true` via `--no-easy-apply`. Scrape → filter → screen → bridge → evaluate. |
 | `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs every pass with `easy_apply: true` via `--easy-apply-only`. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. No-ops cleanly if no easy-apply passes are configured. |
-| `retrieve-batch.yml` | Midnight UTC (7 PM CDT) | Polls Anthropic async batch → writes reports → uploads artifacts (only needed with `--submit-batch`). |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a user-supplied base64 blob. Use after editing the tracker locally. |
 
 **Storage model — no user data is ever committed:**
@@ -256,7 +212,7 @@ Four workflows make up the cloud automation:
      - `GEMINI_API_KEY` — free tier, recommended; get one at aistudio.google.com
      - `GROQ_API_KEY` — free tier with fast open-source models
      - `OPENAI_API_KEY` — OpenAI
-     - `ANTHROPIC_API_KEY` — Anthropic (also required for `--submit-batch` async path)
+     - `ANTHROPIC_API_KEY` — Anthropic
 
    Optional:
    - `PROFILE_MD_B64` — `base64 -w0 modes/_profile.md`
