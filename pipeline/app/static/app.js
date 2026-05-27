@@ -219,9 +219,13 @@ function updatePushButton() {
   }
 }
 
+let selectedJob = null;
+
 async function openReport(job) {
   if (!job.report_num) return;
   selectedNum = job.report_num;
+  selectedJob = job;
+  resetSkillPanel();
   render();
   els.reportLink.href = extractUrl(job) || "#";
   els.reportBody.innerHTML = "<p class='empty'>Loading…</p>";
@@ -343,4 +347,103 @@ els.pushBtn.addEventListener("click", async () => {
   }
 });
 
+// ── career-ops skills (resume tailoring) ───────────────────────────────────
+
+const tailorBtn = document.getElementById("tailor-btn");
+const skillPanel = document.getElementById("skill-panel");
+let CAPS = { cli: { available: false }, api: { available: false }, default_path: "ask" };
+
+async function loadCaps() {
+  try {
+    CAPS = await (await fetch("/api/capabilities")).json();
+  } catch { /* leave defaults; the button explains the no-capability case */ }
+}
+
+function resetSkillPanel() {
+  skillPanel.hidden = true;
+  skillPanel.innerHTML = "";
+}
+
+// Decide which path to use, honoring a set default, then availability.
+function chooseTailorPath() {
+  const cli = CAPS.cli.available, api = CAPS.api.available;
+  if (!cli && !api) return "none";
+  const def = CAPS.default_path;
+  if (def === "cli" && cli) return "cli";
+  if (def === "api" && api) return "api";
+  if (cli && api) return "choose";   // default is "ask" → let the user pick
+  return cli ? "cli" : "api";
+}
+
+tailorBtn.addEventListener("click", () => {
+  if (!selectedJob) return;
+  const path = chooseTailorPath();
+  if (path === "none") {
+    showSkill(
+      "No way to run this yet. Install an agent CLI (e.g. claude) or set an LLM " +
+      "API key (e.g. GEMINI_API_KEY), then reload.", "error");
+    return;
+  }
+  if (path === "choose") {
+    skillPanel.hidden = false;
+    skillPanel.className = "skill-panel";
+    skillPanel.innerHTML =
+      `<p>Run resume tailoring via:</p>
+       <div class="skill-choice">
+         <button data-path="api">⚡ API — ${escapeHtml(CAPS.api.provider || "provider")} (bounded, no install)</button>
+         <button data-path="cli">⌨ CLI — ${escapeHtml(CAPS.cli.name)} (interactive, uses your agent)</button>
+       </div>`;
+    skillPanel.querySelectorAll("button[data-path]").forEach((b) =>
+      b.addEventListener("click", () => runTailor(b.dataset.path)));
+    return;
+  }
+  runTailor(path);
+});
+
+async function runTailor(path) {
+  const job = selectedJob;
+  showSkill(path === "api" ? "Tailoring résumé via the API…" : "Building the CLI command…", "");
+  try {
+    const resp = await fetch("/api/skills/tailor-resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ num: String(job.num), path }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `tailoring failed (${resp.status})`);
+    if (body.path === "cli") renderCliResult(body);
+    else renderApiResult(body);
+  } catch (e) {
+    showSkill(String(e.message || e), "error");
+  }
+}
+
+function renderApiResult(body) {
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel ok";
+  skillPanel.innerHTML =
+    `<p>Tailored résumé generated via ${escapeHtml(body.provider)}:</p>
+     <a class="skill-download" href="${escapeAttr(body.download_url)}" download>⬇ ${escapeHtml(body.output_file)}</a>`;
+}
+
+function renderCliResult(body) {
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel";
+  skillPanel.innerHTML =
+    `<p>Run this in your terminal (interactive — refines with your agent):</p>
+     <pre class="skill-cmd"><code>${escapeHtml(body.command)}</code></pre>
+     <button id="skill-copy">Copy command</button>`;
+  document.getElementById("skill-copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(body.command); showSkill("Command copied.", "ok"); }
+    catch { showSkill("Couldn't copy — select the command and copy manually.", "error"); }
+  });
+}
+
+function showSkill(text, kind) {
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel" + (kind ? " " + kind : "");
+  skillPanel.innerHTML = `<p>${escapeHtml(text)}</p>`;
+}
+
+loadCaps();
 loadJobs();
