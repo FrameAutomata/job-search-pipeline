@@ -17,7 +17,7 @@ fi
 
 echo "==> Cloning career-ops (if missing)"
 if [ ! -d "$root/career-ops" ]; then
-  git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops-1 "$root/career-ops"
+  git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops "$root/career-ops"
 else
   echo "    career-ops already present, skipping clone"
 fi
