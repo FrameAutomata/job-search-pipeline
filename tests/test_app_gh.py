@@ -98,6 +98,58 @@ class TestTriggerWorkflow:
         assert "applications_md_b64=QUJD" in args
 
 
+class TestLatestSuccessfulRun:
+    def _per_workflow(self, mapping):
+        """Build a subprocess.run side_effect that returns each workflow's runs
+        based on the --workflow value in argv."""
+        def fake(args, **kwargs):
+            wf = args[args.index("--workflow") + 1]
+            return _completed(json.dumps(mapping.get(wf, [])))
+        return fake
+
+    def test_picks_newest_across_workflows(self, mocker):
+        mapping = {
+            "daily-pipeline.yml": [
+                {"databaseId": 1, "status": "completed", "conclusion": "success",
+                 "createdAt": "2026-05-27T00:00:00Z", "displayTitle": "Daily"}],
+            "easy-apply-pipeline.yml": [
+                {"databaseId": 2, "status": "completed", "conclusion": "success",
+                 "createdAt": "2026-05-27T06:00:00Z", "displayTitle": "Easy Apply"}],
+        }
+        mocker.patch("pipeline.app.gh.subprocess.run",
+                     side_effect=self._per_workflow(mapping))
+        r = gh.latest_successful_run(["daily-pipeline.yml", "easy-apply-pipeline.yml"])
+        assert r["databaseId"] == 2  # easy-apply ran later
+
+    def test_skips_failed_or_in_progress(self, mocker):
+        mapping = {
+            "daily-pipeline.yml": [
+                {"databaseId": 1, "status": "completed", "conclusion": "success",
+                 "createdAt": "2026-05-27T00:00:00Z"}],
+            "easy-apply-pipeline.yml": [
+                # newest is in-progress (no artifact); next is failed; then success.
+                {"databaseId": 4, "status": "in_progress", "conclusion": None,
+                 "createdAt": "2026-05-27T08:00:00Z"},
+                {"databaseId": 3, "status": "completed", "conclusion": "failure",
+                 "createdAt": "2026-05-27T04:00:00Z"},
+                {"databaseId": 2, "status": "completed", "conclusion": "success",
+                 "createdAt": "2026-05-26T20:00:00Z"}],
+        }
+        mocker.patch("pipeline.app.gh.subprocess.run",
+                     side_effect=self._per_workflow(mapping))
+        r = gh.latest_successful_run(["daily-pipeline.yml", "easy-apply-pipeline.yml"])
+        # easy-apply's only success (2) predates daily's success (1) -> daily wins.
+        assert r["databaseId"] == 1
+
+    def test_returns_none_when_none_successful(self, mocker):
+        mapping = {"daily-pipeline.yml": [
+            {"databaseId": 1, "status": "completed", "conclusion": "failure",
+             "createdAt": "2026-05-27T00:00:00Z"}]}
+        mocker.patch("pipeline.app.gh.subprocess.run",
+                     side_effect=self._per_workflow(mapping))
+        assert gh.latest_successful_run(["daily-pipeline.yml"]) is None
+
+
 class TestRepoVisibility:
     def test_returns_uppercased(self, mocker):
         mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("private\n"))
