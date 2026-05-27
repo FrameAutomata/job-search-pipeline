@@ -73,7 +73,7 @@ Evaluation has two paths, pick whichever fits:
 # Windows
 git clone <this repo>
 cd job-search-pipeline
-.\setup.ps1                  # creates venv, installs deps, clones career-ops, runs profile setup
+.\setup.ps1                  # creates venv, installs deps (incl. UI), clones career-ops
 # Edit config\search.yml, then pick an evaluation mode:
 .\run.ps1 --batch            # interactive CLI agent (default: claude)
 .\run.ps1 --evaluate-batch   # API-driven (free Gemini if GEMINI_API_KEY set)

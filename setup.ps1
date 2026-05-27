@@ -14,6 +14,9 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 & "$root\.venv\Scripts\python.exe" -m pip install --upgrade pip
 & "$root\.venv\Scripts\pip.exe" install -r "$root\requirements.txt"
 
+Write-Host "==> Installing local UI deps (triage + onboarding app)"
+& "$root\.venv\Scripts\pip.exe" install -r "$root\requirements-ui.txt"
+
 Write-Host "==> Cloning career-ops (if missing)"
 $careerOps = "$root\career-ops"
 if (-not (Test-Path $careerOps)) {
@@ -39,5 +42,13 @@ if (-not (Test-Path "$root\resumes")) { New-Item -ItemType Directory "$root\resu
 if (-not (Test-Path "$root\output")) { New-Item -ItemType Directory "$root\output" | Out-Null }
 
 Write-Host ""
-Write-Host "==> Running profile setup"
-node "$root\setup-profile.mjs"
+Write-Host "==> Setup complete."
+Write-Host ""
+Write-Host "Next — finish setup in your browser:"
+Write-Host "    .\run-ui.ps1        then open http://localhost:8000  and click  'Setup'"
+Write-Host ""
+Write-Host "The Setup wizard collects your resume + preferences and writes them to your"
+Write-Host "private repo's GitHub secrets, so the pipeline can run in the cloud."
+Write-Host "It needs the GitHub CLI:  install gh (https://cli.github.com), then 'gh auth login'."
+Write-Host ""
+Write-Host "Prefer the terminal instead? Run:  node setup-profile.mjs"

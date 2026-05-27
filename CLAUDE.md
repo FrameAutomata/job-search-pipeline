@@ -238,7 +238,7 @@ Three workflows make up the cloud automation:
 ## Setup (one-time)
 
 ```powershell
-./setup.ps1    # creates .venv, installs deps, clones career-ops, runs profile setup
+./setup.ps1    # creates .venv, installs deps (core + UI), clones career-ops; points to the /onboard wizard for profile setup
 ```
 
 Requires Python 3.12 (not 3.13 — jobspy pins numpy 1.26.3, no 3.13 wheel).
