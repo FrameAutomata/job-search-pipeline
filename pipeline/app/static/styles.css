@@ -64,6 +64,12 @@ header h1 { margin: 0 0 12px; font-size: 18px; }
 .toolbar button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .toolbar button:disabled { opacity: 0.5; cursor: default; }
 
+#setup-link {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 7px 12px; font-size: 14px; text-decoration: none;
+}
+#setup-link:hover { border-color: var(--accent); color: var(--accent); }
+
 .action-msg {
   margin-top: 10px;
   padding: 8px 12px;
@@ -129,6 +135,50 @@ main { display: flex; height: calc(100vh - 78px); }
 .kanban-card .card-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
 .kanban-card .card-company { font-weight: 600; }
 .kanban-card .card-role { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+/* ── Onboarding wizard ─────────────────────────────────────────────────── */
+.onboard-main { display: block; height: auto; max-width: 760px; margin: 0 auto; padding: 20px; }
+#wizard h2 { font-size: 17px; margin: 0 0 12px; }
+#wizard .muted { color: var(--muted); font-weight: 400; font-size: 13px; }
+.hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+.step { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
+#wizard label { display: block; margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+#wizard label.chk { display: flex; align-items: center; gap: 8px; color: var(--text); }
+#wizard input[type="text"],
+#wizard input[type="email"],
+#wizard input[type="password"],
+#wizard input[type="number"],
+#wizard input:not([type]),
+#wizard select,
+#wizard textarea {
+  display: block; width: 100%; margin-top: 5px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 10px; font-size: 14px; font-family: inherit;
+}
+#wizard input[type="file"] { margin-top: 8px; color: var(--text); }
+#wizard .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+fieldset.sites { border: 1px solid var(--border); border-radius: 6px; margin: 0 0 14px; padding: 10px 14px; }
+fieldset.sites legend { color: var(--muted); font-size: 13px; padding: 0 6px; }
+fieldset.sites .chk { display: inline-flex; margin: 0 16px 0 0; }
+
+.stepper { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; padding: 0; margin: 0 0 16px; }
+.stepper li {
+  font-size: 12px; color: var(--muted); padding: 4px 10px;
+  border: 1px solid var(--border); border-radius: 14px; background: var(--panel);
+}
+.stepper li.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+.stepper li.done { color: var(--good); border-color: rgba(63,185,80,0.4); }
+
+.wizard-nav { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+.wizard-nav button, .wizard-nav .linkbtn {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 8px 14px; font-size: 14px; cursor: pointer; text-decoration: none;
+}
+.wizard-nav button:hover:not(:disabled), .wizard-nav .linkbtn:hover { border-color: var(--accent); color: var(--accent); }
+.wizard-nav button:disabled { opacity: 0.5; cursor: default; }
+#submit-btn { background: var(--accent); color: #fff; border-color: var(--accent); }
+.banner.ok-banner { background: rgba(63,185,80,0.12); border-color: rgba(63,185,80,0.4); color: var(--good); }
+#review { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; white-space: pre-wrap; }
 
 table { width: 100%; border-collapse: collapse; }
 

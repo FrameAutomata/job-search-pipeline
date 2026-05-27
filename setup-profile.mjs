@@ -89,6 +89,7 @@ function parseArgs() {
     auto: false,
     force: false,
     cli: 'claude',
+    fromJson: null,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -100,6 +101,8 @@ function parseArgs() {
       config.force = true;
     } else if (args[i] === '--cli' && args[i + 1]) {
       config.cli = args[++i];
+    } else if (args[i] === '--from-json' && args[i + 1]) {
+      config.fromJson = args[++i];
     }
   }
 
@@ -1202,6 +1205,99 @@ function writeProfileMarkdown(markdown) {
 }
 
 // ============================================================
+// Non-interactive generation (--from-json)
+// ============================================================
+
+/**
+ * Generate profile.yml, cv.md, _profile.md, and search.yml from a JSON payload
+ * instead of interactive prompts. Used by the UI onboarding flow, which collects
+ * the same answers via a web form. The payload mirrors the in-memory objects the
+ * generator functions already consume, so no generation logic is duplicated.
+ *
+ * Shape (all fields optional — sane defaults fill the gaps):
+ *   { resumeText, info, criteria, searchSettings, narrative }
+ *
+ * Emits a final JSON line ({ok, ...paths}) on stdout so the caller can parse the
+ * result deterministically.
+ */
+async function runFromJson(jsonPath) {
+  if (!fs.existsSync(jsonPath)) {
+    error(`--from-json file not found: ${jsonPath}`);
+    process.exit(1);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+  } catch (e) {
+    error(`--from-json file is not valid JSON: ${e.message}`);
+    process.exit(1);
+  }
+
+  const resumeText = payload.resumeText || '';
+  const info = { ...(payload.info || {}) };
+  info.name = info.name || 'Your Name';
+  info.location = info.location || '';
+  info.timezone = info.timezone || 'UTC-6';
+
+  const c = payload.criteria || {};
+  const criteria = {
+    targetRoles: (c.targetRoles && c.targetRoles.length) ? c.targetRoles : ['Software Engineer'],
+    negativeRoles: c.negativeRoles || [],
+    compensationTarget: c.compensationTarget || '$130K-170K',
+    compensationMin: c.compensationMin || '$110K',
+    locationFlexibility: c.locationFlexibility || 'Remote preferred',
+  };
+
+  const s = payload.searchSettings || {};
+  const searchSettings = {
+    locations: (s.locations && s.locations.length) ? s.locations
+      : [{ raw: 'United States', isRemote: true, location: 'United States', country: 'USA' }],
+    hoursOld: s.hoursOld || 24,
+    resultsWanted: s.resultsWanted || 100,
+    sites: (s.sites && s.sites.length) ? s.sites : ['indeed', 'linkedin', 'glassdoor'],
+    includeEasyApply: !!s.includeEasyApply,
+  };
+
+  const n = payload.narrative || {};
+  const narrative = {
+    exitStory: n.exitStory || `Transitioning to ${criteria.targetRoles[0]} roles where I can ship complete products.`,
+    dealBreakers: n.dealBreakers || [],
+    locationPolicy: n.locationPolicy || { preferred: criteria.locationFlexibility, flexibility: 'Flexible for right opportunity' },
+    portfolio: n.portfolio || [],
+  };
+
+  // Ensure the output directories exist (fresh setup may lack them).
+  fs.mkdirSync(path.join(CAREER_OPS_PATH, 'config'), { recursive: true });
+  fs.mkdirSync(path.join(CAREER_OPS_PATH, 'modes'), { recursive: true });
+  fs.mkdirSync(path.join(ROOT, 'config'), { recursive: true });
+
+  // updateSearchConfig rewrites an existing search.yml (preserving any custom
+  // screen: block). Seed one from the example if the user has none yet.
+  const searchPath = path.join(ROOT, 'config', 'search.yml');
+  const examplePath = path.join(ROOT, 'config', 'search.example.yml');
+  if (!fs.existsSync(searchPath) && fs.existsSync(examplePath)) {
+    fs.copyFileSync(examplePath, searchPath);
+  }
+
+  const profile = generateProfile(info, criteria);
+  const cv = generateCV(resumeText, info);
+  const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
+
+  const profileFile = writeProfile(profile);
+  const cvFile = writeCV(cv);
+  const profileMdFile = writeProfileMarkdown(profileMarkdown);
+  const searchFile = updateSearchConfig(criteria.targetRoles, criteria.negativeRoles, searchSettings);
+
+  success(`Profile saved: ${profileFile}`);
+  success(`CV saved: ${cvFile}`);
+  success(`Career narrative saved: ${profileMdFile}`);
+  if (searchFile) success(`Search config updated: ${searchFile}`);
+
+  // Machine-readable result line for the orchestrator.
+  console.log(JSON.stringify({ ok: true, profileFile, cvFile, profileMdFile, searchFile }));
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1217,6 +1313,14 @@ async function main() {
     rl.close();
     process.exit(1);
   }
+
+  // Non-interactive path: generate everything from a JSON payload (UI onboarding).
+  if (args.fromJson) {
+    await runFromJson(args.fromJson);
+    rl.close();
+    return;
+  }
+
   checkPrerequisites();
 
   // Check if files already exist

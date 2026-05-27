@@ -183,8 +183,28 @@ Point it at either your local `career-ops/` directory (if you run the pipeline l
 - **↻ Refresh** — downloads the latest `daily-pipeline` artifact via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
 - **▶ Run now** — triggers a `daily-pipeline` run in the cloud (`gh workflow run`). It executes on GitHub; click Refresh once it finishes.
 - **⇧ Push N changes** — appears once you've made status edits on the board. Pushes them to the cloud tracker via the `edit-tracker` workflow. It first refreshes the latest tracker and applies your changes on top, so roles the pipeline added since your last refresh aren't clobbered.
+- **⚙ Setup** — opens the guided onboarding wizard (see below).
 
-`gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override. A guided onboarding flow (resume + preferences via the UI) is the next phase.
+`gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override.
+
+### Guided onboarding (`/onboard`)
+
+Instead of running the CLI setup + `base64` + `gh secret set` by hand, the
+**⚙ Setup** wizard does it from the browser. Walk through a short form — upload
+your resume PDF, enter target roles / compensation / locations / boards, pick an
+LLM provider and paste its API key — and on submit the server:
+
+1. extracts your resume text with `pdfplumber`,
+2. generates `profile.yml`, `cv.md`, `_profile.md`, and `search.yml` via
+   `setup-profile.mjs --from-json` (same generators as the CLI — one source of truth),
+3. base64-encodes them and writes all required **GitHub secrets** (`gh secret set`,
+   value piped via stdin so keys never hit argv/logs), plus your provider key and
+   `BATCH_PROVIDER` / `BATCH_MODEL` variables.
+
+It **refuses to write to a public repo** (same privacy guard as the workflows),
+and the status line up top shows the target repo, its visibility, and whether
+it's already configured. After onboarding, click **▶ Run now** to kick off your
+first cloud run.
 
 ## Requirements
 

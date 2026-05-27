@@ -20,15 +20,27 @@ class GhError(RuntimeError):
 
 
 def _repo_args() -> list[str]:
+    """`-R <repo>` for subcommands that take the --repo flag (run, secret, …)."""
     repo = os.environ.get("JOB_SEARCH_REPO", "").strip()
     return ["-R", repo] if repo else []
 
 
-def _run(args: list[str], timeout: int = 120) -> str:
-    """Run `gh <args>`, returning stdout. Raises GhError on any failure."""
+def _repo_positional() -> list[str]:
+    """`gh repo view` takes the repository as a positional arg, not -R."""
+    repo = os.environ.get("JOB_SEARCH_REPO", "").strip()
+    return [repo] if repo else []
+
+
+def _run(args: list[str], timeout: int = 120, stdin: str | None = None) -> str:
+    """Run `gh <args>`, returning stdout. Raises GhError on any failure.
+
+    `stdin`, when given, is piped to the process — used for secret values so key
+    material and large base64 blobs never appear in argv (visible in process
+    listings) or hit the OS argument-length limit."""
     try:
         r = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, timeout=timeout
+            ["gh", *args], capture_output=True, text=True, timeout=timeout,
+            input=stdin,
         )
     except FileNotFoundError:
         raise GhError(
@@ -48,7 +60,7 @@ def _run(args: list[str], timeout: int = 120) -> str:
 
 def current_repo() -> str:
     """nameWithOwner of the repo gh is targeting (cwd remote, or override)."""
-    out = _run(["repo", "view", *_repo_args(), "--json", "nameWithOwner",
+    out = _run(["repo", "view", *_repo_positional(), "--json", "nameWithOwner",
                 "-q", ".nameWithOwner"])
     return out.strip()
 
@@ -89,6 +101,32 @@ def download_artifact(run_id: int, dest: Path, name_pattern: str = "pipeline-out
         "Downloaded the artifact but found no reports/ or data/ inside it — "
         "the run may not have produced output yet."
     )
+
+
+def repo_visibility() -> str:
+    """Return the target repo's visibility: 'PUBLIC', 'PRIVATE', or 'INTERNAL'.
+    Used to refuse writing secrets to a public repo (the privacy guard)."""
+    out = _run(["repo", "view", *_repo_positional(), "--json", "visibility",
+                "-q", ".visibility"])
+    return out.strip().upper()
+
+
+def list_secret_names() -> list[str]:
+    """Names of repository secrets already set on the target repo."""
+    out = _run(["secret", "list", *_repo_args(), "--json", "name",
+                "-q", ".[].name"])
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def set_secret(name: str, value: str) -> None:
+    """Set a repository secret. The value is piped via stdin (never argv) so key
+    material / base64 blobs stay out of process listings and argv limits."""
+    _run(["secret", "set", name, *_repo_args(), "--body", "-"], stdin=value)
+
+
+def set_variable(name: str, value: str) -> None:
+    """Set a repository variable (non-secret config, e.g. BATCH_PROVIDER)."""
+    _run(["variable", "set", name, *_repo_args(), "--body", value])
 
 
 def trigger_workflow(workflow: str, fields: dict | None = None) -> None:

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Job Search — Setup</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Job Search — Setup</h1>
+    <div id="repo-line" class="count">Checking your repository…</div>
+    <div id="status-banner" class="banner" hidden></div>
+  </header>
+
+  <main class="onboard-main">
+    <form id="wizard" autocomplete="off">
+      <!-- Step indicator -->
+      <ol id="steps" class="stepper"></ol>
+
+      <!-- 1. Resume -->
+      <section class="step" data-step="0">
+        <h2>Your resume</h2>
+        <p class="hint">Upload your resume as a PDF. We extract the text for keyword
+          scoring and the cloud evaluator — it never leaves your machine except as
+          an encrypted GitHub secret.</p>
+        <label>Resume (PDF)
+          <input id="resume" type="file" accept="application/pdf,.pdf" required />
+        </label>
+      </section>
+
+      <!-- 2. About -->
+      <section class="step" data-step="1" hidden>
+        <h2>About you</h2>
+        <div class="grid2">
+          <label>Full name<input name="name" placeholder="Jane Dev" /></label>
+          <label>Email<input name="email" type="email" placeholder="jane@example.com" /></label>
+          <label>Phone (optional)<input name="phone" placeholder="+1 (555) 123-4567" /></label>
+          <label>Location<input name="location" placeholder="Dallas, TX" /></label>
+          <label>LinkedIn (optional)<input name="linkedin" placeholder="linkedin.com/in/janedev" /></label>
+          <label>GitHub (optional)<input name="github" placeholder="github.com/janedev" /></label>
+        </div>
+      </section>
+
+      <!-- 3. Roles & comp -->
+      <section class="step" data-step="2" hidden>
+        <h2>Roles &amp; compensation</h2>
+        <label>Target roles (comma-separated)
+          <input name="target_roles" placeholder="Senior Full-Stack Engineer, Backend Engineer" />
+        </label>
+        <label>Roles to avoid (comma-separated, optional)
+          <input name="negative_roles" placeholder="Intern, Manager, Director" />
+        </label>
+        <div class="grid2">
+          <label>Target compensation<input name="comp_target" placeholder="$130K-170K" /></label>
+          <label>Minimum acceptable<input name="comp_min" placeholder="$110K" /></label>
+        </div>
+        <label>Location flexibility
+          <input name="location_flexibility" placeholder="Remote preferred" />
+        </label>
+      </section>
+
+      <!-- 4. Search settings -->
+      <section class="step" data-step="3" hidden>
+        <h2>Search settings</h2>
+        <label>Locations (comma-separated; "City, ST" pairs stay together)
+          <input name="locations" placeholder="US Remote, Dallas, TX, Fort Worth, TX" />
+        </label>
+        <p class="hint">Put "Remote" in a chunk to route that pass through JobSpy's
+          remote filter. Examples: <code>Dallas, TX</code> · <code>London, UK</code>.</p>
+        <div class="grid2">
+          <label>Distance for on-site searches (miles)
+            <input name="distance" type="number" value="50" min="1" />
+          </label>
+          <label>How recent? (hours: 24 = today, 168 = week)
+            <input name="hours_old" type="number" value="24" min="1" />
+          </label>
+          <label>Max results per site / term
+            <input name="results_wanted" type="number" value="100" min="1" />
+          </label>
+        </div>
+        <fieldset class="sites">
+          <legend>Job boards</legend>
+          <label class="chk"><input type="checkbox" name="sites" value="indeed" checked /> Indeed</label>
+          <label class="chk"><input type="checkbox" name="sites" value="linkedin" checked /> LinkedIn</label>
+          <label class="chk"><input type="checkbox" name="sites" value="glassdoor" checked /> Glassdoor</label>
+          <label class="chk"><input type="checkbox" name="sites" value="zip_recruiter" /> ZipRecruiter</label>
+          <label class="chk"><input type="checkbox" name="sites" value="google" /> Google</label>
+        </fieldset>
+        <label class="chk">
+          <input type="checkbox" name="include_easy_apply" /> Add an "Easy Apply" pass (runs every 4h in the cloud)
+        </label>
+      </section>
+
+      <!-- 5. Narrative (optional) -->
+      <section class="step" data-step="4" hidden>
+        <h2>Career narrative <span class="muted">(optional — improves evaluations)</span></h2>
+        <label>Your transition story
+          <textarea name="exit_story" rows="2" placeholder="Moving to product-focused full-stack roles where I own the whole product."></textarea>
+        </label>
+        <label>Deal-breakers (comma-separated)
+          <input name="deal_breakers" placeholder="On-site 5 days, Startup under 10 people" />
+        </label>
+        <label>Location flexibility detail
+          <input name="flexibility" placeholder="Occasional travel OK" />
+        </label>
+        <label>Portfolio / proof points (comma-separated)
+          <input name="portfolio" placeholder="github.com/janedev, myblog.dev" />
+        </label>
+      </section>
+
+      <!-- 6. Provider -->
+      <section class="step" data-step="5" hidden>
+        <h2>AI evaluation provider</h2>
+        <p class="hint">Pick a provider and paste its API key. The key is written
+          straight to a GitHub secret (via stdin) and never logged or stored locally.</p>
+        <div class="grid2">
+          <label>Provider
+            <select name="provider">
+              <option value="gemini">Gemini (free tier available)</option>
+              <option value="groq">Groq (free tier available)</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="deepinfra">DeepInfra</option>
+              <option value="openrouter">OpenRouter</option>
+            </select>
+          </label>
+          <label>Model override (optional)
+            <input name="batch_model" placeholder="leave blank for provider default" />
+          </label>
+        </div>
+        <label>API key
+          <input name="api_key" type="password" placeholder="paste your key" autocomplete="off" />
+        </label>
+      </section>
+
+      <!-- 7. Review -->
+      <section class="step" data-step="6" hidden>
+        <h2>Review &amp; submit</h2>
+        <p class="hint">This generates your profile, CV, and search config, then
+          writes them — plus your API key — as encrypted GitHub secrets on
+          <strong id="review-repo">your repo</strong>. We refuse to write to a public repo.</p>
+        <pre id="review"></pre>
+      </section>
+
+      <div id="action-msg" class="action-msg" hidden></div>
+
+      <div class="wizard-nav">
+        <button type="button" id="back-btn" disabled>← Back</button>
+        <span class="spacer"></span>
+        <a href="/" class="linkbtn">Cancel</a>
+        <button type="button" id="next-btn">Next →</button>
+        <button type="submit" id="submit-btn" hidden>Write secrets</button>
+      </div>
+    </form>
+  </main>
+
+  <script src="onboard.js"></script>
+</body>
+</html>

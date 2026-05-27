@@ -222,3 +222,98 @@ def test_push_status_surfaces_gh_error(client, mocker):
     r = client.post("/api/push-status")
     assert r.status_code == 502
     assert "edit-tracker" in r.json()["detail"]
+
+
+# ── Onboarding (Phase 3) ───────────────────────────────────────────────────
+
+def test_onboard_status_reports_readiness(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "list_secret_names", return_value=[
+        "SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64", "GEMINI_API_KEY",
+    ])
+    r = client.get("/api/onboard/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["repo"] == "me/private"
+    assert body["ready"] is True
+
+
+def test_onboard_status_not_ready_without_provider(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "list_secret_names", return_value=[
+        "SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64",
+    ])
+    assert client.get("/api/onboard/status").json()["ready"] is False
+
+
+def _onboard_post(client, form):
+    import json as _json
+    return client.post(
+        "/api/onboard",
+        files={"resume": ("resume.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"form": _json.dumps(form)},
+    )
+
+
+def test_onboard_writes_secrets_on_private_repo(client, tmp_path, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)  # don't write into the real repo
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.onboard, "extract_pdf_text", return_value="resume text body")
+    gen = mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD", "PROFILE_MD_B64": "EE",
+    })
+    set_secret = mocker.patch.object(server.gh, "set_secret")
+    set_var = mocker.patch.object(server.gh, "set_variable")
+
+    r = _onboard_post(client, {"name": "Jane", "provider": "gemini",
+                               "api_key": "key-123", "batch_model": "gemini-2.5-flash"})
+    assert r.status_code == 200
+    written = r.json()["secrets_written"]
+    assert "GEMINI_API_KEY" in written and "PROFILE_YML_B64" in written
+    # Provider key written with the raw key; artifact secret with the blob.
+    set_secret.assert_any_call("GEMINI_API_KEY", "key-123")
+    set_secret.assert_any_call("PROFILE_YML_B64", "DD")
+    set_var.assert_any_call("BATCH_PROVIDER", "gemini")
+    set_var.assert_any_call("BATCH_MODEL", "gemini-2.5-flash")
+    # Resume artifacts persisted under the (patched) ROOT.
+    assert (tmp_path / "resumes" / "resume.pdf").exists()
+    assert (tmp_path / "resumes" / "resume.txt").read_text(encoding="utf-8") == "resume text body"
+    gen.assert_called_once()
+
+
+def test_onboard_refuses_public_repo(client, tmp_path, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PUBLIC")
+    set_secret = mocker.patch.object(server.gh, "set_secret")
+    r = _onboard_post(client, {"provider": "gemini", "api_key": "k"})
+    assert r.status_code == 409
+    assert "PUBLIC" in r.json()["detail"]
+    set_secret.assert_not_called()  # wrote nothing
+
+
+def test_onboard_rejects_unknown_provider(client, mocker):
+    from pipeline.app import server
+    # provider validated before any gh call
+    r = _onboard_post(client, {"provider": "bogus", "api_key": "k"})
+    assert r.status_code == 400
+    assert "Unknown provider" in r.json()["detail"]
+
+
+def test_onboard_rejects_unreadable_pdf(client, tmp_path, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.onboard, "extract_pdf_text",
+                        side_effect=Exception("not a pdf"))
+    r = _onboard_post(client, {"provider": "gemini", "api_key": "k"})
+    assert r.status_code == 400
+    assert "could not read PDF" in r.json()["detail"]

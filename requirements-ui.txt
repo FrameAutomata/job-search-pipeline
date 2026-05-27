@@ -3,3 +3,4 @@
 fastapi
 uvicorn[standard]
 markdown
+python-multipart  # multipart/form-data parsing for onboarding resume upload
