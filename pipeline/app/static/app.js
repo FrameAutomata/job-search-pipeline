@@ -22,9 +22,27 @@ const els = {
 
 async function loadJobs() {
   const resp = await fetch("/api/jobs");
-  JOBS = await resp.json();
+  const payload = await resp.json();
+  JOBS = payload.rows || [];
+  showSourceBanner(payload.source);
   populateStatusFilter();
   render();
+}
+
+// When showing raw tracker-additions (the merge into applications.md didn't
+// run), tell the user — statuses won't reflect any edits they've made.
+function showSourceBanner(source) {
+  const existing = document.getElementById("source-banner");
+  if (existing) existing.remove();
+  if (source !== "tracker-additions") return;
+  const banner = document.createElement("div");
+  banner.id = "source-banner";
+  banner.className = "banner";
+  banner.textContent =
+    "Showing raw evaluation output (tracker-additions). applications.md " +
+    "wasn't found, so status edits aren't reflected — the merge step may not " +
+    "have run.";
+  document.querySelector("header").appendChild(banner);
 }
 
 function populateStatusFilter() {
@@ -143,6 +161,53 @@ els.reportClose.addEventListener("click", () => {
   els.reportPane.hidden = true;
   selectedNum = null;
   render();
+});
+
+// ── Cloud actions (gh-backed) ────────────────────────────────────────────
+
+const refreshBtn = document.getElementById("refresh-btn");
+const runBtn = document.getElementById("run-btn");
+const actionMsg = document.getElementById("action-msg");
+
+function showAction(text, kind) {
+  actionMsg.textContent = text;
+  actionMsg.className = "action-msg" + (kind ? " " + kind : "");
+  actionMsg.hidden = false;
+}
+
+async function postAction(path) {
+  const resp = await fetch(path, { method: "POST" });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(body.detail || `${path} failed (${resp.status})`);
+  return body;
+}
+
+refreshBtn.addEventListener("click", async () => {
+  refreshBtn.disabled = true;
+  showAction("Downloading latest results from GitHub…", "");
+  try {
+    const r = await postAction("/api/refresh");
+    await loadJobs();
+    showAction(`Loaded results from run #${r.run_id}${r.title ? " — " + r.title : ""}.`, "ok");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  } finally {
+    refreshBtn.disabled = false;
+  }
+});
+
+runBtn.addEventListener("click", async () => {
+  if (!confirm("Trigger a new pipeline run in the cloud? Results take a while; use Refresh later to pull them.")) return;
+  runBtn.disabled = true;
+  showAction("Triggering a pipeline run…", "");
+  try {
+    await postAction("/api/run");
+    showAction("Run triggered. It executes on GitHub; click Refresh once it finishes.", "ok");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  } finally {
+    runBtn.disabled = false;
+  }
 });
 
 loadJobs();

@@ -18,6 +18,9 @@ config/search.yml
 # Pipeline outputs
 output/
 
+# Local UI artifact cache (populated by the Refresh button via `gh run download`)
+.ui-cache/
+
 # Setup logs
 setup.log
 

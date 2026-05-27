@@ -15,7 +15,11 @@
         <option value="">All statuses</option>
       </select>
       <span id="count" class="count"></span>
+      <span class="spacer"></span>
+      <button id="refresh-btn" title="Download the latest results from GitHub">↻ Refresh</button>
+      <button id="run-btn" title="Trigger a new pipeline run in the cloud">▶ Run now</button>
     </div>
+    <div id="action-msg" class="action-msg" hidden></div>
   </header>
 
   <main>

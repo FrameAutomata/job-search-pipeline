@@ -173,7 +173,13 @@ pip install -r requirements-ui.txt   # one-time: fastapi, uvicorn, markdown
 
 Then open http://localhost:8000. The current version (phase 1) is **read-only triage**: a sortable, filterable table of every evaluated role (default sorted by score, high→low), click a row to read its rendered report in a side panel.
 
-Point it at either your local `career-ops/` directory (if you run the pipeline locally) or a GitHub Actions artifact you've downloaded and extracted (the artifact has the same `reports/` + `data/applications.md` layout). Later phases add a "Refresh from GitHub" button (auto-downloads the latest artifact via `gh`), a kanban status board with drag-drop write-back, and a guided onboarding flow.
+Point it at either your local `career-ops/` directory (if you run the pipeline locally) or a GitHub Actions artifact you've downloaded and extracted (the artifact has the same `reports/` + `data/applications.md` layout).
+
+**Cloud buttons** (require the [`gh` CLI](https://cli.github.com) installed + `gh auth login`):
+- **↻ Refresh** — downloads the latest `daily-pipeline` artifact via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
+- **▶ Run now** — triggers a `daily-pipeline` run in the cloud (`gh workflow run`). It executes on GitHub; click Refresh once it finishes.
+
+`gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override. Later phases add a kanban status board with drag-drop write-back and a guided onboarding flow.
 
 ## Requirements
 
