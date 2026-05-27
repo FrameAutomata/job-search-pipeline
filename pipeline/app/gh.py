@@ -180,8 +180,12 @@ def list_secret_names() -> list[str]:
 
 def set_secret(name: str, value: str) -> None:
     """Set a repository secret. The value is piped via stdin (never argv) so key
-    material / base64 blobs stay out of process listings and argv limits."""
-    _run(["secret", "set", name, *_repo_args(), "--body", "-"], stdin=value)
+    material / base64 blobs stay out of process listings and argv limits.
+
+    `gh secret set` reads the value from stdin **only when --body is omitted** —
+    passing `--body -` would store the literal string "-", not stdin (it has no
+    `-`-means-stdin convention). So we deliberately leave --body off here."""
+    _run(["secret", "set", name, *_repo_args()], stdin=value)
 
 
 def set_variable(name: str, value: str) -> None:
