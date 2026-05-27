@@ -4,13 +4,17 @@ Isolated here so every GitHub interaction is one mockable surface and the
 server stays declarative. All calls raise GhError with a user-facing message
 on failure (gh missing, not authenticated, command failed).
 
-Repo targeting: by default gh uses the current directory's git remote. Set
-the JOB_SEARCH_REPO env var (owner/name) to override — useful if the UI is
-launched from outside your private copy's clone.
+Repo targeting: every call is pinned to a specific repo so a template-copied
+clone with multiple remotes (origin + upstream) doesn't trip gh's "multiple
+remotes detected" error. Resolution order: JOB_SEARCH_REPO env var (owner/name)
+if set, else the `origin` remote of the current directory. So it works against
+whatever the user named their repo after copying the template, no env var
+needed; the override is only for launching from outside that clone.
 """
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -19,15 +23,47 @@ class GhError(RuntimeError):
     """A gh CLI call failed in a way worth surfacing to the user."""
 
 
+def _parse_owner_name(remote_url: str) -> str | None:
+    """Extract owner/name from a git remote URL (https or ssh form).
+    https://github.com/owner/name(.git) | git@github.com:owner/name(.git)"""
+    m = re.search(r"[:/]([^/:]+/[^/:]+?)(?:\.git)?/?$", remote_url.strip())
+    return m.group(1) if m else None
+
+
+def _origin_repo() -> str | None:
+    """owner/name of the `origin` git remote in the current directory, or None.
+
+    Used as the default target so the app works against whatever the user named
+    their repo after copying the template — without an env var. It also resolves
+    the 'multiple remotes detected' ambiguity gh hits when a template-copied
+    clone keeps both `origin` and an `upstream`/template remote: we pin to
+    `origin` explicitly rather than letting gh guess."""
+    try:
+        r = subprocess.run(["git", "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    return _parse_owner_name(r.stdout)
+
+
+def _target_repo() -> str | None:
+    """The repo every gh call should target: JOB_SEARCH_REPO if set, else the
+    `origin` remote. None means 'let gh resolve it' (single-remote clones)."""
+    repo = os.environ.get("JOB_SEARCH_REPO", "").strip()
+    return repo or _origin_repo()
+
+
 def _repo_args() -> list[str]:
     """`-R <repo>` for subcommands that take the --repo flag (run, secret, …)."""
-    repo = os.environ.get("JOB_SEARCH_REPO", "").strip()
+    repo = _target_repo()
     return ["-R", repo] if repo else []
 
 
 def _repo_positional() -> list[str]:
     """`gh repo view` takes the repository as a positional arg, not -R."""
-    repo = os.environ.get("JOB_SEARCH_REPO", "").strip()
+    repo = _target_repo()
     return [repo] if repo else []
 
 
