@@ -1,0 +1,5 @@
+# Local web UI (pipeline/app) — optional, only needed for `run-ui`.
+# Install with: pip install -r requirements-ui.txt
+fastapi
+uvicorn[standard]
+markdown

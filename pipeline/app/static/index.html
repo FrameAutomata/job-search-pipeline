@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Job Search — Triage</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Job Search — Triage</h1>
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Filter by company, role, notes…" />
+      <select id="status-filter">
+        <option value="">All statuses</option>
+      </select>
+      <span id="count" class="count"></span>
+    </div>
+  </header>
+
+  <main>
+    <section id="table-pane">
+      <table id="jobs">
+        <thead>
+          <tr>
+            <th data-sort="score_value" class="num">Score</th>
+            <th data-sort="company">Company</th>
+            <th data-sort="role">Role</th>
+            <th data-sort="status">Status</th>
+            <th data-sort="date">Date</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+      <p id="empty" class="empty" hidden>
+        No evaluated roles yet. Run the pipeline, then refresh.
+      </p>
+    </section>
+
+    <aside id="report-pane" hidden>
+      <div class="report-head">
+        <button id="report-close" title="Close">✕</button>
+        <a id="report-link" href="#" target="_blank" rel="noopener">Open posting ↗</a>
+      </div>
+      <article id="report-body"></article>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
