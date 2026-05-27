@@ -12,10 +12,23 @@ import pytest
 
 from pipeline.app import gh
 
+# Captured before the autouse fixture patches it, so one test can exercise the
+# real origin-resolution logic with a mocked subprocess.
+_REAL_ORIGIN_REPO = gh._origin_repo
+
 
 def _completed(stdout="", returncode=0, stderr=""):
     return subprocess.CompletedProcess(args=["gh"], returncode=returncode,
                                        stdout=stdout, stderr=stderr)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_target(monkeypatch):
+    """Default: no env override and no origin remote, so _repo_args/_positional
+    add no repo flag and the subprocess.run mocks only ever see `gh` calls.
+    Tests that care about repo targeting override _origin_repo / set the env."""
+    monkeypatch.delenv("JOB_SEARCH_REPO", raising=False)
+    monkeypatch.setattr(gh, "_origin_repo", lambda: None)
 
 
 class TestRunErrorHandling:
@@ -43,30 +56,55 @@ class TestRunErrorHandling:
             gh.current_repo()
 
 
-class TestRepoArgs:
-    def test_no_override_no_repo_flag(self, mocker, monkeypatch):
-        monkeypatch.delenv("JOB_SEARCH_REPO", raising=False)
-        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("[]"))
-        gh.latest_run("daily-pipeline.yml")
-        args = run.call_args.args[0]
-        assert "-R" not in args
+class TestParseOwnerName:
+    @pytest.mark.parametrize("url,expected", [
+        ("https://github.com/Owner/my-repo.git", "Owner/my-repo"),
+        ("https://github.com/Owner/my-repo", "Owner/my-repo"),
+        ("https://github.com/Owner/my-repo/", "Owner/my-repo"),
+        ("git@github.com:Owner/my-repo.git", "Owner/my-repo"),
+        ("ssh://git@github.com/Owner/my-repo.git", "Owner/my-repo"),
+    ])
+    def test_parse(self, url, expected):
+        assert gh._parse_owner_name(url) == expected
 
-    def test_override_adds_repo_flag(self, mocker, monkeypatch):
-        # Subcommands that accept --repo (run/secret/variable) use -R.
-        monkeypatch.setenv("JOB_SEARCH_REPO", "me/job-search-private")
+    def test_origin_repo_reads_git_remote(self, mocker):
+        # Exercise the real _origin_repo against a mocked `git remote get-url`.
+        mocker.patch("pipeline.app.gh.subprocess.run",
+                     return_value=_completed("https://github.com/Me/whatever-they-named-it.git\n"))
+        assert _REAL_ORIGIN_REPO() == "Me/whatever-they-named-it"
+
+
+class TestRepoArgs:
+    def test_no_env_no_origin_adds_no_flag(self, mocker):
+        # Single-remote clone (origin resolves fine on its own) -> let gh decide.
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("[]"))
+        gh.latest_run("daily-pipeline.yml")
+        assert "-R" not in run.call_args.args[0]
+
+    def test_falls_back_to_origin_repo(self, mocker):
+        # No env override, but origin resolves -> pin to it (multi-remote case).
+        mocker.patch.object(gh, "_origin_repo", lambda: "whoever/their-repo")
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("[]"))
         gh.latest_run("daily-pipeline.yml")
         args = run.call_args.args[0]
-        assert "-R" in args and "me/job-search-private" in args
+        assert "-R" in args and "whoever/their-repo" in args
+
+    def test_env_override_wins_over_origin(self, mocker, monkeypatch):
+        monkeypatch.setenv("JOB_SEARCH_REPO", "me/private")
+        mocker.patch.object(gh, "_origin_repo", lambda: "other/repo")
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("[]"))
+        gh.latest_run("daily-pipeline.yml")
+        args = run.call_args.args[0]
+        assert "me/private" in args and "other/repo" not in args
 
     def test_repo_view_uses_positional_not_dash_R(self, mocker, monkeypatch):
         # `gh repo view` does NOT accept -R — the repo is positional.
-        monkeypatch.setenv("JOB_SEARCH_REPO", "me/job-search-private")
-        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("me/job-search-private\n"))
+        monkeypatch.setenv("JOB_SEARCH_REPO", "me/private")
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("me/private\n"))
         gh.current_repo()
         args = run.call_args.args[0]
         assert "-R" not in args
-        assert "me/job-search-private" in args  # positional
+        assert "me/private" in args  # positional
 
 
 class TestLatestRun:
