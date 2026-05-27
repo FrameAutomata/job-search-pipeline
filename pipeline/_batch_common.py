@@ -222,10 +222,42 @@ def load_pending(
     return pending
 
 
+# Canonical applications.md header (matches career-ops onboarding). Seeded
+# before merge so merge-tracker has a file to merge INTO.
+APPLICATIONS_HEADER = (
+    "# Applications Tracker\n\n"
+    "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+    "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+)
+
+
+def ensure_applications_md(career_ops: Path) -> Path:
+    """Make sure career-ops/data/applications.md exists with the canonical
+    header, returning its path.
+
+    merge-tracker.mjs only merges INTO an existing applications.md — if none
+    exists it prints "No applications.md found. Nothing to merge into." and
+    exits 0 (a false success). Our pipeline never runs career-ops's
+    interactive onboarding that would otherwise seed the file, so on a fresh
+    run (especially in CI, where nothing's cached yet) the merge silently
+    no-ops and applications.md never gets created. Seeding the header here
+    fixes that for both local and cloud runs. The `data/` path matches the
+    layout merge-tracker prefers and the workflow uploads."""
+    apps_md = career_ops / "data" / "applications.md"
+    if not apps_md.exists():
+        apps_md.parent.mkdir(parents=True, exist_ok=True)
+        apps_md.write_text(APPLICATIONS_HEADER, encoding="utf-8")
+        print(f"[batch] seeded data/applications.md (was missing)")
+    return apps_md
+
+
 def run_merge_tracker(career_ops: Path) -> bool:
     merge_script = career_ops / "merge-tracker.mjs"
     if not merge_script.exists():
         return False
+    # Seed the tracker header first — otherwise merge-tracker no-ops on a
+    # fresh run (see ensure_applications_md).
+    ensure_applications_md(career_ops)
     print("[batch] running merge-tracker.mjs...")
     r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True)
     if r.returncode == 0:

@@ -309,6 +309,52 @@ class TestRunMergeTracker:
         mock_run.return_value = mocker.MagicMock(returncode=1, stderr="error msg")
         assert run_merge_tracker(career_ops) is False
 
+    def test_seeds_applications_md_before_merge(self, tmp_path, mocker):
+        # Regression: merge-tracker no-ops if applications.md doesn't exist.
+        # run_merge_tracker must seed the header first so the merge lands.
+        career_ops = tmp_path / "career-ops"
+        career_ops.mkdir()
+        (career_ops / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        mocker.patch("pipeline._batch_common.subprocess.run",
+                     return_value=mocker.MagicMock(returncode=0))
+        apps_md = career_ops / "data" / "applications.md"
+        assert not apps_md.exists()
+        run_merge_tracker(career_ops)
+        assert apps_md.exists()
+        assert "Applications Tracker" in apps_md.read_text(encoding="utf-8")
+
+    def test_does_not_clobber_existing_applications_md(self, tmp_path, mocker):
+        # If applications.md already exists (e.g. restored from cache with the
+        # user's status edits), seeding must NOT overwrite it.
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        (career_ops / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        apps_md = career_ops / "data" / "applications.md"
+        apps_md.write_text("# Applications Tracker\n\nEXISTING USER DATA\n", encoding="utf-8")
+        mocker.patch("pipeline._batch_common.subprocess.run",
+                     return_value=mocker.MagicMock(returncode=0))
+        run_merge_tracker(career_ops)
+        assert "EXISTING USER DATA" in apps_md.read_text(encoding="utf-8")
+
+
+class TestEnsureApplicationsMd:
+    def test_creates_header_when_missing(self, tmp_path):
+        from pipeline._batch_common import ensure_applications_md
+        career_ops = tmp_path / "career-ops"
+        p = ensure_applications_md(career_ops)
+        assert p.exists()
+        text = p.read_text(encoding="utf-8")
+        assert text.startswith("# Applications Tracker")
+        assert "| # | Date | Company | Role |" in text
+
+    def test_idempotent_preserves_content(self, tmp_path):
+        from pipeline._batch_common import ensure_applications_md
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        (career_ops / "data" / "applications.md").write_text("custom", encoding="utf-8")
+        ensure_applications_md(career_ops)
+        assert (career_ops / "data" / "applications.md").read_text(encoding="utf-8") == "custom"
+
 
 class TestBuildSystemPrompt:
     def test_includes_cv(self):
