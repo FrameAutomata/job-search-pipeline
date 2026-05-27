@@ -36,9 +36,10 @@ app = FastAPI(title="job-search-pipeline UI")
 
 @app.get("/api/jobs")
 def list_jobs() -> JSONResponse:
-    """Return all tracker rows from applications.md as JSON."""
-    apps_md = _career_ops() / "data" / "applications.md"
-    return JSONResponse(data.parse_applications(apps_md))
+    """Return tracker rows as JSON. Prefers the merged applications.md, falls
+    back to raw tracker-additions when the merge step hasn't run. The response
+    is {"rows": [...], "source": ...} so the UI can flag unmerged output."""
+    return JSONResponse(data.load_jobs(_career_ops()))
 
 
 @app.get("/api/reports/{report_num}", response_class=HTMLResponse)

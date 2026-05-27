@@ -49,7 +49,9 @@ def test_health(client):
 def test_list_jobs(client):
     r = client.get("/api/jobs")
     assert r.status_code == 200
-    jobs = r.json()
+    payload = r.json()
+    assert payload["source"] == "applications"
+    jobs = payload["rows"]
     assert len(jobs) == 1
     assert jobs[0]["company"] == "Acme"
     assert jobs[0]["score_value"] == 4.2

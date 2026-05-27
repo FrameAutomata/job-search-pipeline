@@ -22,9 +22,27 @@ const els = {
 
 async function loadJobs() {
   const resp = await fetch("/api/jobs");
-  JOBS = await resp.json();
+  const payload = await resp.json();
+  JOBS = payload.rows || [];
+  showSourceBanner(payload.source);
   populateStatusFilter();
   render();
+}
+
+// When showing raw tracker-additions (the merge into applications.md didn't
+// run), tell the user — statuses won't reflect any edits they've made.
+function showSourceBanner(source) {
+  const existing = document.getElementById("source-banner");
+  if (existing) existing.remove();
+  if (source !== "tracker-additions") return;
+  const banner = document.createElement("div");
+  banner.id = "source-banner";
+  banner.className = "banner";
+  banner.textContent =
+    "Showing raw evaluation output (tracker-additions). applications.md " +
+    "wasn't found, so status edits aren't reflected — the merge step may not " +
+    "have run.";
+  document.querySelector("header").appendChild(banner);
 }
 
 function populateStatusFilter() {

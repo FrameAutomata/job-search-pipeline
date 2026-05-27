@@ -122,6 +122,102 @@ class TestFindReportFile:
         assert data.find_report_file(tmp_path / "nope", "001") is None
 
 
+SAMPLE_TSV = (
+    "2920\t2026-05-27\tTential Solutions\tFullstack Developer\tEvaluada\t4.0/5\tnull\t"
+    "[2920](reports/2920-tential-solutions-2026-05-27.md)\tCONSIDER: strong match\n"
+)
+
+
+class TestParseTrackerAdditions:
+    def _make(self, tmp_path, files: dict[str, str]) -> Path:
+        d = tmp_path / "batch" / "tracker-additions"
+        d.mkdir(parents=True)
+        for name, content in files.items():
+            (d / name).write_text(content, encoding="utf-8")
+        return d
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert data.parse_tracker_additions(tmp_path / "nope") == []
+
+    def test_parses_tsv_row(self, tmp_path):
+        d = self._make(tmp_path, {"562.tsv": SAMPLE_TSV})
+        rows = data.parse_tracker_additions(d)
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["num"] == "2920"
+        assert r["company"] == "Tential Solutions"
+        assert r["role"] == "Fullstack Developer"
+        assert r["status"] == "Evaluada"      # status before score in TSV order
+        assert r["score_value"] == 4.0
+        assert r["report_num"] == "2920"
+        assert r["report_path"] == "reports/2920-tential-solutions-2026-05-27.md"
+        assert "CONSIDER" in r["notes"]
+
+    def test_sorted_by_tracker_number(self, tmp_path):
+        d = self._make(tmp_path, {
+            "a.tsv": SAMPLE_TSV.replace("2920", "30"),
+            "b.tsv": SAMPLE_TSV.replace("2920", "5"),
+            "c.tsv": SAMPLE_TSV.replace("2920", "100"),
+        })
+        rows = data.parse_tracker_additions(d)
+        assert [r["num"] for r in rows] == ["5", "30", "100"]
+
+    def test_notes_with_tab_not_oversplit(self, tmp_path):
+        # A stray tab in notes must not break column alignment (maxsplit guard).
+        tsv = SAMPLE_TSV.rstrip("\n").rsplit("\t", 1)[0] + "\tnote\twith\ttabs\n"
+        d = self._make(tmp_path, {"x.tsv": tsv})
+        rows = data.parse_tracker_additions(d)
+        assert len(rows) == 1
+        assert rows[0]["notes"] == "note\twith\ttabs"
+
+    def test_short_row_skipped(self, tmp_path):
+        d = self._make(tmp_path, {"bad.tsv": "1\t2026-05-27\tAcme\n"})
+        assert data.parse_tracker_additions(d) == []
+
+
+class TestLoadJobs:
+    def _career_ops(self, tmp_path) -> Path:
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "batch" / "tracker-additions").mkdir(parents=True)
+        return co
+
+    def test_prefers_applications_md(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        (co / "data" / "applications.md").write_text(SAMPLE_APPLICATIONS, encoding="utf-8")
+        (co / "batch" / "tracker-additions" / "x.tsv").write_text(SAMPLE_TSV, encoding="utf-8")
+        result = data.load_jobs(co)
+        assert result["source"] == "applications"
+        assert len(result["rows"]) == 3  # from applications.md, not the tsv
+
+    def test_falls_back_to_tracker_additions(self, tmp_path):
+        # No applications.md → use raw tracker-additions. This is exactly the
+        # production case where merge-tracker didn't run.
+        co = self._career_ops(tmp_path)
+        (co / "batch" / "tracker-additions" / "562.tsv").write_text(SAMPLE_TSV, encoding="utf-8")
+        result = data.load_jobs(co)
+        assert result["source"] == "tracker-additions"
+        assert len(result["rows"]) == 1
+        assert result["rows"][0]["company"] == "Tential Solutions"
+
+    def test_empty_applications_md_falls_back(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        (co / "data" / "applications.md").write_text(
+            "# Applications Tracker\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n",
+            encoding="utf-8",
+        )
+        (co / "batch" / "tracker-additions" / "562.tsv").write_text(SAMPLE_TSV, encoding="utf-8")
+        result = data.load_jobs(co)
+        assert result["source"] == "tracker-additions"
+
+    def test_nothing_anywhere(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        result = data.load_jobs(co)
+        assert result == {"rows": [], "source": "none"}
+
+
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):
         f = tmp_path / "r.md"
