@@ -15,6 +15,9 @@ fi
 "$root/.venv/bin/python" -m pip install --upgrade pip
 "$root/.venv/bin/pip" install -r "$root/requirements.txt"
 
+echo "==> Installing local UI deps (triage + onboarding app)"
+"$root/.venv/bin/pip" install -r "$root/requirements-ui.txt"
+
 echo "==> Cloning career-ops (if missing)"
 if [ ! -d "$root/career-ops" ]; then
   git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops "$root/career-ops"
@@ -34,5 +37,13 @@ echo "==> Copying example configs"
 mkdir -p "$root/resumes" "$root/output"
 
 echo ""
-echo "==> Running profile setup"
-node "$root/setup-profile.mjs"
+echo "==> Setup complete."
+echo ""
+echo "Next — finish setup in your browser:"
+echo "    ./run-ui.sh        then open http://localhost:8000  and click  'Setup'"
+echo ""
+echo "The Setup wizard collects your resume + preferences and writes them to your"
+echo "private repo's GitHub secrets, so the pipeline can run in the cloud."
+echo "It needs the GitHub CLI: install gh (https://cli.github.com), then 'gh auth login'."
+echo ""
+echo "Prefer the terminal instead? Run:  node setup-profile.mjs"
