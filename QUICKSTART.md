@@ -88,7 +88,7 @@ screen:
   liveness_timeout: 8
 ```
 
-`linkedin_fetch_description: true` makes JobSpy fetch each LinkedIn JD individually during scrape — a sequential per-job request that can take hours on 1000+ results. Keep it `false`; the screen stage extracts the JD from the same page it already fetches for the liveness check.
+`linkedin_fetch_description: true` makes JobSpy fetch each LinkedIn JD individually during scrape — a sequential per-job request that can take hours on 1000+ results. Keep it `false`; the screen stage backfills LinkedIn descriptions via LinkedIn's public guest job-posting endpoint (full JD, no login wall) for the small set of jobs that survive filtering.
 
 ---
 

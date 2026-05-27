@@ -6,7 +6,58 @@ from pathlib import Path
 import pytest
 
 from pipeline import screen as screen_mod
-from pipeline.screen import classify_liveness, extract_description, run
+from pipeline.screen import (
+    classify_liveness,
+    extract_description,
+    linkedin_guest_jd_url,
+    run,
+)
+
+
+class TestLinkedInGuestUrl:
+    """Test the LinkedIn /jobs/view/ → guest job-posting endpoint mapping.
+    The guest endpoint serves the full JD without the login wall that the
+    regular page hits from datacenter IPs."""
+
+    GUEST = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/4419521927"
+
+    def test_bare_id(self):
+        assert linkedin_guest_jd_url(
+            "https://www.linkedin.com/jobs/view/4419521927"
+        ) == self.GUEST
+
+    def test_trailing_slash(self):
+        assert linkedin_guest_jd_url(
+            "https://www.linkedin.com/jobs/view/4419521927/"
+        ) == self.GUEST
+
+    def test_query_string(self):
+        assert linkedin_guest_jd_url(
+            "https://www.linkedin.com/jobs/view/4419521927?refId=abc&trk=xyz"
+        ) == self.GUEST
+
+    def test_slug_prefix(self):
+        # LinkedIn sometimes includes a title slug before the numeric ID.
+        assert linkedin_guest_jd_url(
+            "https://www.linkedin.com/jobs/view/software-engineer-at-acme-4419521927"
+        ) == self.GUEST
+
+    def test_no_www(self):
+        assert linkedin_guest_jd_url(
+            "https://linkedin.com/jobs/view/4419521927"
+        ) == self.GUEST
+
+    def test_non_linkedin_returns_none(self):
+        assert linkedin_guest_jd_url("https://indeed.com/viewjob?jk=abc123") is None
+        assert linkedin_guest_jd_url("https://www.glassdoor.com/job-listing/12345") is None
+
+    def test_linkedin_non_view_url_returns_none(self):
+        # A LinkedIn URL that isn't a job-view URL shouldn't map to a guest JD.
+        assert linkedin_guest_jd_url("https://www.linkedin.com/company/acme") is None
+
+    def test_empty_or_none_input(self):
+        assert linkedin_guest_jd_url("") is None
+        assert linkedin_guest_jd_url(None) is None
 
 
 class TestClassifyLiveness:
@@ -289,6 +340,68 @@ class TestBackfillDescription:
             rows = list(csv.DictReader(f))
         assert len(rows) == 1
         assert "Backfilled job description content" in rows[0]["description"]
+
+    def test_linkedin_job_fetched_via_guest_endpoint(self, tmp_path, monkeypatch, mocker):
+        # The whole point of this fix: a LinkedIn job_url should be fetched
+        # through the guest job-posting API, not the login-walled /jobs/view/
+        # page. job_url in the CSV stays unchanged; only the fetch target swaps.
+        cfg = tmp_path / "search.yml"
+        self._write_config(cfg)
+        filtered = tmp_path / "filtered_jobs.csv"
+        view_url = "https://www.linkedin.com/jobs/view/4419521927"
+        self._write_filtered_with_desc(filtered, [
+            {"title": "Eng", "company": "Acme", "job_url": view_url,
+             "description": "", "relevance_score": 8},
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+
+        guest_html = (
+            '<div class="show-more-less-html__markup">'
+            'Full LinkedIn JD from the guest endpoint. ' * 10
+            + '</div>'
+        )
+        fetch_spy = mocker.patch.object(
+            screen_mod, "fetch_and_classify",
+            return_value=("active", "content present", guest_html),
+        )
+
+        run(cfg)
+
+        # fetch_and_classify must have been called with the guest URL, not the
+        # original /jobs/view/ URL.
+        called_url = fetch_spy.call_args.args[0]
+        assert called_url == (
+            "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/4419521927"
+        )
+
+        # And the description got backfilled from the guest fragment.
+        with open(filtered, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert "Full LinkedIn JD from the guest endpoint" in rows[0]["description"]
+        # job_url in the CSV is unchanged — user still clicks the human page.
+        assert rows[0]["job_url"] == view_url
+
+    def test_non_linkedin_job_fetched_via_original_url(self, tmp_path, monkeypatch, mocker):
+        cfg = tmp_path / "search.yml"
+        self._write_config(cfg)
+        filtered = tmp_path / "filtered_jobs.csv"
+        indeed_url = "https://www.indeed.com/viewjob?jk=abc123"
+        self._write_filtered_with_desc(filtered, [
+            {"title": "Eng", "company": "Acme", "job_url": indeed_url,
+             "description": "", "relevance_score": 8},
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+
+        page = '<div id="jobDescriptionText">Indeed JD body here. ' * 20 + '</div>'
+        fetch_spy = mocker.patch.object(
+            screen_mod, "fetch_and_classify",
+            return_value=("active", "content present", page),
+        )
+
+        run(cfg)
+
+        # Non-LinkedIn URLs are fetched as-is.
+        assert fetch_spy.call_args.args[0] == indeed_url
 
     def test_preserves_existing_description(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"

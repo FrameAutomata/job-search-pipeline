@@ -107,6 +107,31 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 _BODY_RE = re.compile(r"<body[^>]*>(.*?)</body>", re.DOTALL | re.IGNORECASE)
 
+# Matches the numeric job ID in a LinkedIn /jobs/view/ URL. Handles both the
+# bare-ID form (/jobs/view/4419521927) and the slug form
+# (/jobs/view/software-engineer-at-acme-4419521927). The non-greedy prefix
+# lets any slug be consumed before the trailing ID is captured.
+_LINKEDIN_VIEW_RE = re.compile(
+    r"linkedin\.com/jobs/view/(?:[^?#/]*?)(\d+)(?:[/?#]|$)", re.IGNORECASE
+)
+
+
+def linkedin_guest_jd_url(url: str) -> str | None:
+    """Map a LinkedIn /jobs/view/{id} URL to the public guest job-posting API
+    endpoint, which returns the full JD HTML without authentication.
+
+    The regular /jobs/view/ page is login-walled when fetched from a
+    datacenter IP — it inconsistently returns a sign-in preview that passes
+    the liveness check but carries no extractable JD. The guest endpoint
+    (jobs-guest/jobs/api/jobPosting/{id}) returns the complete JD reliably and
+    is the same mechanism JobSpy uses for linkedin_fetch_description. Returns
+    None for non-LinkedIn or unparseable URLs so callers fall back to the
+    original URL."""
+    m = _LINKEDIN_VIEW_RE.search(url or "")
+    if not m:
+        return None
+    return f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}"
+
 
 def _clean_html(s: str) -> str:
     """Strip scripts/styles + all HTML tags, decode entities, collapse whitespace."""
@@ -264,7 +289,13 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
         url = (job.get("job_url") or "").strip()
         if not url:
             return job, "uncertain", "", ""
-        result, reason, body = fetch_and_classify(url, liveness_timeout)
+        # For LinkedIn, fetch the guest job-posting endpoint instead of the
+        # login-walled /jobs/view/ page. It serves the complete JD reliably
+        # and gives a cleaner liveness signal (404 = gone, JD present = live).
+        # Non-LinkedIn URLs fetch normally. job_url in the CSV is unchanged —
+        # only the fetch target differs.
+        fetch_url = linkedin_guest_jd_url(url) or url
+        result, reason, body = fetch_and_classify(fetch_url, liveness_timeout)
         return job, result, reason, body
 
     kept: list[dict] = []
