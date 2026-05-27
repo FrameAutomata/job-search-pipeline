@@ -17,7 +17,7 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 Write-Host "==> Cloning career-ops (if missing)"
 $careerOps = "$root\career-ops"
 if (-not (Test-Path $careerOps)) {
-    git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops-1 "$careerOps"
+    git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops "$careerOps"
 } else {
     Write-Host "    career-ops already present, skipping clone"
 }
