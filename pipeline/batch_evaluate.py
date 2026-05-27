@@ -9,7 +9,7 @@ Supported providers
   gemini       gemini-2.5-flash  (default)             GEMINI_API_KEY
   openai       gpt-4o-mini       (default)             OPENAI_API_KEY
   groq         llama-3.3-70b-versatile (default)       GROQ_API_KEY
-  deepinfra    meta-llama/Llama-3.3-70B-Instruct (def) DEEPINFRA_API_KEY
+  deepinfra    deepseek-ai/DeepSeek-V4-Flash (def)     DEEPINFRA_API_KEY
   openrouter   meta-llama/llama-3.3-70b-instruct (def) OPENROUTER_API_KEY
   ollama       qwen2.5:32b       (default)             OLLAMA_BASE_URL (default: http://localhost:11434)
 
@@ -73,10 +73,10 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
-    # Hosted open-weight providers serving Llama 3.3 70B by default. The
-    # model ID conventions differ across providers (capital vs lowercase),
-    # so the two entries below aren't typos. Override via BATCH_MODEL.
-    "deepinfra": "meta-llama/Llama-3.3-70B-Instruct",
+    # Hosted open-weight providers. The model ID conventions differ across
+    # providers (capital vs lowercase namespaces), so these aren't typos.
+    # Override via BATCH_MODEL.
+    "deepinfra": "deepseek-ai/DeepSeek-V4-Flash",
     "openrouter": "meta-llama/llama-3.3-70b-instruct",
     "ollama": "qwen2.5:32b",
 }
