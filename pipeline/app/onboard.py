@@ -152,6 +152,7 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "location": form.get("location") or "",
             "linkedin": form.get("linkedin") or "",
             "github": form.get("github") or "",
+            "portfolio_url": form.get("website") or "",
         },
         "criteria": {
             "targetRoles": _split_csv(form.get("target_roles")),
@@ -180,6 +181,49 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
 
 
 # ── resume text extraction ─────────────────────────────────────────────────
+
+def parse_resume_info(text: str) -> dict:
+    """Best-effort extraction of contact details from resume text, to autofill
+    the onboarding 'About' step. Mirrors setup-profile.mjs's parseResumeInfo.
+    Every field may be None; the user reviews/edits before submitting."""
+    info = {"name": None, "email": None, "phone": None, "location": None,
+            "linkedin": None, "github": None, "website": None}
+
+    m = re.search(r"[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+", text)
+    if m:
+        info["email"] = m.group(0)
+
+    m = re.search(r"\+?1?\s*\(?(\d{3})\)?\s*[-.\s]?(\d{3})[-.\s]?(\d{4})", text)
+    if m:
+        info["phone"] = f"+1 ({m.group(1)}) {m.group(2)}-{m.group(3)}"
+
+    m = re.search(r"linkedin\.com/in/([a-zA-Z0-9-]+)", text, re.I)
+    if m:
+        info["linkedin"] = f"linkedin.com/in/{m.group(1)}"
+
+    m = re.search(r"github\.com/([a-zA-Z0-9-]+)", text, re.I)
+    if m:
+        info["github"] = f"github.com/{m.group(1)}"
+
+    # City, ST (e.g. "Dallas, TX") — the first such pair.
+    m = re.search(r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s*[A-Z]{2})\b", text)
+    if m:
+        info["location"] = m.group(1)
+
+    # Website / portfolio: first http(s) URL that isn't linkedin/github.
+    for um in re.finditer(r"https?://[^\s|)\]]+", text):
+        url = um.group(0).rstrip(".,);")
+        if "linkedin.com" not in url.lower() and "github.com" not in url.lower():
+            info["website"] = url
+            break
+
+    # Name: the first non-empty line, if it looks like a name (short, no @).
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if first_line and len(first_line) < 100 and "@" not in first_line:
+        info["name"] = first_line
+
+    return info
+
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     """Extract text from an uploaded resume PDF using pdfplumber (the same lib

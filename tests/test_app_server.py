@@ -317,3 +317,34 @@ def test_onboard_rejects_unreadable_pdf(client, tmp_path, mocker):
     r = _onboard_post(client, {"provider": "gemini", "api_key": "k"})
     assert r.status_code == 400
     assert "could not read PDF" in r.json()["detail"]
+
+
+def test_onboard_parse_resume_autofills_from_text(client, mocker):
+    from pipeline.app import server
+    # Mock PDF extraction; parse_resume_info runs for real on the text.
+    mocker.patch.object(
+        server.onboard, "extract_pdf_text",
+        return_value="Jane Dev\njane@example.com | Dallas, TX | github.com/janedev\n",
+    )
+    r = client.post(
+        "/api/onboard/parse-resume",
+        files={"resume": ("resume.pdf", b"%PDF-1.4 fake", "application/pdf")},
+    )
+    assert r.status_code == 200
+    info = r.json()
+    assert info["name"] == "Jane Dev"
+    assert info["email"] == "jane@example.com"
+    assert info["location"] == "Dallas, TX"
+    assert info["github"] == "github.com/janedev"
+
+
+def test_onboard_parse_resume_rejects_unreadable_pdf(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.onboard, "extract_pdf_text",
+                        side_effect=Exception("not a pdf"))
+    r = client.post(
+        "/api/onboard/parse-resume",
+        files={"resume": ("resume.pdf", b"%PDF junk", "application/pdf")},
+    )
+    assert r.status_code == 400
+    assert "could not read PDF" in r.json()["detail"]

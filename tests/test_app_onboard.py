@@ -97,6 +97,41 @@ class TestBuildOnboardingJson:
         assert payload["searchSettings"]["resultsWanted"] == 100
 
 
+class TestParseResumeInfo:
+    SAMPLE = (
+        "Thomas Thirlwall\n"
+        "+1 (956) 525-3015 | ththirlwall99@gmail.com | Dallas, TX | "
+        "linkedin.com/in/thomas-thirlwall | https://github.com/FrameAutomata | "
+        "https://thomas.dev\n"
+        "PROFESSIONAL SUMMARY\nEngineer.\n"
+    )
+
+    def test_extracts_all_fields(self):
+        info = onboard.parse_resume_info(self.SAMPLE)
+        assert info["name"] == "Thomas Thirlwall"
+        assert info["email"] == "ththirlwall99@gmail.com"
+        assert info["phone"] == "+1 (956) 525-3015"
+        assert info["location"] == "Dallas, TX"
+        assert info["linkedin"] == "linkedin.com/in/thomas-thirlwall"
+        assert info["github"] == "github.com/FrameAutomata"
+        # website = first non-social URL
+        assert info["website"] == "https://thomas.dev"
+
+    def test_website_skips_social_urls(self):
+        info = onboard.parse_resume_info("Jane\nhttps://github.com/jane only")
+        assert info["website"] is None
+
+    def test_missing_fields_are_none(self):
+        info = onboard.parse_resume_info("Just Some Text\nno contacts here")
+        assert info["email"] is None and info["phone"] is None
+        assert info["name"] == "Just Some Text"
+
+    def test_first_line_with_at_is_not_treated_as_name(self):
+        info = onboard.parse_resume_info("me@example.com\nReal Name")
+        assert info["name"] is None  # first line has '@'
+        assert info["email"] == "me@example.com"
+
+
 class TestCollectSecretBlobs:
     def test_reads_and_base64s_present_files(self, tmp_path):
         (tmp_path / "config").mkdir()

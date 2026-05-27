@@ -1001,7 +1001,7 @@ function generateProfile(info, criteria) {
       location: info.location,
       linkedin: info.linkedin || '',
       github: info.github || '',
-      portfolio_url: '',
+      portfolio_url: info.portfolio_url || '',
     },
     target_roles: {
       primary: criteria.targetRoles.slice(0, 2),
