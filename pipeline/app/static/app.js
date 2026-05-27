@@ -7,6 +7,11 @@ let JOBS = [];
 let sortKey = "score_value";
 let sortDir = -1; // -1 = descending (highest score first by default)
 let selectedNum = null;
+let view = "table"; // "table" | "board"
+let pending = 0;
+
+// Canonical kanban columns — mirror of data.CANONICAL_STATES.
+const STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"];
 
 const els = {
   body: document.getElementById("jobs-body"),
@@ -14,18 +19,25 @@ const els = {
   statusFilter: document.getElementById("status-filter"),
   count: document.getElementById("count"),
   empty: document.getElementById("empty"),
+  tablePane: document.getElementById("table-pane"),
+  boardPane: document.getElementById("board-pane"),
   reportPane: document.getElementById("report-pane"),
   reportBody: document.getElementById("report-body"),
   reportClose: document.getElementById("report-close"),
   reportLink: document.getElementById("report-link"),
+  viewTable: document.getElementById("view-table"),
+  viewBoard: document.getElementById("view-board"),
+  pushBtn: document.getElementById("push-btn"),
 };
 
 async function loadJobs() {
   const resp = await fetch("/api/jobs");
   const payload = await resp.json();
   JOBS = payload.rows || [];
+  pending = payload.pending || 0;
   showSourceBanner(payload.source);
   populateStatusFilter();
+  updatePushButton();
   render();
 }
 
@@ -87,6 +99,15 @@ function visibleRows() {
 }
 
 function render() {
+  els.tablePane.hidden = view !== "table";
+  els.boardPane.hidden = view !== "board";
+  els.viewTable.classList.toggle("active", view === "table");
+  els.viewBoard.classList.toggle("active", view === "board");
+  if (view === "board") renderBoard();
+  else renderTable();
+}
+
+function renderTable() {
   const rows = visibleRows();
   els.body.innerHTML = "";
   for (const j of rows) {
@@ -104,6 +125,98 @@ function render() {
   }
   els.count.textContent = `${rows.length} of ${JOBS.length} role${JOBS.length === 1 ? "" : "s"}`;
   els.empty.hidden = JOBS.length !== 0;
+}
+
+function renderBoard() {
+  const rows = visibleRows();
+  // Bucket by canonical status; anything unrecognized goes under Evaluated.
+  const buckets = Object.fromEntries(STATES.map((s) => [s, []]));
+  for (const j of rows) {
+    const col = STATES.includes(j.status_canonical) ? j.status_canonical : "Evaluated";
+    buckets[col].push(j);
+  }
+  els.boardPane.innerHTML = "";
+  for (const state of STATES) {
+    const col = document.createElement("div");
+    col.className = "kanban-col";
+    col.dataset.status = state;
+    const cards = buckets[state];
+    col.innerHTML = `<h3>${state} <span class="col-count">${cards.length}</span></h3>`;
+    const list = document.createElement("div");
+    list.className = "kanban-cards";
+    for (const j of cards) list.appendChild(makeCard(j));
+    col.appendChild(list);
+    wireColumnDrop(col);
+    els.boardPane.appendChild(col);
+  }
+  els.count.textContent = `${rows.length} of ${JOBS.length} role${JOBS.length === 1 ? "" : "s"}`;
+}
+
+function makeCard(j) {
+  const card = document.createElement("div");
+  card.className = "kanban-card" + (j.pending ? " pending" : "");
+  card.draggable = true;
+  card.dataset.num = j.num;
+  const scoreText = j.score_value == null ? "—" : j.score_value.toFixed(1);
+  card.innerHTML = `
+    <div class="card-top">
+      <span class="card-company">${escapeHtml(j.company)}</span>
+      <span class="score-pill ${scoreClass(j.score_value)}">${scoreText}</span>
+    </div>
+    <div class="card-role">${escapeHtml(j.role)}</div>`;
+  card.addEventListener("click", () => openReport(j));
+  card.addEventListener("dragstart", (e) => {
+    card.classList.add("dragging");
+    e.dataTransfer.setData("text/plain", String(j.num));
+    e.dataTransfer.effectAllowed = "move";
+  });
+  card.addEventListener("dragend", () => card.classList.remove("dragging"));
+  return card;
+}
+
+function wireColumnDrop(col) {
+  col.addEventListener("dragover", (e) => { e.preventDefault(); col.classList.add("dragover"); });
+  col.addEventListener("dragleave", () => col.classList.remove("dragover"));
+  col.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    col.classList.remove("dragover");
+    const num = e.dataTransfer.getData("text/plain");
+    const newStatus = col.dataset.status;
+    const job = JOBS.find((j) => String(j.num) === String(num));
+    if (!job || job.status_canonical === newStatus) return;
+    await changeStatus(job, newStatus);
+  });
+}
+
+async function changeStatus(job, newStatus) {
+  // Optimistic: update in-memory + re-render immediately.
+  job.status = newStatus;
+  job.status_canonical = newStatus;
+  job.pending = true;
+  render();
+  try {
+    const resp = await fetch("/api/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ num: String(job.num), status: newStatus }),
+    });
+    const body = await resp.json();
+    if (!resp.ok) throw new Error(body.detail || "status update failed");
+    pending = body.pending;
+    updatePushButton();
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+    await loadJobs(); // resync on failure
+  }
+}
+
+function updatePushButton() {
+  if (pending > 0) {
+    els.pushBtn.hidden = false;
+    els.pushBtn.textContent = `⇧ Push ${pending} change${pending === 1 ? "" : "s"}`;
+  } else {
+    els.pushBtn.hidden = true;
+  }
 }
 
 async function openReport(job) {
@@ -163,6 +276,9 @@ els.reportClose.addEventListener("click", () => {
   render();
 });
 
+els.viewTable.addEventListener("click", () => { view = "table"; render(); });
+els.viewBoard.addEventListener("click", () => { view = "board"; render(); });
+
 // ── Cloud actions (gh-backed) ────────────────────────────────────────────
 
 const refreshBtn = document.getElementById("refresh-btn");
@@ -207,6 +323,23 @@ runBtn.addEventListener("click", async () => {
     showAction(String(e.message || e), "error");
   } finally {
     runBtn.disabled = false;
+  }
+});
+
+els.pushBtn.addEventListener("click", async () => {
+  els.pushBtn.disabled = true;
+  showAction("Refreshing latest tracker, applying your changes, pushing to GitHub…", "");
+  try {
+    const r = await postAction("/api/push-status");
+    await loadJobs();  // reflects the merged/cleared state
+    const note = r.base === "refreshed"
+      ? "applied onto the latest cloud tracker"
+      : "pushed from the local tracker (couldn't refresh first)";
+    showAction(`Pushed ${r.pushed} status change${r.pushed === 1 ? "" : "s"} — ${note}.`, "ok");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  } finally {
+    els.pushBtn.disabled = false;
   }
 });
 

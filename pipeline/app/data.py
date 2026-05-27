@@ -8,6 +8,40 @@ import — so they're unit-testable without standing up a server.
 import re
 from pathlib import Path
 
+# Canonical applications.md statuses (mirror of career-ops templates/states.yml
+# + merge-tracker.mjs). The kanban board uses these as its columns.
+CANONICAL_STATES = [
+    "Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected",
+    "Discarded", "SKIP",
+]
+
+# Map the aliases merge-tracker accepts (Spanish defaults + variants) onto the
+# canonical English states, so a card written as "Evaluada" lands in the
+# "Evaluated" column. Lowercased keys.
+_STATUS_ALIASES = {
+    "evaluada": "Evaluated", "evaluar": "Evaluated", "condicional": "Evaluated",
+    "hold": "Evaluated", "verificar": "Evaluated",
+    "aplicado": "Applied", "aplicada": "Applied", "enviada": "Applied", "sent": "Applied",
+    "respondido": "Responded",
+    "entrevista": "Interview",
+    "oferta": "Offer",
+    "rechazado": "Rejected", "rechazada": "Rejected",
+    "descartado": "Discarded", "descartada": "Discarded",
+    "cerrada": "Discarded", "cancelada": "Discarded",
+    "no aplicar": "SKIP", "no_aplicar": "SKIP", "monitor": "SKIP",
+}
+
+
+def canonical_status(raw: str) -> str:
+    """Map a raw status string to its canonical state. Unknown values pass
+    through unchanged (so we never silently drop a status we don't recognize)."""
+    clean = (raw or "").replace("*", "").strip()
+    lower = clean.lower()
+    for s in CANONICAL_STATES:
+        if s.lower() == lower:
+            return s
+    return _STATUS_ALIASES.get(lower, clean)
+
 # Canonical applications.md column order (see career-ops AGENTS.md):
 #   | # | Date | Company | Role | Score | Status | PDF | Report | Notes |
 _COLUMNS = ["num", "date", "company", "role", "score", "status", "pdf", "report", "notes"]
@@ -68,6 +102,7 @@ def parse_applications(applications_md: Path) -> list[dict]:
 
         # Parse the leading float out of "4.2/5" → 4.2 for sorting.
         row["score_value"] = _parse_score(row.get("score", ""))
+        row["status_canonical"] = canonical_status(row.get("status", ""))
 
         rows.append(row)
 
@@ -101,6 +136,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
             row["report_num"] = m.group(1).strip() if m else ""
             row["report_path"] = m.group(2).strip() if m else ""
             row["score_value"] = _parse_score(row.get("score", ""))
+            row["status_canonical"] = canonical_status(row.get("status", ""))
             rows.append(row)
     rows.sort(key=lambda r: _safe_int(r.get("num")))
     return rows
@@ -111,6 +147,38 @@ def _safe_int(s) -> int:
         return int(str(s).strip())
     except (ValueError, TypeError):
         return 0
+
+
+def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> str:
+    """Return applications.md text with the Status cell of row `num` replaced.
+
+    Operates at the line level — finds the table row whose first cell (the #
+    column) equals `num` and rewrites only its Status cell, leaving every other
+    byte untouched. This avoids re-serializing the whole table (which could
+    mangle notes containing special chars) and makes the change a minimal diff.
+
+    Returns the text unchanged if the row isn't found."""
+    want = str(num).strip()
+    out_lines = []
+    changed = False
+    for line in applications_md_text.splitlines():
+        if not changed and line.lstrip().startswith("|"):
+            # Split preserving structure: leading/trailing pipes produce empty
+            # edge cells we must keep so indices stay aligned on re-join.
+            parts = line.split("|")
+            # parts[0] is "" (before leading pipe). The 9 data cells are
+            # parts[1..9]; parts[-1] is "" (after trailing pipe).
+            cells = [p.strip() for p in parts]
+            # Data cell positions within `parts`: # is parts[1], Status is parts[6].
+            if len(parts) >= 10 and cells[1] == want and cells[1] not in ("#", ""):
+                parts[6] = f" {new_status} "
+                line = "|".join(parts)
+                changed = True
+        out_lines.append(line)
+    text = "\n".join(out_lines)
+    if applications_md_text.endswith("\n") and not text.endswith("\n"):
+        text += "\n"
+    return text
 
 
 def load_jobs(career_ops: Path) -> dict:

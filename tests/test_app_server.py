@@ -35,6 +35,11 @@ def client(tmp_path, monkeypatch):
     # fine, but reload keeps the test hermetic across runs.
     from pipeline.app import server
     importlib.reload(server)
+    # Isolate mutable module state into tmp so tests don't leak into each other
+    # or touch the real repo's .ui-cache.
+    server.OVERRIDES_FILE = tmp_path / ".ui-cache" / "status-overrides.json"
+    server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
+    server._active_data_dir = None
     return TestClient(server.app)
 
 
@@ -126,3 +131,94 @@ def test_refresh_downloads_and_repoints(client, tmp_path, mocker):
         assert jobs["rows"][0]["company"] == "Refreshed Co"
     finally:
         server._active_data_dir = None  # reset module state for other tests
+
+
+def test_set_status_records_override(client):
+    r = client.post("/api/status", json={"num": "1", "status": "Applied"})
+    assert r.status_code == 200
+    assert r.json()["pending"] == 1
+    # /api/jobs should now overlay the pending status on that row.
+    jobs = client.get("/api/jobs").json()
+    assert jobs["pending"] == 1
+    row = jobs["rows"][0]
+    assert row["status_canonical"] == "Applied"
+    assert row["pending"] is True
+
+
+def test_set_status_rejects_unknown(client):
+    r = client.post("/api/status", json={"num": "1", "status": "Bogus"})
+    assert r.status_code == 400
+    assert "Unknown status" in r.json()["detail"]
+
+
+def test_push_status_400_when_nothing_pending(client):
+    r = client.post("/api/push-status")
+    assert r.status_code == 400
+
+
+def test_push_status_refreshes_applies_and_dispatches(client, tmp_path, mocker):
+    from pipeline.app import server
+    # Pending change: mark role #1 Applied.
+    client.post("/api/status", json={"num": "1", "status": "Applied"})
+
+    # Fresh base from "the cloud" — includes a NEW row #2 the local copy lacks,
+    # to prove the refresh-before-write guard preserves cloud-added rows.
+    fresh = tmp_path / "fresh" / "pipeline-output-9"
+    (fresh / "data").mkdir(parents=True)
+    (fresh / "reports").mkdir(parents=True)
+    (fresh / "data" / "applications.md").write_text(
+        "# Applications Tracker\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 1 | 2026-05-27 | Acme | Eng | 4.2/5 | Evaluated | ❌ | [001](reports/001-acme.md) | APPLY |\n"
+        "| 2 | 2026-05-28 | NewCo | Dev | 3.9/5 | Evaluated | ❌ | [002](reports/002-newco.md) | new |\n",
+        encoding="utf-8",
+    )
+    mocker.patch.object(server.gh, "latest_run", return_value={"databaseId": 9})
+    mocker.patch.object(server.gh, "download_artifact", return_value=fresh)
+    trigger = mocker.patch.object(server.gh, "trigger_workflow")
+
+    r = client.post("/api/push-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["pushed"] == 1
+    assert body["base"] == "refreshed"
+
+    # edit-tracker was dispatched with a base64 blob...
+    trigger.assert_called_once()
+    wf, fields = trigger.call_args.args[0], trigger.call_args.args[1]
+    assert wf == server.EDIT_WORKFLOW
+    import base64
+    pushed_md = base64.b64decode(fields["applications_md_b64"]).decode("utf-8")
+    # ...that has role #1 = Applied (the edit) AND role #2 (cloud-added, preserved).
+    assert "| Applied |" in pushed_md
+    assert "NewCo" in pushed_md
+
+    # Pending cleared after a successful push.
+    assert client.get("/api/jobs").json()["pending"] == 0
+
+
+def test_push_status_falls_back_to_local_when_refresh_fails(client, mocker):
+    from pipeline.app import server
+    client.post("/api/status", json={"num": "1", "status": "Interview"})
+    # No runs available → refresh can't produce a fresh base.
+    mocker.patch.object(server.gh, "latest_run", return_value=None)
+    trigger = mocker.patch.object(server.gh, "trigger_workflow")
+
+    r = client.post("/api/push-status")
+    assert r.status_code == 200
+    assert r.json()["base"] == "local"
+    import base64
+    pushed_md = base64.b64decode(trigger.call_args.args[1]["applications_md_b64"]).decode("utf-8")
+    assert "| Interview |" in pushed_md
+
+
+def test_push_status_surfaces_gh_error(client, mocker):
+    from pipeline.app import server
+    client.post("/api/status", json={"num": "1", "status": "Applied"})
+    mocker.patch.object(server.gh, "latest_run", return_value=None)
+    mocker.patch.object(server.gh, "trigger_workflow",
+                        side_effect=server.gh.GhError("edit-tracker.yml not found"))
+    r = client.post("/api/push-status")
+    assert r.status_code == 502
+    assert "edit-tracker" in r.json()["detail"]
