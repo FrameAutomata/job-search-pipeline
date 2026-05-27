@@ -204,13 +204,15 @@ class TestSecrets:
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
         gh.set_secret("GEMINI_API_KEY", "super-secret-value")
         args = run.call_args.args[0]
-        # Command shape: gh secret set NAME [--R repo] --body -
+        # Command shape: gh secret set NAME [-R repo]. Crucially NO --body: gh
+        # reads the value from stdin only when --body is omitted (`--body -`
+        # would store the literal "-", which is the bug this guards against).
         assert args[:3] == ["gh", "secret", "set"]
         assert "GEMINI_API_KEY" in args
-        assert "-" in args  # --body - sentinel
-        # The value must NOT appear in argv (process listing / argv limits).
+        assert "--body" not in args
+        # The value must NOT appear in argv (process listing / argv limits)...
         assert "super-secret-value" not in args
-        # It must be piped via stdin.
+        # ...it must be piped via stdin.
         assert run.call_args.kwargs.get("input") == "super-secret-value"
 
     def test_set_variable_uses_body(self, mocker):
