@@ -75,3 +75,54 @@ def test_index_served(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Triage" in r.text
+
+
+def test_run_triggers_workflow(client, mocker):
+    from pipeline.app import server
+    trigger = mocker.patch.object(server.gh, "trigger_workflow")
+    r = client.post("/api/run")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    trigger.assert_called_once_with(server.DAILY_WORKFLOW)
+
+
+def test_run_surfaces_gh_error(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.gh, "trigger_workflow",
+                        side_effect=server.gh.GhError("gh not authenticated"))
+    r = client.post("/api/run")
+    assert r.status_code == 502
+    assert "not authenticated" in r.json()["detail"]
+
+
+def test_refresh_404_when_no_runs(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.gh, "latest_run", return_value=None)
+    r = client.post("/api/refresh")
+    assert r.status_code == 404
+
+
+def test_refresh_downloads_and_repoints(client, tmp_path, mocker):
+    from pipeline.app import server
+    art = tmp_path / "dl" / "pipeline-output-7"
+    (art / "data").mkdir(parents=True)
+    (art / "reports").mkdir(parents=True)
+    (art / "data" / "applications.md").write_text(
+        "# Applications Tracker\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 9 | 2026-05-27 | Refreshed Co | Eng | 4.9/5 | Evaluated | ❌ | [009](reports/009-x.md) | APPLY |\n",
+        encoding="utf-8",
+    )
+    mocker.patch.object(server.gh, "latest_run",
+                        return_value={"databaseId": 7, "createdAt": "t", "displayTitle": "Daily"})
+    mocker.patch.object(server.gh, "download_artifact", return_value=art)
+    try:
+        r = client.post("/api/refresh")
+        assert r.status_code == 200
+        assert r.json()["run_id"] == 7
+        # After refresh, /api/jobs reads the downloaded dir, not the env one.
+        jobs = client.get("/api/jobs").json()
+        assert jobs["rows"][0]["company"] == "Refreshed Co"
+    finally:
+        server._active_data_dir = None  # reset module state for other tests

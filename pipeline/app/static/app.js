@@ -163,4 +163,51 @@ els.reportClose.addEventListener("click", () => {
   render();
 });
 
+// ── Cloud actions (gh-backed) ────────────────────────────────────────────
+
+const refreshBtn = document.getElementById("refresh-btn");
+const runBtn = document.getElementById("run-btn");
+const actionMsg = document.getElementById("action-msg");
+
+function showAction(text, kind) {
+  actionMsg.textContent = text;
+  actionMsg.className = "action-msg" + (kind ? " " + kind : "");
+  actionMsg.hidden = false;
+}
+
+async function postAction(path) {
+  const resp = await fetch(path, { method: "POST" });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(body.detail || `${path} failed (${resp.status})`);
+  return body;
+}
+
+refreshBtn.addEventListener("click", async () => {
+  refreshBtn.disabled = true;
+  showAction("Downloading latest results from GitHub…", "");
+  try {
+    const r = await postAction("/api/refresh");
+    await loadJobs();
+    showAction(`Loaded results from run #${r.run_id}${r.title ? " — " + r.title : ""}.`, "ok");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  } finally {
+    refreshBtn.disabled = false;
+  }
+});
+
+runBtn.addEventListener("click", async () => {
+  if (!confirm("Trigger a new pipeline run in the cloud? Results take a while; use Refresh later to pull them.")) return;
+  runBtn.disabled = true;
+  showAction("Triggering a pipeline run…", "");
+  try {
+    await postAction("/api/run");
+    showAction("Run triggered. It executes on GitHub; click Refresh once it finishes.", "ok");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  } finally {
+    runBtn.disabled = false;
+  }
+});
+
 loadJobs();

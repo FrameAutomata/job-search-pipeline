@@ -45,6 +45,32 @@ header h1 { margin: 0 0 12px; font-size: 18px; }
 
 .count { color: var(--muted); font-size: 13px; }
 
+.spacer { flex: 1; }
+
+.toolbar button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 7px 12px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.toolbar button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.toolbar button:disabled { opacity: 0.5; cursor: default; }
+
+.action-msg {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.action-msg.ok { color: var(--good); border-color: rgba(63,185,80,0.4); background: rgba(63,185,80,0.10); }
+.action-msg.error { color: var(--bad); border-color: rgba(248,81,73,0.4); background: rgba(248,81,73,0.10); }
+
 .banner {
   margin-top: 10px;
   padding: 8px 12px;
