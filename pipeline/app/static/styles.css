@@ -12,6 +12,11 @@
 
 * { box-sizing: border-box; }
 
+/* The panes set display:flex/block via #id selectors, which out-specify the
+   UA [hidden]{display:none} rule — so without this, toggling the `hidden`
+   attribute in JS wouldn't actually hide them. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
