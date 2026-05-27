@@ -6,7 +6,8 @@ name: Edit Tracker
 #   1. Go to Actions → Daily Job Pipeline → latest run → "pipeline-output-*"
 #      artifact → download → extract applications.md
 #   2. Edit the file locally (mark "Applied", "Rejected", update notes, etc.)
-#   3. base64-encode it:    base64 -w0 applications.md > applications.b64
+#   3. base64-encode it (Windows: [Convert]::ToBase64String([IO.File]::ReadAllBytes("applications.md"));
+#      macOS: base64 -i applications.md | tr -d '\n'; Linux: base64 -w0 applications.md). Not certutil.
 #   4. Run this workflow → paste the base64 string into the input → Run
 #
 # The workflow writes the new applications.md into the pipeline state cache so
@@ -20,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       applications_md_b64:
-        description: "Base64-encoded new applications.md (use `base64 -w0 applications.md`)"
+        description: "Base64 of applications.md. Win: [Convert]::ToBase64String([IO.File]::ReadAllBytes('applications.md')) · mac: base64 -i applications.md|tr -d '\\n' · linux: base64 -w0 applications.md. Not certutil."
         required: true
         type: string
 
@@ -85,8 +86,16 @@ jobs:
           APPLICATIONS_MD_B64: ${{ inputs.applications_md_b64 }}
         run: |
           mkdir -p career-ops/data
-          # Decode straight to file. base64 -d will fail loudly on garbage input.
-          echo "$APPLICATIONS_MD_B64" | base64 -d > career-ops/data/applications.md.new
+          # Decode to file, tolerating PEM wrappers (Windows certutil -encode) and
+          # CRLF/whitespace so a Windows-encoded paste doesn't abort with a cryptic
+          # "invalid input". Name the failure if it's genuinely not base64.
+          if ! printf '%s' "$APPLICATIONS_MD_B64" \
+               | sed 's/-----[A-Za-z ]*-----//g' \
+               | tr -d '[:space:]' \
+               | base64 -d > career-ops/data/applications.md.new 2>/dev/null; then
+            echo "::error::applications_md_b64 is not valid base64. Re-encode — on Windows use [Convert]::ToBase64String([IO.File]::ReadAllBytes('applications.md')), NOT certutil."
+            exit 1
+          fi
 
           # Smell check: must start with the tracker header. Refuses to overwrite
           # if the input doesn't look like applications.md — protects against

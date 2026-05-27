@@ -44,13 +44,36 @@ See [Guided onboarding](#guided-onboarding-onboard) below and the [QUICKSTART se
 
 #### Option B — set the secrets by hand
 
-First generate the profile artifacts locally with `node setup-profile.mjs`. That writes `cv.md`, `profile.yml`, `_profile.md`, and `search.yml`, but **not** `resumes/resume.txt` — create that yourself from your resume's plain text (e.g. `pdftotext resume.pdf resumes/resume.txt`, or copy-paste the text into the file). Then in your private copy on github.com go to **Settings → Secrets and variables → Actions → New repository secret** and add:
-   - `CV_MD_B64` — `base64 -w0 career-ops/cv.md`
-   - `PROFILE_YML_B64` — `base64 -w0 career-ops/config/profile.yml`
-   - `SEARCH_CONFIG_B64` — `base64 -w0 config/search.yml`
-   - `RESUME_TXT_B64` — `base64 -w0 resumes/resume.txt` (the file you created above)
-   - At least one LLM API key: `GEMINI_API_KEY` (free tier) / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
-   - Optional: `PROFILE_MD_B64` (`base64 -w0 career-ops/modes/_profile.md`), `ARTICLE_DIGEST_B64`
+First generate the profile artifacts locally with `node setup-profile.mjs`. That writes `cv.md`, `profile.yml`, `_profile.md`, and `search.yml`, but **not** `resumes/resume.txt` — create that yourself from your resume's plain text (e.g. `pdftotext resume.pdf resumes/resume.txt`, or copy-paste the text into the file). Then in your private copy on github.com go to **Settings → Secrets and variables → Actions → New repository secret** and add one base64-encoded secret per file:
+
+   | Secret | File to encode |
+   |--------|----------------|
+   | `CV_MD_B64` | `career-ops/cv.md` |
+   | `PROFILE_YML_B64` | `career-ops/config/profile.yml` |
+   | `SEARCH_CONFIG_B64` | `config/search.yml` |
+   | `RESUME_TXT_B64` | `resumes/resume.txt` (the file you created above) |
+   | `PROFILE_MD_B64` *(optional)* | `career-ops/modes/_profile.md` |
+   | `ARTICLE_DIGEST_B64` *(optional)* | `career-ops/article-digest.md` |
+
+   Plus at least one LLM API key secret: `GEMINI_API_KEY` (free tier) / `GROQ_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`.
+
+   **Encoding a file to base64** (paste the output as the secret value) — use the command for your OS:
+
+   ```powershell
+   # Windows / PowerShell — do NOT use `certutil -encode`; it wraps the output in
+   # -----BEGIN CERTIFICATE----- lines that aren't valid base64 and break the run.
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("career-ops\cv.md"))
+   ```
+   ```bash
+   # macOS (BSD base64 has no -w; strip newlines instead)
+   base64 -i career-ops/cv.md | tr -d '\n'
+   ```
+   ```bash
+   # Linux (GNU coreutils)
+   base64 -w0 career-ops/cv.md
+   ```
+
+   This manual path is easy to get wrong (the encoding footgun above is the usual cause of a skipped pipeline run). The **guided wizard (Option A) encodes everything correctly for you** — prefer it unless you specifically need the manual route.
 
 #### Then, either way
 

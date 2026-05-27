@@ -104,15 +104,46 @@ jobs:
         run: |
           mkdir -p config resumes career-ops/config career-ops/modes career-ops/data \
                    career-ops/batch/jds career-ops/batch/tracker-additions career-ops/reports
-          echo "$SEARCH_CONFIG_B64" | base64 -d > config/search.yml
-          echo "$RESUME_TXT_B64"    | base64 -d > resumes/resume.txt
-          echo "$CV_MD_B64"         | base64 -d > career-ops/cv.md
-          echo "$PROFILE_YML_B64"   | base64 -d > career-ops/config/profile.yml
-          if [ -n "$PROFILE_MD_B64" ]; then
-            echo "$PROFILE_MD_B64"     | base64 -d > career-ops/modes/_profile.md
-          fi
-          if [ -n "$ARTICLE_DIGEST_B64" ]; then
-            echo "$ARTICLE_DIGEST_B64" | base64 -d > career-ops/article-digest.md
+
+          # Decode one base64 secret to a file, tolerantly and with a named error.
+          # Tolerance: strip PEM wrapper lines (certutil -encode adds
+          # `-----BEGIN CERTIFICATE-----`) and all whitespace/CRLFs before
+          # decoding, so the common Windows mis-encodings don't abort the run.
+          # On failure we name the offending secret instead of a generic abort.
+          fail=0
+          decode_secret() {  # $1=name $2=value $3=dest $4=required(yes|no)
+            name="$1"; val="$2"; dest="$3"; required="$4"
+            if [ -z "$val" ]; then
+              if [ "$required" = yes ]; then
+                echo "::error::Required secret $name is empty or unset. Add it under Settings → Secrets and variables → Actions (see README 'Configure your private copy')."
+                fail=1
+              fi
+              return
+            fi
+            if ! printf '%s' "$val" \
+                 | sed 's/-----[A-Za-z ]*-----//g' \
+                 | tr -d '[:space:]' \
+                 | base64 -d > "$dest" 2>/dev/null; then
+              echo "::error::Secret $name is not valid base64. Re-encode it — on Windows use [Convert]::ToBase64String([IO.File]::ReadAllBytes('path\\to\\file')), NOT certutil. See README 'Configure your private copy'."
+              fail=1
+              return
+            fi
+            if [ ! -s "$dest" ]; then
+              echo "::error::Secret $name decoded to an empty file. Re-encode it (see README)."
+              fail=1
+            fi
+          }
+
+          decode_secret SEARCH_CONFIG_B64  "$SEARCH_CONFIG_B64" config/search.yml             yes
+          decode_secret RESUME_TXT_B64     "$RESUME_TXT_B64"    resumes/resume.txt             yes
+          decode_secret CV_MD_B64          "$CV_MD_B64"         career-ops/cv.md               yes
+          decode_secret PROFILE_YML_B64    "$PROFILE_YML_B64"   career-ops/config/profile.yml  yes
+          decode_secret PROFILE_MD_B64     "$PROFILE_MD_B64"    career-ops/modes/_profile.md   no
+          decode_secret ARTICLE_DIGEST_B64 "$ARTICLE_DIGEST_B64" career-ops/article-digest.md  no
+
+          if [ "$fail" = 1 ]; then
+            echo "::error::One or more setup secrets failed to decode (see above). Fix them and re-run."
+            exit 1
           fi
 
       - name: Restore pipeline state cache
