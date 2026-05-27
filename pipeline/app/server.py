@@ -1,9 +1,9 @@
 """FastAPI server for the local triage UI.
 
 Serves a single-page frontend on localhost and a small JSON API over the
-evaluation results. Read operations (list jobs, view report) + cloud
-operations via the gh CLI (refresh from the latest artifact, trigger a run).
-Status write-back + onboarding land in later phases.
+evaluation results. Read operations (list jobs, view report), status write-back
+(kanban), cloud operations via the gh CLI (refresh, trigger a run, push status),
+and guided onboarding (generate profile artifacts + write GitHub secrets).
 
 Run:
     uvicorn pipeline.app.server:app --port 8000
@@ -16,12 +16,12 @@ import os
 import shutil
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline.app import data, gh
+from pipeline.app import data, gh, onboard
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -235,6 +235,119 @@ def run_pipeline() -> JSONResponse:
         return JSONResponse({"ok": True, "workflow": DAILY_WORKFLOW})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── Onboarding (Phase 3) ───────────────────────────────────────────────────
+
+@app.get("/onboard", response_class=HTMLResponse)
+def onboard_page() -> FileResponse:
+    """Serve the onboarding wizard SPA."""
+    page = STATIC_DIR / "onboard.html"
+    if not page.exists():
+        raise HTTPException(status_code=404, detail="onboard.html not found")
+    return FileResponse(str(page))
+
+
+@app.get("/api/onboard/status")
+def onboard_status() -> JSONResponse:
+    """Report the target repo, its visibility, and which required secrets are
+    already set — so the UI can show 'needs setup' vs 'already configured'."""
+    try:
+        repo = gh.current_repo()
+        visibility = gh.repo_visibility()
+        present = set(gh.list_secret_names())
+    except gh.GhError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    required_present = [s for s in onboard.REQUIRED_SECRETS if s in present]
+    has_provider = any(v in present for v in onboard.PROVIDER_SECRETS.values())
+    ready = len(required_present) == len(onboard.REQUIRED_SECRETS) and has_provider
+    return JSONResponse({
+        "repo": repo,
+        "visibility": visibility,
+        "secrets_present": sorted(present),
+        "ready": ready,
+    })
+
+
+@app.post("/api/onboard")
+async def onboard_submit(
+    resume: UploadFile = File(...),
+    form: str = Form(...),
+) -> JSONResponse:
+    """Generate the profile artifacts from the uploaded resume + form answers and
+    write them as GitHub secrets. Refuses to write to a public repo."""
+    try:
+        payload = json.loads(form)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="form field is not valid JSON")
+
+    provider = (payload.get("provider") or "").strip().lower()
+    api_key = (payload.get("api_key") or "").strip()
+    if provider and provider not in onboard.PROVIDER_SECRETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider {provider!r}. Valid: {', '.join(onboard.PROVIDER_SECRETS)}",
+        )
+
+    # Privacy guard: never write secrets to a public repo.
+    try:
+        visibility = gh.repo_visibility()
+    except gh.GhError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if visibility == "PUBLIC":
+        raise HTTPException(
+            status_code=409,
+            detail=("Target repo is PUBLIC. Make your fork private before onboarding "
+                    "so your job search stays off the public Actions tab."),
+        )
+
+    # Extract resume text + persist the PDF (local keyword scoring) and .txt.
+    pdf_bytes = await resume.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="resume file is empty")
+    try:
+        resume_text = onboard.extract_pdf_text(pdf_bytes)
+    except Exception as e:  # pdfplumber raises various errors on bad PDFs
+        raise HTTPException(status_code=400, detail=f"could not read PDF: {e}")
+    if not resume_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No text found in the PDF (is it a scanned image?).",
+        )
+
+    resumes_dir = ROOT / "resumes"
+    resumes_dir.mkdir(parents=True, exist_ok=True)
+    (resumes_dir / "resume.pdf").write_bytes(pdf_bytes)
+    (resumes_dir / "resume.txt").write_text(resume_text, encoding="utf-8")
+
+    # Generate artifacts via the shared node generator, then collect base64.
+    try:
+        onboard.run_generation(ROOT, onboard.build_onboarding_json(payload, resume_text))
+        blobs = onboard.collect_secret_blobs(ROOT)
+    except onboard.OnboardError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Write the artifact secrets, then the provider key, then optional vars.
+    written: list[str] = []
+    try:
+        for name, b64 in blobs.items():
+            gh.set_secret(name, b64)
+            written.append(name)
+        if provider and api_key:
+            secret = onboard.PROVIDER_SECRETS[provider]
+            gh.set_secret(secret, api_key)
+            written.append(secret)
+            gh.set_variable("BATCH_PROVIDER", provider)
+            model = (payload.get("batch_model") or "").strip()
+            if model:
+                gh.set_variable("BATCH_MODEL", model)
+    except gh.GhError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Wrote {written} but then gh failed: {e}",
+        )
+
+    return JSONResponse({"ok": True, "repo": gh.current_repo(), "secrets_written": written})
 
 
 # Mount the SPA last so /api/* routes take precedence. html=True serves

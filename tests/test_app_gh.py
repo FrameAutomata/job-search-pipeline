@@ -46,17 +46,27 @@ class TestRunErrorHandling:
 class TestRepoArgs:
     def test_no_override_no_repo_flag(self, mocker, monkeypatch):
         monkeypatch.delenv("JOB_SEARCH_REPO", raising=False)
-        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("owner/repo\n"))
-        gh.current_repo()
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("[]"))
+        gh.latest_run("daily-pipeline.yml")
         args = run.call_args.args[0]
         assert "-R" not in args
 
     def test_override_adds_repo_flag(self, mocker, monkeypatch):
+        # Subcommands that accept --repo (run/secret/variable) use -R.
+        monkeypatch.setenv("JOB_SEARCH_REPO", "me/job-search-private")
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("[]"))
+        gh.latest_run("daily-pipeline.yml")
+        args = run.call_args.args[0]
+        assert "-R" in args and "me/job-search-private" in args
+
+    def test_repo_view_uses_positional_not_dash_R(self, mocker, monkeypatch):
+        # `gh repo view` does NOT accept -R — the repo is positional.
         monkeypatch.setenv("JOB_SEARCH_REPO", "me/job-search-private")
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("me/job-search-private\n"))
         gh.current_repo()
         args = run.call_args.args[0]
-        assert "-R" in args and "me/job-search-private" in args
+        assert "-R" not in args
+        assert "me/job-search-private" in args  # positional
 
 
 class TestLatestRun:
@@ -86,6 +96,39 @@ class TestTriggerWorkflow:
         args = run.call_args.args[0]
         assert "-f" in args
         assert "applications_md_b64=QUJD" in args
+
+
+class TestRepoVisibility:
+    def test_returns_uppercased(self, mocker):
+        mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed("private\n"))
+        assert gh.repo_visibility() == "PRIVATE"
+
+
+class TestSecrets:
+    def test_list_secret_names_splits_lines(self, mocker):
+        mocker.patch("pipeline.app.gh.subprocess.run",
+                     return_value=_completed("CV_MD_B64\nGEMINI_API_KEY\n"))
+        assert gh.list_secret_names() == ["CV_MD_B64", "GEMINI_API_KEY"]
+
+    def test_set_secret_pipes_value_via_stdin_not_argv(self, mocker):
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
+        gh.set_secret("GEMINI_API_KEY", "super-secret-value")
+        args = run.call_args.args[0]
+        # Command shape: gh secret set NAME [--R repo] --body -
+        assert args[:3] == ["gh", "secret", "set"]
+        assert "GEMINI_API_KEY" in args
+        assert "-" in args  # --body - sentinel
+        # The value must NOT appear in argv (process listing / argv limits).
+        assert "super-secret-value" not in args
+        # It must be piped via stdin.
+        assert run.call_args.kwargs.get("input") == "super-secret-value"
+
+    def test_set_variable_uses_body(self, mocker):
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
+        gh.set_variable("BATCH_PROVIDER", "gemini")
+        args = run.call_args.args[0]
+        assert args[:3] == ["gh", "variable", "set"]
+        assert "BATCH_PROVIDER" in args and "gemini" in args
 
 
 class TestDownloadArtifact:
