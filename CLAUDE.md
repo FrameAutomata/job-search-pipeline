@@ -105,7 +105,12 @@ screen:
 
 **JobSpy constraint**: On Indeed/Glassdoor, `hours_old` is mutually exclusive with `job_type`, `is_remote`, and `easy_apply`. Split into separate search passes to use both filters.
 
-**Description backfill**: `linkedin_fetch_description: true` makes JobSpy fetch each LinkedIn JD individually during scrape — a sequential per-job HTTP request that easily takes 30+ minutes on 1000 results. Keep it **false**. The screen stage already fetches each surviving job's page for the liveness check, so it extracts the JD from the same response (site-specific selectors for LinkedIn/Indeed/Glassdoor, plus a generic `<body>` fallback). Net effect: we pay ~dozens of fetches per run for the jobs that actually survive filtering, not thousands.
+**Description backfill**: `linkedin_fetch_description: true` makes JobSpy fetch each LinkedIn JD individually during scrape — a sequential per-job HTTP request that easily takes 30+ minutes on 1000 results. Keep it **false**. The screen stage backfills descriptions for the jobs that survive filtering:
+
+- **LinkedIn** URLs are fetched via the public **guest job-posting endpoint** (`jobs-guest/jobs/api/jobPosting/{id}`), not the regular `/jobs/view/` page. The regular page is login-walled from datacenter IPs and inconsistently returns a sign-in preview that has no extractable JD (this caused ~17% of LinkedIn jobs to reach evaluation with an empty description). The guest endpoint returns the full JD reliably and gives a cleaner liveness signal (404 = gone, JD present = live). `linkedin_guest_jd_url()` in [pipeline/screen.py](pipeline/screen.py) does the URL mapping; `job_url` in the CSV stays the human-facing page.
+- **Indeed / Glassdoor** descriptions usually come from JobSpy directly; if missing, the screen stage extracts them from the same page it fetches for the liveness check (site-specific selectors + a generic `<body>` fallback).
+
+Net effect: we pay ~dozens of fetches per run for the jobs that actually survive filtering, not thousands, and every LinkedIn role gets its complete JD.
 
 ---
 
