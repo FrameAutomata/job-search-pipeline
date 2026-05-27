@@ -23,6 +23,10 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 
 ## Setup (one-time)
 
+Setup is two steps: **install the pipeline**, then **create your profile**.
+
+### Step 1 — install
+
 ```powershell
 # Windows
 .\setup.ps1
@@ -32,12 +36,46 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 ```
 
 The setup script:
-1. Creates a Python virtual environment and installs dependencies
+1. Creates a Python 3.12 virtual environment and installs dependencies (pipeline + local UI)
 2. Clones career-ops into `./career-ops/`
-3. Copies `config/search.example.yml` → `config/search.yml`
-4. Runs `setup-profile.mjs` to generate your candidate profile
+3. Installs the Node dependencies (career-ops + pipeline)
+4. Copies `.env.example` → `.env` and `config/search.example.yml` → `config/search.yml`, and creates `resumes/` and `output/`
 
-During profile setup you'll be prompted for:
+It does **not** ask for your details — you create your profile in step 2.
+
+### Step 2 — create your profile
+
+Your profile (CV + candidate details + `searches:` config) is generated from your resume and a few answers. Pick one path:
+
+#### Option A — guided wizard in the browser (recommended)
+
+The wizard generates your profile **and** writes it to your private repo's GitHub secrets, so it's the path to use if you want the scheduled cloud automation.
+
+1. **Install the GitHub CLI** ([cli.github.com](https://cli.github.com)) and sign in: `gh auth login`. (Needed only for writing the cloud secrets — skip it if you'll run locally only, and use Option B instead.)
+2. **Launch the UI from a clone of your private copy.** `gh` writes secrets to whatever repo the launch directory points at, so run the wizard from inside your private copy (see [Cloud automation](#cloud-automation-github-actions) for how to create it). Override the target with `JOB_SEARCH_REPO=owner/name`.
+3. **Start the UI and open the wizard:**
+   ```powershell
+   .\run-ui.ps1        # macOS / Linux: ./run-ui.sh
+   ```
+   Open http://localhost:8000 and click **⚙ Setup**. The status line up top shows the target repo, its visibility, and whether it's already configured.
+4. **Walk through the steps:**
+   - **Resume** — upload your resume PDF (text is extracted locally; the About step is auto-filled from it)
+   - **About you** — name, email, location, optional phone / LinkedIn / GitHub / website
+   - **Roles & compensation** — target roles, roles to avoid, target / minimum comp, location flexibility
+   - **Search settings** — locations (`City, ST` pairs stay together; put "Remote" in a chunk for a remote pass), distance, recency (`hours_old`), max results, job boards, and an optional easy-apply pass (runs every 4 h in the cloud)
+   - **Career narrative** *(optional, improves evaluations)* — transition story, deal-breakers, portfolio
+   - **AI evaluation provider** — pick a provider and paste its API key (piped straight to a GitHub secret; never logged or stored locally)
+   - **Review & submit** — generates the profile artifacts locally and, when `gh` targets a **private** repo, writes them plus your API key as encrypted GitHub secrets. It refuses to write to a public repo. On the last step the **Finish** button returns you to the triage UI.
+
+#### Option B — terminal prompts
+
+Generates the profile **locally only** — no GitHub secrets are written (use this for local runs, or run it before adding cloud secrets by hand):
+
+```powershell
+node setup-profile.mjs
+```
+
+You'll be prompted for:
 - Your resume path (auto-detected if present in `resumes/`)
 - Target roles and roles to avoid (comma-separated)
 - Compensation expectations (target / minimum)
@@ -48,13 +86,19 @@ During profile setup you'll be prompted for:
 - **Which job boards** to scrape (default linkedin, indeed, glassdoor)
 - Whether to include an **easy-apply pass** (runs on a separate 4 h cloud schedule)
 
-This creates / rewrites:
+### What setup produces
+
+Either path creates / rewrites:
 - `career-ops/config/profile.yml` — your candidate profile
 - `career-ops/cv.md` — your CV in markdown
 - `career-ops/modes/_profile.md` — your career narrative and deal-breakers
-- `config/search.yml` — `searches:` block regenerated from your location prompts; `filter:` / `screen:` blocks preserved
+- `config/search.yml` — `searches:` block regenerated from your locations; `filter:` / `screen:` blocks preserved
 
-To re-run profile setup at any time: `node setup-profile.mjs`. Re-running rewrites the `searches:` block from scratch.
+The wizard (Option A) also saves your uploaded resume as `resumes/resume.pdf` + `resumes/resume.txt` (the extracted text used for keyword scoring); Option B reads the resume path you point it at.
+
+To re-run profile setup at any time, re-open the wizard or run `node setup-profile.mjs`. Re-running rewrites the `searches:` block from scratch.
+
+You're now ready to [run the pipeline](#run-the-pipeline) locally, or to enable the [cloud automation](#cloud-automation-github-actions).
 
 ---
 
@@ -219,7 +263,7 @@ The repo ships three scheduled workflows + one manual workflow. **They refuse to
 | Workflow | Schedule | What it does |
 |---|---|---|
 | `daily-pipeline.yml` | Noon UTC | Runs every pass without `easy_apply: true` via `--no-easy-apply`. |
-| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC | Runs every pass with `easy_apply: true` via `--easy-apply-only`. No-ops if none configured. |
+| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC, **and** right after a successful `daily-pipeline` run | Runs every pass with `easy_apply: true` via `--easy-apply-only`. No-ops if none configured. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a base64 blob — for status edits without committing the file. |
 
 All runtime state (scan-history, applications.md, batch state) lives in `actions/cache@v4`. Reports and tracker snapshots are uploaded as `actions/upload-artifact@v4` (90-day retention). No user data is ever committed.
