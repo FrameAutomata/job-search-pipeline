@@ -14,6 +14,23 @@ import pytest
 from pipeline.app import onboard
 
 
+def _node_deps_available() -> bool:
+    """True only if node AND the npm packages setup-profile.mjs imports
+    (yaml, pdf-parse) resolve. CI has node but doesn't `npm install`, so the
+    round-trip test skips there; it runs locally where setup has installed deps."""
+    if shutil.which("node") is None:
+        return False
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        r = subprocess.run(
+            ["node", "-e", "require.resolve('yaml'); require.resolve('pdf-parse')"],
+            cwd=str(repo), capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 class TestParseLocations:
     @pytest.mark.parametrize("text,expected", [
         ("", []),
@@ -101,7 +118,8 @@ class TestCollectSecretBlobs:
             onboard.collect_secret_blobs(tmp_path)
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+@pytest.mark.skipif(not _node_deps_available(),
+                    reason="node or its npm deps (yaml/pdf-parse) not installed")
 class TestNodeRoundTrip:
     """Guards against the interactive and --from-json paths drifting: run the
     real generator on a fixture and assert the four artifacts appear."""
