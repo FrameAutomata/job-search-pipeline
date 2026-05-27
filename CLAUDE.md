@@ -203,22 +203,27 @@ Three workflows make up the cloud automation:
 
 1. **Fork this repo** on GitHub. Then **Settings → General → Change repository visibility → Make private**. Workflows hard-stop if the repo is public.
 
-2. **Add GitHub Secrets** (Settings → Secrets and variables → Actions → New repository secret):
+2. **Add GitHub Secrets** (Settings → Secrets and variables → Actions → New repository secret). Each `*_B64` secret is one file, base64-encoded. **Easiest: use the ⚙ Setup wizard — it encodes and writes all of these correctly.** To do it by hand, encode with the command for your OS:
 
-   Required:
-   - `CV_MD_B64` — `base64 -w0 path/to/cv.md`
-   - `PROFILE_YML_B64` — `base64 -w0 path/to/profile.yml`
-   - `SEARCH_CONFIG_B64` — `base64 -w0 config/search.yml`
-   - `RESUME_TXT_B64` — `base64 -w0 resumes/resume.txt` (run setup locally to generate the .txt)
-   - At least one LLM provider key:
+   ```powershell
+   # Windows / PowerShell — do NOT use `certutil -encode` (it adds
+   # -----BEGIN CERTIFICATE----- lines that aren't valid base64 and break the run).
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("career-ops\cv.md"))
+   ```
+   ```bash
+   base64 -i career-ops/cv.md | tr -d '\n'   # macOS (BSD base64, no -w)
+   base64 -w0 career-ops/cv.md               # Linux (GNU coreutils)
+   ```
+
+   Required: `CV_MD_B64` (`career-ops/cv.md`), `PROFILE_YML_B64` (`career-ops/config/profile.yml`), `SEARCH_CONFIG_B64` (`config/search.yml`), `RESUME_TXT_B64` (`resumes/resume.txt` — run setup locally to generate the .txt), plus at least one LLM provider key:
      - `GEMINI_API_KEY` — free tier, recommended; get one at aistudio.google.com
      - `GROQ_API_KEY` — free tier with fast open-source models
      - `OPENAI_API_KEY` — OpenAI
      - `ANTHROPIC_API_KEY` — Anthropic
 
-   Optional:
-   - `PROFILE_MD_B64` — `base64 -w0 modes/_profile.md`
-   - `ARTICLE_DIGEST_B64` — `base64 -w0 article-digest.md`
+   Optional: `PROFILE_MD_B64` (`career-ops/modes/_profile.md`), `ARTICLE_DIGEST_B64` (`career-ops/article-digest.md`).
+
+   The workflows decode tolerantly (they strip certutil PEM wrappers and CRLFs) and, if a secret still isn't valid base64, fail with a message naming the offending secret instead of a generic abort.
 
 3. **Enable Actions** (Actions tab → enable workflows). Workflows run on their schedules.
 
@@ -227,7 +232,7 @@ Three workflows make up the cloud automation:
 5. **Edit `applications.md`** (to mark roles as Applied / Rejected / etc.):
    1. Download the latest artifact (above) and extract `applications.md`.
    2. Edit it locally.
-   3. `base64 -w0 applications.md` and copy the output.
+   3. base64-encode it and copy the output — Windows: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("applications.md"))`; macOS: `base64 -i applications.md | tr -d '\n'`; Linux: `base64 -w0 applications.md`. (Not `certutil` on Windows.)
    4. Actions → "Edit Tracker" → Run workflow → paste the base64 → Run.
    5. The next pipeline run will see the updated statuses.
 
