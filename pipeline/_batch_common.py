@@ -169,9 +169,9 @@ def assign_job_numbers(
 ) -> list[dict]:
     """Pre-assign sequential report and tracker numbers to pending jobs.
 
-    Used by both batch_evaluate and batch_submit so number assignment stays
-    consistent across the two code paths. Mutates `state["jobs"]` to record
-    each job's metadata (excluding jd_text to keep state small)."""
+    Pre-assigns sequential report and tracker numbers to pending jobs so
+    parallel workers don't conflict on numbering. Mutates `state["jobs"]` to
+    record each job's metadata (excluding jd_text to keep state small)."""
     report_counter = report_start
     tracker_counter = tracker_start
     if "jobs" not in state:
