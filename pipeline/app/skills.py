@@ -23,6 +23,8 @@ the role's evaluation **report** as the JD signal.
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -63,6 +65,53 @@ def default_path() -> str:
     return v if v in ("ask", "cli", "api") else "ask"
 
 
+# ── "Run in terminal" (one-click launch of the CLI hand-off command) ─────────
+# This is *not* the agent running inside the web server — we spawn a new
+# visible console window from which the user's agent runs. They see what's
+# executing, can read its output, and can kill it; we never have a
+# tool-wielding agent as a child of the FastAPI process.
+
+def terminal_available() -> bool:
+    """Whether we can launch a visible terminal on this OS. Windows uses cmd
+    (always present); mac/Linux launchers can be added later."""
+    return os.name == "nt"
+
+
+def launch_in_terminal(command: str, cwd: str) -> dict:
+    """Open a new console window and run `command` from `cwd`. The window stays
+    open after the command exits so the user can read agent output (it's a
+    new top-level window — they close it when done).
+
+    Returns a small dict describing what was launched, for the UI to show."""
+    if os.name != "nt":
+        raise SkillError(
+            "Run-in-terminal is only wired up for Windows so far. Use Copy "
+            "command and run it in your own terminal."
+        )
+    # A tiny .cmd wrapper handles cmd's quoting for us (the verbatim command
+    # string already has the right shape for cmd) and keeps the window open via
+    # `pause` so prompts and final messages don't disappear.
+    script = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"   # UTF-8 console so accented characters render
+        f"{command}\r\n"
+        "echo.\r\n"
+        "echo (You can close this window when done.)\r\n"
+        "pause >nul\r\n"
+    )
+    tf = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".cmd", delete=False, encoding="utf-8",
+    )
+    tf.write(script)
+    tf.close()
+    # CREATE_NEW_CONSOLE = 0x10. We deliberately don't unlink the script —
+    # the child needs it alive to run, and Windows cleans %TEMP% over time.
+    subprocess.Popen(
+        [tf.name], cwd=cwd, creationflags=0x10, close_fds=True,
+    )
+    return {"launcher": "cmd", "script": tf.name}
+
+
 # ── Skill registry ───────────────────────────────────────────────────────────
 # Each skill maps to a career-ops mode. `api=True` means the work fits a single
 # bounded provider call (we implement a runner below); otherwise it's CLI-only
@@ -101,6 +150,7 @@ def capabilities() -> dict:
     return {
         "cli": {"available": cli_available(), "name": cli_name()},
         "api": {"available": provider is not None, "provider": provider},
+        "terminal": {"available": terminal_available()},
         "default_path": default_path(),
         "skills": [
             {"id": sid, "label": s["label"], "api": s["api"]}

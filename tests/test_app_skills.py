@@ -184,6 +184,53 @@ def test_skill_output_rejects_traversal(client):
     assert r.status_code == 404
 
 
+# ── Run in terminal ──────────────────────────────────────────────────────────
+
+def test_capabilities_includes_terminal(client):
+    caps = client.get("/api/capabilities").json()
+    assert "terminal" in caps and "available" in caps["terminal"]
+
+
+def test_launch_writes_cmd_script_and_spawns(client, mocker, monkeypatch):
+    # Force the Windows code path regardless of test runner OS so the launcher
+    # is exercised end-to-end on Linux CI too.
+    monkeypatch.setattr("pipeline.app.skills.os.name", "nt")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["launched"] is True
+    # Server rebuilt the same hand-off command (clients can't smuggle commands).
+    assert "claude" in body["command"]
+    assert "Acme" in body["command"] and "Eng" in body["command"]
+    # Spawn used a new console (CREATE_NEW_CONSOLE = 0x10) with the .cmd script.
+    args, kwargs = popen.call_args
+    script_path = args[0][0]
+    assert script_path.endswith(".cmd")
+    assert kwargs["creationflags"] == 0x10
+    # The script wraps the command with chcp 65001 (UTF-8) and a final pause
+    # so the window stays open after the agent exits.
+    script = open(script_path, encoding="utf-8").read()
+    assert "chcp 65001" in script
+    assert "pause" in script
+    assert body["command"] in script
+
+
+def test_launch_refused_when_no_cli(client, mocker, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "nt")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value=None)
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    assert r.status_code == 400
+    assert "No agent CLI" in r.json()["detail"]
+
+
+def test_launch_refused_on_unsupported_os(client, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    assert r.status_code == 501
+
+
 # ── Cross-origin guard ───────────────────────────────────────────────────────
 
 def test_cross_origin_post_refused(client):
