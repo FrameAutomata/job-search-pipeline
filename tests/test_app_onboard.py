@@ -193,3 +193,42 @@ class TestRunGenerationErrors:
         mocker.patch("pipeline.app.onboard.subprocess.run", return_value=cp)
         with pytest.raises(onboard.OnboardError, match="kaboom"):
             onboard.run_generation(tmp_path, {"info": {}})
+
+
+class TestSidecar:
+    """The sidecar lets the wizard prefill every field on a revisit so the user
+    only touches the knob they want to change. api_key must never land in it —
+    the sidecar lives on disk; the key belongs in GitHub Secrets only."""
+
+    def test_load_returns_none_when_missing(self, tmp_path):
+        assert onboard.load_sidecar(tmp_path) is None
+
+    def test_save_then_load_round_trips(self, tmp_path):
+        payload = {"name": "Jane", "results_wanted": 5, "sites": ["indeed", "linkedin"]}
+        onboard.save_sidecar(tmp_path, payload)
+        assert onboard.load_sidecar(tmp_path) == payload
+
+    def test_save_strips_api_key(self, tmp_path):
+        onboard.save_sidecar(tmp_path, {"name": "Jane", "api_key": "secret-xyz"})
+        loaded = onboard.load_sidecar(tmp_path)
+        assert "api_key" not in loaded
+        # Belt-and-braces: the raw file shouldn't contain the key either.
+        raw = (tmp_path / ".ui-cache" / "onboarding.json").read_text(encoding="utf-8")
+        assert "secret-xyz" not in raw
+
+    def test_load_returns_none_on_corrupt_file(self, tmp_path):
+        # If someone hand-edits the sidecar into invalid JSON, fall back to
+        # "no prefill" rather than crash the wizard.
+        sidecar = tmp_path / ".ui-cache" / "onboarding.json"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("{ not valid json", encoding="utf-8")
+        assert onboard.load_sidecar(tmp_path) is None
+
+    def test_save_swallows_io_errors(self, tmp_path, mocker):
+        # Sidecar persistence is a UX nicety. If we can't write (read-only fs,
+        # antivirus lock, whatever), don't fail the onboarding submission —
+        # the secrets have already been written at that point.
+        mocker.patch("pipeline.app.onboard.Path.write_text",
+                     side_effect=OSError("read-only"))
+        # No exception:
+        onboard.save_sidecar(tmp_path, {"name": "Jane"})

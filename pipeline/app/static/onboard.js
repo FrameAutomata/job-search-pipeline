@@ -21,6 +21,11 @@ const reviewEl = document.getElementById("review");
 const reviewRepo = document.getElementById("review-repo");
 
 let current = 0;
+// "Edit" when /api/onboard/load-config returned a saved payload — the user
+// has already onboarded once and is just tweaking config. We relax the
+// "resume required" and "api_key required" rules, and the submit button
+// reads "Save changes" instead of "Write secrets".
+let editMode = false;
 
 // Build the step indicator.
 STEP_TITLES.forEach((t, i) => {
@@ -89,12 +94,51 @@ function renderReview() {
 
 // Light per-step validation before advancing.
 function validateStep(i) {
-  if (i === 0 && !resumeInput.files[0]) {
+  // Resume is required for first-time setup. In edit mode the prior resume
+  // already lives on disk and a re-upload is optional, so skip the guard.
+  if (i === 0 && !resumeInput.files[0] && !editMode) {
     showAction("Please choose a PDF resume to continue.", "error");
     return false;
   }
   actionMsg.hidden = true;
   return true;
+}
+
+// Prefill every field from a previously-submitted onboarding payload.
+// Scalar inputs / selects: set .value. sites: tick matching checkboxes,
+// untick the rest. include_easy_apply: set .checked.
+function prefillForm(saved) {
+  for (const [k, v] of Object.entries(saved)) {
+    if (k === "sites" || k === "include_easy_apply") continue;
+    if (v === undefined || v === null || v === "") continue;
+    const el = form.querySelector(`[name="${k}"]`);
+    if (el && el.tagName !== "FIELDSET") el.value = v;
+  }
+  const savedSites = saved.sites || [];
+  form.querySelectorAll('input[name="sites"]').forEach((cb) => {
+    cb.checked = savedSites.includes(cb.value);
+  });
+  const easyCb = form.querySelector('input[name="include_easy_apply"]');
+  if (easyCb) easyCb.checked = !!saved.include_easy_apply;
+}
+
+function enterEditMode(hasResume) {
+  editMode = true;
+  // Resume optional: drop required, swap the hint, restate intent.
+  resumeInput.removeAttribute("required");
+  const resumeHint = document.querySelector('[data-step="0"] .hint');
+  if (resumeHint && hasResume) {
+    resumeHint.textContent =
+      "Resume already on file. Upload a new PDF to replace it, or skip this step to keep the existing one.";
+  }
+  // API key optional: same idea — placeholder explains.
+  const apiKeyEl = form.querySelector('input[name="api_key"]');
+  if (apiKeyEl) {
+    apiKeyEl.placeholder = "leave blank to keep your saved key";
+  }
+  // Submit button copy: "Save changes" reads better than "Write secrets"
+  // for an edit, and signals this isn't a full re-onboarding.
+  submitBtn.textContent = "Save changes";
 }
 
 nextBtn.addEventListener("click", () => {
@@ -141,11 +185,19 @@ resumeInput.addEventListener("change", async () => {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = collectForm();
-  if (!resumeInput.files[0]) { showAction("Resume PDF is required.", "error"); showStep(0); return; }
-  if (!f.api_key) { showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return; }
+  // In edit mode, both fields are optional — the server reuses the existing
+  // resume.pdf on disk and the existing provider secret in GitHub.
+  if (!editMode && !resumeInput.files[0]) {
+    showAction("Resume PDF is required.", "error"); showStep(0); return;
+  }
+  if (!editMode && !f.api_key) {
+    showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return;
+  }
 
   const fd = new FormData();
-  fd.append("resume", resumeInput.files[0]);
+  // Only attach the resume when one is actually selected. The server treats
+  // the missing field as "keep the existing resume on disk."
+  if (resumeInput.files[0]) fd.append("resume", resumeInput.files[0]);
   fd.append("form", JSON.stringify(f));
 
   submitBtn.disabled = true;
@@ -181,17 +233,35 @@ async function loadStatus() {
       statusBanner.textContent =
         "⚠ This repo is PUBLIC. Make your fork private before onboarding — " +
         "onboarding will refuse to write secrets to a public repo.";
-    } else if (s.ready) {
-      statusBanner.hidden = false;
-      statusBanner.classList.add("ok-banner");
-      statusBanner.textContent =
-        "✓ Already configured. Submitting again overwrites the existing secrets.";
     }
+    // Note: the "already configured" banner is set inside loadSavedConfig
+    // (it knows whether we entered edit mode) so we don't double up here.
   } catch (err) {
     repoLine.textContent = `Could not read repo status: ${err.message}. ` +
       "Is gh installed and authenticated?";
   }
 }
 
+// If the user has onboarded before, prefill every form field from the saved
+// payload so they only have to touch the knob they want to change. Sidecar
+// excludes the API key (it lives in GitHub Secrets, write-only).
+async function loadSavedConfig() {
+  try {
+    const resp = await fetch("/api/onboard/load-config");
+    const { form: saved, has_resume } = await resp.json();
+    if (!saved) return;
+    prefillForm(saved);
+    enterEditMode(!!has_resume);
+    statusBanner.hidden = false;
+    statusBanner.classList.add("ok-banner");
+    statusBanner.textContent =
+      "✓ Editing your existing config. Change what you need and click " +
+      "Save changes — leave resume / API key blank to keep them as they are.";
+  } catch {
+    /* first-time setup: no sidecar, leave the wizard in its default state */
+  }
+}
+
 showStep(0);
 loadStatus();
+loadSavedConfig();

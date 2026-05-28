@@ -348,3 +348,140 @@ def test_onboard_parse_resume_rejects_unreadable_pdf(client, mocker):
     )
     assert r.status_code == 400
     assert "could not read PDF" in r.json()["detail"]
+
+
+def test_onboard_load_config_returns_null_when_no_sidecar(client, tmp_path, mocker):
+    # First-time setup: no sidecar, no persisted resume. UI should treat this
+    # as "fresh wizard, nothing to prefill".
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    r = client.get("/api/onboard/load-config")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["form"] is None
+    assert body["has_resume"] is False
+
+
+def test_onboard_load_config_returns_saved_payload(client, tmp_path, mocker):
+    # After a successful onboard, the sidecar is written and load returns it
+    # so the wizard can prefill. has_resume reflects the persisted PDF.
+    from pipeline.app import server
+    import json as _json
+    mocker.patch.object(server, "ROOT", tmp_path)
+    (tmp_path / ".ui-cache").mkdir()
+    (tmp_path / ".ui-cache" / "onboarding.json").write_text(
+        _json.dumps({"name": "Jane", "results_wanted": 5, "sites": ["indeed"]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "resumes").mkdir()
+    (tmp_path / "resumes" / "resume.pdf").write_bytes(b"%PDF-1.4 fake")
+    r = client.get("/api/onboard/load-config")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["form"] == {"name": "Jane", "results_wanted": 5, "sites": ["indeed"]}
+    assert body["has_resume"] is True
+
+
+def test_onboard_writes_sidecar_after_successful_submit(client, tmp_path, mocker):
+    # The sidecar mirrors what the wizard will need to prefill — every field
+    # the user submitted, minus the API key (which lives only in Secrets).
+    from pipeline.app import server
+    import json as _json
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.onboard, "extract_pdf_text", return_value="resume text")
+    mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD",
+    })
+    mocker.patch.object(server.gh, "set_secret")
+    mocker.patch.object(server.gh, "set_variable")
+    r = _onboard_post(client, {"name": "Jane", "provider": "gemini",
+                               "api_key": "supersecret",
+                               "results_wanted": 5, "sites": ["indeed"]})
+    assert r.status_code == 200
+    sidecar = tmp_path / ".ui-cache" / "onboarding.json"
+    assert sidecar.exists()
+    saved = _json.loads(sidecar.read_text(encoding="utf-8"))
+    # API key MUST be excluded so the sidecar is safe on disk.
+    assert "api_key" not in saved
+    # Everything else round-trips so the next wizard visit can prefill.
+    assert saved["name"] == "Jane"
+    assert saved["results_wanted"] == 5
+    assert saved["provider"] == "gemini"
+
+
+def test_onboard_reuses_existing_resume_when_none_uploaded(client, tmp_path, mocker):
+    # Edit-mode flow: the user is tweaking config and didn't re-upload the
+    # resume. Server reuses resumes/resume.txt instead of erroring out.
+    from pipeline.app import server
+    import json as _json
+    mocker.patch.object(server, "ROOT", tmp_path)
+    resumes = tmp_path / "resumes"
+    resumes.mkdir()
+    (resumes / "resume.pdf").write_bytes(b"%PDF-1.4 prior")
+    (resumes / "resume.txt").write_text("existing resume text", encoding="utf-8")
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    # extract_pdf_text MUST NOT be called — we're reusing the .txt directly.
+    extract = mocker.patch.object(server.onboard, "extract_pdf_text",
+                                  side_effect=AssertionError("unexpected PDF extract"))
+    build = mocker.patch.object(server.onboard, "build_onboarding_json",
+                                wraps=server.onboard.build_onboarding_json)
+    mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD",
+    })
+    mocker.patch.object(server.gh, "set_secret")
+    mocker.patch.object(server.gh, "set_variable")
+
+    # Post WITHOUT a resume file — just the form.
+    r = client.post("/api/onboard", data={"form": _json.dumps({"results_wanted": 5})})
+    assert r.status_code == 200, r.json()
+    extract.assert_not_called()
+    # The persisted resume text was the one fed to the generator.
+    _, kwargs_payload = build.call_args.args, build.call_args.kwargs
+    # build_onboarding_json(form, resume_text) — positional.
+    assert build.call_args.args[1] == "existing resume text"
+
+
+def test_onboard_errors_when_no_resume_anywhere(client, tmp_path, mocker):
+    # First-time setup with no PDF upload AND no persisted resume: clear error.
+    from pipeline.app import server
+    import json as _json
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    r = client.post("/api/onboard", data={"form": _json.dumps({})})
+    assert r.status_code == 400
+    assert "resume" in r.json()["detail"].lower()
+
+
+def test_onboard_skips_provider_key_write_when_api_key_blank(client, tmp_path, mocker):
+    # Edit-mode flow: user changed search settings but didn't re-paste their
+    # API key. Provider/key writes should be skipped; artifact writes proceed.
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.onboard, "extract_pdf_text", return_value="resume text")
+    mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD",
+    })
+    set_secret = mocker.patch.object(server.gh, "set_secret")
+    set_var = mocker.patch.object(server.gh, "set_variable")
+    r = _onboard_post(client, {"provider": "gemini", "api_key": ""})  # blank key
+    assert r.status_code == 200
+    written = r.json()["secrets_written"]
+    # Artifact secrets written; provider key NOT.
+    assert "PROFILE_YML_B64" in written
+    assert "GEMINI_API_KEY" not in written
+    # No provider/model variable writes either — nothing changed there.
+    for call in set_secret.call_args_list:
+        assert call.args[0] != "GEMINI_API_KEY"
+    for call in set_var.call_args_list:
+        assert call.args[0] != "BATCH_PROVIDER"
