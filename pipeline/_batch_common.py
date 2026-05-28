@@ -115,6 +115,41 @@ def parse_json_loose(text: str) -> dict | None:
     return None
 
 
+# Tracker schema (9 cols): # · Date · Company · Role · Status · Score · PDF ·
+# Report · Notes. Mirrors what the LLM is told to emit in _profile.md and what
+# merge-tracker.mjs writes into applications.md.
+_TRACKER_TSV_COLUMNS = 9
+
+
+def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
+    """Splice the job URL into the notes (last) column of the tracker row so
+    the UI's "Open posting" link works.
+
+    The LLM generates the notes cell freely — per our prompt it's a
+    one-sentence summary, not the URL. The UI's report pane resolves the
+    "Open posting" target by regex-matching the first http(s) URL in the notes
+    cell ([app.js:extractUrl]), so without this the link has nothing to point
+    at and renders as `#`. Splicing the URL here keeps the prompt unchanged
+    and works for every provider / model.
+
+    If the LLM already put a URL in notes, or returned a row with an
+    unexpected number of columns, leave it alone — better to lose the link
+    than corrupt the row."""
+    if not url:
+        return tracker_tsv
+    line = tracker_tsv.strip()
+    if not line:
+        return tracker_tsv
+    parts = line.split("\t")
+    if len(parts) != _TRACKER_TSV_COLUMNS:
+        return tracker_tsv
+    notes = parts[-1].strip()
+    if re.search(r"https?://\S+", notes):
+        return tracker_tsv
+    parts[-1] = f"{url} — {notes}" if notes else url
+    return "\t".join(parts)
+
+
 def write_job_result(
     response_text: str,
     job_meta: dict,
@@ -136,6 +171,7 @@ def write_job_result(
     if report_content:
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
     if tracker_tsv:
+        tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {
