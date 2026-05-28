@@ -121,13 +121,23 @@ def _run(args: list[str], timeout: int = 120, stdin: str | None = None) -> str:
             input=stdin,
         )
     except FileNotFoundError:
-        # Resolver said this file existed, but exec failed — unusual (e.g. a
-        # broken reparse point). Surface the resolved path so the user can see
-        # what we tried.
-        raise GhError(
-            f"Couldn't launch gh at {gh_bin!r}. Set GH_BIN to a working gh "
-            "executable, or reinstall from https://cli.github.com."
-        )
+        # Direct CreateProcess returned ERROR_FILE_NOT_FOUND despite the path
+        # existing. Seen on Windows when an EDR/AV product blocks direct exec by
+        # the uvicorn process but allows cmd-mediated launches, and in some
+        # configurations where CreateProcess can't resolve a path that cmd.exe
+        # resolves fine. Retry once via shell=True so cmd.exe does the launch.
+        try:
+            r = subprocess.run(
+                subprocess.list2cmdline([gh_bin, *args]),
+                capture_output=True, text=True, timeout=timeout, input=stdin,
+                shell=True,
+            )
+        except FileNotFoundError:
+            raise GhError(
+                f"Couldn't launch gh at {gh_bin!r}, even via the shell. Set "
+                "GH_BIN to a working gh executable, or reinstall from "
+                "https://cli.github.com."
+            )
     except subprocess.TimeoutExpired:
         raise GhError(f"gh {' '.join(args)} timed out after {timeout}s")
     if r.returncode != 0:

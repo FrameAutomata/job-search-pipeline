@@ -65,14 +65,29 @@ class TestRunErrorHandling:
         with pytest.raises(gh.GhError, match="gh CLI not found"):
             gh.current_repo()
 
-    def test_resolver_path_but_exec_fails(self, mocker):
-        # Edge: resolver claimed a path existed, but launching it raises
-        # FileNotFoundError (broken alias / removed between checks). Surface
-        # the path so the user can see what we tried.
+    def test_resolver_path_but_both_attempts_fail(self, mocker):
+        # Resolver claimed a path existed, but both direct exec AND the
+        # shell=True fallback raise FileNotFoundError. Surface the path so the
+        # user can see what we tried.
         mocker.patch("pipeline.app.gh._resolve_gh", return_value="/fake/gh")
         mocker.patch("pipeline.app.gh.subprocess.run", side_effect=FileNotFoundError())
         with pytest.raises(gh.GhError, match="Couldn't launch gh at '/fake/gh'"):
             gh.current_repo()
+
+    def test_shell_fallback_used_when_direct_fails(self, mocker):
+        # Direct CreateProcess fails (some Windows EDR / config blocks it), but
+        # the shell=True retry succeeds. The first call raised; the second
+        # returns a CompletedProcess, and we use its stdout — no GhError.
+        mocker.patch("pipeline.app.gh._resolve_gh", return_value="/fake/gh")
+        run = mocker.patch(
+            "pipeline.app.gh.subprocess.run",
+            side_effect=[FileNotFoundError(), _completed("owner/name\n")],
+        )
+        assert gh.current_repo() == "owner/name"
+        # First call: list-form, no shell. Second: string command, shell=True.
+        first, second = run.call_args_list
+        assert isinstance(first.args[0], list) and first.kwargs.get("shell") is None
+        assert isinstance(second.args[0], str) and second.kwargs.get("shell") is True
 
     def test_auth_failure_message(self, mocker):
         mocker.patch("pipeline.app.gh.subprocess.run",
