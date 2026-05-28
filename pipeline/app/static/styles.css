@@ -263,11 +263,12 @@ tbody tr.selected { background: #233047; }
 }
 #report-close:hover { color: var(--text); }
 
-#tailor-btn {
+.skill-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.skill-actions button {
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
 }
-#tailor-btn:hover { border-color: var(--accent); color: var(--accent); }
+.skill-actions button:hover { border-color: var(--accent); color: var(--accent); }
 
 .skill-panel {
   margin: 0 16px; padding: 10px 12px; font-size: 13px;

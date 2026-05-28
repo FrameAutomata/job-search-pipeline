@@ -284,6 +284,7 @@ def run_pipeline() -> JSONResponse:
 # ── career-ops skills ──────────────────────────────────────────────────────
 
 class SkillRequest(BaseModel):
+    skill: str
     num: str
     path: str  # "api" | "cli"
 
@@ -297,18 +298,23 @@ def _find_role(num: str) -> dict | None:
 
 @app.get("/api/capabilities")
 def capabilities() -> JSONResponse:
-    """Report which skill execution paths are available (agent CLI / API key)
-    and the user's preferred default, so the UI can route or prompt."""
+    """Report which skill execution paths are available (agent CLI / API key),
+    the user's preferred default, and the skill catalog, so the UI can render
+    actions and route or prompt per skill."""
     return JSONResponse(skills.capabilities())
 
 
-@app.post("/api/skills/tailor-resume")
-def tailor_resume(req: SkillRequest) -> JSONResponse:
-    """Tailor the candidate's resume to a triaged role's job description.
+@app.post("/api/skills/run")
+def run_skill(req: SkillRequest) -> JSONResponse:
+    """Run a career-ops skill for a triaged role.
 
     `path="cli"` returns a ready-to-run command for the user's agent (we don't
-    spawn it). `path="api"` runs a bounded synchronous provider call and writes
-    the tailored markdown to the local career-ops output/ dir."""
+    spawn it) — works for every skill. `path="api"` runs a bounded synchronous
+    provider call and is only valid for skills that declare `api=True`
+    (currently résumé-markdown); CLI-only skills reject it with guidance."""
+    spec = skills.SKILLS.get(req.skill)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unknown skill {req.skill!r}.")
     role = _find_role(req.num)
     if role is None:
         raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
@@ -321,15 +327,22 @@ def tailor_resume(req: SkillRequest) -> JSONResponse:
             raise HTTPException(
                 status_code=400,
                 detail=f"No agent CLI found (looked for '{skills.cli_name()}'). "
-                       "Install one or set BATCH_CLI, or use the API path.",
+                       "Install one or set BATCH_CLI"
+                       + ("." if not spec["api"] else ", or use the API path."),
             )
         return JSONResponse({
             "ok": True, "path": "cli",
-            "command": skills.tailor_resume_command(report_rel, company, title),
+            "command": skills.skill_command(req.skill, report_rel, company, title),
             "cwd": "career-ops",
         })
 
     if req.path == "api":
+        if not spec["api"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{spec['label']}' is CLI-only (it needs agent tools the "
+                       "API path can't provide). Use the CLI path.",
+            )
         provider = skills.detect_provider()
         if provider is None:
             raise HTTPException(

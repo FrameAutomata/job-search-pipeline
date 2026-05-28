@@ -1,7 +1,8 @@
-"""career-ops skill launchpad: capability detection + the resume-tailoring skill.
+"""career-ops skill launchpad: capability detection + a registry of skills a
+triaged role can launch.
 
-A triaged role can run a career-ops skill two ways, chosen by the user per
-action (unless they set SKILL_PATH_DEFAULT):
+Each skill runs one of two ways, chosen by the user per action (unless they set
+SKILL_PATH_DEFAULT):
 
   - **API path** — a synchronous provider call that reuses
     ``pipeline.batch_evaluate``'s provider plumbing. Bounded, non-interactive,
@@ -9,9 +10,14 @@ action (unless they set SKILL_PATH_DEFAULT):
   - **CLI path** — we build a ready-to-run command for the user's agent CLI and
     hand it off. We never spawn a tool-wielding agent from this web server.
 
-Resume tailoring is the first skill. It reads ``cv.md`` + ``config/profile.yml``
-from the **local** career-ops install (the source of truth — these are not in a
-downloaded artifact) and uses the role's evaluation **report** as the JD signal.
+Only skills whose work fits a single bounded text call expose the API path.
+Résumé-markdown tailoring does; **PDF** (needs Playwright to render),
+**interview-prep** (needs live WebSearch) and **apply** (needs a live browser)
+are CLI-only — the agent does what an API call can't.
+
+Skills read ``cv.md`` + ``config/profile.yml`` from the **local** career-ops
+install (the source of truth — these are not in a downloaded artifact) and use
+the role's evaluation **report** as the JD signal.
 """
 
 import os
@@ -57,16 +63,63 @@ def default_path() -> str:
     return v if v in ("ask", "cli", "api") else "ask"
 
 
+# ── Skill registry ───────────────────────────────────────────────────────────
+# Each skill maps to a career-ops mode. `api=True` means the work fits a single
+# bounded provider call (we implement a runner below); otherwise it's CLI-only
+# because it needs agent tools (browser, live web). `verb` fills the hand-off
+# prompt: "use {mode} mode to {verb} for {company} / {role}".
+SKILLS: dict[str, dict] = {
+    "tailor-resume": {
+        "label": "Tailor résumé (Markdown)",
+        "mode": "text",
+        "verb": "tailor my résumé (markdown output)",
+        "api": True,
+    },
+    "tailor-resume-pdf": {
+        "label": "Tailor résumé (PDF)",
+        "mode": "pdf",
+        "verb": "generate a tailored ATS-optimized PDF résumé",
+        "api": False,  # PDF rendering needs the agent (Playwright)
+    },
+    "interview-prep": {
+        "label": "Interview prep",
+        "mode": "interview-prep",
+        "verb": "prep me for an interview",
+        "api": False,  # needs live WebSearch research
+    },
+    "apply": {
+        "label": "Apply assistant",
+        "mode": "apply",
+        "verb": "help me fill out the application",
+        "api": False,  # needs a live browser
+    },
+}
+
+
 def capabilities() -> dict:
     provider = detect_provider()
     return {
         "cli": {"available": cli_available(), "name": cli_name()},
         "api": {"available": provider is not None, "provider": provider},
         "default_path": default_path(),
+        "skills": [
+            {"id": sid, "label": s["label"], "api": s["api"]}
+            for sid, s in SKILLS.items()
+        ],
     }
 
 
-# ── Resume tailoring ─────────────────────────────────────────────────────────
+def skill_command(skill_id: str, report_rel: str, company: str, role: str) -> str:
+    """Build the CLI hand-off command for any skill. We never spawn it — the
+    user runs it in their terminal where the agent's tools/cost are visible."""
+    s = SKILLS[skill_id]
+    prompt = f"use {s['mode']} mode to {s['verb']} for {company} / {role}"
+    if report_rel:
+        prompt += f" (evaluation report: {report_rel})"
+    return f'cd career-ops && {cli_name()} "{prompt}"'
+
+
+# ── Résumé tailoring (the one API-path skill) ────────────────────────────────
 
 def _slug(s: str) -> str:
     s = re.sub(r"[^\w\s-]", "", (s or "").lower())
@@ -149,11 +202,3 @@ def tailor_resume_markdown(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content + "\n", encoding="utf-8")
     return out
-
-
-def tailor_resume_command(report_rel: str, company: str, role: str) -> str:
-    """Build the hand-off command for the CLI path. We never spawn it — the user
-    runs it in their own terminal where the agent's tools/cost are visible."""
-    prompt = (f"use text mode to tailor my resume for {company} / {role} "
-              f"(evaluation report: {report_rel})")
-    return f'cd career-ops && {cli_name()} "{prompt}"'

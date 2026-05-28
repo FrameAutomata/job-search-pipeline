@@ -77,11 +77,22 @@ def test_capabilities_provider_with_missing_key_not_available(client, monkeypatc
     assert caps["api"]["available"] is False
 
 
+def test_capabilities_lists_skills(client):
+    caps = client.get("/api/capabilities").json()
+    by_id = {s["id"]: s for s in caps["skills"]}
+    # All four advertised; only résumé-markdown is api-capable.
+    assert set(by_id) == {"tailor-resume", "tailor-resume-pdf", "interview-prep", "apply"}
+    assert by_id["tailor-resume"]["api"] is True
+    assert by_id["tailor-resume-pdf"]["api"] is False
+    assert by_id["interview-prep"]["api"] is False
+    assert by_id["apply"]["api"] is False
+
+
 # ── CLI hand-off ─────────────────────────────────────────────────────────────
 
-def test_tailor_cli_returns_command(client, mocker):
+def test_cli_returns_command(client, mocker):
     mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
-    r = client.post("/api/skills/tailor-resume", json={"num": "1", "path": "cli"})
+    r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "cli"})
     assert r.status_code == 200
     body = r.json()
     assert body["path"] == "cli"
@@ -90,16 +101,25 @@ def test_tailor_cli_returns_command(client, mocker):
     assert "reports/001-acme.md" in body["command"]
 
 
-def test_tailor_cli_no_agent_400(client, mocker):
+def test_cli_command_per_skill_uses_mode(client, mocker):
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    for skill, mode in [("interview-prep", "interview-prep"), ("apply", "apply"),
+                        ("tailor-resume-pdf", "pdf")]:
+        r = client.post("/api/skills/run", json={"skill": skill, "num": "1", "path": "cli"})
+        assert r.status_code == 200, r.text
+        assert f"use {mode} mode" in r.json()["command"]
+
+
+def test_cli_no_agent_400(client, mocker):
     mocker.patch("pipeline.app.skills.shutil.which", return_value=None)
-    r = client.post("/api/skills/tailor-resume", json={"num": "1", "path": "cli"})
+    r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "cli"})
     assert r.status_code == 400
     assert "No agent CLI" in r.json()["detail"]
 
 
-# ── API tailoring ────────────────────────────────────────────────────────────
+# ── API path ─────────────────────────────────────────────────────────────────
 
-def test_tailor_api_writes_file_and_downloads(client, mocker, monkeypatch):
+def test_api_writes_file_and_downloads(client, mocker, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     captured = {}
 
@@ -109,7 +129,7 @@ def test_tailor_api_writes_file_and_downloads(client, mocker, monkeypatch):
         return "# Jane Dev\n\n## Skills\n- Python, FastAPI\n"
 
     mocker.patch("pipeline.app.skills.be._build_caller", return_value=fake_caller)
-    r = client.post("/api/skills/tailor-resume", json={"num": "1", "path": "api"})
+    r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "api"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["provider"] == "gemini"
@@ -123,15 +143,30 @@ def test_tailor_api_writes_file_and_downloads(client, mocker, monkeypatch):
     assert "FastAPI" in dl.text
 
 
-def test_tailor_api_no_key_400(client):
-    r = client.post("/api/skills/tailor-resume", json={"num": "1", "path": "api"})
+def test_api_rejected_for_cli_only_skill(client, monkeypatch):
+    # interview-prep is CLI-only; asking for the API path must 400 with guidance,
+    # even when a key is configured.
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    r = client.post("/api/skills/run", json={"skill": "interview-prep", "num": "1", "path": "api"})
+    assert r.status_code == 400
+    assert "CLI-only" in r.json()["detail"]
+
+
+def test_api_no_key_400(client):
+    r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "api"})
     assert r.status_code == 400
     assert "No LLM API key" in r.json()["detail"]
 
 
-def test_tailor_unknown_role_404(client, mocker):
+def test_unknown_skill_404(client, mocker):
     mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
-    r = client.post("/api/skills/tailor-resume", json={"num": "999", "path": "cli"})
+    r = client.post("/api/skills/run", json={"skill": "nope", "num": "1", "path": "cli"})
+    assert r.status_code == 404
+
+
+def test_unknown_role_404(client, mocker):
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "999", "path": "cli"})
     assert r.status_code == 404
 
 
