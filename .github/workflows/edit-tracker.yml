@@ -77,6 +77,7 @@ jobs:
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
+            career-ops/reports
           key: pipeline-state-v1-${{ github.run_id }}
           restore-keys: |
             pipeline-state-v1-
@@ -124,6 +125,7 @@ jobs:
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
+            career-ops/reports
           key: pipeline-state-v1-${{ github.run_id }}
 
       - name: Upload new applications.md as artifact (verification)
