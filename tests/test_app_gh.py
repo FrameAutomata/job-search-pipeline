@@ -6,6 +6,7 @@ with real runs), so live behavior is verified manually.
 """
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -202,6 +203,33 @@ class TestTriggerWorkflow:
         args = run.call_args.args[0]
         assert "-f" in args
         assert "applications_md_b64=QUJD" in args
+
+    def test_large_field_spilled_to_temp_file(self, mocker, tmp_path):
+        # Big values must not go through argv — Windows caps at ~32K direct and
+        # ~8K via cmd /c (ERROR_FILENAME_EXCED_RANGE / winerror 206). gh
+        # accepts `-f key=@path` to read the value from a file instead.
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
+        big = "A" * 10_000
+        gh.trigger_workflow("edit-tracker.yml", fields={"applications_md_b64": big})
+        args = run.call_args.args[0]
+        # The literal value must NOT appear in argv...
+        joined = " ".join(args)
+        assert big not in joined
+        # ...instead, a -f k=@path reference is passed.
+        ref = next((a for a in args if a.startswith("applications_md_b64=@")), None)
+        assert ref is not None, f"expected -f applications_md_b64=@... reference, got {args}"
+        # The temp file should be cleaned up after the call completes.
+        path = ref.split("=@", 1)[1]
+        assert not os.path.exists(path), f"temp file {path} should have been deleted"
+
+    def test_mixed_fields_only_large_one_spilled(self, mocker):
+        run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
+        gh.trigger_workflow("edit-tracker.yml",
+                            fields={"small": "x", "big": "A" * 10_000})
+        args = run.call_args.args[0]
+        assert "small=x" in args                               # inline
+        assert any(a.startswith("big=@") for a in args)        # spilled
+        assert "big=" + "A" * 10_000 not in " ".join(args)     # never inline
 
 
 class TestLatestSuccessfulRun:
