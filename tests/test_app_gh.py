@@ -31,10 +31,47 @@ def _isolate_repo_target(monkeypatch):
     monkeypatch.setattr(gh, "_origin_repo", lambda: None)
 
 
+class TestResolveGh:
+    def test_gh_bin_env_wins(self, mocker, monkeypatch, tmp_path):
+        # GH_BIN should override shutil.which even when PATH has gh, so users
+        # can point us at a working executable explicitly.
+        fake = tmp_path / "my-gh.exe"
+        fake.write_text("")
+        monkeypatch.setenv("GH_BIN", str(fake))
+        # shutil.which would normally win, but GH_BIN wins ahead of it.
+        which = mocker.patch("pipeline.app.gh.shutil.which", return_value="/some/other/gh")
+        assert gh._resolve_gh() == str(fake)
+        which.assert_not_called()
+
+    def test_falls_back_to_which(self, monkeypatch, mocker):
+        monkeypatch.delenv("GH_BIN", raising=False)
+        mocker.patch("pipeline.app.gh.shutil.which", return_value="/usr/bin/gh")
+        assert gh._resolve_gh() == "/usr/bin/gh"
+
+    def test_returns_none_when_nothing_resolves(self, monkeypatch, mocker):
+        # No GH_BIN, nothing on PATH; on Windows the standard install paths are
+        # missing too. Resolver returns None so _run can fail fast with guidance.
+        monkeypatch.delenv("GH_BIN", raising=False)
+        mocker.patch("pipeline.app.gh.shutil.which", return_value=None)
+        mocker.patch("pipeline.app.gh.os.path.isfile", return_value=False)
+        assert gh._resolve_gh() is None
+
+
 class TestRunErrorHandling:
     def test_missing_gh_raises_install_hint(self, mocker):
-        mocker.patch("pipeline.app.gh.subprocess.run", side_effect=FileNotFoundError())
+        # Resolver finds nothing → fail fast with the install/PATH guidance,
+        # without ever calling subprocess.
+        mocker.patch("pipeline.app.gh._resolve_gh", return_value=None)
         with pytest.raises(gh.GhError, match="gh CLI not found"):
+            gh.current_repo()
+
+    def test_resolver_path_but_exec_fails(self, mocker):
+        # Edge: resolver claimed a path existed, but launching it raises
+        # FileNotFoundError (broken alias / removed between checks). Surface
+        # the path so the user can see what we tried.
+        mocker.patch("pipeline.app.gh._resolve_gh", return_value="/fake/gh")
+        mocker.patch("pipeline.app.gh.subprocess.run", side_effect=FileNotFoundError())
+        with pytest.raises(gh.GhError, match="Couldn't launch gh at '/fake/gh'"):
             gh.current_repo()
 
     def test_auth_failure_message(self, mocker):
@@ -125,7 +162,8 @@ class TestTriggerWorkflow:
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
         gh.trigger_workflow("daily-pipeline.yml")
         args = run.call_args.args[0]
-        assert args[:3] == ["gh", "workflow", "run"]
+        # args[0] is the resolved gh path, not bare "gh", so check the verb pair.
+        assert args[1:3] == ["workflow", "run"]
         assert "daily-pipeline.yml" in args
 
     def test_passes_fields(self, mocker):
@@ -207,7 +245,7 @@ class TestSecrets:
         # Command shape: gh secret set NAME [-R repo]. Crucially NO --body: gh
         # reads the value from stdin only when --body is omitted (`--body -`
         # would store the literal "-", which is the bug this guards against).
-        assert args[:3] == ["gh", "secret", "set"]
+        assert args[1:3] == ["secret", "set"]
         assert "GEMINI_API_KEY" in args
         assert "--body" not in args
         # The value must NOT appear in argv (process listing / argv limits)...
@@ -219,7 +257,7 @@ class TestSecrets:
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
         gh.set_variable("BATCH_PROVIDER", "gemini")
         args = run.call_args.args[0]
-        assert args[:3] == ["gh", "variable", "set"]
+        assert args[1:3] == ["variable", "set"]
         assert "BATCH_PROVIDER" in args and "gemini" in args
 
 

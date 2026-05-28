@@ -15,6 +15,7 @@ needed; the override is only for launching from outside that clone.
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -67,21 +68,65 @@ def _repo_positional() -> list[str]:
     return [repo] if repo else []
 
 
+# Standard Windows install locations for gh, in priority order. Used as a
+# last-resort fallback when neither GH_BIN nor PATH resolves it — which happens
+# when gh ships as a Microsoft Store "App Execution Alias" (a reparse point
+# under WindowsApps that CreateProcess can't follow), or PATH was set in the
+# user's shell init but not in the environment that launched the UI.
+_WIN_GH_FALLBACKS = (
+    r"C:\Program Files\GitHub CLI\gh.exe",
+    r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\GitHub CLI\gh.exe"),
+)
+
+
+def _resolve_gh() -> str | None:
+    """Return an absolute path to the gh executable, or None if we can't find
+    it. ``GH_BIN`` env var wins; otherwise ``shutil.which`` (which honors
+    PATHEXT so it picks up gh.exe / gh.cmd correctly); on Windows we also try
+    the standard install locations. Re-resolved each call so a user can install
+    gh without restarting the UI."""
+    override = os.environ.get("GH_BIN", "").strip()
+    if override and os.path.isfile(override):
+        return override
+    found = shutil.which("gh")
+    if found:
+        return found
+    if os.name == "nt":
+        for path in _WIN_GH_FALLBACKS:
+            if os.path.isfile(path):
+                return path
+    return None
+
+
 def _run(args: list[str], timeout: int = 120, stdin: str | None = None) -> str:
     """Run `gh <args>`, returning stdout. Raises GhError on any failure.
 
     `stdin`, when given, is piped to the process — used for secret values so key
     material and large base64 blobs never appear in argv (visible in process
     listings) or hit the OS argument-length limit."""
+    gh_bin = _resolve_gh()
+    if gh_bin is None:
+        raise GhError(
+            "gh CLI not found. If it's installed, the UI process can't see it "
+            "(common on Windows when gh is a Microsoft Store alias, or the "
+            "terminal that launched the UI doesn't have it on PATH). Fixes: "
+            "(1) install via the MSI from https://cli.github.com, (2) restart "
+            "the terminal/VS Code that launched the UI, or (3) set "
+            "GH_BIN=<full path to gh.exe> in your .env. Then run `gh auth login`."
+        )
     try:
         r = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, timeout=timeout,
+            [gh_bin, *args], capture_output=True, text=True, timeout=timeout,
             input=stdin,
         )
     except FileNotFoundError:
+        # Resolver said this file existed, but exec failed — unusual (e.g. a
+        # broken reparse point). Surface the resolved path so the user can see
+        # what we tried.
         raise GhError(
-            "gh CLI not found. Install it from https://cli.github.com and run "
-            "`gh auth login`."
+            f"Couldn't launch gh at {gh_bin!r}. Set GH_BIN to a working gh "
+            "executable, or reinstall from https://cli.github.com."
         )
     except subprocess.TimeoutExpired:
         raise GhError(f"gh {' '.join(args)} timed out after {timeout}s")
