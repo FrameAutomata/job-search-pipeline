@@ -235,13 +235,23 @@ async function openReport(job) {
     els.reportBody.innerHTML = resp.ok
       ? await resp.text()
       : "<p class='empty'>Report not found.</p>";
+    // Fallback: rows evaluated before the URL-into-notes splice landed (or
+    // produced by a provider that ignored the splice) have no URL in the
+    // tracker's notes cell, so extractUrl returned null and the link is "#".
+    // Every report's markdown header carries a "**URL:** ..." line, so once
+    // the report body is in the DOM we can recover the link from there.
+    if (resp.ok && els.reportLink.getAttribute("href") === "#") {
+      const m = (els.reportBody.textContent || "").match(/https?:\/\/[^\s<>"')]+/);
+      if (m) els.reportLink.href = m[0];
+    }
   } catch (e) {
     els.reportBody.innerHTML = `<p class='empty'>Error loading report: ${escapeHtml(String(e))}</p>`;
   }
 }
 
 // The report URL isn't a tracker column; pull the first http(s) link out of
-// the notes cell if present. (The full URL also lives in the report header.)
+// the notes cell if present. (The full URL also lives in the report header,
+// recovered as a fallback in openReport above.)
 function extractUrl(job) {
   const m = (job.notes || "").match(/https?:\/\/\S+/);
   return m ? m[0] : null;
