@@ -320,7 +320,9 @@ def run_skill(req: SkillRequest) -> JSONResponse:
         raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
     company = role.get("company") or "company"
     title = role.get("role") or "role"
-    report_rel = role.get("report_path") or ""
+    # Resolve the report to an absolute path from the *active* data dir — it may
+    # live in a Refresh artifact cache, not under career-ops/reports/.
+    report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
 
     if req.path == "cli":
         if not skills.cli_available():
@@ -332,7 +334,7 @@ def run_skill(req: SkillRequest) -> JSONResponse:
             )
         return JSONResponse({
             "ok": True, "path": "cli",
-            "command": skills.skill_command(req.skill, report_rel, company, title),
+            "command": skills.skill_command(req.skill, report_file, company, title),
             "cwd": "career-ops",
         })
 
@@ -350,8 +352,7 @@ def run_skill(req: SkillRequest) -> JSONResponse:
                 detail="No LLM API key configured. Set one (e.g. GEMINI_API_KEY) "
                        "or use the CLI path.",
             )
-        # The report is the JD signal; resolve it from the active data dir.
-        report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
+        # The report (resolved above) is the JD signal.
         role_context = report_file.read_text(encoding="utf-8") if report_file else \
             f"# {company} — {title}\n(No evaluation report on disk; tailor from the CV only.)"
         try:
