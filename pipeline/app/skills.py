@@ -109,13 +109,20 @@ def capabilities() -> dict:
     }
 
 
-def skill_command(skill_id: str, report_rel: str, company: str, role: str) -> str:
+def skill_command(skill_id: str, report_path: Path | None,
+                  company: str, role: str) -> str:
     """Build the CLI hand-off command for any skill. We never spawn it — the
-    user runs it in their terminal where the agent's tools/cost are visible."""
+    user runs it in their terminal where the agent's tools/cost are visible.
+
+    The command `cd`s into career-ops (the UI is launched from the repo root, so
+    the relative path is fine) and points at the role's report by **absolute**
+    path — the report may live in a downloaded-artifact cache (after a Refresh),
+    not under career-ops/reports/, so a career-ops-relative path would miss it.
+    Forward slashes work across PowerShell, cmd, and bash."""
     s = SKILLS[skill_id]
     prompt = f"use {s['mode']} mode to {s['verb']} for {company} / {role}"
-    if report_rel:
-        prompt += f" (evaluation report: {report_rel})"
+    if report_path is not None:
+        prompt += f" (evaluation report: {report_path.resolve().as_posix()})"
     return f'cd career-ops && {cli_name()} "{prompt}"'
 
 

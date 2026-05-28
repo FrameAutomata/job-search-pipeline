@@ -98,7 +98,14 @@ def test_cli_returns_command(client, mocker):
     assert body["path"] == "cli"
     assert "claude" in body["command"]
     assert "Acme" in body["command"] and "Eng" in body["command"]
-    assert "reports/001-acme.md" in body["command"]
+    # cd stays relative (UI runs from the repo root)...
+    assert body["command"].startswith("cd career-ops && ")
+    assert body["cwd"] == "career-ops"
+    # ...but the report is referenced by ABSOLUTE path, not a career-ops-relative
+    # one (it may live in a Refresh artifact cache, not career-ops/reports/).
+    report_ref = body["command"].split("evaluation report: ", 1)[1].rstrip(') "')
+    assert os.path.isabs(report_ref.replace("/", os.sep)) or report_ref[1:3] == ":/"
+    assert report_ref.endswith("/reports/001-acme.md")
 
 
 def test_cli_command_per_skill_uses_mode(client, mocker):
