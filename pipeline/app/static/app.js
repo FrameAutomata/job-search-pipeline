@@ -351,7 +351,8 @@ els.pushBtn.addEventListener("click", async () => {
 
 const skillActions = document.getElementById("skill-actions");
 const skillPanel = document.getElementById("skill-panel");
-let CAPS = { cli: { available: false }, api: { available: false }, default_path: "ask", skills: [] };
+let CAPS = { cli: { available: false }, api: { available: false }, terminal: { available: false }, default_path: "ask", skills: [] };
+let currentSkill = null;  // last skill run; used by Run-in-terminal's relaunch.
 
 async function loadCaps() {
   try {
@@ -422,6 +423,7 @@ function startSkill(skill) {
 }
 
 async function runSkill(skill, path) {
+  currentSkill = skill;
   const job = selectedJob;
   showSkill(path === "api" ? `Running “${skill.label}” via the API…` : "Building the CLI command…", "");
   try {
@@ -450,14 +452,40 @@ function renderApiResult(body) {
 function renderCliResult(body) {
   skillPanel.hidden = false;
   skillPanel.className = "skill-panel";
+  const canLaunch = !!(CAPS.terminal && CAPS.terminal.available);
   skillPanel.innerHTML =
     `<p>Run this in your terminal (interactive — refines with your agent):</p>
      <pre class="skill-cmd"><code>${escapeHtml(body.command)}</code></pre>
-     <button id="skill-copy">Copy command</button>`;
+     <div class="skill-choice">
+       ${canLaunch ? `<button id="skill-run">▶ Run in terminal</button>` : ""}
+       <button id="skill-copy">Copy command</button>
+     </div>`;
   document.getElementById("skill-copy").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(body.command); showSkill("Command copied.", "ok"); }
     catch { showSkill("Couldn't copy — select the command and copy manually.", "error"); }
   });
+  if (canLaunch) {
+    document.getElementById("skill-run").addEventListener("click", () => runInTerminal(body));
+  }
+}
+
+async function runInTerminal(cliBody) {
+  showSkill("Opening a new terminal…", "");
+  try {
+    const resp = await fetch("/api/skills/launch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // selectedJob is the role currently open in the side panel; the server
+      // rebuilds the exact same command from {skill, num} so a cross-origin
+      // attacker can't smuggle an arbitrary command through this endpoint.
+      body: JSON.stringify({ skill: currentSkill.id, num: String(selectedJob.num) }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `launch failed (${resp.status})`);
+    showSkill("Terminal opened — the agent is running in the new window.", "ok");
+  } catch (e) {
+    showSkill(String(e.message || e), "error");
+  }
 }
 
 function showSkill(text, kind) {

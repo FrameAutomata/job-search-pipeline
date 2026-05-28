@@ -373,6 +373,50 @@ def run_skill(req: SkillRequest) -> JSONResponse:
     raise HTTPException(status_code=400, detail="path must be 'api' or 'cli'.")
 
 
+class SkillLaunchRequest(BaseModel):
+    skill: str
+    num: str
+
+
+@app.post("/api/skills/launch")
+def launch_skill(req: SkillLaunchRequest) -> JSONResponse:
+    """Open a new terminal window and run the skill's CLI hand-off command —
+    one-click alternative to copy/paste. The command is rebuilt server-side
+    (same logic as the CLI path of /api/skills/run), so the client can't smuggle
+    arbitrary commands; the new window is visible and the user can kill it."""
+    if not skills.terminal_available():
+        raise HTTPException(
+            status_code=501,
+            detail="Run-in-terminal isn't wired up on this OS yet. Use Copy command.",
+        )
+    if req.skill not in skills.SKILLS:
+        raise HTTPException(status_code=404, detail=f"Unknown skill {req.skill!r}.")
+    if not skills.cli_available():
+        raise HTTPException(
+            status_code=400,
+            detail=f"No agent CLI found (looked for '{skills.cli_name()}'). "
+                   "Install one or set BATCH_CLI.",
+        )
+    role = _find_role(req.num)
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
+    company = role.get("company") or "company"
+    title = role.get("role") or "role"
+    report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
+    command = skills.skill_command(req.skill, report_file, company, title)
+    # Launch from the repo root so the `cd career-ops` at the start of the
+    # command resolves consistently regardless of where the UI was launched.
+    try:
+        info = skills.launch_in_terminal(command, str(ROOT))
+    except skills.SkillError as e:
+        raise HTTPException(status_code=501, detail=str(e))
+    except OSError as e:  # rare: temp-file or Popen problem
+        raise HTTPException(status_code=502, detail=f"Couldn't open a terminal: {e}")
+    return JSONResponse({
+        "ok": True, "launched": True, "command": command, **info,
+    })
+
+
 @app.get("/api/skills/output/{filename}")
 def skill_output(filename: str) -> FileResponse:
     """Download a generated skill artifact from the local career-ops output/."""
