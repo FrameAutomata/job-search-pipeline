@@ -657,6 +657,54 @@ async function promptForSearchSettings(autoMode) {
 
 
 // ============================================================
+// Prompt for Evaluation Config (local Ollama vs cloud API)
+// ============================================================
+
+async function promptForEvaluationConfig(autoMode) {
+  if (autoMode) return null;
+
+  console.log('\n🤖 Evaluation Method');
+  console.log('='.repeat(60));
+  console.log('\nHow will you evaluate job matches? (used by --evaluate-batch)');
+  console.log('  1. Cloud API — add a provider key to .env (Gemini free tier recommended)');
+  console.log('  2. Local model via Ollama — runs on your machine, no API key needed');
+
+  const choice = await prompt('\nChoice [1/2, default: 1]\n→ ');
+
+  if (/^2/.test((choice || '').trim())) {
+    const urlInput = await prompt('\nOllama server URL [http://localhost:11434]\n→ ');
+    const modelInput = await prompt('\nOllama model [qwen2.5:32b]\n→ ');
+    return {
+      provider: 'ollama',
+      ollamaBaseUrl: (urlInput || '').trim() || 'http://localhost:11434',
+      ollamaModel: (modelInput || '').trim() || 'qwen2.5:32b',
+    };
+  }
+  return null;
+}
+
+/**
+ * Uncomment or set a single var in .env content, or append it if absent.
+ * Handles both `# KEY=val` and `KEY=val` existing lines.
+ */
+function setEnvVar(content, key, value) {
+  const re = new RegExp(`^#?\\s*${key}=.*$`, 'm');
+  const line = `${key}=${value}`;
+  return re.test(content) ? content.replace(re, line) : content.trimEnd() + `\n${line}\n`;
+}
+
+function writeEvaluationEnvVars(ollamaConfig) {
+  let envContent = fs.existsSync(RESUME_ENV_PATH)
+    ? fs.readFileSync(RESUME_ENV_PATH, 'utf-8')
+    : '';
+  envContent = setEnvVar(envContent, 'BATCH_PROVIDER', ollamaConfig.provider);
+  envContent = setEnvVar(envContent, 'OLLAMA_BASE_URL', ollamaConfig.ollamaBaseUrl);
+  envContent = setEnvVar(envContent, 'BATCH_MODEL', ollamaConfig.ollamaModel);
+  envContent = setEnvVar(envContent, 'OLLAMA_MODEL', ollamaConfig.ollamaModel);
+  fs.writeFileSync(RESUME_ENV_PATH, envContent, 'utf-8');
+}
+
+// ============================================================
 // Prompt for Career Narrative (for _profile.md)
 // ============================================================
 
@@ -1382,6 +1430,9 @@ async function main() {
   // Prompt for career narrative (for _profile.md)
   const narrative = await promptForCareerNarrative(args.auto, info, criteria);
 
+  // Prompt for evaluation method (cloud API vs local Ollama)
+  const evalConfig = await promptForEvaluationConfig(args.auto);
+
   // Generate files
   log('Generating profile.yml, cv.md, and _profile.md...');
   const profile = generateProfile(info, criteria);
@@ -1400,6 +1451,10 @@ async function main() {
   if (searchFile) {
     success(`Search config updated: ${searchFile}`);
   }
+  if (evalConfig) {
+    writeEvaluationEnvVars(evalConfig);
+    success(`.env updated: BATCH_PROVIDER=ollama, OLLAMA_BASE_URL=${evalConfig.ollamaBaseUrl}, BATCH_MODEL=${evalConfig.ollamaModel}`);
+  }
 
   // Summary
   log('\n📋 Setup Complete!\n');
@@ -1414,6 +1469,11 @@ async function main() {
   console.log(`  - Target Roles: ${criteria.targetRoles.join(', ')}`);
   console.log(`  - Compensation: ${criteria.compensationTarget} (min: ${criteria.compensationMin})`);
   console.log(`  - Location preference: ${criteria.locationFlexibility}`);
+  if (evalConfig) {
+    console.log(`  - Evaluation: Ollama (${evalConfig.ollamaModel} @ ${evalConfig.ollamaBaseUrl})`);
+  } else {
+    console.log(`  - Evaluation: cloud API (add a provider key to .env — see .env.example)`);
+  }
   console.log(`  - Deal-breakers: ${narrative.dealBreakers.join(', ') || 'None specified'}`);
   console.log(`\n🔍 Search Settings (written to config/search.yml):`);
   for (const loc of searchSettings.locations) {

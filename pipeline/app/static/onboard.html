@@ -114,26 +114,39 @@
       <!-- 6. Provider -->
       <section class="step" data-step="5" hidden>
         <h2>AI evaluation provider</h2>
-        <p class="hint">Pick a provider and paste its API key. The key is written
+        <p class="hint" id="provider-hint">Pick a provider and paste its API key. The key is written
           straight to a GitHub secret (via stdin) and never logged or stored locally.</p>
         <div class="grid2">
           <label>Provider
-            <select name="provider">
+            <select name="provider" id="provider-select">
               <option value="gemini">Gemini (free tier available)</option>
               <option value="groq">Groq (free tier available)</option>
               <option value="openai">OpenAI</option>
               <option value="anthropic">Anthropic</option>
               <option value="deepinfra">DeepInfra</option>
               <option value="openrouter">OpenRouter</option>
+              <option value="ollama">Ollama (local — no API key needed)</option>
             </select>
           </label>
-          <label>Model override (optional)
+          <label id="batch-model-label">Model override (optional)
             <input name="batch_model" placeholder="leave blank for provider default" />
           </label>
         </div>
-        <label>API key
+        <label id="api-key-label">API key
           <input name="api_key" type="password" placeholder="paste your key" autocomplete="off" />
         </label>
+        <div id="ollama-fields" hidden>
+          <div class="grid2">
+            <label>Ollama server URL
+              <input name="ollama_base_url" placeholder="http://localhost:11434" />
+            </label>
+            <label>Ollama model
+              <input name="ollama_model" placeholder="qwen2.5:32b" />
+            </label>
+          </div>
+          <p class="hint">The server must be running when you evaluate jobs locally. For GitHub
+            Actions cloud automation, the server must be publicly reachable.</p>
+        </div>
       </section>
 
       <!-- 7. Review -->

@@ -19,6 +19,18 @@ const repoLine = document.getElementById("repo-line");
 const statusBanner = document.getElementById("status-banner");
 const reviewEl = document.getElementById("review");
 const reviewRepo = document.getElementById("review-repo");
+const providerSelect = document.getElementById("provider-select");
+const ollamaFieldsEl = document.getElementById("ollama-fields");
+const apiKeyLabel = document.getElementById("api-key-label");
+const providerHint = document.getElementById("provider-hint");
+
+function handleProviderChange() {
+  const isOllama = providerSelect.value === "ollama";
+  ollamaFieldsEl.hidden = !isOllama;
+  apiKeyLabel.hidden = isOllama;
+  providerHint.hidden = isOllama;
+}
+providerSelect.addEventListener("change", handleProviderChange);
 
 let current = 0;
 
@@ -69,6 +81,7 @@ function collectForm() {
 function renderReview() {
   const f = collectForm();
   const file = resumeInput.files[0];
+  const isOllama = f.provider === "ollama";
   const lines = [
     `Resume:        ${file ? file.name : "(none selected!)"}`,
     `Name:          ${f.name || "(default)"}`,
@@ -81,8 +94,9 @@ function renderReview() {
     `Recency:       ${f.hours_old || 24}h · results ${f.results_wanted || 100} · ${f.distance || 50}mi`,
     `Boards:        ${(f.sites || []).join(", ") || "(default)"}`,
     `Easy Apply:    ${f.include_easy_apply ? "yes" : "no"}`,
-    `Provider:      ${f.provider}${f.batch_model ? " · " + f.batch_model : ""}`,
-    `API key:       ${f.api_key ? "•".repeat(Math.min(12, f.api_key.length)) + " (will be written)" : "(none — required)"}`,
+    isOllama
+      ? `Provider:      Ollama (local)\nOllama URL:    ${f.ollama_base_url || "http://localhost:11434"}\nOllama model:  ${f.ollama_model || "qwen2.5:32b"}`
+      : `Provider:      ${f.provider}${f.batch_model ? " · " + f.batch_model : ""}\nAPI key:       ${f.api_key ? "•".repeat(Math.min(12, f.api_key.length)) + " (will be written)" : "(none — required)"}`,
   ];
   reviewEl.textContent = lines.join("\n");
 }
@@ -142,7 +156,7 @@ form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = collectForm();
   if (!resumeInput.files[0]) { showAction("Resume PDF is required.", "error"); showStep(0); return; }
-  if (!f.api_key) { showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return; }
+  if (!f.api_key && f.provider !== "ollama") { showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return; }
 
   const fd = new FormData();
   fd.append("resume", resumeInput.files[0]);
@@ -195,3 +209,4 @@ async function loadStatus() {
 
 showStep(0);
 loadStatus();
+handleProviderChange();

@@ -488,10 +488,11 @@ async def onboard_submit(
 
     provider = (payload.get("provider") or "").strip().lower()
     api_key = (payload.get("api_key") or "").strip()
-    if provider and provider not in onboard.PROVIDER_SECRETS:
+    is_ollama = provider == "ollama"
+    if provider and not is_ollama and provider not in onboard.PROVIDER_SECRETS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown provider {provider!r}. Valid: {', '.join(onboard.PROVIDER_SECRETS)}",
+            detail=f"Unknown provider {provider!r}. Valid: {', '.join(onboard.PROVIDER_SECRETS)} or 'ollama'",
         )
 
     # Privacy guard: never write secrets to a public repo.
@@ -532,13 +533,19 @@ async def onboard_submit(
     except onboard.OnboardError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Write the artifact secrets, then the provider key, then optional vars.
+    # Write the artifact secrets, then provider config, then optional vars.
     written: list[str] = []
     try:
         for name, b64 in blobs.items():
             gh.set_secret(name, b64)
             written.append(name)
-        if provider and api_key:
+        if is_ollama:
+            ollama_url = (payload.get("ollama_base_url") or "http://localhost:11434").strip()
+            ollama_model = (payload.get("ollama_model") or "qwen2.5:32b").strip()
+            gh.set_variable("BATCH_PROVIDER", "ollama")
+            gh.set_variable("OLLAMA_BASE_URL", ollama_url)
+            gh.set_variable("OLLAMA_MODEL", ollama_model)
+        elif provider and api_key:
             secret = onboard.PROVIDER_SECRETS[provider]
             gh.set_secret(secret, api_key)
             written.append(secret)
