@@ -74,6 +74,21 @@ class TestRunErrorHandling:
         with pytest.raises(gh.GhError, match="Couldn't launch gh at '/fake/gh'"):
             gh.current_repo()
 
+    def test_both_attempts_fail_surfaces_winerror(self, mocker):
+        # When both direct and shell-mediated launch fail, the WinError code
+        # from the OS shows up in the error message so the user can tell an AV
+        # block (5) from a policy block (1260) from file-not-found (2).
+        mocker.patch("pipeline.app.gh._resolve_gh", return_value="/fake/gh")
+        access_denied = PermissionError(13, "Access is denied")
+        access_denied.winerror = 5
+        mocker.patch("pipeline.app.gh.subprocess.run", side_effect=access_denied)
+        with pytest.raises(gh.GhError) as ei:
+            gh.current_repo()
+        msg = str(ei.value)
+        assert "/fake/gh" in msg
+        assert "winerror=5" in msg
+        assert "ACCESS_DENIED" in msg  # the hint is surfaced
+
     def test_shell_fallback_used_when_direct_fails(self, mocker):
         # Direct CreateProcess fails (some Windows EDR / config blocks it), but
         # the shell=True retry succeeds. The first call raised; the second

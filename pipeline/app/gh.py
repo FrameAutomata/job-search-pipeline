@@ -99,6 +99,42 @@ def _resolve_gh() -> str | None:
     return None
 
 
+# Common Windows error codes we hit when a launch is blocked, with a one-line
+# explanation of what each typically means in this context. Helps the user
+# pinpoint the real cause (AV/EDR vs missing file vs policy) instead of guessing.
+_WINERROR_HINTS = {
+    2:    "ERROR_FILE_NOT_FOUND — the OS reports the executable can't be located.",
+    3:    "ERROR_PATH_NOT_FOUND — a directory along the path is missing.",
+    5:    "ERROR_ACCESS_DENIED — usually an AV/EDR or AppLocker rule blocking python.exe from launching this binary. Check Defender / your security tool's logs.",
+    740:  "ERROR_ELEVATION_REQUIRED — launching this needs admin elevation.",
+    1260: "ERROR_ACCESS_DISABLED_BY_POLICY — Group Policy / AppLocker / SRP is blocking the launch.",
+}
+
+
+def _fmt_oserror(exc: OSError) -> str:
+    win = getattr(exc, "winerror", None)
+    return f"winerror={win}, errno={exc.errno}, strerror={exc.strerror!r}"
+
+
+def _explain_launch_failure(gh_bin: str, direct_err: OSError,
+                            shell_err: OSError) -> str:
+    """Build a diagnostic error message when both the direct and shell-mediated
+    gh launches failed. Surfaces the Windows error codes so the user (and we)
+    can tell AV/EDR blocks (winerror 5) from policy blocks (1260) from genuine
+    file-not-found cases — instead of all of them collapsing to one message."""
+    win = (getattr(shell_err, "winerror", None) or
+           getattr(direct_err, "winerror", None))
+    hint = _WINERROR_HINTS.get(win, "")
+    return (
+        f"Couldn't launch gh at {gh_bin!r}. "
+        f"Direct: {_fmt_oserror(direct_err)}. "
+        f"Shell:  {_fmt_oserror(shell_err)}. "
+        + (hint + " " if hint else "")
+        + "Set GH_BIN to a working gh executable, or reinstall from "
+          "https://cli.github.com."
+    )
+
+
 def _run(args: list[str], timeout: int = 120, stdin: str | None = None) -> str:
     """Run `gh <args>`, returning stdout. Raises GhError on any failure.
 
@@ -120,24 +156,20 @@ def _run(args: list[str], timeout: int = 120, stdin: str | None = None) -> str:
             [gh_bin, *args], capture_output=True, text=True, timeout=timeout,
             input=stdin,
         )
-    except FileNotFoundError:
-        # Direct CreateProcess returned ERROR_FILE_NOT_FOUND despite the path
-        # existing. Seen on Windows when an EDR/AV product blocks direct exec by
-        # the uvicorn process but allows cmd-mediated launches, and in some
-        # configurations where CreateProcess can't resolve a path that cmd.exe
-        # resolves fine. Retry once via shell=True so cmd.exe does the launch.
+    except OSError as direct_err:
+        # Catch OSError (not just FileNotFoundError) so PermissionError
+        # (winerror 5 = ACCESS_DENIED, common when an EDR/AV blocks direct exec)
+        # and policy-block errors (winerror 1260) don't escape as uncaught 500s.
+        # Retry once via shell=True so cmd.exe does the launch — some envs allow
+        # cmd-mediated launches where direct CreateProcess is blocked.
         try:
             r = subprocess.run(
                 subprocess.list2cmdline([gh_bin, *args]),
                 capture_output=True, text=True, timeout=timeout, input=stdin,
                 shell=True,
             )
-        except FileNotFoundError:
-            raise GhError(
-                f"Couldn't launch gh at {gh_bin!r}, even via the shell. Set "
-                "GH_BIN to a working gh executable, or reinstall from "
-                "https://cli.github.com."
-            )
+        except OSError as shell_err:
+            raise GhError(_explain_launch_failure(gh_bin, direct_err, shell_err))
     except subprocess.TimeoutExpired:
         raise GhError(f"gh {' '.join(args)} timed out after {timeout}s")
     if r.returncode != 0:
