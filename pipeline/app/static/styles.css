@@ -263,6 +263,31 @@ tbody tr.selected { background: #233047; }
 }
 #report-close:hover { color: var(--text); }
 
+.skill-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.skill-actions button {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+}
+.skill-actions button:hover { border-color: var(--accent); color: var(--accent); }
+
+.skill-panel {
+  margin: 0 16px; padding: 10px 12px; font-size: 13px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--muted);
+}
+.skill-panel.ok { color: var(--good); border-color: rgba(63,185,80,0.4); background: rgba(63,185,80,0.10); }
+.skill-panel.error { color: var(--bad); border-color: rgba(248,81,73,0.4); background: rgba(248,81,73,0.10); }
+.skill-panel p { margin: 0 0 8px; }
+.skill-choice { display: flex; flex-wrap: wrap; gap: 8px; }
+.skill-choice button, #skill-copy {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+}
+.skill-choice button:hover, #skill-copy:hover { border-color: var(--accent); color: var(--accent); }
+.skill-cmd { white-space: pre-wrap; word-break: break-all; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px; color: var(--text); }
+.skill-download { color: var(--accent); text-decoration: none; font-weight: 600; }
+
 #report-body { padding: 8px 20px 40px; }
 #report-body table { width: auto; margin: 12px 0; }
 #report-body th, #report-body td { white-space: normal; max-width: none; border: 1px solid var(--border); }

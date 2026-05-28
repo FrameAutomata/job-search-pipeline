@@ -52,9 +52,9 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | `orchestrate.py`                        | Main entrypoint — chains all stages, parses CLI flags                                            |
 | `run.ps1` / `run.sh`                    | Wrappers — activate venv, route `--batch` to the career-ops CLI runner                           |
 | `run-ui.ps1` / `run-ui.sh`              | Launch the local triage UI (`pipeline/app`, FastAPI on localhost) — read-only results view       |
-| `pipeline/app/`                         | Local web UI — `server.py` (FastAPI routes), `data.py` (parse applications.md + render reports), `static/` (SPA). Deps in `requirements-ui.txt`. |
+| `pipeline/app/`                         | Local web UI — `server.py` (FastAPI routes + a localhost-only cross-origin guard), `data.py` (parse applications.md + render reports), `skills.py` (career-ops skill launchpad: capability detection + a skill registry — résumé-markdown via API or CLI, and PDF / interview-prep / apply via CLI hand-off), `static/` (SPA). Deps in `requirements-ui.txt`. |
 | `config/search.yml`                     | **Edit this** — searches, filters, screening config                                              |
-| `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`      |
+| `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`, `SKILL_PATH_DEFAULT` |
 | `resumes/resume.pdf`                    | Resume used to extract scoring keywords                                                          |
 | `output/jobs.csv`                       | Raw scrape output                                                                                |
 | `output/filtered_jobs.csv`              | Score-filtered and screened jobs                                                                 |

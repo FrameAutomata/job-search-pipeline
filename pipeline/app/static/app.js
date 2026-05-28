@@ -219,9 +219,13 @@ function updatePushButton() {
   }
 }
 
+let selectedJob = null;
+
 async function openReport(job) {
   if (!job.report_num) return;
   selectedNum = job.report_num;
+  selectedJob = job;
+  resetSkillPanel();
   render();
   els.reportLink.href = extractUrl(job) || "#";
   els.reportBody.innerHTML = "<p class='empty'>Loading…</p>";
@@ -343,4 +347,124 @@ els.pushBtn.addEventListener("click", async () => {
   }
 });
 
+// ── career-ops skills ──────────────────────────────────────────────────────
+
+const skillActions = document.getElementById("skill-actions");
+const skillPanel = document.getElementById("skill-panel");
+let CAPS = { cli: { available: false }, api: { available: false }, default_path: "ask", skills: [] };
+
+async function loadCaps() {
+  try {
+    CAPS = await (await fetch("/api/capabilities")).json();
+  } catch { /* leave defaults; buttons explain the no-capability case */ }
+  renderSkillActions();
+}
+
+// One button per skill in the report header. Rendered once caps are known.
+function renderSkillActions() {
+  skillActions.innerHTML = "";
+  for (const skill of CAPS.skills || []) {
+    const btn = document.createElement("button");
+    btn.textContent = skill.label;
+    btn.title = `Run "${skill.label}" for this role`;
+    btn.addEventListener("click", () => startSkill(skill));
+    skillActions.appendChild(btn);
+  }
+}
+
+function resetSkillPanel() {
+  skillPanel.hidden = true;
+  skillPanel.innerHTML = "";
+}
+
+// Which paths can run THIS skill: CLI works for all; API only for api-capable
+// skills with a key configured.
+function pathsFor(skill) {
+  return { cli: !!CAPS.cli.available, api: !!(skill.api && CAPS.api.available) };
+}
+
+// Decide the path, honoring a set default then availability.
+function choosePath(skill) {
+  const { cli, api } = pathsFor(skill);
+  if (!cli && !api) return "none";
+  const def = CAPS.default_path;
+  if (def === "cli" && cli) return "cli";
+  if (def === "api" && api) return "api";
+  if (cli && api) return "choose";   // default is "ask" → let the user pick
+  return cli ? "cli" : "api";
+}
+
+function startSkill(skill) {
+  if (!selectedJob) return;
+  const path = choosePath(skill);
+  if (path === "none") {
+    // Skill is unrunnable: say specifically what's missing for it.
+    const need = skill.api
+      ? "Install an agent CLI (e.g. claude) or set an LLM API key (e.g. GEMINI_API_KEY)"
+      : "This skill needs an agent CLI (live browser / web search). Install one (e.g. claude) or set BATCH_CLI";
+    showSkill(`Can't run “${skill.label}” yet. ${need}, then reload.`, "error");
+    return;
+  }
+  if (path === "choose") {
+    skillPanel.hidden = false;
+    skillPanel.className = "skill-panel";
+    skillPanel.innerHTML =
+      `<p>Run “${escapeHtml(skill.label)}” via:</p>
+       <div class="skill-choice">
+         <button data-path="api">⚡ API — ${escapeHtml(CAPS.api.provider || "provider")} (bounded, no install)</button>
+         <button data-path="cli">⌨ CLI — ${escapeHtml(CAPS.cli.name)} (interactive, uses your agent)</button>
+       </div>`;
+    skillPanel.querySelectorAll("button[data-path]").forEach((b) =>
+      b.addEventListener("click", () => runSkill(skill, b.dataset.path)));
+    return;
+  }
+  runSkill(skill, path);
+}
+
+async function runSkill(skill, path) {
+  const job = selectedJob;
+  showSkill(path === "api" ? `Running “${skill.label}” via the API…` : "Building the CLI command…", "");
+  try {
+    const resp = await fetch("/api/skills/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skill: skill.id, num: String(job.num), path }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `skill failed (${resp.status})`);
+    if (body.path === "cli") renderCliResult(body);
+    else renderApiResult(body);
+  } catch (e) {
+    showSkill(String(e.message || e), "error");
+  }
+}
+
+function renderApiResult(body) {
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel ok";
+  skillPanel.innerHTML =
+    `<p>Generated via ${escapeHtml(body.provider)}:</p>
+     <a class="skill-download" href="${escapeAttr(body.download_url)}" download>⬇ ${escapeHtml(body.output_file)}</a>`;
+}
+
+function renderCliResult(body) {
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel";
+  skillPanel.innerHTML =
+    `<p>Run this in your terminal (interactive — refines with your agent):</p>
+     <pre class="skill-cmd"><code>${escapeHtml(body.command)}</code></pre>
+     <button id="skill-copy">Copy command</button>`;
+  document.getElementById("skill-copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(body.command); showSkill("Command copied.", "ok"); }
+    catch { showSkill("Couldn't copy — select the command and copy manually.", "error"); }
+  });
+}
+
+function showSkill(text, kind) {
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel" + (kind ? " " + kind : "");
+  skillPanel.innerHTML = `<p>${escapeHtml(text)}</p>`;
+}
+
+loadCaps();
 loadJobs();

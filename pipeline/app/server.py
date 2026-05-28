@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import shutil
+import urllib.parse
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -21,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline.app import data, gh, onboard
+from pipeline.app import data, gh, onboard, skills
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -70,17 +71,53 @@ class StatusChange(BaseModel):
     status: str
 
 
-def _career_ops() -> Path:
-    """Resolve the data directory. A successful Refresh wins; otherwise fall
-    back to CAREER_OPS_PATH (resolved like orchestrate.py does)."""
-    if _active_data_dir is not None:
-        return _active_data_dir
+def _career_ops_local() -> Path:
+    """The local career-ops install (CAREER_OPS_PATH, resolved like
+    orchestrate.py does). This is where cv.md / config / modes / output live —
+    a downloaded artifact only carries reports/ + data/, so skills that need the
+    CV must read from here, not from a Refresh artifact."""
     raw = os.environ.get("CAREER_OPS_PATH") or "career-ops"
     p = Path(raw)
     return p if p.is_absolute() else (ROOT / p).resolve()
 
 
+def _career_ops() -> Path:
+    """Resolve the data directory for reads (jobs, reports). A successful
+    Refresh wins; otherwise the local install."""
+    return _active_data_dir if _active_data_dir is not None else _career_ops_local()
+
+
 app = FastAPI(title="job-search-pipeline UI")
+
+# ── Cross-origin guard ───────────────────────────────────────────────────────
+# This server binds to localhost, but "localhost" is reachable from any web page
+# the user has open: a malicious site could fire a cross-origin `fetch` at
+# http://localhost:8000 and trigger secret writes, cloud runs, or skill
+# subprocesses (CSRF). Browsers attach an `Origin` header to such cross-origin
+# requests, so we refuse any state-changing request whose Origin is present and
+# not loopback. Same-origin SPA calls send a loopback Origin (allowed); non-
+# browser clients (curl, tests) send no Origin (allowed).
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    try:
+        return urllib.parse.urlsplit(origin).hostname in _LOOPBACK_HOSTS
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def _same_origin_guard(request, call_next):
+    if request.method in _MUTATING_METHODS:
+        origin = request.headers.get("origin")
+        if origin and not _is_loopback_origin(origin):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Cross-origin request refused (this UI is localhost-only)."},
+            )
+    return await call_next(request)
 
 
 @app.get("/api/jobs")
@@ -242,6 +279,107 @@ def run_pipeline() -> JSONResponse:
         return JSONResponse({"ok": True, "workflow": DAILY_WORKFLOW})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── career-ops skills ──────────────────────────────────────────────────────
+
+class SkillRequest(BaseModel):
+    skill: str
+    num: str
+    path: str  # "api" | "cli"
+
+
+def _find_role(num: str) -> dict | None:
+    for row in data.load_jobs(_career_ops())["rows"]:
+        if str(row.get("num")) == str(num):
+            return row
+    return None
+
+
+@app.get("/api/capabilities")
+def capabilities() -> JSONResponse:
+    """Report which skill execution paths are available (agent CLI / API key),
+    the user's preferred default, and the skill catalog, so the UI can render
+    actions and route or prompt per skill."""
+    return JSONResponse(skills.capabilities())
+
+
+@app.post("/api/skills/run")
+def run_skill(req: SkillRequest) -> JSONResponse:
+    """Run a career-ops skill for a triaged role.
+
+    `path="cli"` returns a ready-to-run command for the user's agent (we don't
+    spawn it) — works for every skill. `path="api"` runs a bounded synchronous
+    provider call and is only valid for skills that declare `api=True`
+    (currently résumé-markdown); CLI-only skills reject it with guidance."""
+    spec = skills.SKILLS.get(req.skill)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unknown skill {req.skill!r}.")
+    role = _find_role(req.num)
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
+    company = role.get("company") or "company"
+    title = role.get("role") or "role"
+    report_rel = role.get("report_path") or ""
+
+    if req.path == "cli":
+        if not skills.cli_available():
+            raise HTTPException(
+                status_code=400,
+                detail=f"No agent CLI found (looked for '{skills.cli_name()}'). "
+                       "Install one or set BATCH_CLI"
+                       + ("." if not spec["api"] else ", or use the API path."),
+            )
+        return JSONResponse({
+            "ok": True, "path": "cli",
+            "command": skills.skill_command(req.skill, report_rel, company, title),
+            "cwd": "career-ops",
+        })
+
+    if req.path == "api":
+        if not spec["api"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{spec['label']}' is CLI-only (it needs agent tools the "
+                       "API path can't provide). Use the CLI path.",
+            )
+        provider = skills.detect_provider()
+        if provider is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No LLM API key configured. Set one (e.g. GEMINI_API_KEY) "
+                       "or use the CLI path.",
+            )
+        # The report is the JD signal; resolve it from the active data dir.
+        report_file = data.find_report_file(_career_ops() / "reports", role.get("report_num", ""))
+        role_context = report_file.read_text(encoding="utf-8") if report_file else \
+            f"# {company} — {title}\n(No evaluation report on disk; tailor from the CV only.)"
+        try:
+            out = skills.tailor_resume_markdown(
+                _career_ops_local(), role_context, company,
+                provider, os.environ.get("BATCH_MODEL") or None,
+            )
+        except skills.SkillError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception as e:  # provider/SDK failure
+            raise HTTPException(status_code=502, detail=f"Provider call failed: {e}")
+        return JSONResponse({
+            "ok": True, "path": "api", "provider": provider,
+            "output_file": out.name,
+            "download_url": f"/api/skills/output/{out.name}",
+        })
+
+    raise HTTPException(status_code=400, detail="path must be 'api' or 'cli'.")
+
+
+@app.get("/api/skills/output/{filename}")
+def skill_output(filename: str) -> FileResponse:
+    """Download a generated skill artifact from the local career-ops output/."""
+    safe = Path(filename).name  # strip any path components (traversal guard)
+    f = _career_ops_local() / "output" / safe
+    if not f.exists():
+        raise HTTPException(status_code=404, detail="Output file not found.")
+    return FileResponse(str(f), filename=safe, media_type="text/markdown")
 
 
 # ── Onboarding (Phase 3) ───────────────────────────────────────────────────

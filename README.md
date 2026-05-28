@@ -155,6 +155,7 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Ollama model used when `BATCH_CLI=opencode` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. See [QUICKSTART](QUICKSTART.md#which-provider-should-i-pick) for picking one. |
 | `OPENAI_BASE_URL` | OpenAI's default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint. |
+| `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the UI: `ask` (choose each time), `api`, or `cli`. |
 
 ## Screening (opt-in)
 
@@ -235,6 +236,31 @@ Point it at either your local `career-ops/` directory (if you run the pipeline l
 - **⚙ Setup** — opens the guided onboarding wizard (see below).
 
 `gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override.
+
+### Running career-ops skills from the UI
+
+After the cloud pipeline has scraped and scored, open a role's report in the side panel — each report has a row of **skill actions** that run the matching career-ops mode for that role:
+
+| Action | What it does | Runs via |
+|--------|--------------|----------|
+| **Tailor résumé (Markdown)** | JD-matched résumé as `.md` you can drop into your own format | API **or** CLI |
+| **Tailor résumé (PDF)** | ATS-optimized PDF (rendered with Playwright) | CLI only |
+| **Interview prep** | company/role interview intel with live web research | CLI only |
+| **Apply assistant** | reads the application form in your browser and drafts answers | CLI only |
+
+Each skill runs one of two ways, and you choose per action:
+
+- **API** — a bounded, synchronous provider call (uses the LLM keys you already configured). Zero install, finishes in place, returns a downloadable file. No live web research or back-and-forth — so only the résumé-markdown skill offers it.
+- **CLI** — hands you a ready-to-run command for your agent (`BATCH_CLI`, default `claude`). Interactive, can pull the live JD, search the web, and drive a browser. We never run the agent for you — it runs in your terminal, where its tools and cost are visible. Every skill supports this path.
+
+The UI shows whichever paths each skill can use (an agent CLI on your PATH, an API key, or both). Set **`SKILL_PATH_DEFAULT=api|cli`** in `.env` to skip the chooser; leave it `ask` (default) to pick each time — handy if you'd rather spend an agent-CLI membership than API credits, or use the API for batch scoring and the CLI for tailoring.
+
+**Which should I use?**
+- *API* — fast, no install, good for tailoring résumés at volume; pick this if you don't want to install an agent. (Résumé-markdown only.)
+- *CLI* — interactive, with live web research and a real browser. Required for **PDF**, **interview-prep**, and the live **apply** assistant (they need tools the API path can't provide), and best when you want to iterate or pull the freshest JD.
+- *Both* — API for quick tailoring, CLI for depth and the browser-driven skills. Recommended for an active search.
+
+> Security: the UI is localhost-only and now refuses cross-origin state-changing requests, so a web page you have open can't trigger skill runs, cloud actions, or secret writes behind your back.
 
 ### Guided onboarding (`/onboard`)
 
