@@ -225,8 +225,74 @@ def test_launch_refused_when_no_cli(client, mocker, monkeypatch):
     assert "No agent CLI" in r.json()["detail"]
 
 
+def test_launch_macos_opens_terminal_app(client, mocker, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "darwin")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/local/bin/claude")
+    popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["launcher"] == "Terminal.app"
+    args, _ = popen.call_args
+    # `open -a Terminal <script.sh>` opens the script in Terminal.app.
+    cmd = args[0]
+    assert cmd[:3] == ["open", "-a", "Terminal"]
+    assert cmd[3].endswith(".sh")
+    # Script is executable and contains the cd, command, and key-wait.
+    assert os.access(cmd[3], os.X_OK)
+    script = open(cmd[3], encoding="utf-8").read()
+    assert "#!/usr/bin/env bash" in script
+    assert "cd '" in script  # POSIX-quoted cwd
+    assert "claude" in script
+    assert "read -n 1" in script
+
+
+def test_launch_linux_uses_first_resolved_terminal(client, mocker, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
+    monkeypatch.delenv("TERMINAL", raising=False)
+    # Only xterm and claude on PATH; the resolver should fall through to xterm.
+    available = {"claude", "xterm"}
+    mocker.patch("pipeline.app.skills.shutil.which",
+                 side_effect=lambda name: f"/usr/bin/{name}" if name in available else None)
+    popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["launcher"] == "xterm"
+    args, _ = popen.call_args
+    cmd = args[0]
+    assert cmd[0] == "xterm" and cmd[1] == "-e" and cmd[2].endswith(".sh")
+
+
+def test_launch_linux_honors_TERMINAL_env(client, mocker, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
+    monkeypatch.setenv("TERMINAL", "alacritty")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
+    popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["launcher"] == "alacritty"
+    args, _ = popen.call_args
+    assert args[0][0] == "alacritty"
+
+
+def test_launch_linux_no_terminal_emulator(client, mocker, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
+    monkeypatch.delenv("TERMINAL", raising=False)
+    # Only the agent CLI is on PATH — no terminal emulators.
+    mocker.patch("pipeline.app.skills.shutil.which",
+                 side_effect=lambda name: "/usr/bin/claude" if name == "claude" else None)
+    r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
+    # capabilities reports terminal.available == False → endpoint 501s.
+    assert r.status_code == 501
+    assert "terminal" in r.json()["detail"].lower()
+
+
 def test_launch_refused_on_unsupported_os(client, monkeypatch):
     monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "freebsd13")
     r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
     assert r.status_code == 501
 
