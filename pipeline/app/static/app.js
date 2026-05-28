@@ -204,20 +204,74 @@ async function changeStatus(job, newStatus) {
     const body = await resp.json();
     if (!resp.ok) throw new Error(body.detail || "status update failed");
     pending = body.pending;
-    updatePushButton();
+    schedulePush();
   } catch (e) {
     showAction(String(e.message || e), "error");
     await loadJobs(); // resync on failure
   }
 }
 
-function updatePushButton() {
-  if (pending > 0) {
-    els.pushBtn.hidden = false;
-    els.pushBtn.textContent = `⇧ Push ${pending} change${pending === 1 ? "" : "s"}`;
-  } else {
-    els.pushBtn.hidden = true;
+// Debounce window before auto-pushing pending status changes. Each push fires
+// the edit-tracker workflow on GitHub (Actions minutes!), so we let rapid
+// triage batch into a single push instead of one push per click.
+const AUTO_PUSH_DEBOUNCE_MS = 2500;
+
+let pushTimer = null;
+let pushInFlight = false;
+let pushQueued = false;     // a change arrived during an in-flight push
+let pushFailed = false;     // last push errored — stop auto-retrying, wait for user
+let pushBtnState = "idle";  // idle | scheduled | saving | error
+
+function schedulePush() {
+  updatePushButton();
+  if (pending === 0) return;
+  if (pushFailed) return;   // don't auto-retry; user clicks to retry
+  if (pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => { pushTimer = null; doAutoPush(); }, AUTO_PUSH_DEBOUNCE_MS);
+  setPushBtnState("scheduled");
+}
+
+async function doAutoPush() {
+  if (pushInFlight) { pushQueued = true; return; }
+  pushInFlight = true;
+  setPushBtnState("saving");
+  try {
+    const r = await postAction("/api/push-status");
+    await loadJobs();  // reflects merged/cleared state; sets pending from server
+    pushFailed = false;
+    const note = r.base === "refreshed"
+      ? "applied onto the latest cloud tracker"
+      : "pushed from the local tracker (couldn't refresh first)";
+    showAction(`Auto-saved ${r.pushed} status change${r.pushed === 1 ? "" : "s"} — ${note}.`, "ok");
+  } catch (e) {
+    pushFailed = true;
+    showAction(`Auto-save failed — click the button to retry. (${String(e.message || e)})`, "error");
+  } finally {
+    pushInFlight = false;
+    setPushBtnState(pushFailed ? "error" : "idle");
+    // If changes arrived mid-flight, schedule the next push.
+    if (pushQueued && !pushFailed) { pushQueued = false; schedulePush(); }
   }
+}
+
+function setPushBtnState(state) {
+  pushBtnState = state;
+  updatePushButton();
+}
+
+function updatePushButton() {
+  if (pending === 0) {
+    els.pushBtn.hidden = true;
+    return;
+  }
+  els.pushBtn.hidden = false;
+  els.pushBtn.disabled = pushBtnState === "saving";
+  const n = pending;
+  const plural = (k) => `${k} change${k === 1 ? "" : "s"}`;
+  if (pushBtnState === "saving")    els.pushBtn.textContent = `⏳ Saving ${plural(n)}…`;
+  else if (pushBtnState === "error") els.pushBtn.textContent = `⚠ Retry push of ${plural(n)}`;
+  else if (pushBtnState === "scheduled") els.pushBtn.textContent = `⏱ Auto-saving ${plural(n)}…`;
+  else                               els.pushBtn.textContent = `⇧ Push ${plural(n)}`;
 }
 
 let selectedJob = null;
@@ -357,21 +411,12 @@ runBtn.addEventListener("click", async () => {
   }
 });
 
-els.pushBtn.addEventListener("click", async () => {
-  els.pushBtn.disabled = true;
-  showAction("Refreshing latest tracker, applying your changes, pushing to GitHub…", "");
-  try {
-    const r = await postAction("/api/push-status");
-    await loadJobs();  // reflects the merged/cleared state
-    const note = r.base === "refreshed"
-      ? "applied onto the latest cloud tracker"
-      : "pushed from the local tracker (couldn't refresh first)";
-    showAction(`Pushed ${r.pushed} status change${r.pushed === 1 ? "" : "s"} — ${note}.`, "ok");
-  } catch (e) {
-    showAction(String(e.message || e), "error");
-  } finally {
-    els.pushBtn.disabled = false;
-  }
+els.pushBtn.addEventListener("click", () => {
+  // Manual "push now" / "retry": cancel any pending debounce and run immediately.
+  // Clears the failure flag so subsequent changes auto-push again if this works.
+  if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; }
+  pushFailed = false;
+  doAutoPush();
 });
 
 // ── career-ops skills ──────────────────────────────────────────────────────
