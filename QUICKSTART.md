@@ -16,7 +16,7 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 - Node.js 18+ (career-ops + profile setup)
 - A resume PDF
 - At least one of:
-  - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai) + [Ollama](https://ollama.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI
+  - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI — any of these can be backed by a local [Ollama](https://ollama.com) model via `OLLAMA_MODEL`
   - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
 
 ---
@@ -181,7 +181,8 @@ Results land in:
 Invokes `career-ops/batch/batch-runner.sh` using the CLI set by `BATCH_CLI` (default: `claude`). Supported: `claude`, `opencode`, `gemini`, `qwen`. Runs locally — the agent can read files, call WebSearch, and generate PDFs.
 
 ```bash
-# Use OpenCode + a local Ollama model instead of Claude
+# Use a local Ollama model with any supported CLI (e.g. Claude Code or OpenCode)
+OLLAMA_MODEL=qwen2.5:32b ./run.sh --batch
 BATCH_CLI=opencode OLLAMA_MODEL=qwen2.5:32b ./run.sh --batch
 ```
 
@@ -309,7 +310,7 @@ job-search-pipeline/
 | `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides detection) |
 | `BATCH_MODEL` | per-provider default | Model name for `--evaluate-batch` |
-| `OLLAMA_MODEL` | `qwen2.5:32b` | Local model passed to `--batch` when `BATCH_CLI=opencode` |
+| `OLLAMA_MODEL` | `qwen2.5:32b` | Model name passed as `--model` to whichever CLI `--batch` uses (works with any `BATCH_CLI`) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint for `--evaluate-batch --batch-provider ollama` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. |
 | `OPENAI_BASE_URL` | OpenAI default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint (local vLLM, custom proxy, etc.) |
