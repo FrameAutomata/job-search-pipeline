@@ -6,7 +6,6 @@ with real runs), so live behavior is verified manually.
 """
 
 import json
-import os
 import subprocess
 
 import pytest
@@ -204,32 +203,38 @@ class TestTriggerWorkflow:
         assert "-f" in args
         assert "applications_md_b64=QUJD" in args
 
-    def test_large_field_spilled_to_temp_file(self, mocker, tmp_path):
+    def test_large_field_piped_as_json_stdin(self, mocker):
         # Big values must not go through argv — Windows caps at ~32K direct and
-        # ~8K via cmd /c (ERROR_FILENAME_EXCED_RANGE / winerror 206). gh
-        # accepts `-f key=@path` to read the value from a file instead.
+        # ~8K via cmd /c (ERROR_FILENAME_EXCED_RANGE / winerror 206). And we
+        # can't use gh's `-f k=@path` spill: `-f` is raw-only and sends `@path`
+        # literally (the actual bug that broke Edit Tracker pushes — the GHA
+        # step received `@C:\Users\...\tmp.gh-field` and failed to decode it as
+        # base64). Fall back to `gh workflow run --json` on stdin instead.
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
         big = "A" * 10_000
         gh.trigger_workflow("edit-tracker.yml", fields={"applications_md_b64": big})
         args = run.call_args.args[0]
         # The literal value must NOT appear in argv...
-        joined = " ".join(args)
-        assert big not in joined
-        # ...instead, a -f k=@path reference is passed.
-        ref = next((a for a in args if a.startswith("applications_md_b64=@")), None)
-        assert ref is not None, f"expected -f applications_md_b64=@... reference, got {args}"
-        # The temp file should be cleaned up after the call completes.
-        path = ref.split("=@", 1)[1]
-        assert not os.path.exists(path), f"temp file {path} should have been deleted"
+        assert big not in " ".join(args)
+        # ...no `-f` / `-F` field passed inline...
+        assert "-f" not in args and "-F" not in args
+        # ...instead, `--json` is set and the dict is piped via stdin.
+        assert "--json" in args
+        assert json.loads(run.call_args.kwargs.get("input")) == {"applications_md_b64": big}
 
-    def test_mixed_fields_only_large_one_spilled(self, mocker):
+    def test_mixed_fields_any_large_value_triggers_json_stdin(self, mocker):
+        # If ANY field is oversized, the whole dict goes through stdin — we
+        # don't mix inline and stdin in the same call, that's not a gh mode.
         run = mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
         gh.trigger_workflow("edit-tracker.yml",
                             fields={"small": "x", "big": "A" * 10_000})
         args = run.call_args.args[0]
-        assert "small=x" in args                               # inline
-        assert any(a.startswith("big=@") for a in args)        # spilled
-        assert "big=" + "A" * 10_000 not in " ".join(args)     # never inline
+        assert "--json" in args
+        assert "-f" not in args
+        assert "A" * 10_000 not in " ".join(args)
+        assert json.loads(run.call_args.kwargs.get("input")) == {
+            "small": "x", "big": "A" * 10_000,
+        }
 
 
 class TestLatestSuccessfulRun:

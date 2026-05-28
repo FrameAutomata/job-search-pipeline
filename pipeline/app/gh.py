@@ -17,7 +17,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 
@@ -282,39 +281,33 @@ def set_variable(name: str, value: str) -> None:
     _run(["variable", "set", name, *_repo_args(), "--body", value])
 
 
-# Spill any field value at least this large to a temp file (passed via gh's
-# `-f k=@path` syntax) instead of argv. Windows' direct CreateProcess command
-# line caps at ~32,767 chars and cmd /c at ~8,191; one big base64 field (the
-# edit-tracker payload, ~tens of KB once you have many tracker rows) blows past
-# both → ERROR_FILENAME_EXCED_RANGE (winerror 206). 4 KB leaves comfortable
-# headroom for the rest of argv on every platform.
+# When any field is at least this large, fall back to feeding the whole input
+# dict as JSON on stdin via `gh workflow run --json`. Windows' direct
+# CreateProcess command line caps at ~32,767 chars and cmd /c at ~8,191; one big
+# base64 field (the edit-tracker payload, ~tens of KB once you have many tracker
+# rows) blows past both → ERROR_FILENAME_EXCED_RANGE (winerror 206). 4 KB
+# leaves comfortable headroom for the rest of argv on every platform.
+#
+# We can't use gh's `-f k=@file` spill trick: `-f` / `--raw-field` is
+# raw-string-only and sends `@path` literally; `-F` / `--field` does the @-
+# dereference but coerces value types, which mangles base64. `--json` on stdin
+# sidesteps both issues for any size of payload.
 _ARGV_SPILL_THRESHOLD = 4096
 
 
 def trigger_workflow(workflow: str, fields: dict | None = None) -> None:
-    """Dispatch a workflow_dispatch run of `workflow`. `fields` become `-f k=v`,
-    or `-f k=@tmpfile` for any value large enough to risk overflowing argv."""
+    """Dispatch a workflow_dispatch run of `workflow`. Small fields go inline
+    via `-f k=v`; if any value is large enough to risk overflowing argv, fall
+    back to feeding the whole input dict as JSON on stdin via
+    `gh workflow run --json`."""
+    fields = fields or {}
+    if any(len(v) >= _ARGV_SPILL_THRESHOLD for v in fields.values()):
+        _run(
+            ["workflow", "run", workflow, *_repo_args(), "--json"],
+            stdin=json.dumps(fields),
+        )
+        return
     args = ["workflow", "run", workflow, *_repo_args()]
-    temp_paths: list[str] = []
-    try:
-        for k, v in (fields or {}).items():
-            if len(v) >= _ARGV_SPILL_THRESHOLD:
-                # NamedTemporaryFile must be closed before gh reads it (Windows
-                # locks the file while the handle is open). delete=False so we
-                # control cleanup ourselves in the finally block.
-                tf = tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".gh-field", delete=False, encoding="utf-8",
-                )
-                tf.write(v)
-                tf.close()
-                temp_paths.append(tf.name)
-                args += ["-f", f"{k}=@{tf.name}"]
-            else:
-                args += ["-f", f"{k}={v}"]
-        _run(args)
-    finally:
-        for p in temp_paths:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+    for k, v in fields.items():
+        args += ["-f", f"{k}={v}"]
+    _run(args)
