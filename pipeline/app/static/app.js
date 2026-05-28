@@ -453,8 +453,19 @@ function renderCliResult(body) {
   skillPanel.hidden = false;
   skillPanel.className = "skill-panel";
   const canLaunch = !!(CAPS.terminal && CAPS.terminal.available);
+  const prereqs = body.prereqs || [];
+  // Prereq notes render any backtick-wrapped commands as <code> so the user
+  // can copy them. The notes themselves are server-controlled strings — never
+  // user input — so this rich rendering is safe.
+  const prereqHtml = prereqs.length
+    ? `<div class="skill-prereqs">
+         <strong>One-time setup for this skill:</strong>
+         <ul>${prereqs.map((n) => `<li>${renderPrereq(n)}</li>`).join("")}</ul>
+       </div>`
+    : "";
   skillPanel.innerHTML =
-    `<p>Run this in your terminal (interactive — refines with your agent):</p>
+    `${prereqHtml}
+     <p>Run this in your terminal (interactive — refines with your agent):</p>
      <pre class="skill-cmd"><code>${escapeHtml(body.command)}</code></pre>
      <div class="skill-choice">
        ${canLaunch ? `<button id="skill-run">▶ Run in terminal</button>` : ""}
@@ -492,6 +503,13 @@ function showSkill(text, kind) {
   skillPanel.hidden = false;
   skillPanel.className = "skill-panel" + (kind ? " " + kind : "");
   skillPanel.innerHTML = `<p>${escapeHtml(text)}</p>`;
+}
+
+// Prereq notes are server-controlled strings; we escape them, then promote
+// backtick-fenced spans to <code> so commands are visually distinct (and
+// easy to spot-copy).
+function renderPrereq(note) {
+  return escapeHtml(note).replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
 loadCaps();

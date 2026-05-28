@@ -212,31 +212,46 @@ def launch_in_terminal(command: str, cwd: str) -> dict:
 # Each skill maps to a career-ops mode. `api=True` means the work fits a single
 # bounded provider call (we implement a runner below); otherwise it's CLI-only
 # because it needs agent tools (browser, live web). `verb` fills the hand-off
-# prompt: "use {mode} mode to {verb} for {company} / {role}".
+# prompt. `prereqs` is a list of short one-line setup notes — surfaced inline
+# in the UI whenever a CLI hand-off is generated, so users see the requirement
+# right at the point of use instead of buried in docs.
+_PLAYWRIGHT_MCP_NOTE = (
+    "Needs the Playwright MCP server registered with your agent (one-time):  "
+    "`claude mcp add playwright -- npx -y @playwright/mcp@latest`"
+)
+_CHROMIUM_NOTE = (
+    "Needs Chromium installed for Playwright (one-time, in career-ops/):  "
+    "`npx playwright install chromium`"
+)
+
 SKILLS: dict[str, dict] = {
     "tailor-resume": {
         "label": "Tailor résumé (Markdown)",
         "mode": "text",
         "verb": "tailor my résumé (markdown output)",
         "api": True,
+        "prereqs": [],
     },
     "tailor-resume-pdf": {
         "label": "Tailor résumé (PDF)",
         "mode": "pdf",
         "verb": "generate a tailored ATS-optimized PDF résumé",
         "api": False,  # PDF rendering needs the agent (Playwright)
+        "prereqs": [_CHROMIUM_NOTE],
     },
     "interview-prep": {
         "label": "Interview prep",
         "mode": "interview-prep",
         "verb": "prep me for an interview",
         "api": False,  # needs live WebSearch research
+        "prereqs": [],
     },
     "apply": {
         "label": "Apply assistant",
         "mode": "apply",
         "verb": "help me fill out the application",
-        "api": False,  # needs a live browser
+        "api": False,  # needs a live browser via the Playwright MCP server
+        "prereqs": [_PLAYWRIGHT_MCP_NOTE, _CHROMIUM_NOTE],
     },
 }
 
@@ -249,7 +264,12 @@ def capabilities() -> dict:
         "terminal": {"available": terminal_available()},
         "default_path": default_path(),
         "skills": [
-            {"id": sid, "label": s["label"], "api": s["api"]}
+            {
+                "id": sid,
+                "label": s["label"],
+                "api": s["api"],
+                "prereqs": s.get("prereqs", []),
+            }
             for sid, s in SKILLS.items()
         ],
     }

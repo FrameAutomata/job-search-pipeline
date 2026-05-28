@@ -108,6 +108,32 @@ def test_cli_returns_command(client, mocker):
     assert report_ref.endswith("/reports/001-acme.md")
 
 
+def test_cli_returns_prereqs_for_browser_skill(client, mocker):
+    # `apply` needs the Playwright MCP server registered with claude; the API
+    # response must surface that one-time setup so the UI can display it inline.
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    r = client.post("/api/skills/run", json={"skill": "apply", "num": "1", "path": "cli"})
+    assert r.status_code == 200
+    prereqs = r.json().get("prereqs", [])
+    assert prereqs, "apply must list its setup prerequisites"
+    joined = " ".join(prereqs)
+    assert "Playwright MCP" in joined
+    assert "claude mcp add playwright" in joined
+
+
+def test_cli_no_prereqs_for_plain_resume_skill(client, mocker):
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "cli"})
+    assert r.json().get("prereqs") == []
+
+
+def test_capabilities_includes_per_skill_prereqs(client):
+    caps = client.get("/api/capabilities").json()
+    by_id = {s["id"]: s for s in caps["skills"]}
+    assert by_id["apply"]["prereqs"]
+    assert by_id["tailor-resume"]["prereqs"] == []
+
+
 def test_cli_command_per_skill_uses_mode(client, mocker):
     mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
     for skill, mode in [("interview-prep", "interview-prep"), ("apply", "apply"),

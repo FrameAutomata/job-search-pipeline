@@ -287,6 +287,20 @@ tbody tr.selected { background: #233047; }
 .skill-cmd { white-space: pre-wrap; word-break: break-all; background: var(--panel);
   border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px; color: var(--text); }
 .skill-download { color: var(--accent); text-decoration: none; font-weight: 600; }
+.skill-prereqs {
+  border-left: 3px solid var(--warn);
+  background: rgba(210,153,34,0.08);
+  padding: 6px 10px; margin: 0 0 10px;
+  border-radius: 4px;
+  color: var(--text);
+}
+.skill-prereqs strong { color: var(--warn); }
+.skill-prereqs ul { margin: 4px 0 0; padding-left: 20px; }
+.skill-prereqs code {
+  background: var(--panel); border: 1px solid var(--border);
+  padding: 1px 4px; border-radius: 3px; font-size: 12px;
+  word-break: break-all;
+}
 
 #report-body { padding: 8px 20px 40px; }
 #report-body table { width: auto; margin: 12px 0; }
