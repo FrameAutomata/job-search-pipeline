@@ -1,25 +1,20 @@
 name: Easy Apply Job Pipeline
 
-# Runs the "easy apply" pass every 4 hours. Easy-apply listings churn fast
+# Runs the "easy apply" pass every 8 hours. Easy-apply listings churn fast
 # (fill in hours) so we re-scrape often and rely on screen-stage dedup
 # against the cached scan-history so each run only evaluates genuinely
 # new + live postings.
 #
-# Schedule offset (02/06/10/14/18/22 UTC) avoids overlap with the 12:00
-# daily-pipeline run. It also chains off the daily pipeline: a successful
-# daily run triggers an easy-apply pass immediately after, so the freshest
-# easy-apply listings are picked up as soon as the daily scrape completes.
+# Schedule offset (06/14/22 UTC) avoids overlap with the 12:00 daily-pipeline
+# run.
 #
 # See daily-pipeline.yml for the full privacy model and secrets list.
 # This workflow refuses to run in a public repository.
 
 on:
   schedule:
-    - cron: '0 2,6,10,14,18,22 * * *'
+    - cron: '0 6,14,22 * * *'
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Daily Job Pipeline"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -33,6 +28,10 @@ env:
 
 jobs:
   preflight:
+    # Skip entirely in the upstream template repo so scheduled triggers consume
+    # zero Actions minutes there. Forks/template-uses have a different
+    # github.repository and proceed normally.
+    if: github.repository != 'FrameAutomata/job-search-pipeline'
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
@@ -58,11 +57,7 @@ jobs:
 
   scrape-and-evaluate:
     needs: preflight
-    # Run for schedule / manual dispatch always; for the daily-pipeline chain,
-    # only after a *successful* daily run (skip if it failed or was cancelled).
-    if: >-
-      needs.preflight.outputs.should_run == 'true' &&
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    if: needs.preflight.outputs.should_run == 'true'
     runs-on: ubuntu-latest
 
     steps:

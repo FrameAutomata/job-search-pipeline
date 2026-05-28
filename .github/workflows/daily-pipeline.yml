@@ -51,6 +51,11 @@ jobs:
   preflight:
     # Cheap gating job. Decides whether the real work runs. Keeps the privacy
     # guards in one place instead of repeated as `if:` on every downstream step.
+    #
+    # Skip entirely in the upstream template repo so scheduled triggers consume
+    # zero Actions minutes there. Forks/template-uses have a different
+    # github.repository and proceed normally.
+    if: github.repository != 'FrameAutomata/job-search-pipeline'
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
