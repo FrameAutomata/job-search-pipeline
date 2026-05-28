@@ -336,6 +336,7 @@ def run_skill(req: SkillRequest) -> JSONResponse:
             "ok": True, "path": "cli",
             "command": skills.skill_command(req.skill, report_file, company, title),
             "cwd": "career-ops",
+            "prereqs": spec.get("prereqs", []),
         })
 
     if req.path == "api":
