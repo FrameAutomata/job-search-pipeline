@@ -286,6 +286,61 @@ class TestWriteJobResult:
         out = write_job_result(response, meta, reports, tracker, "2026-01-01")
         assert "acme-corp-llc" in out["report_file"]
 
+    def test_url_spliced_into_notes_cell(self, tmp_path):
+        # The UI's "Open posting" link reads the URL out of the notes cell.
+        # Per our prompt, the LLM writes a freeform one-sentence summary there
+        # — typically no URL — so without this splice the link points to `#`
+        # for every row. Confirm we write the URL into the notes column.
+        reports = tmp_path / "reports"; reports.mkdir()
+        tracker = tmp_path / "tracker"; tracker.mkdir()
+        meta = {"id": "42", "report_num": "001", "company": "Acme",
+                "url": "https://www.linkedin.com/jobs/view/12345"}
+        write_job_result(self._make_response(), meta, reports, tracker, "2026-01-01")
+        written = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n")
+        cells = written.split("\t")
+        assert len(cells) == 9
+        assert "https://www.linkedin.com/jobs/view/12345" in cells[-1]
+        # Original LLM notes are preserved alongside the URL.
+        assert "APPLY" in cells[-1]
+
+    def test_url_injection_skipped_when_notes_already_have_a_url(self, tmp_path):
+        # Don't double up if the LLM already included a URL.
+        reports = tmp_path / "reports"; reports.mkdir()
+        tracker = tmp_path / "tracker"; tracker.mkdir()
+        existing = "https://other.example/posting"
+        tracker_row = f"1\t2026-01-01\tAcme\tEng\tEvaluada\t4.0/5\tnull\t[001](reports/001-acme-2026-01-01.md)\t{existing}"
+        meta = {"id": "42", "report_num": "001", "company": "Acme",
+                "url": "https://canonical.example/job"}
+        write_job_result(self._make_response(tracker=tracker_row), meta, reports, tracker, "2026-01-01")
+        written = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n")
+        notes = written.split("\t")[-1]
+        # Existing URL is preserved; we don't append the canonical one.
+        assert notes == existing
+
+    def test_url_injection_no_op_when_meta_lacks_url(self, tmp_path):
+        # Older callers / legacy state may pass meta without a url field.
+        # Leave the row untouched rather than write the literal "—  ".
+        reports = tmp_path / "reports"; reports.mkdir()
+        tracker = tmp_path / "tracker"; tracker.mkdir()
+        meta = {"id": "42", "report_num": "001", "company": "Acme"}  # no url
+        write_job_result(self._make_response(), meta, reports, tracker, "2026-01-01")
+        written = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n")
+        assert written.split("\t")[-1] == "APPLY"
+
+    def test_url_injection_no_op_on_malformed_row(self, tmp_path):
+        # If the LLM returned a row with the wrong number of columns, leave it
+        # alone rather than corrupt it by splitting/rejoining at the wrong
+        # boundary.
+        reports = tmp_path / "reports"; reports.mkdir()
+        tracker = tmp_path / "tracker"; tracker.mkdir()
+        malformed = "1\t2026-01-01\tAcme"  # only 3 cols
+        meta = {"id": "42", "report_num": "001", "company": "Acme",
+                "url": "https://example.com/job"}
+        write_job_result(self._make_response(tracker=malformed), meta, reports, tracker, "2026-01-01")
+        written = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n")
+        assert written == malformed
+        assert "example.com" not in written
+
 
 class TestRunMergeTracker:
     def test_returns_false_when_script_missing(self, tmp_path):

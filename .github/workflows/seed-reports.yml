@@ -1,0 +1,139 @@
+name: Seed Reports Cache
+
+# Manual one-shot to backfill `career-ops/reports` in the pipeline state cache
+# with every report from past `pipeline-output-*` artifacts. Run this once
+# after enabling reports-in-cache if you have older reports that never made
+# it into the cache — they exist only in 90-day-retention artifacts until
+# this workflow merges them in. After running, every future pipeline artifact
+# will contain the full accumulated history, not just that run's new reports.
+#
+# Triggers no scrape/evaluate/LLM work. Pure data move: list past successful
+# pipeline runs, download each one's `pipeline-output-*` artifact, copy any
+# `*.md` files under `reports/` into the cached `career-ops/reports/`, save.
+#
+# WARNING — concurrency:
+#   This writes to the same `pipeline-state-v1-*` cache that the scheduled
+#   pipelines use. The save step here doesn't know about evaluations that a
+#   daily / easy-apply run completed in parallel, so triggering it while
+#   another pipeline run is in flight can cause its updates to be overwritten.
+#   Wait until the Actions tab shows no running pipeline before clicking
+#   "Run workflow". The concurrency group below serializes against
+#   edit-tracker but NOT against daily/easy-apply (they use different groups).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: pipeline-state
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check repo visibility and template status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IS_TEMPLATE=$(gh api repos/${{ github.repository }} --jq .is_template)
+          VIS=$(gh api repos/${{ github.repository }} --jq .visibility)
+          echo "is_template=$IS_TEMPLATE visibility=$VIS"
+          if [ "$IS_TEMPLATE" = "true" ]; then
+            echo "Template repository — manual runs no-op here."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$VIS" != "private" ]; then
+            echo "::error::This workflow only runs in PRIVATE repositories."
+            exit 1
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+  seed:
+    needs: preflight
+    if: needs.preflight.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Restore pipeline state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            career-ops/data/scan-history.tsv
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
+            career-ops/reports
+          key: pipeline-state-v1-${{ github.run_id }}
+          restore-keys: |
+            pipeline-state-v1-
+
+      - name: Backfill reports from past pipeline-output artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p career-ops/reports
+          before=$(find career-ops/reports -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
+          echo "starting report count: $before"
+
+          # Collect successful run IDs from both pipeline workflows. gh's
+          # --workflow flag isn't repeatable, so loop. We pull up to 100 per
+          # workflow which comfortably covers the artifact retention window
+          # (90 days × 6+ runs/day = ~540 — most older runs will have expired
+          # artifacts anyway; gh run download silently skips those).
+          : > runs.txt
+          for wf in daily-pipeline.yml easy-apply-pipeline.yml; do
+            gh run list --workflow "$wf" --status success --limit 100 \
+              --json databaseId --jq '.[].databaseId' >> runs.txt || true
+          done
+          sort -u runs.txt -o runs.txt
+          echo "candidate runs: $(wc -l < runs.txt)"
+
+          mkdir -p artifacts
+          ok=0; skipped=0
+          while read -r run_id; do
+            [ -z "$run_id" ] && continue
+            rm -rf "artifacts/$run_id"
+            if gh run download "$run_id" --pattern 'pipeline-output-*' \
+                 --dir "artifacts/$run_id" >/dev/null 2>&1; then
+              # `cp -n` = no-clobber. If the cache already has a report file
+              # of the same name, the cached version wins. Backfill only fills
+              # gaps, never overwrites fresher data.
+              find "artifacts/$run_id" -path '*/reports/*.md' \
+                   -exec cp -n {} career-ops/reports/ \;
+              ok=$((ok + 1))
+            else
+              skipped=$((skipped + 1))
+            fi
+            rm -rf "artifacts/$run_id"
+          done < runs.txt
+
+          after=$(find career-ops/reports -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
+          echo "merged $ok artifact(s), skipped $skipped (expired or no artifact)"
+          echo "ending report count: $after (added $((after - before)))"
+
+      - name: Save pipeline state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            career-ops/data/scan-history.tsv
+            career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
+            career-ops/reports
+          key: pipeline-state-v1-${{ github.run_id }}
