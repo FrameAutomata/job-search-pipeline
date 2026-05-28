@@ -460,6 +460,18 @@ def onboard_status() -> JSONResponse:
     })
 
 
+@app.get("/api/onboard/load-config")
+def onboard_load_config() -> JSONResponse:
+    """Return the last-submitted onboarding form (minus api_key) so the wizard
+    can prefill every field on a revisit. Returns {"form": null, "has_resume":
+    false} on a first-time setup so the UI knows it's not in edit mode."""
+    resume_present = (ROOT / "resumes" / "resume.pdf").exists()
+    return JSONResponse({
+        "form": onboard.load_sidecar(ROOT),
+        "has_resume": resume_present,
+    })
+
+
 @app.post("/api/onboard/parse-resume")
 async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
     """Extract contact details from an uploaded resume PDF to autofill the
@@ -476,11 +488,16 @@ async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
 
 @app.post("/api/onboard")
 async def onboard_submit(
-    resume: UploadFile = File(...),
     form: str = Form(...),
+    resume: UploadFile = File(default=None),
 ) -> JSONResponse:
-    """Generate the profile artifacts from the uploaded resume + form answers and
-    write them as GitHub secrets. Refuses to write to a public repo."""
+    """Generate the profile artifacts from form answers (and optionally a new
+    resume) and write them as GitHub secrets. Refuses to write to a public repo.
+
+    Resume + API key are optional on re-submit. If no new resume is uploaded
+    and resumes/resume.pdf already exists locally, we reuse it (the user is
+    just tweaking config). Same for the API key: a blank value keeps whatever
+    is already in GitHub Secrets, avoiding a forced re-paste every edit."""
     try:
         payload = json.loads(form)
     except json.JSONDecodeError:
@@ -506,24 +523,35 @@ async def onboard_submit(
                     "so your job search stays off the public Actions tab."),
         )
 
-    # Extract resume text + persist the PDF (local keyword scoring) and .txt.
-    pdf_bytes = await resume.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="resume file is empty")
-    try:
-        resume_text = onboard.extract_pdf_text(pdf_bytes)
-    except Exception as e:  # pdfplumber raises various errors on bad PDFs
-        raise HTTPException(status_code=400, detail=f"could not read PDF: {e}")
-    if not resume_text.strip():
+    resumes_dir = ROOT / "resumes"
+    pdf_path = resumes_dir / "resume.pdf"
+    txt_path = resumes_dir / "resume.txt"
+
+    # Resume: prefer a freshly-uploaded PDF; fall back to the persisted one
+    # from a prior submit. UploadFile is always non-None when the multipart
+    # field exists, so check filename/size rather than identity.
+    pdf_bytes = await resume.read() if resume is not None else b""
+    if pdf_bytes:
+        try:
+            resume_text = onboard.extract_pdf_text(pdf_bytes)
+        except Exception as e:  # pdfplumber raises various errors on bad PDFs
+            raise HTTPException(status_code=400, detail=f"could not read PDF: {e}")
+        if not resume_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="No text found in the PDF (is it a scanned image?).",
+            )
+        resumes_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path.write_bytes(pdf_bytes)
+        txt_path.write_text(resume_text, encoding="utf-8")
+    elif txt_path.exists():
+        resume_text = txt_path.read_text(encoding="utf-8")
+    else:
         raise HTTPException(
             status_code=400,
-            detail="No text found in the PDF (is it a scanned image?).",
+            detail=("No resume on file — upload a PDF on the first onboarding "
+                    "step before submitting."),
         )
-
-    resumes_dir = ROOT / "resumes"
-    resumes_dir.mkdir(parents=True, exist_ok=True)
-    (resumes_dir / "resume.pdf").write_bytes(pdf_bytes)
-    (resumes_dir / "resume.txt").write_text(resume_text, encoding="utf-8")
 
     # Generate artifacts via the shared node generator, then collect base64.
     try:
@@ -532,7 +560,10 @@ async def onboard_submit(
     except onboard.OnboardError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Write the artifact secrets, then the provider key, then optional vars.
+    # Write the artifact secrets, then the provider key (if supplied), then
+    # optional vars. Blank api_key means "keep whatever's already in Secrets" —
+    # supports the common edit-mode flow where the user only changed search
+    # settings, not their provider.
     written: list[str] = []
     try:
         for name, b64 in blobs.items():
@@ -551,6 +582,10 @@ async def onboard_submit(
             status_code=502,
             detail=f"Wrote {written} but then gh failed: {e}",
         )
+
+    # Sidecar the (non-sensitive parts of the) payload so the next wizard
+    # visit can prefill instead of forcing a full re-fill.
+    onboard.save_sidecar(ROOT, payload)
 
     return JSONResponse({"ok": True, "repo": gh.current_repo(), "secrets_written": written})
 

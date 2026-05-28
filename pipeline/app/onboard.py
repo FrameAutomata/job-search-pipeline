@@ -50,10 +50,42 @@ SECRET_FILES = {
 }
 REQUIRED_SECRETS = ["SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64"]
 
+# Sidecar of the last submitted onboarding payload (minus the API key), so a
+# second visit to the wizard prefills every field instead of forcing the user
+# to re-fill the whole form just to tweak one knob like `results_wanted`.
+# Lives under .ui-cache/ — already gitignored. Excludes the API key so the
+# file is safe to keep on disk; provider key stays in GitHub Secrets.
+_SIDECAR_NAME = Path(".ui-cache") / "onboarding.json"
+
 
 # The generator script lives at the repo root regardless of which working dir
 # we run it in (production: the repo; tests: an isolated tmp dir).
 _SCRIPT = Path(__file__).resolve().parent.parent.parent / "setup-profile.mjs"
+
+
+def save_sidecar(root: Path, payload: dict) -> None:
+    """Persist the last-submitted onboarding form (minus api_key) so the
+    wizard can prefill on its next visit. Never raises — sidecar persistence
+    is a UX nicety; failures shouldn't fail the onboarding submission."""
+    sidecar = root / _SIDECAR_NAME
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {k: v for k, v in payload.items() if k != "api_key"}
+        sidecar.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_sidecar(root: Path) -> dict | None:
+    """Return the saved onboarding payload, or None if there isn't one yet
+    or the file is unreadable. Read-only — the wizard uses it for prefill."""
+    sidecar = root / _SIDECAR_NAME
+    if not sidecar.exists():
+        return None
+    try:
+        return json.loads(sidecar.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 class OnboardError(RuntimeError):
