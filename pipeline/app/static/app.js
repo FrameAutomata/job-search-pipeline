@@ -25,6 +25,7 @@ const els = {
   reportBody: document.getElementById("report-body"),
   reportClose: document.getElementById("report-close"),
   reportLink: document.getElementById("report-link"),
+  reportStatus: document.getElementById("report-status"),
   viewTable: document.getElementById("view-table"),
   viewBoard: document.getElementById("view-board"),
   pushBtn: document.getElementById("push-btn"),
@@ -228,6 +229,7 @@ async function openReport(job) {
   resetSkillPanel();
   render();
   els.reportLink.href = extractUrl(job) || "#";
+  els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : "Evaluated";
   els.reportBody.innerHTML = "<p class='empty'>Loading…</p>";
   els.reportPane.hidden = false;
   try {
@@ -292,6 +294,21 @@ els.reportClose.addEventListener("click", () => {
 
 els.viewTable.addEventListener("click", () => { view = "table"; render(); });
 els.viewBoard.addEventListener("click", () => { view = "board"; render(); });
+
+// Populate the report-pane status select once, then wire its change event to
+// the same persistence path the kanban uses (optimistic update + pending push).
+for (const s of STATES) {
+  const opt = document.createElement("option");
+  opt.value = s;
+  opt.textContent = s;
+  els.reportStatus.appendChild(opt);
+}
+els.reportStatus.addEventListener("change", () => {
+  if (!selectedJob) return;
+  const newStatus = els.reportStatus.value;
+  if (selectedJob.status_canonical === newStatus) return;
+  changeStatus(selectedJob, newStatus);
+});
 
 // ── Cloud actions (gh-backed) ────────────────────────────────────────────
 

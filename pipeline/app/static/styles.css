@@ -257,6 +257,11 @@ tbody tr.selected { background: #233047; }
   background: var(--panel);
 }
 .report-head a { color: var(--accent); text-decoration: none; font-size: 13px; }
+.report-head select {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 4px 8px; font-size: 13px; cursor: pointer;
+}
+.report-head select:hover { border-color: var(--accent); }
 #report-close {
   background: none; border: none; color: var(--muted);
   font-size: 16px; cursor: pointer;
