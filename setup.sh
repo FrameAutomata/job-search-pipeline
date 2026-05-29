@@ -31,6 +31,25 @@ echo "==> Installing career-ops node deps"
 echo "==> Installing pipeline node deps (yaml, pdf-parse)"
 (cd "$root" && npm install)
 
+echo "==> Installing Playwright Chromium (used by the PDF + apply skills, ~150 MB)"
+# `npx playwright install` is idempotent: it no-ops if Chromium of the same
+# version is already on disk, so re-running setup is cheap.
+if ! (cd "$root/career-ops" && npx --yes playwright install chromium); then
+  echo "    Playwright Chromium install failed. Re-run later from career-ops/." >&2
+fi
+
+echo "==> Registering the Playwright MCP server with Claude Code (for the apply skill)"
+if command -v claude >/dev/null 2>&1; then
+  # `claude mcp add` errors if the server is already registered. That's a
+  # benign re-run — log and continue rather than aborting the whole setup.
+  if ! claude mcp add playwright -- npx -y @playwright/mcp@latest; then
+    echo "    Playwright MCP already registered (or claude mcp add failed). Continuing." >&2
+  fi
+else
+  echo "    'claude' CLI not found on PATH — skipping. Install Claude Code, then run:" >&2
+  echo "      claude mcp add playwright -- npx -y @playwright/mcp@latest" >&2
+fi
+
 echo "==> Copying example configs"
 [ -f "$root/.env" ] || cp "$root/.env.example" "$root/.env"
 [ -f "$root/config/search.yml" ] || cp "$root/config/search.example.yml" "$root/config/search.yml"

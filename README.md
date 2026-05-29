@@ -260,7 +260,7 @@ The UI shows whichever paths each skill can use (an agent CLI on your PATH, an A
 - *CLI* — interactive, with live web research and a real browser. Required for **PDF**, **interview-prep**, and the live **apply** assistant (they need tools the API path can't provide), and best when you want to iterate or pull the freshest JD.
 - *Both* — API for quick tailoring, CLI for depth and the browser-driven skills. Recommended for an active search.
 
-**One-time setup for the browser-driven skills** (Apply assistant + PDF résumé). The UI surfaces these inline when you run the affected skill, but the same info up front:
+**One-time setup for the browser-driven skills** (Apply assistant + PDF résumé). `setup.ps1` / `setup.sh` does both of these for you now; the steps below are the manual fallback if setup couldn't (no `claude` on PATH, install failure, etc.) — the UI also surfaces them inline when you run the affected skill.
 
 - **Apply assistant** drives a live browser; your agent needs the **Playwright MCP server** registered. For Claude Code:
   ```bash
@@ -272,7 +272,7 @@ The UI shows whichever paths each skill can use (an agent CLI on your PATH, an A
   cd career-ops
   npx playwright install chromium
   ```
-  (Skipped by `setup.ps1`/`setup.sh` so you don't pay the ~150 MB download unless you actually use these skills.)
+  (~150 MB. Idempotent — re-running setup is cheap.)
 
 > Security: the UI is localhost-only and now refuses cross-origin state-changing requests, so a web page you have open can't trigger skill runs, cloud actions, or secret writes behind your back.
 
