@@ -21,8 +21,12 @@ on:
   workflow_dispatch:
     inputs:
       applications_md_b64:
-        description: "Base64 of applications.md. Win: [Convert]::ToBase64String([IO.File]::ReadAllBytes('applications.md')) · mac: base64 -i applications.md|tr -d '\\n' · linux: base64 -w0 applications.md. Not certutil."
-        required: true
+        description: "Full-file replacement: base64 of applications.md. Win: [Convert]::ToBase64String([IO.File]::ReadAllBytes('applications.md')) · mac: base64 -i applications.md|tr -d '\\n' · linux: base64 -w0 applications.md. Not certutil."
+        required: false
+        type: string
+      status_overrides_json:
+        description: "Status-only changes: JSON object of {\"num\": \"Status\"} pairs (e.g. {\"1\":\"Applied\",\"3\":\"SKIP\"}). Used by the UI push button — much smaller than a full-file dispatch, avoids the GitHub input size limit."
+        required: false
         type: string
 
 permissions:
@@ -64,6 +68,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate inputs
+        env:
+          MD_B64: ${{ inputs.applications_md_b64 }}
+          OVERRIDES: ${{ inputs.status_overrides_json }}
+        run: |
+          if [ -z "$MD_B64" ] && [ -z "$OVERRIDES" ]; then
+            echo "::error::Provide either applications_md_b64 (full tracker replacement) or status_overrides_json (status-only changes)."
+            exit 1
+          fi
+
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -83,6 +97,7 @@ jobs:
             pipeline-state-v1-
 
       - name: Decode and validate new applications.md
+        if: inputs.applications_md_b64 != ''
         env:
           APPLICATIONS_MD_B64: ${{ inputs.applications_md_b64 }}
         run: |
@@ -113,6 +128,43 @@ jobs:
           echo "New applications.md installed:"
           wc -l career-ops/data/applications.md
           head -n 5 career-ops/data/applications.md
+
+      - name: Apply status overrides
+        if: inputs.status_overrides_json != ''
+        env:
+          STATUS_OVERRIDES_JSON: ${{ inputs.status_overrides_json }}
+        run: |
+          python3 - << 'PYEOF'
+          import json, os, sys
+          overrides = json.loads(os.environ['STATUS_OVERRIDES_JSON'])
+          path = 'career-ops/data/applications.md'
+          if not os.path.exists(path):
+              print('::error::applications.md not found in the pipeline state cache.')
+              print('::error::Run the pipeline at least once before pushing status changes.')
+              sys.exit(1)
+          with open(path) as f:
+              text = f.read()
+          for num, status in overrides.items():
+              want = str(num).strip()
+              out_lines = []
+              changed = False
+              for line in text.splitlines():
+                  if not changed and line.lstrip().startswith('|'):
+                      parts = line.split('|')
+                      cells = [p.strip() for p in parts]
+                      if len(parts) >= 10 and cells[1] == want and cells[1] not in ('#', ''):
+                          parts[6] = ' ' + status + ' '
+                          line = '|'.join(parts)
+                          changed = True
+                  out_lines.append(line)
+              result = '\n'.join(out_lines)
+              if text.endswith('\n') and not result.endswith('\n'):
+                  result += '\n'
+              text = result
+          with open(path, 'w') as f:
+              f.write(text)
+          print(f'Applied {len(overrides)} status override(s) to {path}')
+          PYEOF
 
       - name: Save pipeline state cache
         if: always()
