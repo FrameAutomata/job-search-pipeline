@@ -49,6 +49,10 @@ PIPELINE_WORKFLOWS = [DAILY_WORKFLOW, EASY_APPLY_WORKFLOW]
 # tracker number → canonical status. Persisted so they survive a server
 # restart mid-triage; cleared on a successful push.
 OVERRIDES_FILE = ROOT / ".ui-cache" / "status-overrides.json"
+# Overrides that have been dispatched to the cloud but aren't yet reflected in
+# a pipeline artifact. Applied on every job load so statuses survive Refresh
+# and restarts; self-cleans entry-by-entry once the artifact catches up.
+PUSHED_OVERRIDES_FILE = ROOT / ".ui-cache" / "pushed-overrides.json"
 
 
 def _load_overrides() -> dict:
@@ -63,6 +67,20 @@ def _load_overrides() -> dict:
 def _save_overrides(d: dict) -> None:
     OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
     OVERRIDES_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
+
+
+def _load_pushed_overrides() -> dict:
+    if PUSHED_OVERRIDES_FILE.exists():
+        try:
+            return json.loads(PUSHED_OVERRIDES_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_pushed_overrides(d: dict) -> None:
+    PUSHED_OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PUSHED_OVERRIDES_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
 
 
 class StatusChange(BaseModel):
@@ -126,9 +144,30 @@ def list_jobs() -> JSONResponse:
     un-pushed status overrides so the board reflects pending edits across page
     reloads. Response: {"rows": [...], "source": ..., "pending": N}."""
     payload = data.load_jobs(_career_ops())
+    rows = payload["rows"]
+
+    # Apply pushed-overrides: changes dispatched to the cloud that aren't yet in
+    # a pipeline artifact. Self-clean any entry where the artifact has caught up.
+    pushed = _load_pushed_overrides()
+    if pushed:
+        caught_up: set[str] = set()
+        for row in rows:
+            num = str(row.get("num"))
+            if num in pushed:
+                if row.get("status_canonical") == pushed[num]:
+                    caught_up.add(num)
+                else:
+                    row["status"] = pushed[num]
+                    row["status_canonical"] = pushed[num]
+        if caught_up:
+            for num in caught_up:
+                del pushed[num]
+            _save_pushed_overrides(pushed)
+
+    # Apply pending-overrides: local kanban drags not yet pushed.
     overrides = _load_overrides()
     if overrides:
-        for row in payload["rows"]:
+        for row in rows:
             ov = overrides.get(str(row.get("num")))
             if ov:
                 row["status"] = ov
@@ -215,6 +254,11 @@ def push_status() -> JSONResponse:
 
     count = len(overrides)
     _save_overrides({})  # clear pending on success
+    # Persist dispatched overrides so they survive Refresh and restarts until
+    # the pipeline produces a new artifact that already has the correct statuses.
+    pushed = _load_pushed_overrides()
+    pushed.update(overrides)
+    _save_pushed_overrides(pushed)
     return JSONResponse({"ok": True, "pushed": count, "base": base_source})
 
 
