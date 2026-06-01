@@ -13,10 +13,15 @@ let pending = 0;
 // Canonical kanban columns — mirror of data.CANONICAL_STATES.
 const STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"];
 
+// Statuses hidden by default: terminal/actioned states where no further action is needed.
+const ACTIONED_STATUSES = new Set(["Applied", "Rejected", "Discarded", "SKIP"]);
+let hideActioned = localStorage.getItem("hideActioned") !== "false";
+
 const els = {
   body: document.getElementById("jobs-body"),
   filter: document.getElementById("filter"),
   statusFilter: document.getElementById("status-filter"),
+  hideActionedChk: document.getElementById("hide-actioned"),
   count: document.getElementById("count"),
   empty: document.getElementById("empty"),
   tablePane: document.getElementById("table-pane"),
@@ -79,6 +84,7 @@ function visibleRows() {
   const q = els.filter.value.trim().toLowerCase();
   const status = els.statusFilter.value;
   let rows = JOBS.filter((j) => {
+    if (hideActioned && ACTIONED_STATUSES.has(j.status_canonical)) return false;
     if (status && j.status !== status) return false;
     if (!q) return true;
     return [j.company, j.role, j.notes].some(
@@ -286,6 +292,12 @@ document.querySelectorAll("th[data-sort]").forEach((th) => {
 
 els.filter.addEventListener("input", render);
 els.statusFilter.addEventListener("change", render);
+els.hideActionedChk.checked = hideActioned;
+els.hideActionedChk.addEventListener("change", () => {
+  hideActioned = els.hideActionedChk.checked;
+  localStorage.setItem("hideActioned", hideActioned);
+  render();
+});
 els.reportClose.addEventListener("click", () => {
   els.reportPane.hidden = true;
   selectedNum = null;

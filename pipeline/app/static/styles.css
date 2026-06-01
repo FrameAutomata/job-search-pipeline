@@ -50,6 +50,9 @@ header h1 { margin: 0 0 12px; font-size: 18px; }
 
 .count { color: var(--muted); font-size: 13px; }
 
+.hide-actioned-label { font-size: 13px; cursor: pointer; white-space: nowrap; }
+.hide-actioned-label input[type="checkbox"] { cursor: pointer; }
+
 .spacer { flex: 1; }
 
 .toolbar button {

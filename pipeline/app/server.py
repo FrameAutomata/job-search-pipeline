@@ -10,7 +10,6 @@ Run:
 or use the run-ui.sh / run-ui.ps1 launchers.
 """
 
-import base64
 import json
 import os
 import shutil
@@ -207,10 +206,10 @@ def push_status() -> JSONResponse:
     apps.parent.mkdir(parents=True, exist_ok=True)
     apps.write_text(base_text, encoding="utf-8")
 
-    # Dispatch edit-tracker with the merged tracker.
-    b64 = base64.b64encode(base_text.encode("utf-8")).decode("ascii")
+    # Dispatch edit-tracker with only the pending overrides — avoids GitHub's
+    # workflow_dispatch input size limit that the full base64 tracker can exceed.
     try:
-        gh.trigger_workflow(EDIT_WORKFLOW, {"applications_md_b64": b64})
+        gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(overrides)})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
