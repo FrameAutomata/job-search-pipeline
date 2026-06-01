@@ -84,7 +84,7 @@ function visibleRows() {
   const q = els.filter.value.trim().toLowerCase();
   const status = els.statusFilter.value;
   let rows = JOBS.filter((j) => {
-    if (hideActioned && ACTIONED_STATUSES.has(j.status_canonical)) return false;
+    if (view === "table" && hideActioned && ACTIONED_STATUSES.has(j.status_canonical)) return false;
     if (status && j.status !== status) return false;
     if (!q) return true;
     return [j.company, j.role, j.notes].some(
