@@ -545,6 +545,93 @@ async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(onboard.parse_resume_info(text))
 
 
+_KNOWN_CLIS = ["claude", "gemini", "opencode", "qwen"]
+_KNOWN_PROVIDERS = set(onboard.PROVIDER_SECRETS) | {"ollama"}
+
+
+@app.get("/api/onboard/providers")
+def get_providers() -> JSONResponse:
+    """Return detected local LLM providers (API keys present in env) and
+    installed CLI tools so the setup wizard can show what's available for
+    local Add Job evaluations."""
+    api_providers = []
+    for name, key_var in onboard.PROVIDER_SECRETS.items():
+        api_providers.append({
+            "name": name,
+            "configured": bool(os.environ.get(key_var, "").strip()),
+            "key_var": key_var,
+            "default_model": PROVIDER_DEFAULTS.get(name, ""),
+        })
+    api_providers.append({
+        "name": "ollama",
+        "configured": bool(os.environ.get("OLLAMA_BASE_URL", "").strip()),
+        "key_var": "OLLAMA_BASE_URL",
+        "default_model": PROVIDER_DEFAULTS.get("ollama", "qwen2.5:32b"),
+    })
+    cli_tools = [
+        {"name": name, "available": shutil.which(name) is not None}
+        for name in _KNOWN_CLIS
+    ]
+    return JSONResponse({
+        "api_providers": api_providers,
+        "cli_tools": cli_tools,
+        "current": {
+            "batch_provider": os.environ.get("BATCH_PROVIDER", ""),
+            "batch_model": os.environ.get("BATCH_MODEL", ""),
+            "batch_cli": os.environ.get("BATCH_CLI", "claude"),
+        },
+        "provider_defaults": dict(PROVIDER_DEFAULTS),
+    })
+
+
+class LocalConfigRequest(BaseModel):
+    batch_provider: str = ""
+    batch_model: str = ""
+    batch_cli: str = ""
+
+
+@app.post("/api/onboard/local-config")
+def save_local_config(req: LocalConfigRequest) -> JSONResponse:
+    """Write BATCH_PROVIDER, BATCH_MODEL, and BATCH_CLI to the local .env and
+    update os.environ immediately so changes take effect without a restart."""
+    from dotenv import set_key, unset_key
+
+    provider = req.batch_provider.strip().lower()
+    if provider and provider not in _KNOWN_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider {provider!r}. Valid: {', '.join(sorted(_KNOWN_PROVIDERS))}",
+        )
+    cli = req.batch_cli.strip()
+    if cli and cli not in _KNOWN_CLIS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown CLI {cli!r}. Valid: {', '.join(_KNOWN_CLIS)}",
+        )
+
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        env_path.write_text("", encoding="utf-8")
+
+    updated: list[str] = []
+
+    def _set(key: str, value: str) -> None:
+        if value:
+            set_key(str(env_path), key, value, quote_mode="never")
+            os.environ[key] = value
+        else:
+            unset_key(str(env_path), key)
+            os.environ.pop(key, None)
+        updated.append(key)
+
+    _set("BATCH_PROVIDER", provider)
+    _set("BATCH_MODEL", req.batch_model.strip())
+    if cli:
+        _set("BATCH_CLI", cli)
+
+    return JSONResponse({"ok": True, "updated": updated})
+
+
 @app.post("/api/onboard")
 async def onboard_submit(
     form: str = Form(...),
@@ -709,7 +796,7 @@ def add_job(req: AddJobRequest) -> JSONResponse:
     if not provider:
         raise HTTPException(
             status_code=503,
-            detail="No LLM provider configured. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or another provider key in .env.",
+            detail="No LLM provider configured. Use ⚙ Setup → Local evaluation to pick one, or add an API key to .env.",
         )
 
     # Fetch job description.
