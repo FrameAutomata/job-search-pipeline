@@ -136,8 +136,46 @@
         </label>
       </section>
 
-      <!-- 7. Review -->
+      <!-- 7. Local evaluation -->
       <section class="step" data-step="6" hidden>
+        <h2>Local evaluation provider</h2>
+        <p class="hint">Configures which provider the UI uses for <strong>+ Add Job</strong>
+          evaluations and the API path for career skills. Saved to your local
+          <code>.env</code> — separate from the GitHub secrets above. You can skip this
+          step and configure it later.</p>
+
+        <div id="local-provider-detection" class="provider-detection">
+          <span class="muted">Detecting…</span>
+        </div>
+
+        <div class="grid2" style="margin-top:14px">
+          <label>API provider
+            <select id="local-provider-select">
+              <option value="">— auto-detect —</option>
+            </select>
+          </label>
+          <label>Model override <span class="muted">(optional)</span>
+            <input id="local-model-input" placeholder="leave blank for provider default" />
+          </label>
+        </div>
+        <p id="local-model-hint" class="hint" hidden></p>
+
+        <label style="margin-top:8px">Interactive CLI <span class="muted">(for --batch and career skills)</span>
+          <select id="local-cli-select">
+            <option value="claude">claude</option>
+            <option value="gemini">gemini</option>
+            <option value="opencode">opencode</option>
+            <option value="qwen">qwen</option>
+          </select>
+        </label>
+        <p id="local-cli-hint" class="hint"></p>
+
+        <button type="button" id="save-local-btn" style="margin-top:8px">Save to .env</button>
+        <div id="local-save-msg" class="action-msg" hidden></div>
+      </section>
+
+      <!-- 8. Review -->
+      <section class="step" data-step="7" hidden>
         <h2>Review &amp; submit</h2>
         <p class="hint">This generates your profile, CV, and search config, then
           writes them — plus your API key — as encrypted GitHub secrets on

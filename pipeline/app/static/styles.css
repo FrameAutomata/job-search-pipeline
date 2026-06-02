@@ -183,6 +183,9 @@ fieldset.sites .chk { display: inline-flex; margin: 0 16px 0 0; }
 .banner.ok-banner { background: rgba(63,185,80,0.12); border-color: rgba(63,185,80,0.4); color: var(--good); }
 #review { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; white-space: pre-wrap; }
 
+.provider-detection { font-size: 13px; padding: 8px 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.ok-text { color: var(--good); }
+
 table { width: 100%; border-collapse: collapse; }
 
 th, td {
