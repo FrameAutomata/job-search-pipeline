@@ -596,8 +596,9 @@ addJobForm.addEventListener("submit", async (e) => {
   addJobSubmit.disabled = true;
   setAddJobStatus("Fetching job description and evaluating… this takes 20–60 s.", "");
 
+  let resp;
   try {
-    const resp = await fetch("/api/jobs/add", {
+    resp = await fetch("/api/jobs/add", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, company, role }),
@@ -614,7 +615,16 @@ addJobForm.addEventListener("submit", async (e) => {
     await loadJobs();
     setTimeout(closeAddJobModal, 1800);
   } catch (err) {
-    setAddJobStatus(String(err.message || err), "error");
+    const msg = String(err.message || err);
+    setAddJobStatus(msg, "error");
+    // For the "no provider" 503, append a direct link to the setup wizard.
+    if (resp && resp.status === 503) {
+      const link = document.createElement("a");
+      link.href = "/onboard";
+      link.textContent = " → ⚙ Setup";
+      link.style.marginLeft = "6px";
+      addJobStatus.appendChild(link);
+    }
     addJobSubmit.disabled = false;
   }
 });

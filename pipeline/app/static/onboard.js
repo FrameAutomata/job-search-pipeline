@@ -4,7 +4,7 @@
 // multipart to /api/onboard, which generates the profile artifacts and writes
 // them as GitHub secrets.
 
-const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Review"];
+const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local eval", "Review"];
 
 const form = document.getElementById("wizard");
 const steps = [...document.querySelectorAll(".step")];
@@ -50,6 +50,9 @@ function showStep(i) {
   // "done" rather than abandoning setup.
   cancelBtn.textContent = last ? "Finish" : "Cancel";
   if (last) renderReview();
+  // Refresh provider detection whenever the Local eval step is shown so it
+  // reflects any key just saved from the cloud Provider step.
+  if (current === 6) loadLocalProviders();
 }
 
 function showAction(text, kind) {
@@ -141,8 +144,29 @@ function enterEditMode(hasResume) {
   submitBtn.textContent = "Save changes";
 }
 
-nextBtn.addEventListener("click", () => {
+nextBtn.addEventListener("click", async () => {
   if (!validateStep(current)) return;
+  // Leaving the cloud Provider step (5) → save the key to .env first, then
+  // advance. Awaiting the save ensures loadLocalProviders() (called by
+  // showStep(6)) sees the key in os.environ and shows it as configured.
+  if (current === 5) {
+    const cloudProvider = form.querySelector('[name="provider"]')?.value;
+    const cloudModel    = form.querySelector('[name="batch_model"]')?.value;
+    const apiKey        = form.querySelector('[name="api_key"]')?.value?.trim();
+    const hasKey        = !!apiKey || editMode;
+    if (cloudProvider && hasKey) {
+      await fetch("/api/onboard/local-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          batch_provider: cloudProvider,
+          batch_model:    cloudModel || "",
+          batch_cli:      "",
+          api_key:        apiKey || "",
+        }),
+      }).catch(() => {});
+    }
+  }
   showStep(current + 1);
 });
 backBtn.addEventListener("click", () => showStep(current - 1));
@@ -262,6 +286,106 @@ async function loadSavedConfig() {
   }
 }
 
+// ── Local evaluation provider (step 6) ──────────────────────────────────────
+
+async function loadLocalProviders() {
+  const detection = document.getElementById("local-provider-detection");
+  const select    = document.getElementById("local-provider-select");
+  const cliSelect = document.getElementById("local-cli-select");
+  const modelInput = document.getElementById("local-model-input");
+  const modelHint  = document.getElementById("local-model-hint");
+  const cliHint    = document.getElementById("local-cli-hint");
+  if (!detection) return;
+  try {
+    const resp = await fetch("/api/onboard/providers");
+    const d = await resp.json();
+
+    // Build detection summary.
+    const apiLines = d.api_providers.map((p) => {
+      const tick = p.configured ? "✓" : "✗";
+      return `<span class="${p.configured ? "ok-text" : "muted"}">${tick} ${p.name}${p.configured ? "" : " (no key)"}</span>`;
+    });
+    const cliLines = d.cli_tools.map((c) => {
+      const tick = c.available ? "✓" : "✗";
+      return `<span class="${c.available ? "ok-text" : "muted"}">${tick} ${c.name}</span>`;
+    });
+    detection.innerHTML =
+      `<strong>API providers:</strong> ${apiLines.join(" &nbsp; ")} &nbsp;&nbsp; ` +
+      `<strong>CLIs:</strong> ${cliLines.join(" &nbsp; ")}`;
+
+    // Populate provider select — only configured ones enabled.
+    select.innerHTML = '<option value="">— auto-detect (first available key) —</option>';
+    for (const p of d.api_providers) {
+      const opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = p.name + (p.configured ? " ✓" : " (no key)");
+      if (!p.configured) opt.disabled = true;
+      select.appendChild(opt);
+    }
+    if (d.current.batch_provider) select.value = d.current.batch_provider;
+
+    // Current model.
+    modelInput.value = d.current.batch_model || "";
+
+    // Update model hint when provider changes.
+    function updateModelHint() {
+      const pName = select.value;
+      const def = d.provider_defaults[pName] || "";
+      modelHint.hidden = !def;
+      modelHint.textContent = def ? `Default for ${pName}: ${def}` : "";
+    }
+    select.addEventListener("change", updateModelHint);
+    updateModelHint();
+
+    // Populate CLI select — mark unavailable ones.
+    for (const opt of cliSelect.options) {
+      const found = d.cli_tools.find((c) => c.name === opt.value);
+      if (found && !found.available) opt.textContent = opt.value + " (not installed)";
+    }
+    if (d.current.batch_cli) cliSelect.value = d.current.batch_cli;
+
+    // CLI hint.
+    function updateCliHint() {
+      const name = cliSelect.value;
+      const found = d.cli_tools.find((c) => c.name === name);
+      cliHint.textContent = found && !found.available
+        ? `${name} is not on PATH — install it or pick an available CLI.`
+        : "";
+    }
+    cliSelect.addEventListener("change", updateCliHint);
+    updateCliHint();
+  } catch (e) {
+    detection.textContent = "Could not detect providers: " + (e.message || e);
+  }
+}
+
+document.getElementById("save-local-btn")?.addEventListener("click", async () => {
+  const btn     = document.getElementById("save-local-btn");
+  const msgEl   = document.getElementById("local-save-msg");
+  const provider = document.getElementById("local-provider-select").value;
+  const model    = document.getElementById("local-model-input").value.trim();
+  const cli      = document.getElementById("local-cli-select").value;
+  btn.disabled = true;
+  msgEl.hidden = true;
+  try {
+    const resp = await fetch("/api/onboard/local-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || "save failed");
+    msgEl.textContent = `Saved to .env (${body.updated.join(", ")}). Changes take effect immediately.`;
+    msgEl.className = "action-msg ok";
+  } catch (e) {
+    msgEl.textContent = String(e.message || e);
+    msgEl.className = "action-msg error";
+  }
+  msgEl.hidden = false;
+  btn.disabled = false;
+});
+
 showStep(0);
 loadStatus();
 loadSavedConfig();
+loadLocalProviders();
