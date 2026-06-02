@@ -42,6 +42,13 @@ from pipeline.screen import extract_description, fetch_and_classify, linkedin_gu
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# Load .env so JOB_SEARCH_REPO, API keys, BATCH_PROVIDER, etc. are visible to
+# the server. Pipeline scripts call load_dotenv themselves; the server didn't,
+# which meant .env values were silently ignored unless set in the shell.
+# override=False so a shell-level export always wins over .env.
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env", override=False)
+
 # Where `gh run download` drops artifacts. Gitignored. When a Refresh has
 # populated this, the data layer reads from here; otherwise it falls back to
 # CAREER_OPS_PATH (a local run, or a manually-passed --data dir).
