@@ -143,6 +143,21 @@ function enterEditMode(hasResume) {
 
 nextBtn.addEventListener("click", () => {
   if (!validateStep(current)) return;
+  // Leaving the cloud Provider step (5) → pre-fill Local eval (6) with the
+  // same provider/model. If the user entered a key there, they almost certainly
+  // want to use it locally too. editMode means the key field is blank but the
+  // saved key is still active, so pre-fill in that case too.
+  if (current === 5) {
+    const cloudProvider = form.querySelector('[name="provider"]')?.value;
+    const cloudModel    = form.querySelector('[name="batch_model"]')?.value;
+    const hasKey        = !!(form.querySelector('[name="api_key"]')?.value) || editMode;
+    if (cloudProvider && hasKey) {
+      const sel = document.getElementById("local-provider-select");
+      const mod = document.getElementById("local-model-input");
+      if (sel && !sel.value) sel.value = cloudProvider;
+      if (mod && !mod.value && cloudModel) mod.value = cloudModel;
+    }
+  }
   showStep(current + 1);
 });
 backBtn.addEventListener("click", () => showStep(current - 1));
