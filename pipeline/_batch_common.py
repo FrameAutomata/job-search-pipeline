@@ -121,6 +121,21 @@ def parse_json_loose(text: str) -> dict | None:
 _TRACKER_TSV_COLUMNS = 9
 
 
+def _strip_role_pipe(tracker_tsv: str) -> str:
+    """Remove any '| <suffix>' the LLM appends to the role column.
+
+    The LLM sometimes writes "Software Engineer | Remote" or
+    "Platform Engineer | $35/hr Remote" as the role. That pipe is harmless in
+    a tab-delimited TSV but merge-tracker.mjs copies it verbatim into a
+    markdown table row where it splits the cell, shifting every subsequent
+    column (score ends up as status, report link ends up in notes, etc.)."""
+    line = tracker_tsv.strip()
+    parts = line.split("\t")
+    if len(parts) >= 4:
+        parts[3] = re.sub(r"\s*\|.*$", "", parts[3]).strip()
+    return "\t".join(parts)
+
+
 def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     """Splice the job URL into the notes (last) column of the tracker row so
     the UI's "Open posting" link works.
@@ -171,6 +186,7 @@ def write_job_result(
     if report_content:
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
     if tracker_tsv:
+        tracker_tsv = _strip_role_pipe(tracker_tsv)
         tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 

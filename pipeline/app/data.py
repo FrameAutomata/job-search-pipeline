@@ -58,6 +58,40 @@ _REPORT_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 # A markdown table separator row: | --- | :--: | ... |
 _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|?\s*$")
 
+# Report link cell: [num](path). Used to re-anchor columns when extra cells
+# shift the layout (e.g. LLM writes "Role | Remote" and the pipe splits the cell).
+_REPORT_CELL_RE = re.compile(r"^\[[\w\d]+\]\([^)]+\)$")
+# Expected 0-indexed position of the Report cell in a well-formed row.
+_REPORT_COL_IDX = _COLUMNS.index("report")  # 7
+
+
+def _realign_cells(cells: list[str]) -> list[str]:
+    """Recover correct column mapping when a row has extra cells.
+
+    The LLM occasionally appends context to a role title with a bare pipe
+    (e.g. "Software Engineer | Remote"), which merge-tracker.mjs writes
+    verbatim into the markdown table and the pipe is interpreted as a cell
+    separator. This shifts every subsequent column right.
+
+    Strategy: anchor on the Report link cell (always [num](path)), which is
+    identifiable by regex and whose expected position is known. Work backward
+    from it to recover score, status, and pdf; everything right of it is notes."""
+    for i, c in enumerate(cells):
+        if _REPORT_CELL_RE.match(c) and i > _REPORT_COL_IDX:
+            before = cells[4:i]        # cells between role and report
+            if len(before) < 3:
+                break                  # not enough context; leave as-is
+            score  = before[-3]
+            status = before[-2]
+            pdf    = before[-1]
+            notes_parts = cells[i + 1:]
+            return (
+                cells[:4]
+                + [score, status, pdf, c]
+                + ([" | ".join(notes_parts)] if notes_parts else [""])
+            )
+    return cells
+
 
 def _split_row(line: str) -> list[str]:
     """Split a markdown table row into trimmed cell values, dropping the
@@ -92,6 +126,8 @@ def parse_applications(applications_md: Path) -> list[dict]:
         # Skip the header row.
         if cells[0].lower() in ("#", "num") and cells[1].lower() == "date":
             continue
+        if len(cells) > len(_COLUMNS):
+            cells = _realign_cells(cells)
 
         row = dict(zip(_COLUMNS, cells))
 
@@ -166,12 +202,19 @@ def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> 
             # Split preserving structure: leading/trailing pipes produce empty
             # edge cells we must keep so indices stay aligned on re-join.
             parts = line.split("|")
-            # parts[0] is "" (before leading pipe). The 9 data cells are
-            # parts[1..9]; parts[-1] is "" (after trailing pipe).
+            # parts[0] is "" (before leading pipe). Data cells start at parts[1].
             cells = [p.strip() for p in parts]
-            # Data cell positions within `parts`: # is parts[1], Status is parts[6].
             if len(parts) >= 10 and cells[1] == want and cells[1] not in ("#", ""):
-                parts[6] = f" {new_status} "
+                # Locate the Status cell by anchoring on the Report link, which
+                # is always [num](path). Status sits 2 positions before it
+                # (…|score|status|pdf|report|…), regardless of extra cells the
+                # LLM may have injected (e.g. "Role | Remote").
+                status_idx = 6  # fallback: correct for normal 9-cell rows
+                for pi, p in enumerate(parts):
+                    if _REPORT_CELL_RE.match(p.strip()):
+                        status_idx = pi - 2
+                        break
+                parts[status_idx] = f" {new_status} "
                 line = "|".join(parts)
                 changed = True
         out_lines.append(line)
