@@ -21,6 +21,9 @@ output/
 # Local UI artifact cache (populated by the Refresh button via `gh run download`)
 .ui-cache/
 
+# Temporary artifact downloads (ad-hoc inspection, never committed)
+tempartifact-inspect/
+
 # Setup logs
 setup.log
 
