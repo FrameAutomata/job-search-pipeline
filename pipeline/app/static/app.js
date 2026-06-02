@@ -560,6 +560,7 @@ const addJobModal  = document.getElementById("add-job-modal");
 const addJobForm   = document.getElementById("add-job-form");
 const addJobStatus = document.getElementById("add-job-status");
 const addJobSubmit = document.getElementById("add-job-submit");
+const evalStatus   = document.getElementById("eval-status");
 
 function openAddJobModal() {
   addJobForm.reset();
@@ -580,6 +581,40 @@ function setAddJobStatus(text, kind) {
   addJobStatus.hidden = false;
 }
 
+function showEvalStatus(text, kind) {
+  evalStatus.className = "eval-status" + (kind ? " " + kind : "");
+  evalStatus.innerHTML = "";
+  if (kind === "pending") {
+    const dot = document.createElement("span");
+    dot.className = "eval-status-dot";
+    evalStatus.appendChild(dot);
+  }
+  const span = document.createElement("span");
+  span.textContent = text;
+  evalStatus.appendChild(span);
+  evalStatus.hidden = false;
+}
+
+function pollAddJobStatus(jobId) {
+  const iv = setInterval(async () => {
+    try {
+      const resp = await fetch(`/api/jobs/add-status/${jobId}`);
+      const body = await resp.json().catch(() => ({}));
+      if (body.status === "done") {
+        clearInterval(iv);
+        const r = body.result;
+        const scoreText = r.score != null ? ` · score ${Number(r.score).toFixed(1)}/5` : "";
+        const coRole = [r.company, r.role].filter(Boolean).join(" — ");
+        showEvalStatus(`Added #${r.report_num}${coRole ? " — " + coRole : ""}${scoreText}`, "ok");
+        await loadJobs();
+      } else if (body.status === "error") {
+        clearInterval(iv);
+        showEvalStatus(body.error || "Evaluation failed", "error");
+      }
+    } catch (_) { /* network blip — keep polling */ }
+  }, 3000);
+}
+
 document.getElementById("add-job-btn").addEventListener("click", openAddJobModal);
 document.getElementById("add-job-close").addEventListener("click", closeAddJobModal);
 document.getElementById("add-job-cancel").addEventListener("click", closeAddJobModal);
@@ -594,25 +629,30 @@ addJobForm.addEventListener("submit", async (e) => {
   if (!url) return;
 
   addJobSubmit.disabled = true;
-  setAddJobStatus("Fetching job description and evaluating… this takes 20–60 s.", "");
 
+  let resp;
   try {
-    const resp = await fetch("/api/jobs/add", {
+    resp = await fetch("/api/jobs/add-async", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url, company, role }),
     });
     const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(body.detail || `Request failed (${resp.status})`);
-
-    const scoreText = body.score != null ? ` · score ${Number(body.score).toFixed(1)}/5` : "";
-    const coRole = [body.company, body.role].filter(Boolean).join(" — ");
-    setAddJobStatus(
-      `Added #${body.report_num}${coRole ? " — " + coRole : ""}${scoreText}. Reloading…`,
-      "ok",
-    );
-    await loadJobs();
-    setTimeout(closeAddJobModal, 1800);
+    if (!resp.ok) {
+      setAddJobStatus(body.detail || `Request failed (${resp.status})`, "error");
+      if (resp.status === 503) {
+        const link = document.createElement("a");
+        link.href = "/onboard";
+        link.textContent = " → ⚙ Setup";
+        link.style.marginLeft = "6px";
+        addJobStatus.appendChild(link);
+      }
+      addJobSubmit.disabled = false;
+      return;
+    }
+    closeAddJobModal();
+    showEvalStatus("Evaluating job — fetching description and running LLM… (20–60 s)", "pending");
+    pollAddJobStatus(body.job_id);
   } catch (err) {
     setAddJobStatus(String(err.message || err), "error");
     addJobSubmit.disabled = false;

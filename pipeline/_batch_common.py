@@ -311,7 +311,7 @@ def run_merge_tracker(career_ops: Path) -> bool:
     # fresh run (see ensure_applications_md).
     ensure_applications_md(career_ops)
     print("[batch] running merge-tracker.mjs...")
-    r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True)
+    r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
     if r.returncode == 0:
         print("[batch] tracker merged")
         return True
