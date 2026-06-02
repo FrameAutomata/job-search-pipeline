@@ -407,3 +407,29 @@ tbody tr.selected { background: #233047; }
 }
 .add-job-status.ok    { border-color: var(--good); color: var(--good); }
 .add-job-status.error { border-color: var(--bad);  color: var(--bad);  }
+
+.eval-status {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 10px 14px;
+  font-size: 13px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.eval-status.ok    { color: var(--good); background: rgba(63,185,80,0.08); border-bottom-color: rgba(63,185,80,0.3); }
+.eval-status.error { color: var(--bad);  background: rgba(248,81,73,0.08); border-bottom-color: rgba(248,81,73,0.3); }
+.eval-status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  animation: eval-pulse 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes eval-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}

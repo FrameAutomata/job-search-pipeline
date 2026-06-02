@@ -14,7 +14,9 @@ import datetime
 import json
 import os
 import shutil
+import threading
 import urllib.parse
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -57,6 +59,10 @@ UI_CACHE = ROOT / ".ui-cache" / "latest"
 # Set by /api/refresh to the artifact subdir gh extracted, so subsequent reads
 # use freshly-downloaded data without restarting the server.
 _active_data_dir: Path | None = None
+
+# Background add-job tasks: job_id → {status, result?, error?}
+_add_job_tasks: dict[str, dict] = {}
+_add_job_lock = threading.Lock()
 
 # Cloud workflow filenames (must match .github/workflows/*.yml).
 DAILY_WORKFLOW = "daily-pipeline.yml"
@@ -867,6 +873,110 @@ def add_job(req: AddJobRequest) -> JSONResponse:
         "provider":    provider,
         "merged":      merged,
     })
+
+
+def _run_add_job(job_id: str, url: str, company: str, role: str) -> None:
+    try:
+        jd_text = _fetch_jd(url)
+        system = _load_eval_system_prompt()
+
+        co = _career_ops_local()
+        apps_md = co / "data" / "applications.md"
+        reports_dir = co / "reports"
+        tracker_dir = co / "batch" / "tracker-additions"
+
+        tracker_num = max_tracker_num(apps_md, {}) + 1
+        report_num  = max_report_num(reports_dir, {}) + 1
+        report_num_str = str(report_num).zfill(3)
+        today = datetime.date.today().isoformat()
+
+        job_meta = {
+            "id":          f"manual-{tracker_num}",
+            "url":         url,
+            "company":     company,
+            "role":        role,
+            "report_num":  report_num_str,
+            "tracker_num": tracker_num,
+            "jd_text":     jd_text,
+        }
+
+        provider = _detect_provider()
+        model = os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
+        caller = _build_caller(provider, model)
+        user = build_user_message(job_meta, today)
+        response_text = _call_with_retry(caller, system, user)
+
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        tracker_dir.mkdir(parents=True, exist_ok=True)
+        result = write_job_result(response_text, job_meta, reports_dir, tracker_dir, today)
+        run_merge_tracker(co)
+
+        # If the UI is currently showing a cloud-artifact directory (_active_data_dir),
+        # list_jobs reads from there instead of the local career-ops path. Copy the
+        # updated applications.md and the new report into that directory so the
+        # next loadJobs() call sees the newly added entry.
+        if _active_data_dir is not None:
+            local_apps = co / "data" / "applications.md"
+            cache_apps = _active_data_dir / "data" / "applications.md"
+            if local_apps.exists():
+                cache_apps.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local_apps, cache_apps)
+            if result.get("report_file"):
+                cache_reports = _active_data_dir / "reports"
+                cache_reports.mkdir(parents=True, exist_ok=True)
+                local_report = reports_dir / result["report_file"]
+                if local_report.exists():
+                    shutil.copy2(local_report, cache_reports / result["report_file"])
+
+        with _add_job_lock:
+            _add_job_tasks[job_id] = {
+                "status":      "done",
+                "result": {
+                    "report_num":  result["summary"].get("report_num", report_num_str),
+                    "tracker_num": tracker_num,
+                    "company":     result["summary"].get("company", company),
+                    "role":        result["summary"].get("role", role),
+                    "score":       result["summary"].get("score"),
+                },
+            }
+    except Exception as exc:
+        with _add_job_lock:
+            _add_job_tasks[job_id] = {"status": "error", "error": str(exc)}
+
+
+@app.post("/api/jobs/add-async")
+def add_job_async(req: AddJobRequest) -> JSONResponse:
+    """Start a background add-job evaluation and return immediately."""
+    if not req.url.strip():
+        raise HTTPException(status_code=400, detail="url is required")
+
+    provider = _detect_provider()
+    if not provider:
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM provider configured. Use ⚙ Setup → Local evaluation to pick one, or add an API key to .env.",
+        )
+
+    job_id = str(uuid.uuid4())
+    with _add_job_lock:
+        _add_job_tasks[job_id] = {"status": "pending"}
+
+    t = threading.Thread(
+        target=_run_add_job,
+        args=(job_id, req.url.strip(), req.company.strip(), req.role.strip()),
+        daemon=True,
+    )
+    t.start()
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/jobs/add-status/{job_id}")
+def add_job_status(job_id: str) -> JSONResponse:
+    with _add_job_lock:
+        task = _add_job_tasks.get(job_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    return JSONResponse(task)
 
 
 # Mount the SPA last so /api/* routes take precedence. html=True serves
