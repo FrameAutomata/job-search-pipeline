@@ -184,15 +184,13 @@ def test_push_status_refreshes_applies_and_dispatches(client, tmp_path, mocker):
     assert body["pushed"] == 1
     assert body["base"] == "refreshed"
 
-    # edit-tracker was dispatched with a base64 blob...
+    # edit-tracker was dispatched with a status_overrides_json payload.
     trigger.assert_called_once()
     wf, fields = trigger.call_args.args[0], trigger.call_args.args[1]
     assert wf == server.EDIT_WORKFLOW
-    import base64
-    pushed_md = base64.b64decode(fields["applications_md_b64"]).decode("utf-8")
-    # ...that has role #1 = Applied (the edit) AND role #2 (cloud-added, preserved).
-    assert "| Applied |" in pushed_md
-    assert "NewCo" in pushed_md
+    import json
+    overrides = json.loads(fields["status_overrides_json"])
+    assert overrides == {"1": "Applied"}
 
     # Pending cleared after a successful push.
     assert client.get("/api/jobs").json()["pending"] == 0
@@ -208,9 +206,9 @@ def test_push_status_falls_back_to_local_when_refresh_fails(client, mocker):
     r = client.post("/api/push-status")
     assert r.status_code == 200
     assert r.json()["base"] == "local"
-    import base64
-    pushed_md = base64.b64decode(trigger.call_args.args[1]["applications_md_b64"]).decode("utf-8")
-    assert "| Interview |" in pushed_md
+    import json
+    overrides = json.loads(trigger.call_args.args[1]["status_overrides_json"])
+    assert overrides == {"1": "Interview"}
 
 
 def test_push_status_surfaces_gh_error(client, mocker):
