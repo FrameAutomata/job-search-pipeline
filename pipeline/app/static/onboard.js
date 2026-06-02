@@ -144,22 +144,18 @@ function enterEditMode(hasResume) {
   submitBtn.textContent = "Save changes";
 }
 
-nextBtn.addEventListener("click", () => {
+nextBtn.addEventListener("click", async () => {
   if (!validateStep(current)) return;
-  // Leaving the cloud Provider step (5) → pre-fill Local eval (6) with the
-  // same provider/model. If the user entered a key there, they almost certainly
-  // want to use it locally too. editMode means the key field is blank but the
-  // saved key is still active, so pre-fill in that case too.
+  // Leaving the cloud Provider step (5) → save the key to .env first, then
+  // advance. Awaiting the save ensures loadLocalProviders() (called by
+  // showStep(6)) sees the key in os.environ and shows it as configured.
   if (current === 5) {
     const cloudProvider = form.querySelector('[name="provider"]')?.value;
     const cloudModel    = form.querySelector('[name="batch_model"]')?.value;
     const apiKey        = form.querySelector('[name="api_key"]')?.value?.trim();
     const hasKey        = !!apiKey || editMode;
     if (cloudProvider && hasKey) {
-      // Write the key (and provider) to .env now so the Local eval step detects
-      // it as configured. Fire-and-forget — the re-detect in showStep(6) picks
-      // up the result once the request completes.
-      fetch("/api/onboard/local-config", {
+      await fetch("/api/onboard/local-config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -169,11 +165,6 @@ nextBtn.addEventListener("click", () => {
           api_key:        apiKey || "",
         }),
       }).catch(() => {});
-      // Pre-fill select immediately (options already populated by loadLocalProviders).
-      const sel = document.getElementById("local-provider-select");
-      const mod = document.getElementById("local-model-input");
-      if (sel && !sel.value) sel.value = cloudProvider;
-      if (mod && !mod.value && cloudModel) mod.value = cloudModel;
     }
   }
   showStep(current + 1);
