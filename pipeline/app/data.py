@@ -63,6 +63,8 @@ _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|?\s*$")
 _REPORT_CELL_RE = re.compile(r"^\[[\w\d]+\]\([^)]+\)$")
 # Expected 0-indexed position of the Report cell in a well-formed row.
 _REPORT_COL_IDX = _COLUMNS.index("report")  # 7
+# Score cell: X.X/5
+_SCORE_CELL_RE = re.compile(r"^\d+\.?\d*/5$")
 
 
 def _realign_cells(cells: list[str]) -> list[str]:
@@ -73,21 +75,26 @@ def _realign_cells(cells: list[str]) -> list[str]:
     verbatim into the markdown table and the pipe is interpreted as a cell
     separator. This shifts every subsequent column right.
 
-    Strategy: anchor on the Report link cell (always [num](path)), which is
-    identifiable by regex and whose expected position is known. Work backward
-    from it to recover score, status, and pdf; everything right of it is notes."""
+    Strategy: anchor on the Report link cell (always [num](path)), scan the
+    middle cells for a recognisable score (X.X/5) and a recognisable status
+    (canonical value lookup), then reconstruct a clean 9-cell row. Defaults
+    status to "Evaluated" when none of the middle cells is a canonical value —
+    which happens for compound-corrupted rows that have accumulated multiple
+    extra score cells from re-evaluations."""
     for i, c in enumerate(cells):
         if _REPORT_CELL_RE.match(c) and i > _REPORT_COL_IDX:
-            before = cells[4:i]        # cells between role and report
-            if len(before) < 3:
-                break                  # not enough context; leave as-is
-            score  = before[-3]
-            status = before[-2]
-            pdf    = before[-1]
+            before = cells[4:i]   # cells between role and report
+            score = next((v for v in before if _SCORE_CELL_RE.match(v)), "")
+            status = next(
+                (v for v in before
+                 if not _SCORE_CELL_RE.match(v)
+                 and canonical_status(v) in CANONICAL_STATES),
+                "Evaluated",      # safe default — batch rows always start here
+            )
             notes_parts = cells[i + 1:]
             return (
                 cells[:4]
-                + [score, status, pdf, c]
+                + [score, status, "null", c]
                 + ([" | ".join(notes_parts)] if notes_parts else [""])
             )
     return cells
