@@ -50,6 +50,9 @@ function showStep(i) {
   // "done" rather than abandoning setup.
   cancelBtn.textContent = last ? "Finish" : "Cancel";
   if (last) renderReview();
+  // Refresh provider detection whenever the Local eval step is shown so it
+  // reflects any key just saved from the cloud Provider step.
+  if (current === 6) loadLocalProviders();
 }
 
 function showAction(text, kind) {
@@ -150,8 +153,23 @@ nextBtn.addEventListener("click", () => {
   if (current === 5) {
     const cloudProvider = form.querySelector('[name="provider"]')?.value;
     const cloudModel    = form.querySelector('[name="batch_model"]')?.value;
-    const hasKey        = !!(form.querySelector('[name="api_key"]')?.value) || editMode;
+    const apiKey        = form.querySelector('[name="api_key"]')?.value?.trim();
+    const hasKey        = !!apiKey || editMode;
     if (cloudProvider && hasKey) {
+      // Write the key (and provider) to .env now so the Local eval step detects
+      // it as configured. Fire-and-forget — the re-detect in showStep(6) picks
+      // up the result once the request completes.
+      fetch("/api/onboard/local-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          batch_provider: cloudProvider,
+          batch_model:    cloudModel || "",
+          batch_cli:      "",
+          api_key:        apiKey || "",
+        }),
+      }).catch(() => {});
+      // Pre-fill select immediately (options already populated by loadLocalProviders).
       const sel = document.getElementById("local-provider-select");
       const mod = document.getElementById("local-model-input");
       if (sel && !sel.value) sel.value = cloudProvider;

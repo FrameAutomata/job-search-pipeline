@@ -595,12 +595,13 @@ class LocalConfigRequest(BaseModel):
     batch_provider: str = ""
     batch_model: str = ""
     batch_cli: str = ""
+    api_key: str = ""   # optional — write the provider's API key to .env too
 
 
 @app.post("/api/onboard/local-config")
 def save_local_config(req: LocalConfigRequest) -> JSONResponse:
-    """Write BATCH_PROVIDER, BATCH_MODEL, and BATCH_CLI to the local .env and
-    update os.environ immediately so changes take effect without a restart."""
+    """Write BATCH_PROVIDER, BATCH_MODEL, BATCH_CLI (and optionally the
+    provider API key) to the local .env and update os.environ immediately."""
     from dotenv import set_key, unset_key
 
     provider = req.batch_provider.strip().lower()
@@ -635,6 +636,10 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     _set("BATCH_MODEL", req.batch_model.strip())
     if cli:
         _set("BATCH_CLI", cli)
+    # Write the provider's API key to .env so the server detects it immediately.
+    api_key = req.api_key.strip()
+    if api_key and provider and provider in onboard.PROVIDER_SECRETS:
+        _set(onboard.PROVIDER_SECRETS[provider], api_key)
 
     return JSONResponse({"ok": True, "updated": updated})
 
