@@ -553,3 +553,68 @@ function renderPrereq(note) {
 
 loadCaps();
 loadJobs();
+
+// ── Add Job modal ────────────────────────────────────────────────────────────
+
+const addJobModal  = document.getElementById("add-job-modal");
+const addJobForm   = document.getElementById("add-job-form");
+const addJobStatus = document.getElementById("add-job-status");
+const addJobSubmit = document.getElementById("add-job-submit");
+
+function openAddJobModal() {
+  addJobForm.reset();
+  addJobStatus.hidden = true;
+  addJobStatus.className = "add-job-status";
+  addJobSubmit.disabled = false;
+  addJobModal.hidden = false;
+  document.getElementById("add-job-url").focus();
+}
+
+function closeAddJobModal() {
+  addJobModal.hidden = true;
+}
+
+function setAddJobStatus(text, kind) {
+  addJobStatus.textContent = text;
+  addJobStatus.className = "add-job-status" + (kind ? " " + kind : "");
+  addJobStatus.hidden = false;
+}
+
+document.getElementById("add-job-btn").addEventListener("click", openAddJobModal);
+document.getElementById("add-job-close").addEventListener("click", closeAddJobModal);
+document.getElementById("add-job-cancel").addEventListener("click", closeAddJobModal);
+addJobModal.addEventListener("click", (e) => { if (e.target === addJobModal) closeAddJobModal(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !addJobModal.hidden) closeAddJobModal(); });
+
+addJobForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const url     = document.getElementById("add-job-url").value.trim();
+  const company = document.getElementById("add-job-company").value.trim();
+  const role    = document.getElementById("add-job-role").value.trim();
+  if (!url) return;
+
+  addJobSubmit.disabled = true;
+  setAddJobStatus("Fetching job description and evaluating… this takes 20–60 s.", "");
+
+  try {
+    const resp = await fetch("/api/jobs/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, company, role }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `Request failed (${resp.status})`);
+
+    const scoreText = body.score != null ? ` · score ${Number(body.score).toFixed(1)}/5` : "";
+    const coRole = [body.company, body.role].filter(Boolean).join(" — ");
+    setAddJobStatus(
+      `Added #${body.report_num}${coRole ? " — " + coRole : ""}${scoreText}. Reloading…`,
+      "ok",
+    );
+    await loadJobs();
+    setTimeout(closeAddJobModal, 1800);
+  } catch (err) {
+    setAddJobStatus(String(err.message || err), "error");
+    addJobSubmit.disabled = false;
+  }
+});

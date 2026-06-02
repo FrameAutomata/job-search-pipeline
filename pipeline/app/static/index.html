@@ -22,6 +22,7 @@
       <span id="count" class="count"></span>
       <span class="spacer"></span>
       <button id="push-btn" title="Push status changes to the cloud tracker" hidden></button>
+      <button id="add-job-btn" title="Evaluate a job you found online and add it to the tracker">+ Add job</button>
       <button id="refresh-btn" title="Download the latest results from GitHub">↻ Refresh</button>
       <button id="run-btn" title="Trigger a new pipeline run in the cloud">▶ Run now</button>
       <a id="setup-link" href="/onboard" title="Set up or update your profile and search config">⚙ Setup</a>
@@ -62,6 +63,29 @@
       <article id="report-body"></article>
     </aside>
   </main>
+
+  <!-- Add Job modal -->
+  <div id="add-job-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="add-job-title">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 id="add-job-title">Add Job for Evaluation</h2>
+        <button id="add-job-close" title="Close">✕</button>
+      </div>
+      <form id="add-job-form" autocomplete="off">
+        <label for="add-job-url">Job URL <span class="field-required">*</span></label>
+        <input id="add-job-url" type="url" placeholder="https://linkedin.com/jobs/view/…" required />
+        <label for="add-job-company">Company <span class="field-optional">(optional — LLM extracts from JD if blank)</span></label>
+        <input id="add-job-company" type="text" placeholder="Acme Corp" />
+        <label for="add-job-role">Role <span class="field-optional">(optional — LLM extracts from JD if blank)</span></label>
+        <input id="add-job-role" type="text" placeholder="Senior Software Engineer" />
+        <div id="add-job-status" class="add-job-status" hidden></div>
+        <div class="modal-actions">
+          <button type="button" id="add-job-cancel">Cancel</button>
+          <button type="submit" id="add-job-submit">▶ Evaluate</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

@@ -10,6 +10,7 @@ Run:
 or use the run-ui.sh / run-ui.ps1 launchers.
 """
 
+import datetime
 import json
 import os
 import shutil
@@ -22,6 +23,21 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.app import data, gh, onboard, skills
+from pipeline._batch_common import (
+    build_system_prompt,
+    build_user_message,
+    max_report_num,
+    max_tracker_num,
+    write_job_result,
+    run_merge_tracker,
+)
+from pipeline.batch_evaluate import (
+    _build_caller,
+    _call_with_retry,
+    _detect_provider,
+    PROVIDER_DEFAULTS,
+)
+from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -631,6 +647,127 @@ async def onboard_submit(
     onboard.save_sidecar(ROOT, payload)
 
     return JSONResponse({"ok": True, "repo": gh.current_repo(), "secrets_written": written})
+
+
+def _fetch_jd(url: str, timeout: int = 20) -> str:
+    """Fetch and extract the job description text from a URL.
+
+    Uses the LinkedIn guest endpoint for LinkedIn jobs (bypasses the login
+    wall). Returns empty string on any fetch failure so the LLM can still
+    evaluate with the URL and metadata alone."""
+    fetch_url = linkedin_guest_jd_url(url) or url
+    try:
+        _, _, html_body = fetch_and_classify(fetch_url, timeout=timeout)
+        return extract_description(html_body)
+    except Exception:
+        return ""
+
+
+def _load_eval_system_prompt() -> str:
+    """Load the evaluation system prompt from the local career-ops install."""
+    co = _career_ops_local()
+
+    def _opt(p: Path) -> str:
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    cv = _opt(co / "cv.md")
+    profile_yml = _opt(co / "config" / "profile.yml")
+    if not cv and not profile_yml:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "cv.md and profile.yml not found in career-ops. "
+                "Complete the Setup wizard first."
+            ),
+        )
+    return build_system_prompt(
+        cv=cv,
+        profile_yml=profile_yml,
+        profile_md=_opt(co / "modes" / "_profile.md"),
+        article_digest=_opt(co / "article-digest.md"),
+    )
+
+
+class AddJobRequest(BaseModel):
+    url: str
+    company: str = ""
+    role: str = ""
+
+
+@app.post("/api/jobs/add")
+def add_job(req: AddJobRequest) -> JSONResponse:
+    """Fetch, evaluate, and add a manually-entered job to the tracker.
+
+    Reuses the same LLM evaluation prompt and result-writing pipeline as the
+    batch evaluator so the output is indistinguishable from a pipeline-sourced
+    role. The request is synchronous — evaluation takes 20-60 s depending on
+    the provider."""
+    if not req.url.strip():
+        raise HTTPException(status_code=400, detail="url is required")
+
+    provider = _detect_provider()
+    if not provider:
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM provider configured. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or another provider key in .env.",
+        )
+
+    # Fetch job description.
+    jd_text = _fetch_jd(req.url.strip())
+
+    # Load evaluation system prompt from local career-ops profile.
+    system = _load_eval_system_prompt()
+
+    # Assign the next available tracker and report numbers.
+    co = _career_ops_local()
+    apps_md = co / "data" / "applications.md"
+    reports_dir = co / "reports"
+    tracker_dir = co / "batch" / "tracker-additions"
+
+    tracker_num = max_tracker_num(apps_md, {}) + 1
+    report_num  = max_report_num(reports_dir, {}) + 1
+    report_num_str = str(report_num).zfill(3)
+    today = datetime.date.today().isoformat()
+    job_id = f"manual-{tracker_num}"
+
+    job_meta = {
+        "id":          job_id,
+        "url":         req.url.strip(),
+        "company":     req.company.strip(),
+        "role":        req.role.strip(),
+        "report_num":  report_num_str,
+        "tracker_num": tracker_num,
+        "jd_text":     jd_text,
+    }
+
+    # Evaluate via LLM.
+    model = os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
+    caller = _build_caller(provider, model)
+    user = build_user_message(job_meta, today)
+    try:
+        response_text = _call_with_retry(caller, system, user)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM evaluation failed: {exc}")
+
+    # Write report .md and tracker-additions .tsv.
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    tracker_dir.mkdir(parents=True, exist_ok=True)
+    result = write_job_result(response_text, job_meta, reports_dir, tracker_dir, today)
+
+    # Merge into applications.md. Failure is non-fatal — the tracker-additions
+    # file is written and the next pipeline run will pick it up.
+    merged = run_merge_tracker(co)
+
+    return JSONResponse({
+        "ok":          True,
+        "report_num":  result["summary"].get("report_num", report_num_str),
+        "tracker_num": tracker_num,
+        "company":     result["summary"].get("company", req.company),
+        "role":        result["summary"].get("role", req.role),
+        "score":       result["summary"].get("score"),
+        "provider":    provider,
+        "merged":      merged,
+    })
 
 
 # Mount the SPA last so /api/* routes take precedence. html=True serves
