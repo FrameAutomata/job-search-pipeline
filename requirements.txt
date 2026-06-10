@@ -9,3 +9,8 @@ anthropic
 # Optional — install only the provider(s) you use with --evaluate-batch:
 # pip install google-genai          # Gemini (free tier available)
 openai                             # OpenAI, Groq, DeepInfra, and Ollama (all OpenAI-compatible)
+
+# Optional — auto-apply (--apply), LOCAL ONLY. Drives a real logged-in browser,
+# so it's never used in the cloud workflows. After installing, fetch the browser:
+#   pip install playwright && playwright install chromium
+# playwright
