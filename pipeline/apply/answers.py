@@ -94,9 +94,22 @@ class AnswerEngine:
         # Questions we couldn't answer (LLM unavailable) — surfaced for review so
         # the human completes/verifies them before submitting.
         self.unanswered: list[str] = []
-        # Tailored cover-letter text for the current job (set per job by run()).
-        # When present, it fills a cover-letter field instead of skipping it.
+        # Tailored cover letter for the current job. Generated/loaded LAZILY —
+        # only when a form actually has a cover-letter field — via the provider
+        # callback set per job by run(); cached here once obtained.
         self.cover_letter_text: str = ""
+        self.cover_letter_provider: Callable[[], str] | None = None
+
+    def cover_letter(self) -> str:
+        """The tailored cover letter for the current job, generated on first
+        request (so we never produce one for a form that doesn't ask). Returns
+        "" if none is available / generation failed."""
+        if not self.cover_letter_text and self.cover_letter_provider:
+            try:
+                self.cover_letter_text = self.cover_letter_provider() or ""
+            except Exception:
+                self.cover_letter_text = ""
+        return self.cover_letter_text
 
     # ── public API ──────────────────────────────────────────────────────────
 

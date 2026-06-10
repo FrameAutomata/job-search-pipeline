@@ -532,17 +532,23 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
         return
 
     if tag == "textarea":
-        # Cover letter: paste the tailored one career-ops generated for this job,
-        # if we have it (works even when the field is optional — a tailored cover
-        # letter strengthens the application).
-        if "cover letter" in label.lower() and answers.cover_letter_text:
-            el.fill(answers.cover_letter_text)
-            drafted.append((label, f"tailored cover letter ({len(answers.cover_letter_text)} chars)"))
+        # Cover letter: generate one ONLY now, because this form actually asks
+        # for it (request-gated — see AnswerEngine.cover_letter). Reuses an
+        # existing tailored file if present.
+        if "cover letter" in label.lower():
+            text = answers.cover_letter()
+            if text:
+                el.fill(text)
+                drafted.append((label, f"cover letter ({len(text)} chars)"))
+                return
+            if not _is_required(el):
+                drafted.append((label, "(skipped optional)"))
+                return
+            drafted.append((label, "(needs cover letter — review)"))
             return
-        # Other free-text (summary, "why are you a fit"). Skip OPTIONAL ones — a
-        # cover letter with no tailored text is usually optional, and generating
-        # generic prose per job is slow and unnecessary. Only spend an LLM call
-        # on a required free-text field.
+        # Other free-text (summary, "why are you a fit"). Skip OPTIONAL ones —
+        # generating generic prose per job is slow and unnecessary. Only spend an
+        # LLM call on a required free-text field.
         if not _is_required(el):
             drafted.append((label, "(skipped optional)"))
             return
