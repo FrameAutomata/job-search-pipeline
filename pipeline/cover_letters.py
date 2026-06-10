@@ -73,6 +73,7 @@ def build_prompt(profile: ApplyProfile, cv: str, job, report_text: str) -> tuple
 
 def _resolve_caller(provider: str | None, model: str | None):
     from pipeline.batch_evaluate import _build_caller, _detect_provider, PROVIDER_DEFAULTS
+    from pipeline.apply.answers import thinking_disabled
     provider = provider or _detect_provider()
     if not provider:
         raise RuntimeError(
@@ -80,7 +81,10 @@ def _resolve_caller(provider: str | None, model: str | None):
             "(DEEPINFRA_API_KEY, etc.) or BATCH_PROVIDER in .env"
         )
     model = model or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
-    return _build_caller(provider, model)
+    # A cover letter is prose, not a reasoning task — disable thinking so the
+    # model writes directly (faster, and avoids the truncated/garbled tails MiMo
+    # produces when it spends the token budget thinking).
+    return _build_caller(provider, model, disable_thinking=thinking_disabled())
 
 
 def find_existing(career_ops: Path, company: str) -> str:
@@ -183,6 +187,9 @@ def run(
 
 
 if __name__ == "__main__":
+    # python -m pipeline.cover_letters [career-ops-path] [min-score]
+    # Standalone invocation regenerates (force) so it's easy to re-test output.
     import sys
     co = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "career-ops"
-    run(co.resolve())
+    ms = float(sys.argv[2]) if len(sys.argv) > 2 else 4.0
+    run(co.resolve(), min_score=ms, force=True)

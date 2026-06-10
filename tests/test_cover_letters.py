@@ -84,7 +84,8 @@ class TestRun:
 
     def _patch_caller(self, monkeypatch, fn):
         monkeypatch.setattr("pipeline.batch_evaluate._detect_provider", lambda: "deepinfra")
-        monkeypatch.setattr("pipeline.batch_evaluate._build_caller", lambda provider, model: fn)
+        monkeypatch.setattr("pipeline.batch_evaluate._build_caller",
+                            lambda provider, model, **kw: fn)
 
     def test_writes_letter_for_high_fit_only(self, tmp_path, monkeypatch):
         co = self._career_ops(tmp_path)

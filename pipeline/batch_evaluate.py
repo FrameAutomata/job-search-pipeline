@@ -206,9 +206,21 @@ def _build_gemini_caller(model: str) -> Caller:
     return call
 
 
-def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None = None) -> Caller:
+# Providers whose OpenAI-compatible backends are vLLM/TGI-style and accept
+# `chat_template_kwargs` — so we can turn off a reasoning model's <think> phase.
+# Real OpenAI / Groq reject unknown body params, so they never get the toggle.
+_THINKING_TOGGLE_PROVIDERS = frozenset({"deepinfra", "openrouter", "ollama"})
+
+
+def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None = None,
+                                disable_thinking: bool = False) -> Caller:
     from openai import OpenAI  # type: ignore[import]
     client = OpenAI(api_key=api_key, base_url=base_url)
+    # Reasoning models (MiMo, Qwen3, DeepSeek-R1) emit long <think> traces by
+    # default — slow, and they can exhaust max_tokens before producing the answer
+    # (→ empty content). For short/direct outputs we don't need it, so pass
+    # chat_template_kwargs to disable it. Non-reasoning models ignore the field.
+    extra_body = {"chat_template_kwargs": {"enable_thinking": False}} if disable_thinking else None
 
     def call(system: str, user: str) -> str:
         resp = client.chat.completions.create(
@@ -218,6 +230,7 @@ def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None =
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            extra_body=extra_body,
         )
         content = resp.choices[0].message.content
         if not content:
@@ -228,7 +241,12 @@ def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None =
     return call
 
 
-def _build_caller(provider: str, model: str) -> Caller:
+def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:
+    """Build the LLM caller. `disable_thinking` turns off reasoning models'
+    <think> phase, but only for providers whose backend supports the toggle
+    (vLLM/TGI-style); it's ignored elsewhere so callers can pass it safely
+    regardless of which provider is active."""
+    toggle = disable_thinking and provider in _THINKING_TOGGLE_PROVIDERS
     if provider == "anthropic":
         return _build_anthropic_caller(model)
     if provider == "gemini":
@@ -250,19 +268,19 @@ def _build_caller(provider: str, model: str) -> Caller:
     if provider == "deepinfra":
         return _build_openai_compat_caller(
             model, api_key=os.environ["DEEPINFRA_API_KEY"],
-            base_url="https://api.deepinfra.com/v1/openai",
+            base_url="https://api.deepinfra.com/v1/openai", disable_thinking=toggle,
         )
     if provider == "openrouter":
         return _build_openai_compat_caller(
             model, api_key=os.environ["OPENROUTER_API_KEY"],
-            base_url="https://openrouter.ai/api/v1",
+            base_url="https://openrouter.ai/api/v1", disable_thinking=toggle,
         )
     if provider == "ollama":
         # `or DEFAULT` not `get(VAR, DEFAULT)` — see BATCH_MODEL fix below for
         # the rationale. Empty-string OLLAMA_BASE_URL would otherwise produce
         # a bogus "/v1" base URL.
         base = (os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/") + "/v1"
-        return _build_openai_compat_caller(model, api_key="ollama", base_url=base)
+        return _build_openai_compat_caller(model, api_key="ollama", base_url=base, disable_thinking=toggle)
     raise ValueError(f"Unknown provider: {provider!r}. Choose: {', '.join(PROVIDER_DEFAULTS)}")
 
 

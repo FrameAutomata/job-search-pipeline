@@ -214,4 +214,6 @@ def _build_caller(provider: str | None, model: str | None):
     if not provider:
         return None
     from pipeline.batch_evaluate import _build_caller as _bc, PROVIDER_DEFAULTS
-    return _bc(provider, model or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider])
+    from pipeline.apply.answers import thinking_disabled
+    return _bc(provider, model or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider],
+               disable_thinking=thinking_disabled())

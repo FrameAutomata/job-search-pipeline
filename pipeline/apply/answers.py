@@ -50,6 +50,14 @@ def _cache_key(question: str, field_type: str) -> str:
     return f"{field_type}::{_sanitize(question)}"
 
 
+def thinking_disabled() -> bool:
+    """Reasoning/thinking is unnecessary for short application answers and cover
+    letters (and slows/garbles vLLM-served reasoning models like MiMo/Qwen3), so
+    disable it by default for those use cases. Set APPLY_ENABLE_THINKING=true to
+    keep it on (e.g. if a provider rejects the toggle)."""
+    return os.environ.get("APPLY_ENABLE_THINKING", "").strip().lower() not in ("1", "true", "yes")
+
+
 def _match_option(answer: str, options: list[str]) -> str:
     """Map a free-form answer onto one of the allowed options (exact →
     case-insensitive → whole-word containment either direction). Falls back to
@@ -266,7 +274,7 @@ class AnswerEngine:
                 "provider key (GEMINI_API_KEY, etc.) or BATCH_PROVIDER in .env"
             )
         model = os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
-        self._caller = _build_caller(provider, model)
+        self._caller = _build_caller(provider, model, disable_thinking=thinking_disabled())
         return self._caller
 
     # ── cache persistence ───────────────────────────────────────────────────
