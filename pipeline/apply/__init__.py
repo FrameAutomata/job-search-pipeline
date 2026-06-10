@@ -15,6 +15,7 @@ Local-only: it needs a real LinkedIn session, so it never runs in the cloud."""
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from pipeline.app import data as _data
@@ -89,8 +90,9 @@ def run(
 
             for job in jobs:
                 engine.job_context = f"{job.company} — {job.role}"
+                resume = _resolve_resume(career_ops, job)
                 try:
-                    result = linkedin.apply_to(page, job, engine, mode=mode)
+                    result = linkedin.apply_to(page, job, engine, mode=mode, resume_path=resume)
                 except Exception as e:  # never let one job kill the batch
                     result = failed(f"exception:{type(e).__name__}")
 
@@ -100,6 +102,13 @@ def run(
     except ImportError as e:
         print(f"[apply] {e}")
         return 0
+    except Exception as e:
+        # Most commonly the browser window was closed mid-run (Playwright raises
+        # a target-closed / navigation-aborted error). Report cleanly rather than
+        # dumping a traceback; whatever finished before the close still counts.
+        msg = str(e).splitlines()[0] if str(e) else type(e).__name__
+        print(f"[apply] session ended early ({type(e).__name__}: {msg[:80]}) — "
+              "did the browser window close?")
 
     print(f"[apply] done — {applied} submitted, {held} filled (held for review), "
           f"{failures} failed | {engine.llm_calls} LLM calls, {engine.cache_hits} cache hits")
@@ -126,6 +135,28 @@ def _report(job, result: ApplyResult, mode: str, applications_md: Path,
         print(f"[apply] [XX]   {result.code.upper()} {tag}"
               + (f" ({result.reason})" if result.reason else ""))
     return applied, held, failures
+
+
+def _find_tailored_resume(career_ops: Path, job) -> Path | None:
+    """A per-job tailored resume PDF, if one exists. Searches APPLY_TAILORED_DIR
+    (default career-ops/output, where career-ops' pdf mode writes tailored CVs)
+    for a .pdf whose filename contains the company slug; returns the most recent
+    match. Returns None when there's no tailored resume for this job."""
+    base = os.environ.get("APPLY_TAILORED_DIR")
+    tdir = Path(base) if base else career_ops / "output"
+    if not tdir.exists():
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "", (job.company or "").lower())
+    if not slug:
+        return None
+    matches = [p for p in tdir.glob("*.pdf")
+               if slug in re.sub(r"[^a-z0-9]+", "", p.stem.lower())]
+    return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+
+def _resolve_resume(career_ops: Path, job) -> Path | None:
+    """Tailored resume for this job when available, else the configured default."""
+    return _find_tailored_resume(career_ops, job) or linkedin._resume_pdf()
 
 
 def _refresh_tracker(career_ops: Path) -> Path:

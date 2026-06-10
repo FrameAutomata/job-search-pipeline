@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from pipeline.apply import queue, result
+import pipeline.apply as apply_pkg
+from pipeline.apply import linkedin, queue, result
 from pipeline.apply.answers import AnswerEngine, _match_option, _sanitize
 from pipeline.apply.profile import ApplyProfile, _parse_salary
 
@@ -268,3 +269,61 @@ class TestQueueHelpers:
 
     def test_extract_url_strips_trailing_punctuation(self):
         assert queue._extract_url("see https://x.com/a/b, fits") == "https://x.com/a/b"
+
+
+# ── linkedin.py pure helpers (no browser) ────────────────────────────────────
+
+class TestOptoutCheckbox:
+    def test_detects_follow_and_marketing(self):
+        for lbl in ("Follow Apexon to stay up to date with their page.",
+                    "Subscribe to our newsletter",
+                    "Receive marketing emails",
+                    "Opt-in to promotional updates"):
+            assert linkedin._is_optout_checkbox(lbl) is True
+
+    def test_normal_consent_not_optout(self):
+        assert linkedin._is_optout_checkbox("I agree to the terms and conditions") is False
+        assert linkedin._is_optout_checkbox("I certify the information is accurate") is False
+
+
+class TestResumeResolution:
+    def test_prefers_resume_path_env(self, tmp_path, monkeypatch):
+        pdf = tmp_path / "my_resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        monkeypatch.setenv("RESUME_PATH", str(pdf))
+        assert linkedin._resume_pdf() == pdf
+
+    def test_coerces_txt_path_to_pdf(self, tmp_path, monkeypatch):
+        pdf = tmp_path / "r.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        monkeypatch.setenv("RESUME_PATH", str(tmp_path / "r.txt"))  # points at .txt sibling
+        assert linkedin._resume_pdf() == pdf
+
+    def test_falls_back_when_resume_path_missing(self, monkeypatch):
+        monkeypatch.setenv("RESUME_PATH", str(Path("/nonexistent/x.pdf")))
+        r = linkedin._resume_pdf()
+        # Either the repo's default resumes/resume.pdf, or None if absent.
+        assert r is None or r.name == "resume.pdf"
+
+
+class TestTailoredResume:
+    def _job(self, company):
+        return queue.ApplyJob(num="1", company=company, role="Eng",
+                              url="https://www.linkedin.com/jobs/view/1", score=4.5)
+
+    def test_finds_by_company_slug(self, tmp_path):
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "CV - Apexon Inc.pdf").write_bytes(b"%PDF-1.4")
+        (out / "CV - Globex.pdf").write_bytes(b"%PDF-1.4")
+        found = apply_pkg._find_tailored_resume(tmp_path, self._job("Apexon"))
+        assert found is not None and found.name == "CV - Apexon Inc.pdf"
+
+    def test_none_when_no_company_match(self, tmp_path):
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "CV - Globex.pdf").write_bytes(b"%PDF-1.4")
+        assert apply_pkg._find_tailored_resume(tmp_path, self._job("Apexon")) is None
+
+    def test_none_when_dir_absent(self, tmp_path):
+        assert apply_pkg._find_tailored_resume(tmp_path, self._job("Apexon")) is None

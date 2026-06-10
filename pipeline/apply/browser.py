@@ -49,11 +49,18 @@ def launch(headless: bool = False, user_data_dir: Path | None = None):
     udd = Path(user_data_dir) if user_data_dir else default_user_data_dir()
     udd.mkdir(parents=True, exist_ok=True)
 
+    args = list(_LAUNCH_ARGS)
+    # Skip image loading by default — LinkedIn job pages are image-heavy and we
+    # don't need them to fill a form, so this noticeably speeds up the initial
+    # page load and the modal render. Re-enable with APPLY_LOAD_IMAGES=true.
+    if os.environ.get("APPLY_LOAD_IMAGES", "").strip().lower() not in ("1", "true", "yes"):
+        args.append("--blink-settings=imagesEnabled=false")
+
     pw = sync_playwright().start()
     context = pw.chromium.launch_persistent_context(
         user_data_dir=str(udd),
         headless=headless,
-        args=_LAUNCH_ARGS,
+        args=args,
         viewport={"width": 1280, "height": 900},
     )
     try:
@@ -73,14 +80,21 @@ def is_logged_in(page) -> bool:
     Easy Apply button. The global search box and the 'Me' avatar menu only exist
     once signed in."""
     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2000)
     url = page.url.lower()
-    if any(x in url for x in ("/login", "/uas/login", "/checkpoint", "/authwall")):
+    # Primary signal — redirect, not DOM: a logged-out session bounces /feed to
+    # authwall/login/signup (or the public homepage); a logged-in one stays on
+    # /feed. This is layout-independent, unlike element selectors that LinkedIn
+    # A/B-tests and renames.
+    if any(x in url for x in ("/login", "/uas/login", "/checkpoint", "/authwall", "/signup")):
         return False
+    if "/feed" in url:
+        return True
+    # Ambiguous URL (rare) — fall back to authenticated-only chrome.
     try:
         return page.locator(
             "input.search-global-typeahead__input, .global-nav__me, "
-            "button[aria-label='Me'], img.global-nav__me-photo"
+            "img.global-nav__me-photo, button[aria-label*='Me' i]"
         ).count() > 0
     except Exception:
         return False
@@ -109,10 +123,11 @@ def ensure_logged_in(page, *, headless: bool, timeout_s: int = 240) -> bool:
     while time.time() < deadline:
         time.sleep(3)
         cur = page.url.lower()
-        if any(x in cur for x in ("/login", "/uas/login", "/checkpoint", "/authwall")):
+        if any(x in cur for x in ("/login", "/uas/login", "/checkpoint", "/authwall", "/signup")):
             continue  # still on a login / challenge page
-        # Require authenticated-only chrome (not the bare nav, which exists
-        # logged-out too) before declaring success.
+        # Landed on any authenticated section → signed in (layout-independent).
+        if any(s in cur for s in ("/feed", "/jobs", "/in/", "/mynetwork", "/messaging")):
+            return True
         try:
             if page.locator("input.search-global-typeahead__input, .global-nav__me, "
                             "img.global-nav__me-photo").count() > 0:
