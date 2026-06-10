@@ -4,6 +4,8 @@ whose backend accepts it (deepinfra/openrouter/ollama), never OpenAI/Groq."""
 
 import types
 
+import pytest
+
 import pipeline.batch_evaluate as be
 
 
@@ -16,6 +18,52 @@ def _fake_openai_client(captured: dict):
     return types.SimpleNamespace(
         chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
     )
+
+
+class _Busy(Exception):
+    """Mimics a provider 'overloaded' 429 (what _is_rate_limit_error keys on)."""
+    status_code = 429
+
+
+def _routing_client(behavior: dict):
+    """OpenAI stand-in that, per requested model, returns text or raises."""
+    def create(**kwargs):
+        outcome = behavior[kwargs["model"]]
+        if isinstance(outcome, Exception):
+            raise outcome
+        msg = types.SimpleNamespace(content=outcome)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+    return types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+    )
+
+
+class TestFailover:
+    def _patch(self, monkeypatch, behavior):
+        monkeypatch.setenv("DEEPINFRA_API_KEY", "k")
+        monkeypatch.setattr("openai.OpenAI", lambda **kw: _routing_client(behavior))
+
+    def test_fails_over_to_next_when_busy(self, monkeypatch):
+        self._patch(monkeypatch, {"A": _Busy("busy"), "B": "from B"})
+        caller = be._build_caller("deepinfra", "A,B")
+        assert caller("s", "u") == "from B"
+
+    def test_raises_when_all_busy(self, monkeypatch):
+        self._patch(monkeypatch, {"A": _Busy("busy"), "B": _Busy("busy")})
+        caller = be._build_caller("deepinfra", "A,B")
+        with pytest.raises(_Busy):
+            caller("s", "u")
+
+    def test_non_overload_error_not_masked(self, monkeypatch):
+        # A bad model id (not a 429) must surface, not silently fail over.
+        self._patch(monkeypatch, {"A": ValueError("bad model"), "B": "from B"})
+        caller = be._build_caller("deepinfra", "A,B")
+        with pytest.raises(ValueError):
+            caller("s", "u")
+
+    def test_single_model_is_not_failover(self, monkeypatch):
+        self._patch(monkeypatch, {"A": "from A"})
+        assert be._build_caller("deepinfra", "A")("s", "u") == "from A"
 
 
 class TestThinkingToggle:

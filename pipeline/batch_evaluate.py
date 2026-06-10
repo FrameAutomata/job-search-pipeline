@@ -241,10 +241,52 @@ def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None =
     return call
 
 
+def _split_models(model: str) -> list[str]:
+    """Parse a model spec into a list. Comma-separated = a failover chain tried
+    in order; a single value = no failover (back-compatible)."""
+    return [m.strip() for m in (model or "").split(",") if m.strip()]
+
+
+def _build_failover_caller(provider: str, models: list[str], *,
+                           disable_thinking: bool = False) -> Caller:
+    """Try each model in order, falling over to the next when one is overloaded
+    (429 / "engine_overloaded"). Raises the last overload error if ALL are busy —
+    which _call_with_retry then backs off and retries (re-trying the whole chain).
+    Non-overload errors (e.g. a bad model id) raise immediately and aren't masked."""
+    built = [(m, _build_single_caller(provider, m, disable_thinking=disable_thinking))
+             for m in models]
+
+    def call(system: str, user: str) -> str:
+        last_exc: Exception | None = None
+        for i, (model, caller) in enumerate(built):
+            try:
+                return caller(system, user)
+            except Exception as exc:
+                if not _is_rate_limit_error(exc):
+                    raise
+                last_exc = exc
+                if i + 1 < len(built):
+                    print(f"  model busy ({model}) — failing over to {built[i + 1][0]}", flush=True)
+        raise last_exc if last_exc else RuntimeError("no models configured")
+
+    return call
+
+
 def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:
-    """Build the LLM caller. `disable_thinking` turns off reasoning models'
-    <think> phase, but only for providers whose backend supports the toggle
-    (vLLM/TGI-style); it's ignored elsewhere so callers can pass it safely
+    """Build the LLM caller. `model` may be a comma-separated failover chain
+    (tried in order on overload). `disable_thinking` is honored per the
+    single-model builder."""
+    models = _split_models(model)
+    if len(models) > 1:
+        return _build_failover_caller(provider, models, disable_thinking=disable_thinking)
+    return _build_single_caller(provider, models[0] if models else model,
+                                disable_thinking=disable_thinking)
+
+
+def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:
+    """Build a caller bound to one model. `disable_thinking` turns off reasoning
+    models' <think> phase, but only for providers whose backend supports the
+    toggle (vLLM/TGI-style); ignored elsewhere so callers can pass it safely
     regardless of which provider is active."""
     toggle = disable_thinking and provider in _THINKING_TOGGLE_PROVIDERS
     if provider == "anthropic":
