@@ -33,6 +33,27 @@ def _parse_salary(value: str | int | None) -> int | None:
     return int(num)
 
 
+def _parse_salary_target(value: str | int | None) -> int | None:
+    """A figure to STATE as the expectation — the midpoint of a target range
+    ("$130K-$170K" → 150000), or the single value if there's only one. Distinct
+    from the walk-away minimum, which we never reveal on an application."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    nums: list[int] = []
+    for n, suf in re.findall(r"(\d[\d,\.]*)\s*([kKmM]?)", str(value)):
+        x = float(n.replace(",", ""))
+        if suf.lower() == "k":
+            x *= 1_000
+        elif suf.lower() == "m":
+            x *= 1_000_000
+        nums.append(int(x))
+    if not nums:
+        return None
+    return (nums[0] + nums[1]) // 2 if len(nums) >= 2 else nums[0]
+
+
 def _as_list(value) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
@@ -56,8 +77,10 @@ class ApplyProfile:
     requires_sponsorship: bool = False
     work_permit_type: str = ""
     eligible_countries: list[str] = field(default_factory=list)
-    # Compensation
+    # Compensation. salary_floor is the walk-away minimum — NEVER stated on an
+    # application. salary_target is what we put in a numeric salary field.
     salary_floor: int | None = None
+    salary_target: int | None = None
     salary_currency: str = "USD"
 
     @property
@@ -107,6 +130,7 @@ class ApplyProfile:
             work_permit_type=str(wa.get("work_permit_type", "")).strip(),
             eligible_countries=eligible,
             salary_floor=_parse_salary(comp.get("minimum") or comp.get("target_range")),
+            salary_target=_parse_salary_target(comp.get("target_range") or comp.get("minimum")),
             salary_currency=str(comp.get("currency", "USD")).strip() or "USD",
         )
 
@@ -130,6 +154,7 @@ class ApplyProfile:
         lines.append(f"Requires visa sponsorship: {'yes' if self.requires_sponsorship else 'no'}")
         if self.work_permit_type:
             lines.append(f"Work permit / status: {self.work_permit_type}")
-        if self.salary_floor:
-            lines.append(f"Salary floor: {self.salary_floor} {self.salary_currency}")
+        # Deliberately NOT exposing salary floor/target — applications and cover
+        # letters should never reveal the walk-away minimum, and salary fields are
+        # handled deterministically ("Negotiable" / target), not via this context.
         return lines

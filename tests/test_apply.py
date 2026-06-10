@@ -12,7 +12,7 @@ import pytest
 import pipeline.apply as apply_pkg
 from pipeline.apply import linkedin, queue, result
 from pipeline.apply.answers import AnswerEngine, _match_option, _sanitize
-from pipeline.apply.profile import ApplyProfile, _parse_salary
+from pipeline.apply.profile import ApplyProfile, _parse_salary, _parse_salary_target
 
 
 # ── result.py ────────────────────────────────────────────────────────────────
@@ -53,6 +53,16 @@ class TestParseSalary:
     ])
     def test_parse(self, raw, expected):
         assert _parse_salary(raw) == expected
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("$130K-$170K", 150000),   # midpoint of a range
+        ("$130K - 170K", 150000),
+        ("$150K", 150000),         # single value
+        ("", None),
+        (None, None),
+    ])
+    def test_parse_target(self, raw, expected):
+        assert _parse_salary_target(raw) == expected
 
 
 class TestApplyProfile:
@@ -113,7 +123,7 @@ def profile():
         full_name="Thomas Thirlwall", email="t@example.com", phone="+1 (956) 525-3015",
         city="Dallas", country="United States", linkedin="linkedin.com/in/x",
         citizenship="US", authorized_regions=["United States"],
-        requires_sponsorship=False, salary_floor=75000,
+        requires_sponsorship=False, salary_floor=75000, salary_target=150000,
     )
 
 
@@ -151,9 +161,16 @@ class TestAnswerEngineDeterministic:
         assert e.answer("Gender", "select", ["Male", "Female", "Prefer not to say"]) == "Prefer not to say"
         assert e.answer("Veteran status", "text") == "Prefer not to say"
 
-    def test_salary(self, profile, tmp_path):
+    def test_salary_text_is_negotiable(self, profile, tmp_path):
+        # Never reveal the walk-away minimum; a text salary field gets "Negotiable".
         e = self._engine(profile, tmp_path)
-        assert e.answer("Desired salary", "numeric") == "75000"
+        assert e.answer("What are your salary expectations?", "text") == "Negotiable"
+
+    def test_salary_numeric_uses_target_not_floor(self, profile, tmp_path):
+        # A numeric salary field can't take "Negotiable" → use the target (150000),
+        # NOT the floor (75000).
+        e = self._engine(profile, tmp_path)
+        assert e.answer("Desired salary", "numeric") == "150000"
 
 
 class TestAnswerEngineCache:

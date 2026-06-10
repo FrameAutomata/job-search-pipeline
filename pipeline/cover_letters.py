@@ -134,14 +134,27 @@ def find_existing(career_ops: Path, company: str) -> str:
 def render_pdf(text: str, pdf_path: Path) -> bool:
     """Render plain cover-letter text to a simple PDF via headless Chromium
     (Playwright is already an apply dependency — no extra package). Returns False
-    if Playwright/Chromium isn't available or rendering fails (caller then skips
-    the upload rather than erroring)."""
+    if Playwright/Chromium isn't available or rendering fails (the caller then
+    skips the upload rather than erroring).
+
+    Runs in a SEPARATE thread: during an apply run we're already inside a
+    sync_playwright() context on the main thread, and Playwright forbids nesting
+    sync contexts in one thread — so a direct call there would throw."""
+    import concurrent.futures
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return bool(ex.submit(_render_pdf_sync, str(text or ""), str(pdf_path)).result(timeout=90))
+    except Exception:
+        return False
+
+
+def _render_pdf_sync(text: str, pdf_path: str) -> bool:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return False
     import html as _html
-    paras = [p.strip() for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
     body = "\n".join(f"<p>{_html.escape(p).replace(chr(10), '<br>')}</p>" for p in paras)
     doc = ("<!doctype html><html><head><meta charset='utf-8'><style>"
            "body{font-family:Georgia,'Times New Roman',serif;font-size:11pt;"

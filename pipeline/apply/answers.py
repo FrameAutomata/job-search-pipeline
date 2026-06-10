@@ -226,9 +226,14 @@ class AnswerEngine:
         if "location" in q and field_type in ("text", "textarea"):
             return ", ".join(x for x in (p.city, p.country) if x) or None
 
-        # Compensation.
-        if re.search(r"\b(salary|compensation|expected pay|desired pay|rate)\b", q) and p.salary_floor:
-            return str(p.salary_floor)
+        # Compensation. NEVER state the walk-away minimum — that hands the
+        # employer your floor. Text fields → "Negotiable"; numeric fields (which
+        # can't take "Negotiable") → the target figure, not the floor.
+        if re.search(r"\b(salary|compensation|expected pay|desired pay|pay expectation|"
+                     r"expected compensation|comp expectation)\b", q):
+            if field_type == "numeric":
+                return str(p.salary_target) if p.salary_target else None
+            return "Negotiable"
 
         # Affirmative consent.
         if _AFFIRM_RE.search(q):
