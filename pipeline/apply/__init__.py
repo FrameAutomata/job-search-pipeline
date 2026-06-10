@@ -24,7 +24,11 @@ from pipeline.apply.answers import AnswerEngine
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.result import ApplyResult, failed
 
+ROOT = Path(__file__).resolve().parent.parent.parent
 _VALID_MODES = ("review", "dry-run", "auto")
+# The workflows whose artifact carries the latest applications.md (mirror of
+# server.py's list — both pipelines upload the same pipeline-output-* artifact).
+_PIPELINE_WORKFLOWS = ["daily-pipeline.yml", "easy-apply-pipeline.yml"]
 
 
 def run(
@@ -34,19 +38,34 @@ def run(
     min_score: float = 4.0,
     limit: int = 0,
     headless: bool = False,
+    refresh: bool = True,
     provider: str | None = None,
     model: str | None = None,
 ) -> int:
     """Apply to qualifying LinkedIn Easy Apply jobs. Returns the count applied
-    (auto mode) or filled-and-held (review/dry-run)."""
+    (auto mode) or filled-and-held (review/dry-run).
+
+    refresh: pull the latest applications.md from the most recent GitHub pipeline
+        artifact before selecting (defaults on, since evaluations accumulate in
+        the cloud). Falls back to the local tracker when gh/network is unavailable."""
     career_ops = Path(career_ops)
     if mode not in _VALID_MODES:
         mode = "review"
 
-    jobs = queue.select(career_ops, min_score=min_score, limit=limit, linkedin_only=True)
+    applications_md = (
+        _refresh_tracker(career_ops) if refresh
+        else career_ops / "data" / "applications.md"
+    )
+
+    jobs = queue.select(career_ops, min_score=min_score, limit=limit,
+                        linkedin_only=True, applications_md=applications_md)
     if not jobs:
-        print(f"[apply] no LinkedIn Easy Apply candidates (score >= {min_score}, status Evaluated)")
+        print(f"[apply] no LinkedIn Easy Apply candidates "
+              f"(score >= {min_score}, status Evaluated) in {applications_md.name}")
         return 0
+    if mode == "auto" and refresh:
+        print("[apply] note: status write-back goes to the downloaded tracker copy; "
+              "it won't reach the cloud until pushed (UI Refresh→Push / Edit Tracker).")
 
     print(f"[apply] {len(jobs)} candidate(s) | mode={mode} | "
           f"{'headless' if headless else 'windowed'}")
@@ -60,7 +79,6 @@ def run(
     )
 
     applied = held = failures = 0
-    applications_md = career_ops / "data" / "applications.md"
 
     try:
         with browser.launch(headless=headless) as page:
@@ -106,6 +124,28 @@ def _report(job, result: ApplyResult, mode: str, applications_md: Path,
         print(f"[apply] ✗ {result.code.upper()} {tag}"
               + (f" ({result.reason})" if result.reason else ""))
     return applied, held, failures
+
+
+def _refresh_tracker(career_ops: Path) -> Path:
+    """Download the latest pipeline artifact's applications.md from GitHub so we
+    apply against current cloud evaluations. Returns the refreshed file's path,
+    or the local tracker on any failure (no gh, offline, no runs yet)."""
+    local = career_ops / "data" / "applications.md"
+    try:
+        from pipeline.app import gh
+        run_info = gh.latest_successful_run(_PIPELINE_WORKFLOWS)
+        if not run_info:
+            print("[apply] refresh: no successful pipeline run on GitHub — using local tracker")
+            return local
+        data_dir = gh.download_artifact(run_info["databaseId"], ROOT / ".ui-cache" / "apply")
+        apps = data_dir / "data" / "applications.md"
+        if apps.exists():
+            print(f"[apply] refreshed tracker from GitHub run {run_info['databaseId']}")
+            return apps
+        print("[apply] refresh: artifact has no applications.md — using local tracker")
+    except Exception as e:
+        print(f"[apply] refresh failed ({type(e).__name__}: {e}) — using local tracker")
+    return local
 
 
 def _mark_applied(applications_md: Path, num: str) -> None:

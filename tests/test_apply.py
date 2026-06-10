@@ -245,6 +245,19 @@ class TestQueueSelect:
     def test_missing_tracker_returns_empty(self, tmp_path):
         assert queue.select(tmp_path, min_score=4.0) == []
 
+    def test_explicit_applications_md_override(self, tmp_path):
+        """applications_md points the queue at a refreshed artifact's tracker,
+        not the (possibly absent/stale) local one."""
+        co = tmp_path / "career-ops"
+        co.mkdir()  # deliberately no data/applications.md here
+        art = tmp_path / "artifact" / "data"
+        art.mkdir(parents=True)
+        (art / "applications.md").write_text(_TRACKER, encoding="utf-8")
+        jobs = queue.select(co, min_score=4.0, applications_md=art / "applications.md")
+        assert [j.num for j in jobs] == ["5", "1"]
+        # Without the override, the empty local career-ops yields nothing.
+        assert queue.select(co, min_score=4.0) == []
+
 
 class TestQueueHelpers:
     def test_is_linkedin_job(self):

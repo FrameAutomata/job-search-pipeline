@@ -40,6 +40,10 @@ def main() -> int:
                     help="Only apply to jobs scoring >= this (default: 4.0)")
     ap.add_argument("--apply-limit", type=int, default=0,
                     help="Max applications to attempt this run (0 = no cap)")
+    ap.add_argument("--apply-refresh", action=argparse.BooleanOptionalAction, default=True,
+                    help="Pull the latest tracker from the most recent GitHub pipeline "
+                         "artifact before applying (default on; --no-apply-refresh to use "
+                         "the local applications.md). Falls back to local when offline.")
     ap.add_argument("--headless", action="store_true",
                     help="Run the apply browser headless (only works once you've logged in once)")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
@@ -125,6 +129,7 @@ def main() -> int:
             min_score=args.apply_min_score,
             limit=args.apply_limit,
             headless=args.headless,
+            refresh=args.apply_refresh,
             provider=args.batch_provider,
             model=args.batch_model,
         )

@@ -52,14 +52,18 @@ def select(
     min_score: float = 4.0,
     limit: int = 0,
     linkedin_only: bool = True,
+    applications_md: Path | None = None,
 ) -> list[ApplyJob]:
     """Return apply candidates, highest score first.
 
     min_score: skip rows scoring below this (rows with no score are skipped).
     limit: cap the number returned (0 = no cap).
-    linkedin_only: keep only linkedin.com/jobs/view URLs (the Phase 2 engine)."""
-    applications_md = Path(career_ops) / "data" / "applications.md"
-    rows = _data.parse_applications(applications_md)
+    linkedin_only: keep only linkedin.com/jobs/view URLs (the Phase 2 engine).
+    applications_md: tracker to read; defaults to career_ops/data/applications.md.
+        The apply stage points this at a freshly-downloaded GitHub artifact so it
+        applies against current cloud evaluations, not a stale local copy."""
+    tracker = Path(applications_md) if applications_md else Path(career_ops) / "data" / "applications.md"
+    rows = _data.parse_applications(tracker)
 
     jobs: list[ApplyJob] = []
     for row in rows:
