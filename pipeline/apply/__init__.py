@@ -65,7 +65,7 @@ def run(
         return 0
     if mode == "auto" and refresh:
         print("[apply] note: status write-back goes to the downloaded tracker copy; "
-              "it won't reach the cloud until pushed (UI Refresh→Push / Edit Tracker).")
+              "it won't reach the cloud until pushed (UI Refresh/Push or Edit Tracker).")
 
     print(f"[apply] {len(jobs)} candidate(s) | mode={mode} | "
           f"{'headless' if headless else 'windowed'}")
@@ -109,19 +109,21 @@ def run(
 def _report(job, result: ApplyResult, mode: str, applications_md: Path,
             applied: int, held: int, failures: int) -> tuple[int, int, int]:
     """Log one job's outcome and, for a real submission, mark the tracker."""
+    # ASCII-only markers: Windows consoles default to cp1252, which can't encode
+    # glyphs like ✓/✗/→ and would crash the whole run on the print.
     tag = f"#{job.num} {job.company} / {job.role}"[:60]
     if result.applied and result.submitted:
         _mark_applied(applications_md, job.num)
         applied += 1
-        print(f"[apply] ✓ SUBMITTED {tag}")
+        print(f"[apply] [OK]   SUBMITTED {tag}")
     elif result.applied:  # filled but held (review/dry-run)
         held += 1
-        print(f"[apply] · FILLED  {tag} — {len(result.answers)} field(s) drafted, not submitted")
+        print(f"[apply] [..]   FILLED {tag} -- {len(result.answers)} field(s) drafted, not submitted")
         for q, a in result.answers:
-            print(f"          {q[:50]} → {a[:60]}")
+            print(f"               {q[:50]} -> {a[:60]}")
     else:
         failures += 1
-        print(f"[apply] ✗ {result.code.upper()} {tag}"
+        print(f"[apply] [XX]   {result.code.upper()} {tag}"
               + (f" ({result.reason})" if result.reason else ""))
     return applied, held, failures
 

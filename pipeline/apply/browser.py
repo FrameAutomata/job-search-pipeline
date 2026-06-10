@@ -109,6 +109,14 @@ def ensure_logged_in(page, *, headless: bool, timeout_s: int = 240) -> bool:
     while time.time() < deadline:
         time.sleep(3)
         cur = page.url.lower()
-        if "/feed" in cur or "/jobs" in cur or page.locator("#global-nav").count() > 0:
-            return True
+        if any(x in cur for x in ("/login", "/uas/login", "/checkpoint", "/authwall")):
+            continue  # still on a login / challenge page
+        # Require authenticated-only chrome (not the bare nav, which exists
+        # logged-out too) before declaring success.
+        try:
+            if page.locator("input.search-global-typeahead__input, .global-nav__me, "
+                            "img.global-nav__me-photo").count() > 0:
+                return True
+        except Exception:
+            pass
     return is_logged_in(page)
