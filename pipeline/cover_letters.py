@@ -189,7 +189,11 @@ def run(
 if __name__ == "__main__":
     # python -m pipeline.cover_letters [career-ops-path] [min-score]
     # Standalone invocation regenerates (force) so it's easy to re-test output.
+    # Load .env here — unlike the in-pipeline path, this bypasses orchestrate.py
+    # (which normally loads it), so provider keys wouldn't otherwise be seen.
     import sys
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
     co = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "career-ops"
     ms = float(sys.argv[2]) if len(sys.argv) > 2 else 4.0
     run(co.resolve(), min_score=ms, force=True)
