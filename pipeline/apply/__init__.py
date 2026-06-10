@@ -101,11 +101,13 @@ def run(
             for job in jobs:
                 engine.job_context = f"{job.company} — {job.role}"
                 # Cover letter generated lazily — only if this form has a cover-
-                # letter field (request-gated). Reuses the engine's LLM caller.
+                # letter field (request-gated). Builds its own caller so it can
+                # use COVER_MODEL (quality-first) rather than the speed-first
+                # APPLY_MODEL chain the short answers use.
                 engine.cover_letter_text = ""
                 engine.cover_letter_provider = (
                     lambda j=job: cover_letters.generate_for_job(
-                        career_ops, j, caller=engine._ensure_caller())
+                        career_ops, j, provider=provider, model=model)
                 )
                 resume = _resolve_resume(career_ops, job)
                 try:

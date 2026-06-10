@@ -80,10 +80,11 @@ def _resolve_caller(provider: str | None, model: str | None):
             "no LLM provider configured for cover letters — set a provider key "
             "(DEEPINFRA_API_KEY, etc.) or BATCH_PROVIDER in .env"
         )
-    # APPLY_MODEL overrides BATCH_MODEL for this light task — keep the heavy
-    # evaluation model for evals, use a faster/available one for prose.
-    model = (model or os.environ.get("APPLY_MODEL") or os.environ.get("BATCH_MODEL")
-             or PROVIDER_DEFAULTS[provider])
+    # Model precedence for cover letters: COVER_MODEL (a quality-first chain,
+    # since a letter is recruiter-facing) → APPLY_MODEL → BATCH_MODEL → default.
+    # Each may be a comma-separated failover chain.
+    model = (model or os.environ.get("COVER_MODEL") or os.environ.get("APPLY_MODEL")
+             or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider])
     # A cover letter is prose, not a reasoning task — disable thinking so the
     # model writes directly (faster, and avoids the truncated/garbled tails MiMo
     # produces when it spends the token budget thinking).
