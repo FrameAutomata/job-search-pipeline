@@ -317,7 +317,7 @@ def _fill_visible_fields(page, answers: AnswerEngine, drafted: list[tuple[str, s
     # resume is already selected, the upload simply replaces it with the
     # current one — which is what we want anyway.
     try:
-        _handle_file_inputs(dialog, drafted, resume_path)
+        _handle_file_inputs(dialog, answers, drafted, resume_path)
     except Exception:
         pass
 
@@ -698,32 +698,44 @@ def _resume_pdf() -> Path | None:
     return None
 
 
-def _handle_file_inputs(dialog, drafted: list[tuple[str, str]],
+def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, str]],
                         resume_path: Path | None = None) -> None:
-    """Upload the resume into any resume file input on the visible step.
+    """Fill file-upload fields on the visible step.
 
-    Uses the caller-supplied resume_path (a per-job tailored PDF when available),
-    falling back to the configured default. Cover-letter inputs are left alone
-    (optional on Easy Apply, and we don't generate per-job cover letters here)."""
+    A cover-letter file input gets the cover letter rendered to PDF (generated
+    on demand, only because this form asks for it); every other file input gets
+    the resume (caller-supplied tailored PDF, else the configured default).
+    Playwright can set a file input even when it's visually hidden behind an
+    "Upload" button."""
     files = dialog.locator("input[type=file]")
     try:
         count = files.count()
     except Exception:
         return
-    if not count:
-        return
-    pdf = resume_path if (resume_path and Path(resume_path).exists()) else _resume_pdf()
-    if pdf is None:
-        drafted.append(("Resume upload", "SKIPPED - no resume PDF found (set RESUME_PATH)"))
-        return
+    resume_pdf = None  # resolved lazily, only if a non-cover file field appears
     for i in range(count):
         el = files.nth(i)
         try:
             label = (_field_label(dialog, el) or el.get_attribute("name") or "").lower()
+        except Exception:
+            label = ""
+        try:
             if "cover" in label:
+                pdf = answers.cover_letter_pdf()
+                if pdf is not None:
+                    el.set_input_files(str(pdf))
+                    drafted.append(("Upload (cover letter)", Path(pdf).name))
+                else:
+                    drafted.append(("Cover letter upload", "(skipped — no letter)"))
                 continue
-            el.set_input_files(str(pdf))
-            drafted.append((f"Upload ({label or 'resume'})", pdf.name))
+            if resume_pdf is None:
+                resume_pdf = (resume_path if (resume_path and Path(resume_path).exists())
+                              else _resume_pdf())
+            if resume_pdf is None:
+                drafted.append(("Resume upload", "SKIPPED - no resume PDF found (set RESUME_PATH)"))
+                continue
+            el.set_input_files(str(resume_pdf))
+            drafted.append((f"Upload ({label or 'resume'})", resume_pdf.name))
         except Exception:
             continue
 

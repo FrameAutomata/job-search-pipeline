@@ -41,6 +41,11 @@ def cover_path(out_dir: Path, company: str) -> Path:
     return Path(out_dir) / f"{_safe_company(company)} - cover.md"
 
 
+def cover_pdf_path(career_ops: Path, company: str) -> Path:
+    """The PDF rendered from the cover letter (for forms that want an upload)."""
+    return cover_path(Path(career_ops) / "output", company).with_suffix(".pdf")
+
+
 def build_prompt(profile: ApplyProfile, cv: str, job, report_text: str) -> tuple[str, str]:
     """(system, user) for one cover letter. Grounded in the CV + report so the
     model can't invent employers, titles, or credentials."""
@@ -124,6 +129,52 @@ def find_existing(career_ops: Path, company: str) -> str:
     if not matches:
         return ""
     return read_text(max(matches, key=lambda p: p.stat().st_mtime))
+
+
+def render_pdf(text: str, pdf_path: Path) -> bool:
+    """Render plain cover-letter text to a simple PDF via headless Chromium
+    (Playwright is already an apply dependency — no extra package). Returns False
+    if Playwright/Chromium isn't available or rendering fails (caller then skips
+    the upload rather than erroring)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    import html as _html
+    paras = [p.strip() for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+    body = "\n".join(f"<p>{_html.escape(p).replace(chr(10), '<br>')}</p>" for p in paras)
+    doc = ("<!doctype html><html><head><meta charset='utf-8'><style>"
+           "body{font-family:Georgia,'Times New Roman',serif;font-size:11pt;"
+           "line-height:1.5;color:#111;} p{margin:0 0 12pt;}"
+           "</style></head><body>" + body + "</body></html>")
+    try:
+        Path(pdf_path).parent.mkdir(parents=True, exist_ok=True)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(doc, wait_until="load")
+                page.pdf(path=str(pdf_path), format="Letter",
+                         margin={"top": "1in", "bottom": "1in", "left": "1in", "right": "1in"})
+            finally:
+                browser.close()
+        return True
+    except Exception:
+        return False
+
+
+def ensure_cover_pdf(career_ops: Path, company: str) -> Path | None:
+    """Return a PDF of this company's cover letter, rendering it from the saved
+    .md text if one doesn't exist yet. None when there's no letter text or the
+    render fails. Used for forms whose cover-letter field is a file upload."""
+    career_ops = Path(career_ops)
+    text = find_existing(career_ops, company)
+    if not text:
+        return None
+    pdf = cover_pdf_path(career_ops, company)
+    if pdf.exists():
+        return pdf
+    return pdf if render_pdf(text, pdf) else None
 
 
 def generate_for_job(career_ops: Path, job, *, caller=None,

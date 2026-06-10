@@ -109,6 +109,11 @@ def run(
                     lambda j=job: cover_letters.generate_for_job(
                         career_ops, j, provider=provider, model=model)
                 )
+                # For forms whose cover-letter field is a PDF upload (not a
+                # textarea), render the generated letter to a PDF on demand.
+                engine.cover_pdf_provider = (
+                    lambda j=job: cover_letters.ensure_cover_pdf(career_ops, j.company)
+                )
                 resume = _resolve_resume(career_ops, job)
                 try:
                     result = linkedin.apply_to(page, job, engine, mode=mode, resume_path=resume)

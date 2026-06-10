@@ -371,3 +371,15 @@ class TestCoverLetterLazy:
         e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "x")
         e.cover_letter_provider = boom
         assert e.cover_letter() == ""
+
+    def test_cover_letter_pdf_needs_letter_then_renders(self, profile, tmp_path):
+        pdf = tmp_path / "cover.pdf"
+        pdf.write_bytes(b"%PDF")
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "x")
+        # No letter yet → no PDF (request-gated, never renders for a form that
+        # doesn't ask).
+        assert e.cover_letter_pdf() is None
+        # Once the letter is available and a pdf provider is set, returns the path.
+        e.cover_letter_provider = lambda: "Dear team"
+        e.cover_pdf_provider = lambda: pdf
+        assert e.cover_letter_pdf() == pdf

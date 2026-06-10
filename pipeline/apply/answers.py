@@ -107,6 +107,9 @@ class AnswerEngine:
         # callback set per job by run(); cached here once obtained.
         self.cover_letter_text: str = ""
         self.cover_letter_provider: Callable[[], str] | None = None
+        # Returns a Path to the cover letter rendered as a PDF (for upload-style
+        # cover-letter fields), or None. Set per job by run().
+        self.cover_pdf_provider: Callable[[], object] | None = None
 
     def cover_letter(self) -> str:
         """The tailored cover letter for the current job, generated on first
@@ -118,6 +121,18 @@ class AnswerEngine:
             except Exception:
                 self.cover_letter_text = ""
         return self.cover_letter_text
+
+    def cover_letter_pdf(self):
+        """Path to the cover letter rendered as a PDF (for an upload field), or
+        None. Generates the letter text first (request-gated), then renders it."""
+        if not self.cover_letter():       # ensure the text exists (writes the .md)
+            return None
+        if self.cover_pdf_provider is None:
+            return None
+        try:
+            return self.cover_pdf_provider()
+        except Exception:
+            return None
 
     # ── public API ──────────────────────────────────────────────────────────
 
