@@ -50,6 +50,32 @@ def _cache_key(question: str, field_type: str) -> str:
     return f"{field_type}::{_sanitize(question)}"
 
 
+# A salary range in an evaluation report ("$150-220K", "$150K-$220K",
+# "$150,000 to $220,000"). The 30K floor rejects year/headcount ranges.
+_SALARY_RANGE_RE = re.compile(
+    r"\$?\s?(\d{2,3}(?:,\d{3})?)\s*([kK]?)\s*(?:[-–—]|to)\s*\$?\s?(\d{2,3}(?:,\d{3})?)\s*([kK]?)"
+)
+
+
+def _to_dollars(digits: str, suffix: str) -> int:
+    x = float(digits.replace(",", ""))
+    if suffix.lower() == "k" or x < 1000:   # "150K" or a bare "150" meaning 150k
+        x *= 1000
+    return int(x)
+
+
+def salary_from_report(report_text: str) -> int | None:
+    """Midpoint of the role's posted comp range as researched by career-ops in
+    its evaluation report (a 'publicly known' figure to state). None if no
+    plausible salary range is found."""
+    for m in _SALARY_RANGE_RE.finditer(report_text or ""):
+        lo = _to_dollars(m.group(1), m.group(2) or m.group(4))
+        hi = _to_dollars(m.group(3), m.group(4) or m.group(2))
+        if 30_000 <= lo <= hi <= 1_000_000:
+            return (lo + hi) // 2
+    return None
+
+
 def thinking_disabled() -> bool:
     """Reasoning/thinking is unnecessary for short application answers and cover
     letters (and slows/garbles vLLM-served reasoning models like MiMo/Qwen3), so
@@ -102,6 +128,9 @@ class AnswerEngine:
         # Questions we couldn't answer (LLM unavailable) — surfaced for review so
         # the human completes/verifies them before submitting.
         self.unanswered: list[str] = []
+        # The role's market comp midpoint from career-ops's evaluation report,
+        # used for numeric salary fields ("publicly known" figure). Set per job.
+        self.role_salary_target: int | None = None
         # Tailored cover letter for the current job. Generated/loaded LAZILY —
         # only when a form actually has a cover-letter field — via the provider
         # callback set per job by run(); cached here once obtained.
@@ -232,7 +261,10 @@ class AnswerEngine:
         if re.search(r"\b(salary|compensation|expected pay|desired pay|pay expectation|"
                      r"expected compensation|comp expectation)\b", q):
             if field_type == "numeric":
-                return str(p.salary_target) if p.salary_target else None
+                # The role's researched market comp (from the report) beats a
+                # generic profile target; never the walk-away floor.
+                target = self.role_salary_target or p.salary_target
+                return str(target) if target else None
             return "Negotiable"
 
         # Affirmative consent.

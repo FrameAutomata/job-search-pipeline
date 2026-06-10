@@ -11,7 +11,7 @@ import pytest
 
 import pipeline.apply as apply_pkg
 from pipeline.apply import linkedin, queue, result
-from pipeline.apply.answers import AnswerEngine, _match_option, _sanitize
+from pipeline.apply.answers import AnswerEngine, _match_option, _sanitize, salary_from_report
 from pipeline.apply.profile import ApplyProfile, _parse_salary, _parse_salary_target
 
 
@@ -171,6 +171,25 @@ class TestAnswerEngineDeterministic:
         # NOT the floor (75000).
         e = self._engine(profile, tmp_path)
         assert e.answer("Desired salary", "numeric") == "150000"
+
+    def test_salary_numeric_prefers_report_comp(self, profile, tmp_path):
+        # The role's researched comp (from the report) beats the profile target.
+        e = self._engine(profile, tmp_path)
+        e.role_salary_target = 185000
+        assert e.answer("Desired salary", "numeric") == "185000"
+
+
+class TestSalaryFromReport:
+    @pytest.mark.parametrize("text,expected", [
+        ("D) Comp y Demanda — the range is $150-220K, competitive", 185000),
+        ("posted $150K-$220K base", 185000),
+        ("$150,000 to $220,000", 185000),
+        ("5-10 years of experience required", None),   # not a salary range
+        ("team of 10-20 engineers", None),
+        ("no compensation info", None),
+    ])
+    def test_extract(self, text, expected):
+        assert salary_from_report(text) == expected
 
 
 class TestAnswerEngineCache:

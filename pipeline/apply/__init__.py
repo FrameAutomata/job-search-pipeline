@@ -19,9 +19,9 @@ import re
 from pathlib import Path
 
 from pipeline.app import data as _data
-from pipeline._batch_common import atomic_write_text
+from pipeline._batch_common import atomic_write_text, read_text
 from pipeline.apply import browser, linkedin, queue
-from pipeline.apply.answers import AnswerEngine
+from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.result import ApplyResult, failed
 
@@ -100,6 +100,10 @@ def run(
 
             for job in jobs:
                 engine.job_context = f"{job.company} — {job.role}"
+                # Role's researched market comp (from the report) for salary fields.
+                report_text = (read_text(career_ops / job.report_path)
+                               if getattr(job, "report_path", "") else "")
+                engine.role_salary_target = salary_from_report(report_text)
                 # Cover letter generated lazily — only if this form has a cover-
                 # letter field (request-gated). Builds its own caller so it can
                 # use COVER_MODEL (quality-first) rather than the speed-first
