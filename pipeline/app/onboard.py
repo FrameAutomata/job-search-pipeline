@@ -175,6 +175,9 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
                     "location": "United States", "country": "USA"}]
 
     flexibility_pref = form.get("location_flexibility") or "Remote preferred"
+    # Home country for work-auth defaults — derived from the candidate's own
+    # locations rather than assuming the US, so a non-US user gets sane defaults.
+    home_country = infer_remote_location(entries[0]["country"])
     return {
         "resumeText": resume_text,
         "info": {
@@ -185,6 +188,15 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "linkedin": form.get("linkedin") or "",
             "github": form.get("github") or "",
             "portfolio_url": form.get("website") or "",
+            "country": home_country,
+            # Work authorization (country-neutral — drives the eligibility
+            # pre-filter and apply-time screening answers). Blank fields fall
+            # back to home-country defaults on the node side.
+            "citizenship": form.get("citizenship") or "",
+            "workAuthRegions": _split_csv(form.get("work_auth_regions")),
+            "requiresSponsorship": str(form.get("requires_sponsorship") or "").lower() == "yes",
+            "workPermitType": form.get("work_permit_type") or "",
+            "eligibleCountries": _split_csv(form.get("eligible_countries")),
         },
         "criteria": {
             "targetRoles": _split_csv(form.get("target_roles")),

@@ -82,6 +82,7 @@ function renderReview() {
     `Name:          ${f.name || "(default)"}`,
     `Contact:       ${[f.email, f.phone, f.location].filter(Boolean).join(" · ") || "(none)"}`,
     `Links:         ${[f.linkedin, f.github, f.website].filter(Boolean).join(" · ") || "(none)"}`,
+    `Work auth:     ${[f.citizenship, f.requires_sponsorship === "yes" && "needs sponsorship", f.work_auth_regions && `auth: ${f.work_auth_regions}`].filter(Boolean).join(" · ") || "(defaults)"}`,
     `Target roles:  ${f.target_roles || "(default: Software Engineer)"}`,
     `Avoid:         ${f.negative_roles || "(none)"}`,
     `Comp:          ${f.comp_target || "$130K-170K"} (min ${f.comp_min || "$110K"})`,

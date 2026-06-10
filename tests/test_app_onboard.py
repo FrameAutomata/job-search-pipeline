@@ -171,15 +171,29 @@ class TestNodeRoundTrip:
 
         payload = onboard.build_onboarding_json(
             {"name": "Jane Dev", "target_roles": "Backend Engineer",
-             "locations": "US Remote, Dallas, TX", "sites": ["indeed"]},
+             "locations": "US Remote, Dallas, TX", "sites": ["indeed"],
+             "citizenship": "Canadian", "requires_sponsorship": "yes",
+             "work_auth_regions": "Canada", "eligible_countries": "Canada, United States",
+             "work_permit_type": "Needs sponsorship"},
             resume_text="Jane Dev\nSKILLS\nPython, AWS\nEXPERIENCE\nAcme",
         )
         result = onboard.run_generation(work, payload)
         assert result.get("ok") is True
-        assert (work / "career-ops" / "config" / "profile.yml").exists()
+        profile_path = work / "career-ops" / "config" / "profile.yml"
+        assert profile_path.exists()
         assert (work / "career-ops" / "cv.md").exists()
         assert (work / "career-ops" / "modes" / "_profile.md").exists()
         assert (work / "config" / "search.yml").exists()
+
+        # Work-authorization answers flow form -> JSON -> generated profile.yml.
+        import yaml
+        profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        wa = profile["work_authorization"]
+        assert wa["citizenship"] == "Canadian"
+        assert wa["requires_sponsorship"] is True
+        assert wa["legally_authorized_to_work_in"] == ["Canada"]
+        assert wa["eligible_countries"] == ["Canada", "United States"]
+        assert wa["work_permit_type"] == "Needs sponsorship"
 
 
 class TestRunGenerationErrors:

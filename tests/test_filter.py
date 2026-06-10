@@ -559,3 +559,175 @@ filter:
             # Verify scores are in descending order
             scores = df["relevance_score"].tolist()
             assert scores == sorted(scores, reverse=True)
+
+
+class TestIsEligible:
+    """Test filter.is_eligible — the location/description pre-filter gate."""
+
+    def _pat(self, terms):
+        return filter_mod._compile_alternation(terms)
+
+    def test_no_constraints_is_eligible(self):
+        """No patterns → always eligible."""
+        row = {"location": "Bratislava, Slovakia", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, None, None, None) is True
+
+    def test_short_token_does_not_match_inside_word(self):
+        """Word boundaries: negative_locations ['US'] must NOT exclude 'Moscow, Russia'
+        just because 'Russia' contains the substring 'us'."""
+        row = {"location": "Moscow, Russia", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, self._pat(["US"]), None, None) is True
+
+    def test_short_token_matches_as_whole_word(self):
+        """The same ['US'] term still excludes a location where 'US' stands alone."""
+        row = {"location": "Dallas, TX, US", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, self._pat(["US"]), None, None) is False
+
+    def test_negative_location_excludes_non_remote(self):
+        """A non-remote job in a negative location is excluded."""
+        row = {"location": "Bratislava, Slovakia", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, self._pat(["Slovakia"]), None, None) is False
+
+    def test_remote_bypasses_negative_location(self):
+        """is_remote=true makes location irrelevant."""
+        row = {"location": "Bratislava, Slovakia", "description": "", "is_remote": "true"}
+        assert filter_mod.is_eligible(row, self._pat(["Slovakia"]), None, None) is True
+
+    def test_eligible_locations_allowlist_keeps_match(self):
+        """A non-remote location containing an allowlisted term is kept."""
+        row = {"location": "Dallas, TX, United States", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, None, self._pat(["United States", "USA"]), None) is True
+
+    def test_eligible_locations_allowlist_excludes_non_match(self):
+        """A non-remote location matching no allowlist term is excluded."""
+        row = {"location": "Berlin, Germany", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, None, self._pat(["United States", "USA"]), None) is False
+
+    def test_empty_location_not_excluded_by_allowlist(self):
+        """An unknown/blank location is ambiguous — don't exclude on the allowlist."""
+        row = {"location": "", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, None, self._pat(["United States"]), None) is True
+
+    def test_negative_description_term_excludes(self):
+        """A description matching a negative term (e.g. a required clearance) is excluded."""
+        row = {
+            "location": "Dallas, TX",
+            "description": "Must hold an active TS/SCI security clearance.",
+            "is_remote": "",
+        }
+        assert filter_mod.is_eligible(row, None, None, self._pat(["security clearance", "ts/sci"])) is False
+
+    def test_no_description_pattern_keeps_job(self):
+        """With no negative-description terms configured, the same job is kept (opt-in)."""
+        row = {
+            "location": "Dallas, TX",
+            "description": "Must hold an active TS/SCI security clearance.",
+            "is_remote": "",
+        }
+        assert filter_mod.is_eligible(row, None, None, None) is True
+
+    def test_description_term_excludes_even_when_remote(self):
+        """Description terms are location-independent — a remote match is still excluded."""
+        row = {
+            "location": "Anywhere",
+            "description": "Requires an active Secret clearance.",
+            "is_remote": "true",
+        }
+        assert filter_mod.is_eligible(row, None, None, self._pat(["secret clearance"])) is False
+
+    def test_description_term_matches_exact_substring_only(self):
+        """A loose mention ('clearance of priorities') doesn't match the configured terms."""
+        row = {
+            "location": "Dallas, TX",
+            "description": "We value clear communication and a clearance of priorities.",
+            "is_remote": "",
+        }
+        assert filter_mod.is_eligible(row, None, None, self._pat(["security clearance", "ts/sci"])) is True
+
+
+class TestRunEligibility:
+    """Integration: location pre-filter wired through filter.run()."""
+
+    def test_run_excludes_negative_location_keeps_remote(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        """Non-remote overseas job dropped; remote job in the same place survives."""
+        jobs_path, output_path = patch_filter_paths
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            '1,https://intl.com,engineer,a,"Bratislava, Slovakia",2026-05-12,stuff,,""\n'
+            '2,https://remote.com,engineer,b,"Bratislava, Slovakia",2026-05-12,stuff,,"true"\n'
+            '3,https://us.com,engineer,c,"Dallas, TX",2026-05-12,stuff,,""\n'
+        )
+        jobs_path.write_text(csv_content)
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: ["engineer"]
+  negative_titles: []
+  min_score: 1
+  negative_locations: ["Slovakia"]
+""")
+        filter_mod.run(config)
+
+        urls = set(pd.read_csv(output_path)["job_url"])
+        assert "https://intl.com" not in urls
+        assert "https://remote.com" in urls
+        assert "https://us.com" in urls
+
+    def test_run_eligible_locations_allowlist(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        """Only non-remote jobs in an allowlisted location are kept."""
+        jobs_path, output_path = patch_filter_paths
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            '1,https://us.com,engineer,a,"Austin, TX, United States",2026-05-12,stuff,,""\n'
+            '2,https://de.com,engineer,b,"Berlin, Germany",2026-05-12,stuff,,""\n'
+        )
+        jobs_path.write_text(csv_content)
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: ["engineer"]
+  negative_titles: []
+  min_score: 1
+  eligible_locations: ["United States", "USA"]
+""")
+        filter_mod.run(config)
+
+        urls = set(pd.read_csv(output_path)["job_url"])
+        assert urls == {"https://us.com"}
+
+    def test_run_negative_description_terms(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        """Jobs whose description contains a configured negative term are dropped."""
+        jobs_path, output_path = patch_filter_paths
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_content = (
+            "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
+            '1,https://clear.com,engineer,a,"Dallas, TX",2026-05-12,"Requires TS/SCI security clearance",,""\n'
+            '2,https://ok.com,engineer,b,"Dallas, TX",2026-05-12,"Build web apps",,""\n'
+        )
+        jobs_path.write_text(csv_content)
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: ["engineer"]
+  negative_titles: []
+  min_score: 1
+  negative_description_terms: ["security clearance"]
+""")
+        filter_mod.run(config)
+
+        urls = set(pd.read_csv(output_path)["job_url"])
+        assert urls == {"https://ok.com"}

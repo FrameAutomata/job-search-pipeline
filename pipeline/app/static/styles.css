@@ -163,6 +163,8 @@ main { display: flex; height: calc(100vh - 78px); }
 fieldset.sites { border: 1px solid var(--border); border-radius: 6px; margin: 0 0 14px; padding: 10px 14px; }
 fieldset.sites legend { color: var(--muted); font-size: 13px; padding: 0 6px; }
 fieldset.sites .chk { display: inline-flex; margin: 0 16px 0 0; }
+fieldset.workauth { border: 1px solid var(--border); border-radius: 6px; margin: 14px 0 0; padding: 10px 14px; }
+fieldset.workauth legend { font-size: 14px; padding: 0 6px; }
 
 .stepper { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; padding: 0; margin: 0 0 16px; }
 .stepper li {
