@@ -29,6 +29,9 @@ _LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-notifications",
     "--deny-permission-prompts",
+    # After a crash / power loss Chrome shows a "didn't shut down correctly"
+    # restore bubble that can sit over the page; suppress it.
+    "--hide-crash-restore-bubble",
 ]
 
 
