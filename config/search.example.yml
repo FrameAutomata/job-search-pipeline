@@ -179,6 +179,21 @@ filter:
   #   "epic emr": 3
   #   "BLS": 2
 
+  # Location / work-eligibility pre-filter (all optional). A non-remote job is
+  # dropped BEFORE evaluation when its location matches negative_locations, or
+  # fails the eligible_locations allowlist. This is YOUR eligibility — set it the
+  # same way whether you're applying at home or abroad. Remote roles bypass it.
+  # negative_locations:        # case-insensitive substrings to exclude
+  #   - "India"
+  #   - "Brazil"
+  # eligible_locations:        # if set, a non-remote location must contain one of these
+  #   - "United States"
+  #   - "Canada"
+  # negative_description_terms:  # drop jobs whose description contains any of these
+  #   - "security clearance"     # e.g. a clearance you don't hold — works for any country's
+  #   - "TS/SCI"                 #   vocabulary (UK "vetting", FR "habilitation", etc.)
+  #   - "polygraph"
+
   # Minimum score to keep. With YAKE defaults (base weight=1, skills-section
   # boost=2, title-match=5), a score of 5 means roughly one target_titles hit
   # OR several resume-keyword matches. Raise to be pickier, lower to see more.

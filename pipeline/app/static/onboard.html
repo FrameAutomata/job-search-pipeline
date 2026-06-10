@@ -42,6 +42,32 @@
           <label>Website / portfolio (optional)<input name="website" placeholder="janedev.dev" /></label>
         </div>
         <p class="hint" id="about-autofill-note" hidden></p>
+
+        <fieldset class="workauth">
+          <legend>Work authorization <span class="muted">(optional — filters roles you can't take &amp; answers screening questions)</span></legend>
+          <p class="hint">Country-neutral: describe <em>your</em> eligibility. A US citizen
+            eyeing roles in the EU and an EU citizen eyeing the US fill this in the same way.</p>
+          <div class="grid2">
+            <label>Citizenship / nationality
+              <input name="citizenship" placeholder="e.g. US, Indian, EU" />
+            </label>
+            <label>Do you need visa sponsorship?
+              <select name="requires_sponsorship">
+                <option value="no">No — authorized without sponsorship</option>
+                <option value="yes">Yes — I need sponsorship</option>
+              </select>
+            </label>
+            <label>Authorized to work in (no sponsorship; comma-separated)
+              <input name="work_auth_regions" placeholder="United States, Canada" />
+            </label>
+            <label>Countries you'd accept a job in (comma-separated)
+              <input name="eligible_countries" placeholder="blank = same as authorized" />
+            </label>
+          </div>
+          <label>Work permit / status (optional)
+            <input name="work_permit_type" placeholder='e.g. Citizen, Green Card, H-1B, "Needs sponsorship"' />
+          </label>
+        </fieldset>
       </section>
 
       <!-- 3. Roles & comp -->

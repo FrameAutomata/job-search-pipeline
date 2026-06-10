@@ -414,6 +414,30 @@ async function promptForInfo(parsed, autoMode) {
     }
   }
 
+  // Work authorization — used to filter roles you can't legally take and to
+  // answer application screening questions. Intentionally country-neutral: it's
+  // about YOUR eligibility, not any one region (a US citizen applying to the EU
+  // and an EU citizen applying to the US fill this in the same way).
+  if (!autoMode && info.requiresSponsorship === undefined) {
+    console.log('\n🛂 Work authorization (optional — press enter to skip any)');
+    if (!info.citizenship) {
+      info.citizenship = await prompt('Citizenship / nationality (e.g. "US", "Indian", "EU"): ');
+    }
+    if (info.workAuthRegions === undefined) {
+      const authIn = await prompt('Countries/regions you can work in WITHOUT sponsorship (comma-separated): ');
+      info.workAuthRegions = authIn ? authIn.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
+    const sponsor = await prompt('Do you need visa sponsorship for the roles you’re targeting? (y/N): ');
+    info.requiresSponsorship = /^\s*y/i.test(sponsor || '');
+    if (!info.workPermitType) {
+      info.workPermitType = await prompt('Work permit / status (e.g. "Citizen", "Green Card", "H-1B", "Needs sponsorship"): ');
+    }
+    if (info.eligibleCountries === undefined) {
+      const eligible = await prompt('Countries you’d accept a job in (comma-separated, blank = same as above): ');
+      info.eligibleCountries = eligible ? eligible.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
+  }
+
   return info;
 }
 
@@ -993,6 +1017,13 @@ function generateProfile(info, criteria) {
     }
   }
 
+  // Work-authorization model (drives the eligibility pre-filter and the apply-time
+  // screening answers). Country-neutral: defaults derive from the candidate's own
+  // answers, falling back to their home country rather than assuming any region.
+  const homeCountry = info.country || 'United States';
+  const workAuthRegions = info.workAuthRegions?.length ? info.workAuthRegions : [homeCountry];
+  const eligibleCountries = info.eligibleCountries?.length ? info.eligibleCountries : workAuthRegions;
+
   const profile = {
     candidate: {
       full_name: info.name,
@@ -1025,10 +1056,18 @@ function generateProfile(info, criteria) {
       location_flexibility: criteria.locationFlexibility,
     },
     location: {
-      country: 'United States',
+      country: homeCountry,
       city: (info.location || '').split(',')[0].trim(),
       timezone: timezone,
-      visa_status: 'No sponsorship needed',
+      visa_status: info.requiresSponsorship ? 'Requires sponsorship' : 'No sponsorship needed',
+    },
+    work_authorization: {
+      citizenship: info.citizenship || '',
+      legally_authorized_to_work_in: workAuthRegions,
+      requires_sponsorship: info.requiresSponsorship === true,
+      work_permit_type: info.workPermitType || '',
+      eligible_countries: eligibleCountries,
+      eligible_for_remote: info.eligibleForRemote !== false,
     },
     cv: {
       output_format: 'html',
@@ -1216,6 +1255,12 @@ function writeProfileMarkdown(markdown) {
  *
  * Shape (all fields optional — sane defaults fill the gaps):
  *   { resumeText, info, criteria, searchSettings, narrative }
+ *
+ * `info` also carries the optional work-authorization answers consumed by
+ * generateProfile(): country, citizenship, workAuthRegions (string[]),
+ * requiresSponsorship (bool), workPermitType, eligibleCountries (string[]),
+ * eligibleForRemote (bool). Omit them and country-neutral defaults are derived
+ * from the candidate's home country.
  *
  * Emits a final JSON line ({ok, ...paths}) on stdout so the caller can parse the
  * result deterministically.

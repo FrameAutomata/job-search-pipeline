@@ -173,6 +173,52 @@ def _compile_alternation(terms: list[str]) -> re.Pattern | None:
     return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
 
 
+def _compile_substrings(terms: list[str]) -> re.Pattern | None:
+    """Compile a case-insensitive substring-alternation (no word boundaries).
+    Used for location matching where terms like "USA" or "Sao Paulo" should match
+    anywhere in a free-form location string. Returns None for an empty list."""
+    pieces = sorted({t.strip().lower() for t in terms if t and t.strip()}, key=len, reverse=True)
+    if not pieces:
+        return None
+    return re.compile("|".join(re.escape(p) for p in pieces), re.IGNORECASE)
+
+
+def _is_remote(row: dict) -> bool:
+    """JobSpy writes is_remote as a stringified bool ("True"/"False"/"") or empty."""
+    return str(row.get("is_remote") or "").strip().lower() in ("true", "1", "yes", "t")
+
+
+def is_eligible(
+    row: dict,
+    negative_loc_pattern: re.Pattern | None,
+    eligible_loc_pattern: re.Pattern | None,
+    negative_desc_pattern: re.Pattern | None,
+) -> bool:
+    """Cheap eligibility gate, applied before scoring.
+
+    Excludes a job when its description matches a negative-description term — a
+    configured substring list, so it works for any country's vocabulary (e.g. a
+    security clearance the candidate can't hold: "security clearance", "TS/SCI",
+    "vetting", "polygraph"). Also excludes a non-remote job in a negative location
+    or one that fails an eligible-locations allowlist. Remote roles are
+    location-independent and bypass the location checks (description terms still
+    apply). Per-question work-auth/sponsorship matching is deferred to apply time."""
+    if negative_desc_pattern is not None and negative_desc_pattern.search(row.get("description") or ""):
+        return False
+
+    if _is_remote(row):
+        return True
+
+    if negative_loc_pattern is None and eligible_loc_pattern is None:
+        return True
+    location = (row.get("location") or "").strip()
+    if negative_loc_pattern is not None and location and negative_loc_pattern.search(location):
+        return False
+    if eligible_loc_pattern is not None and location and not eligible_loc_pattern.search(location):
+        return False
+    return True
+
+
 def score_job(
     row: dict,
     keywords: dict[str, int],
@@ -240,6 +286,13 @@ def run(config_path: Path) -> Path:
     max_age_hours = fcfg.get("max_age_hours")
     cutoff = datetime.now() - timedelta(hours=max_age_hours) if max_age_hours else None
 
+    negative_locations = fcfg.get("negative_locations") or []
+    eligible_locations = fcfg.get("eligible_locations") or []
+    negative_description_terms = fcfg.get("negative_description_terms") or []
+    negative_loc_pattern = _compile_substrings(negative_locations)
+    eligible_loc_pattern = _compile_substrings(eligible_locations)
+    negative_desc_pattern = _compile_substrings(negative_description_terms)
+
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
 
@@ -284,6 +337,7 @@ def run(config_path: Path) -> Path:
     jobs = []
     excluded = 0
     too_old = 0
+    ineligible = 0
     with open(JOBS_PATH, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if cutoff:
@@ -291,6 +345,9 @@ def run(config_path: Path) -> Path:
                 if posted is not None and posted < cutoff:
                     too_old += 1
                     continue
+            if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
+                ineligible += 1
+                continue
             result = _score_job(
                 row, keywords, keyword_pattern, target_pattern, negative_pattern, target_titles,
             )
@@ -308,7 +365,8 @@ def run(config_path: Path) -> Path:
     if not relevant:
         print(
             f"[filter] no jobs scored >= {min_score} "
-            f"(of {len(jobs)} scored, {excluded} negative-excluded, {too_old} too old)"
+            f"(of {len(jobs)} scored, {excluded} negative-excluded, "
+            f"{ineligible} ineligible, {too_old} too old)"
         )
         OUTPUT_PATH.write_text("", encoding="utf-8")
         return OUTPUT_PATH
@@ -327,7 +385,8 @@ def run(config_path: Path) -> Path:
 
     print(
         f"[filter] kept {len(relevant)} of {len(jobs)} "
-        f"({excluded} negative-excluded, {too_old} too old) -> {OUTPUT_PATH}"
+        f"({excluded} negative-excluded, {ineligible} ineligible, {too_old} too old) "
+        f"-> {OUTPUT_PATH}"
     )
     return OUTPUT_PATH
 
