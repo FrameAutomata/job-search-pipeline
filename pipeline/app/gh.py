@@ -230,6 +230,10 @@ def download_artifact(run_id: int, dest: Path, name_pattern: str = "pipeline-out
 
     `gh run download` lays each artifact into dest/<artifact-name>/. We return
     the matching artifact subdir so callers can point the data layer at it."""
+    # gh refuses to overwrite existing files, so a re-download into a dir that
+    # still holds the previous extraction fails ("file exists"). Always start
+    # from a clean dest.
+    shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
     _run([
         "run", "download", str(run_id), *_repo_args(),
