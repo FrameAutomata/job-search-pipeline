@@ -40,6 +40,9 @@ def main() -> int:
                     help="Only apply to jobs scoring >= this (default: 4.0)")
     ap.add_argument("--apply-limit", type=int, default=0,
                     help="Max applications to attempt this run (0 = no cap)")
+    ap.add_argument("--apply-url", type=str, default=None,
+                    help="Apply to a single specific job URL, bypassing the tracker "
+                         "queue (one-off apply, or to reproduce a specific posting).")
     ap.add_argument("--apply-refresh", action=argparse.BooleanOptionalAction, default=True,
                     help="Pull the latest tracker from the most recent GitHub pipeline "
                          "artifact before applying (default on; --no-apply-refresh to use "
@@ -130,6 +133,7 @@ def main() -> int:
             limit=args.apply_limit,
             headless=args.headless,
             refresh=args.apply_refresh,
+            target_url=args.apply_url,
             provider=args.batch_provider,
             model=args.batch_model,
         )

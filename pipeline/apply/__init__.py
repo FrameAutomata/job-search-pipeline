@@ -40,12 +40,15 @@ def run(
     limit: int = 0,
     headless: bool = False,
     refresh: bool = True,
+    target_url: str | None = None,
     provider: str | None = None,
     model: str | None = None,
 ) -> int:
     """Apply to qualifying LinkedIn Easy Apply jobs. Returns the count applied
     (auto mode) or filled-and-held (review/dry-run).
 
+    target_url: apply to this one posting, bypassing the tracker queue (for a
+        one-off apply or to reproduce a specific job). Skips refresh/selection.
     refresh: pull the latest applications.md from the most recent GitHub pipeline
         artifact before selecting (defaults on, since evaluations accumulate in
         the cloud). Falls back to the local tracker when gh/network is unavailable."""
@@ -53,17 +56,22 @@ def run(
     if mode not in _VALID_MODES:
         mode = "review"
 
-    applications_md = (
-        _refresh_tracker(career_ops) if refresh
-        else career_ops / "data" / "applications.md"
-    )
-
-    jobs = queue.select(career_ops, min_score=min_score, limit=limit,
-                        linkedin_only=True, applications_md=applications_md)
-    if not jobs:
-        print(f"[apply] no LinkedIn Easy Apply candidates "
-              f"(score >= {min_score}, status Evaluated) in {applications_md.name}")
-        return 0
+    # Always bound (used by _report/_mark_applied). For a --apply-url one-off it
+    # stays the local default and is effectively unused (the synthetic job has no
+    # tracker row, so _mark_applied no-ops on its empty num).
+    applications_md = career_ops / "data" / "applications.md"
+    if target_url:
+        jobs = [queue.ApplyJob(num="", company="(target)", role="", url=target_url, score=None)]
+        print(f"[apply] targeting single URL: {target_url}")
+    else:
+        if refresh:
+            applications_md = _refresh_tracker(career_ops)
+        jobs = queue.select(career_ops, min_score=min_score, limit=limit,
+                            linkedin_only=True, applications_md=applications_md)
+        if not jobs:
+            print(f"[apply] no LinkedIn Easy Apply candidates "
+                  f"(score >= {min_score}, status Evaluated) in {applications_md.name}")
+            return 0
     if mode == "auto" and refresh:
         print("[apply] note: status write-back goes to the downloaded tracker copy; "
               "it won't reach the cloud until pushed (UI Refresh/Push or Edit Tracker).")

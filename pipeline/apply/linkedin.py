@@ -214,11 +214,47 @@ def _apply_cta_debug(page) -> str:
         return "no Easy Apply button found"
 
 
-def _modal_open(page) -> bool:
+# aria-labels of the Easy Apply footer actions, used both to find the primary
+# button and to identify WHICH [role=dialog] is the Easy Apply modal.
+_PRIMARY_NEEDLES = ("submit application", "review your application", "review",
+                    "continue to next", "next", "continue")
+_PRIMARY_SEL = ", ".join(f"button[aria-label*='{n}' i]" for n in _PRIMARY_NEEDLES)
+
+
+def _modal(page):
+    """Return the Easy Apply dialog locator, or None.
+
+    LinkedIn can have several [role=dialog] mounted at once (the messaging
+    overlay is one), and their DOM order varies — so `.first` is unreliable and
+    sometimes lands on a non-form dialog (symptom: 0 fields filled +
+    no_primary_button). Pick the dialog that actually holds the Easy Apply flow:
+    one with a Submit/Review/Next/Continue button, else one with form controls."""
+    dialogs = page.locator(_MODAL)
     try:
-        return page.locator(_MODAL).count() > 0
+        n = dialogs.count()
     except Exception:
-        return False
+        return None
+    if n == 0:
+        return None
+    for i in range(n):
+        d = dialogs.nth(i)
+        try:
+            if d.locator(_PRIMARY_SEL).count() > 0:
+                return d
+        except Exception:
+            continue
+    for i in range(n):
+        d = dialogs.nth(i)
+        try:
+            if d.locator("input, select, textarea").count() > 0:
+                return d
+        except Exception:
+            continue
+    return dialogs.first
+
+
+def _modal_open(page) -> bool:
+    return _modal(page) is not None
 
 
 def _primary_button(page):
@@ -226,14 +262,10 @@ def _primary_button(page):
     aria-label in priority order — submit beats review beats next, so we never
     advance past the submit step. (LinkedIn's button aria-labels are stable even
     though the wrapper classes are hashed.)"""
-    dialog = page.locator(_MODAL).first
-    try:
-        if not dialog.count():
-            return None
-    except Exception:
+    dialog = _modal(page)
+    if dialog is None:
         return None
-    for needle in ("submit application", "review your application", "review",
-                   "continue to next", "next", "continue"):
+    for needle in _PRIMARY_NEEDLES:
         loc = dialog.locator(f"button[aria-label*='{needle}' i]")
         try:
             if loc.count():
@@ -256,9 +288,11 @@ def _btn_label(button) -> str:
 def _has_validation_error(page) -> bool:
     # artdeco-* component classes are NOT hashed, so the inline-error class is a
     # reliable hook; role=alert is the layout-independent backstop.
+    dialog = _modal(page)
+    if dialog is None:
+        return False
     try:
-        return page.locator(f"{_MODAL} .artdeco-inline-feedback--error, "
-                            f"{_MODAL} [role='alert']").count() > 0
+        return dialog.locator(".artdeco-inline-feedback--error, [role='alert']").count() > 0
     except Exception:
         return False
 
@@ -273,11 +307,8 @@ def _fill_visible_fields(page, answers: AnswerEngine, drafted: list[tuple[str, s
     walk the actual controls and read each one's question from its label[for=id]
     (or aria-label). Radio/checkbox groups live in <fieldset>s (question =
     <legend>). Per-field try/except keeps one odd widget from aborting the run."""
-    dialog = page.locator(_MODAL).first
-    try:
-        if not dialog.count():
-            return
-    except Exception:
+    dialog = _modal(page)
+    if dialog is None:
         return
 
     # Resume / file-upload step: set the file input directly (Playwright can do
@@ -324,8 +355,8 @@ def _fill_visible_fields(page, answers: AnswerEngine, drafted: list[tuple[str, s
 def _debug_dump_optins(page) -> None:
     """APPLY_DEBUG: dump every checkbox/switch control and every element whose own
     text mentions 'Follow', with structure, so we can target a styled toggle."""
-    dialog = page.locator(_MODAL).first
-    if not dialog.count():
+    dialog = _modal(page)
+    if dialog is None:
         return
     try:
         data = dialog.evaluate(r"""
@@ -502,6 +533,8 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
 
     if tag == "textarea":
         value = answers.answer(label, "textarea")
+        if value and _already_has_value(el, value):
+            return  # already correct (e.g. carried over from a prior step)
         el.fill(value)
         drafted.append((label, value))
         return
@@ -526,8 +559,20 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
     # text / email / tel / number
     field_type = "numeric" if typ == "number" else "text"
     value = answers.answer(label, field_type)
+    if value and _already_has_value(el, value):
+        return  # LinkedIn carried this value forward — skip the redundant re-fill
     el.fill(value)
     drafted.append((label, value))
+
+
+def _already_has_value(el, value: str) -> bool:
+    """True if the input already holds the intended value — lets us skip a
+    redundant fill (and the scroll-into-view it triggers) when LinkedIn has
+    pre-filled or carried a field forward across steps."""
+    try:
+        return (el.input_value() or "").strip() == value.strip()
+    except Exception:
+        return False
 
 
 def _resume_pdf() -> Path | None:
