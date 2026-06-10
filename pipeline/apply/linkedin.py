@@ -104,10 +104,15 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
             return failed("next_click_failed")
         page.wait_for_timeout(1500)
         if _has_validation_error(page):
-            # One more fill pass can clear a freshly-revealed required field; if
-            # the error persists we stop rather than loop on a field we can't fill.
-            _fill_visible_fields(page, answers, drafted)
+            # One more fill pass can clear a freshly-revealed required field.
+            _fill_visible_fields(page, answers, drafted, resume_path)
             if _has_validation_error(page):
+                # In review/dry-run, a field we couldn't satisfy isn't a failure —
+                # hand the partly-filled form to the human to complete and submit.
+                # Auto mode can't proceed past an invalid required field.
+                if not submit:
+                    return ApplyResult(code=APPLIED, reason="needs review (validation)",
+                                       answers=tuple(drafted), submitted=False)
                 return failed("validation_error")
 
     return failed("max_steps_exceeded")

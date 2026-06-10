@@ -91,6 +91,9 @@ class AnswerEngine:
         self.cache: dict[str, str] = self._load_cache()
         self.llm_calls = 0
         self.cache_hits = 0
+        # Questions we couldn't answer (LLM unavailable) — surfaced for review so
+        # the human completes/verifies them before submitting.
+        self.unanswered: list[str] = []
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -110,11 +113,30 @@ class AnswerEngine:
             cached = self.cache[key]
             return _match_option(cached, options) if options else cached
 
-        raw = self._llm(question, field_type, options)
+        # A missing provider is a setup error — surface it (raises). A provider
+        # that's configured but fails the call (overloaded after retries) is
+        # transient: fall back to a best-effort placeholder flagged for review,
+        # so the form proceeds rather than the whole job getting skipped.
+        self._ensure_caller()
+        try:
+            raw = self._llm(question, field_type, options)
+        except Exception:
+            self.unanswered.append(question)
+            return self._fallback(field_type, options)
         value = _match_option(raw, options) if options else raw
         self.cache[key] = value
         self._save_cache()
         return value
+
+    def _fallback(self, field_type: str, options: list[str] | None) -> str:
+        """Best-effort value when the LLM is unavailable — never a fabricated
+        credential. Choice fields decline (or take the first option); numeric →
+        0; free text is left blank for the human to complete in review."""
+        if options:
+            return self._decline(options)
+        if field_type == "numeric":
+            return "0"
+        return ""
 
     # ── deterministic layer ───────────────────────────────────────────────────
 
@@ -209,9 +231,13 @@ class AnswerEngine:
             parts.append(f"Job context: {self.job_context}")
         parts.append("Answer:")
         self.llm_calls += 1
-        # Reuse the evaluator's retry wrapper so rate limits don't fail the job.
+        # Reuse the evaluator's retry wrapper, but retry harder than the batch
+        # evaluator: an apply run is interactive and we'd rather wait out a busy
+        # provider (deepinfra/MiMo's "engine_overloaded") than skip a form.
         from pipeline.batch_evaluate import _call_with_retry
-        return _call_with_retry(caller, system, "\n\n".join(parts)).strip()
+        return _call_with_retry(
+            caller, system, "\n\n".join(parts), max_attempts=10, base_delay=2.0,
+        ).strip()
 
     def _ensure_caller(self) -> Caller:
         if self._caller is not None:

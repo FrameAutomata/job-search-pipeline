@@ -185,11 +185,28 @@ class TestAnswerEngineCache:
         assert ans == "Yes"
 
     def test_no_provider_raises(self, profile, tmp_path, monkeypatch):
-        # caller=None forces auto-detect; with no keys it must fail loudly.
+        # caller=None forces auto-detect; with no keys it must fail loudly
+        # (a missing provider is a setup error, not a per-field fallback).
         monkeypatch.setattr("pipeline.batch_evaluate._detect_provider", lambda: None)
         e = AnswerEngine(profile, tmp_path / "c.json", caller=None)
         with pytest.raises(RuntimeError, match="no LLM provider"):
             e.answer("Describe your ideal team.", "textarea")
+
+    def test_llm_failure_falls_back_and_flags(self, profile, tmp_path):
+        # A configured provider that fails the call (after retries) must NOT skip
+        # the job — fall back to a best-effort placeholder and flag for review.
+        def boom(system, user):
+            raise RuntimeError("provider returned empty content")
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=boom)
+        assert e.answer("Tell us about a project you led.", "textarea") == ""   # blank free text
+        assert e.answer("Years of experience with Go?", "numeric") == "0"
+        assert e.answer("Are you willing to relocate to Mars?",
+                        "select", ["Yes", "No", "Prefer not to say"]) == "Prefer not to say"
+        assert e.unanswered == [
+            "Tell us about a project you led.",
+            "Years of experience with Go?",
+            "Are you willing to relocate to Mars?",
+        ]
 
 
 class TestAnswerHelpers:
