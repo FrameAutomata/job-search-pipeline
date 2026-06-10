@@ -35,15 +35,18 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
     page.goto(job.url, wait_until="domcontentloaded")
     _wait_for_apply_cta(page)
 
-    if _already_applied(page):
-        return ApplyResult(code="already_applied")
-    if _closed(page):
-        return ApplyResult(code=EXPIRED)
-
+    # Check for the Easy Apply button FIRST. Only when it's absent do we try to
+    # explain why — otherwise a stray "no longer accepting applications" string
+    # elsewhere on a live page (e.g. a recommended-jobs module) falsely flags a
+    # real Easy Apply posting as EXPIRED.
     btn = _easy_apply_button(page)
     if btn is None:
-        # Not an Easy Apply posting (or the CTA didn't render). The reason carries
-        # what we DID see, so non-Easy-Apply bails are diagnosable from the log.
+        if _already_applied(page):
+            return ApplyResult(code="already_applied")
+        if _closed(page):
+            return ApplyResult(code=EXPIRED)
+        # No CTA at all usually means a logged-out guest view; the reason carries
+        # the page URL/title and whether a sign-in wall is present.
         return ApplyResult(code="not_easy_apply", reason=_apply_cta_debug(page))
 
     try:
@@ -159,8 +162,9 @@ def _already_applied(page) -> bool:
 
 
 def _apply_cta_debug(page) -> str:
-    """Summarize the apply buttons we DID see, to explain a non-Easy-Apply bail.
-    Surfaced in the per-job log so selectors can be tuned against real postings."""
+    """Explain a non-Easy-Apply bail: which apply buttons were seen, plus the page
+    URL/title and whether a sign-in wall is present. A sign-in wall or an authwall
+    URL means the session is logged out (the most common cause of 'no apply CTA')."""
     try:
         loc = page.locator("button[aria-label*='Apply' i], button.jobs-apply-button")
         labels: list[str] = []
@@ -169,7 +173,16 @@ def _apply_cta_debug(page) -> str:
             label = (el.get_attribute("aria-label") or el.inner_text() or "").strip()
             if label:
                 labels.append(label[:40])
-        return "no Easy Apply button; saw: " + ("; ".join(labels) if labels else "no apply CTA at all")
+        seen = "; ".join(labels) if labels else "no apply CTA at all"
+        signin = False
+        try:
+            signin = page.locator("a[href*='/login'], .authwall, form.login__form, "
+                                  ".join-form, [data-test-id='sign-in-form']").count() > 0
+        except Exception:
+            pass
+        url = (page.url or "")[:70]
+        title = (page.title() or "")[:50]
+        return f"saw: {seen} | signin_wall={signin} | title='{title}' | url={url}"
     except Exception:
         return "no Easy Apply button found"
 

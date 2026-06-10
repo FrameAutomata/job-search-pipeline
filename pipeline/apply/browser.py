@@ -65,14 +65,25 @@ def launch(headless: bool = False, user_data_dir: Path | None = None):
 
 
 def is_logged_in(page) -> bool:
-    """Heuristic LinkedIn login check: load the feed and look for the signed-in
-    global nav. A redirect to /login or a visible sign-in form means logged out."""
+    """LinkedIn login check: load the feed and look for AUTHENTICATED-only chrome.
+
+    Important: the bare global nav (#global-nav) renders logged-out too (it holds
+    the Sign in / Join buttons), so we must NOT key on it — doing so lets a guest
+    session pass as logged in, after which every job page is a guest view with no
+    Easy Apply button. The global search box and the 'Me' avatar menu only exist
+    once signed in."""
     page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
     url = page.url.lower()
-    if "/login" in url or "/uas/login" in url or "/checkpoint" in url:
+    if any(x in url for x in ("/login", "/uas/login", "/checkpoint", "/authwall")):
         return False
-    # The authenticated app always renders the global nav search box.
-    return page.locator("input.search-global-typeahead__input, #global-nav").count() > 0
+    try:
+        return page.locator(
+            "input.search-global-typeahead__input, .global-nav__me, "
+            "button[aria-label='Me'], img.global-nav__me-photo"
+        ).count() > 0
+    except Exception:
+        return False
 
 
 def ensure_logged_in(page, *, headless: bool, timeout_s: int = 240) -> bool:
