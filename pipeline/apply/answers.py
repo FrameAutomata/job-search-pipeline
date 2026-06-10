@@ -273,7 +273,10 @@ class AnswerEngine:
                 "no LLM provider configured for screening questions — set a "
                 "provider key (GEMINI_API_KEY, etc.) or BATCH_PROVIDER in .env"
             )
-        model = os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider]
+        # APPLY_MODEL lets these light tasks use a faster/more-available model
+        # than the (possibly heavy/overloaded) evaluation model in BATCH_MODEL.
+        model = (os.environ.get("APPLY_MODEL") or os.environ.get("BATCH_MODEL")
+                 or PROVIDER_DEFAULTS[provider])
         self._caller = _build_caller(provider, model, disable_thinking=thinking_disabled())
         return self._caller
 
