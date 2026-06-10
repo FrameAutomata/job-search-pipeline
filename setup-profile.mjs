@@ -372,6 +372,13 @@ async function promptForInfo(parsed, autoMode) {
     }
   }
 
+  // Home country — drives location.country and the work-auth defaults below.
+  // Asked explicitly (rather than assumed) so non-US users aren't defaulted to
+  // the US. The UI onboarding path infers this from the location instead.
+  if (!autoMode && !info.country) {
+    info.country = await prompt('Country [default: United States]: ') || 'United States';
+  }
+
   if (!info.linkedin) {
     if (!autoMode) {
       const li = await prompt(

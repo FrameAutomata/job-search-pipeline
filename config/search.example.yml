@@ -183,7 +183,9 @@ filter:
   # dropped BEFORE evaluation when its location matches negative_locations, or
   # fails the eligible_locations allowlist. This is YOUR eligibility — set it the
   # same way whether you're applying at home or abroad. Remote roles bypass it.
-  # negative_locations:        # case-insensitive substrings to exclude
+  # All terms match on word boundaries (case-insensitive), so a short code like
+  # "US" matches "Dallas, US" but not the "us" inside "Russia".
+  # negative_locations:        # whole words/phrases to exclude
   #   - "India"
   #   - "Brazil"
   # eligible_locations:        # if set, a non-remote location must contain one of these

@@ -565,12 +565,23 @@ class TestIsEligible:
     """Test filter.is_eligible — the location/description pre-filter gate."""
 
     def _pat(self, terms):
-        return filter_mod._compile_substrings(terms)
+        return filter_mod._compile_alternation(terms)
 
     def test_no_constraints_is_eligible(self):
         """No patterns → always eligible."""
         row = {"location": "Bratislava, Slovakia", "description": "", "is_remote": ""}
         assert filter_mod.is_eligible(row, None, None, None) is True
+
+    def test_short_token_does_not_match_inside_word(self):
+        """Word boundaries: negative_locations ['US'] must NOT exclude 'Moscow, Russia'
+        just because 'Russia' contains the substring 'us'."""
+        row = {"location": "Moscow, Russia", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, self._pat(["US"]), None, None) is True
+
+    def test_short_token_matches_as_whole_word(self):
+        """The same ['US'] term still excludes a location where 'US' stands alone."""
+        row = {"location": "Dallas, TX, US", "description": "", "is_remote": ""}
+        assert filter_mod.is_eligible(row, self._pat(["US"]), None, None) is False
 
     def test_negative_location_excludes_non_remote(self):
         """A non-remote job in a negative location is excluded."""

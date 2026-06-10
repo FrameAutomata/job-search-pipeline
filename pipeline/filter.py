@@ -173,16 +173,6 @@ def _compile_alternation(terms: list[str]) -> re.Pattern | None:
     return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
 
 
-def _compile_substrings(terms: list[str]) -> re.Pattern | None:
-    """Compile a case-insensitive substring-alternation (no word boundaries).
-    Used for location matching where terms like "USA" or "Sao Paulo" should match
-    anywhere in a free-form location string. Returns None for an empty list."""
-    pieces = sorted({t.strip().lower() for t in terms if t and t.strip()}, key=len, reverse=True)
-    if not pieces:
-        return None
-    return re.compile("|".join(re.escape(p) for p in pieces), re.IGNORECASE)
-
-
 def _is_remote(row: dict) -> bool:
     """JobSpy writes is_remote as a stringified bool ("True"/"False"/"") or empty."""
     return str(row.get("is_remote") or "").strip().lower() in ("true", "1", "yes", "t")
@@ -197,12 +187,14 @@ def is_eligible(
     """Cheap eligibility gate, applied before scoring.
 
     Excludes a job when its description matches a negative-description term — a
-    configured substring list, so it works for any country's vocabulary (e.g. a
-    security clearance the candidate can't hold: "security clearance", "TS/SCI",
-    "vetting", "polygraph"). Also excludes a non-remote job in a negative location
-    or one that fails an eligible-locations allowlist. Remote roles are
-    location-independent and bypass the location checks (description terms still
-    apply). Per-question work-auth/sponsorship matching is deferred to apply time."""
+    configured whole-word/phrase list, so it works for any country's vocabulary
+    (e.g. a security clearance the candidate can't hold: "security clearance",
+    "TS/SCI", "vetting", "polygraph"). Also excludes a non-remote job in a negative
+    location or one that fails an eligible-locations allowlist. All matching is on
+    word boundaries, so a short token like "US" matches the "US" in "Dallas, US"
+    but not the "us" inside "Russia". Remote roles are location-independent and
+    bypass the location checks (description terms still apply). Per-question
+    work-auth/sponsorship matching is deferred to apply time."""
     if negative_desc_pattern is not None and negative_desc_pattern.search(row.get("description") or ""):
         return False
 
@@ -289,9 +281,9 @@ def run(config_path: Path) -> Path:
     negative_locations = fcfg.get("negative_locations") or []
     eligible_locations = fcfg.get("eligible_locations") or []
     negative_description_terms = fcfg.get("negative_description_terms") or []
-    negative_loc_pattern = _compile_substrings(negative_locations)
-    eligible_loc_pattern = _compile_substrings(eligible_locations)
-    negative_desc_pattern = _compile_substrings(negative_description_terms)
+    negative_loc_pattern = _compile_alternation(negative_locations)
+    eligible_loc_pattern = _compile_alternation(eligible_locations)
+    negative_desc_pattern = _compile_alternation(negative_description_terms)
 
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
