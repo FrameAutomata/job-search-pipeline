@@ -33,17 +33,18 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
     """Drive one LinkedIn Easy Apply application. Pure side effect on `page`."""
     submit = mode == "auto"
     page.goto(job.url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    _wait_for_apply_cta(page)
 
-    if _text(page, "button.jobs-apply-button, .jobs-s-apply").lower().find("applied") >= 0:
+    if _already_applied(page):
         return ApplyResult(code="already_applied")
     if _closed(page):
         return ApplyResult(code=EXPIRED)
 
     btn = _easy_apply_button(page)
     if btn is None:
-        # Not an Easy Apply posting — Phase 3's agentic fallback handles these.
-        return ApplyResult(code="not_easy_apply")
+        # Not an Easy Apply posting (or the CTA didn't render). The reason carries
+        # what we DID see, so non-Easy-Apply bails are diagnosable from the log.
+        return ApplyResult(code="not_easy_apply", reason=_apply_cta_debug(page))
 
     try:
         btn.click()
@@ -110,21 +111,67 @@ def _closed(page) -> bool:
     ))
 
 
+def _wait_for_apply_cta(page) -> None:
+    """LinkedIn renders the apply button via client-side JS after load. Wait for
+    any apply CTA to appear before probing, falling back to a short fixed wait."""
+    try:
+        page.wait_for_selector(
+            "button.jobs-apply-button, button[aria-label*='Apply' i]",
+            timeout=10000, state="visible",
+        )
+    except Exception:
+        page.wait_for_timeout(1500)
+
+
 def _easy_apply_button(page):
-    """The 'Easy Apply' CTA. Returns a locator or None. We require the Easy
-    Apply label specifically so we never click a plain 'Apply' (off-site) button."""
-    for sel in (
-        "button.jobs-apply-button[aria-label*='Easy Apply' i]",
-        "button.jobs-apply-button",
-        "button[aria-label*='Easy Apply' i]",
-    ):
-        loc = page.locator(sel).first
+    """The 'Easy Apply' CTA. Returns a locator or None. Matches on the Easy Apply
+    label in EITHER the aria-label or the visible text (so an icon-rendered button
+    whose text node is empty still counts), and never on a plain 'Apply' (off-site)
+    button. There can be two CTAs (top + sticky bar); the first matching wins."""
+    loc = page.locator(
+        "button.jobs-apply-button, "
+        "button[aria-label*='Easy Apply' i], "
+        "button:has-text('Easy Apply')"
+    )
+    try:
+        n = loc.count()
+    except Exception:
+        return None
+    for i in range(n):
+        b = loc.nth(i)
         try:
-            if loc.count() and "easy apply" in (loc.inner_text(timeout=1000) or "").lower():
-                return loc
+            aria = (b.get_attribute("aria-label") or "").lower()
+            txt = (b.inner_text() or "").lower()
         except Exception:
             continue
+        if "easy apply" in aria or "easy apply" in txt:
+            return b
     return None
+
+
+def _already_applied(page) -> bool:
+    """True if LinkedIn shows this job as already applied to."""
+    txt = _text(page, "button.jobs-apply-button, .jobs-s-apply, "
+                      ".artdeco-inline-feedback").strip().lower()
+    return (txt.startswith("applied")
+            or "application submitted" in txt
+            or "you've applied" in txt)
+
+
+def _apply_cta_debug(page) -> str:
+    """Summarize the apply buttons we DID see, to explain a non-Easy-Apply bail.
+    Surfaced in the per-job log so selectors can be tuned against real postings."""
+    try:
+        loc = page.locator("button[aria-label*='Apply' i], button.jobs-apply-button")
+        labels: list[str] = []
+        for i in range(min(loc.count(), 3)):
+            el = loc.nth(i)
+            label = (el.get_attribute("aria-label") or el.inner_text() or "").strip()
+            if label:
+                labels.append(label[:40])
+        return "no Easy Apply button; saw: " + ("; ".join(labels) if labels else "no apply CTA at all")
+    except Exception:
+        return "no Easy Apply button found"
 
 
 def _modal_open(page) -> bool:
