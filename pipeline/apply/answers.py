@@ -94,6 +94,9 @@ class AnswerEngine:
         # Questions we couldn't answer (LLM unavailable) — surfaced for review so
         # the human completes/verifies them before submitting.
         self.unanswered: list[str] = []
+        # Tailored cover-letter text for the current job (set per job by run()).
+        # When present, it fills a cover-letter field instead of skipping it.
+        self.cover_letter_text: str = ""
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -231,12 +234,12 @@ class AnswerEngine:
             parts.append(f"Job context: {self.job_context}")
         parts.append("Answer:")
         self.llm_calls += 1
-        # Reuse the evaluator's retry wrapper, but retry harder than the batch
-        # evaluator: an apply run is interactive and we'd rather wait out a busy
-        # provider (deepinfra/MiMo's "engine_overloaded") than skip a form.
+        # Reuse the evaluator's retry wrapper. Bounded backoff (1,2,4,8,16s →
+        # ~31s worst case) so a busy provider doesn't make the run appear hung;
+        # past that we fall back to a best-effort answer flagged for review.
         from pipeline.batch_evaluate import _call_with_retry
         return _call_with_retry(
-            caller, system, "\n\n".join(parts), max_attempts=10, base_delay=2.0,
+            caller, system, "\n\n".join(parts), max_attempts=6, base_delay=1.0,
         ).strip()
 
     def _ensure_caller(self) -> Caller:

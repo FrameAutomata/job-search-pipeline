@@ -344,3 +344,26 @@ class TestTailoredResume:
 
     def test_none_when_dir_absent(self, tmp_path):
         assert apply_pkg._find_tailored_resume(tmp_path, self._job("Apexon")) is None
+
+
+class TestTailoredCoverLetter:
+    def _job(self, company):
+        return queue.ApplyJob(num="1", company=company, role="Eng",
+                              url="https://www.linkedin.com/jobs/view/1", score=4.5)
+
+    def test_reads_matching_cover_letter_text(self, tmp_path):
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "Apexon - cover letter.md").write_text("Dear Apexon team, ...", encoding="utf-8")
+        (out / "Globex-cover.txt").write_text("not this one", encoding="utf-8")
+        text = apply_pkg._find_tailored_cover_letter(tmp_path, self._job("Apexon"))
+        assert text == "Dear Apexon team, ..."
+
+    def test_requires_cover_in_name(self, tmp_path):
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "Apexon - resume.txt").write_text("resume not cover", encoding="utf-8")
+        assert apply_pkg._find_tailored_cover_letter(tmp_path, self._job("Apexon")) == ""
+
+    def test_empty_when_no_match_or_dir(self, tmp_path):
+        assert apply_pkg._find_tailored_cover_letter(tmp_path, self._job("Apexon")) == ""

@@ -98,6 +98,7 @@ def run(
 
             for job in jobs:
                 engine.job_context = f"{job.company} — {job.role}"
+                engine.cover_letter_text = _find_tailored_cover_letter(career_ops, job)
                 resume = _resolve_resume(career_ops, job)
                 try:
                     result = linkedin.apply_to(page, job, engine, mode=mode, resume_path=resume)
@@ -165,6 +166,34 @@ def _find_tailored_resume(career_ops: Path, job) -> Path | None:
 def _resolve_resume(career_ops: Path, job) -> Path | None:
     """Tailored resume for this job when available, else the configured default."""
     return _find_tailored_resume(career_ops, job) or linkedin._resume_pdf()
+
+
+def _find_tailored_cover_letter(career_ops: Path, job) -> str:
+    """Tailored cover-letter TEXT for this job, if career-ops generated one.
+
+    Searches APPLY_COVER_DIR (default career-ops/output, where career-ops writes
+    generated documents) for a .txt/.md whose filename contains the company slug
+    and 'cover', returning the most recent match's text. Empty string when there
+    isn't one — the engine then skips the (optional) cover-letter field."""
+    base = os.environ.get("APPLY_COVER_DIR")
+    cdir = Path(base) if base else career_ops / "output"
+    slug = re.sub(r"[^a-z0-9]+", "", (job.company or "").lower())
+    if not cdir.exists() or not slug:
+        return ""
+    matches = []
+    for p in cdir.glob("*"):
+        if p.suffix.lower() not in (".txt", ".md"):
+            continue
+        name = re.sub(r"[^a-z0-9]+", "", p.stem.lower())
+        if slug in name and "cover" in name:
+            matches.append(p)
+    if not matches:
+        return ""
+    best = max(matches, key=lambda p: p.stat().st_mtime)
+    try:
+        return best.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def _refresh_tracker(career_ops: Path) -> Path:

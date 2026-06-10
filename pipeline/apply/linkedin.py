@@ -532,6 +532,20 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
         return
 
     if tag == "textarea":
+        # Cover letter: paste the tailored one career-ops generated for this job,
+        # if we have it (works even when the field is optional — a tailored cover
+        # letter strengthens the application).
+        if "cover letter" in label.lower() and answers.cover_letter_text:
+            el.fill(answers.cover_letter_text)
+            drafted.append((label, f"tailored cover letter ({len(answers.cover_letter_text)} chars)"))
+            return
+        # Other free-text (summary, "why are you a fit"). Skip OPTIONAL ones — a
+        # cover letter with no tailored text is usually optional, and generating
+        # generic prose per job is slow and unnecessary. Only spend an LLM call
+        # on a required free-text field.
+        if not _is_required(el):
+            drafted.append((label, "(skipped optional)"))
+            return
         value = answers.answer(label, "textarea")
         if value and _already_has_value(el, value):
             return  # already correct (e.g. carried over from a prior step)
@@ -561,6 +575,15 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
     value = answers.answer(label, field_type)
     if value and _already_has_value(el, value):
         return  # LinkedIn carried this value forward — skip the redundant re-fill
+
+    # Location/city fields are typeahead comboboxes: plain fill() leaves an
+    # "invalid location" because LinkedIn requires choosing from the suggestion
+    # listbox. Type and select a suggestion instead.
+    if value and (_is_typeahead(el) or _is_location_label(label)):
+        ok, chosen = _fill_typeahead(el, value)
+        drafted.append((label, chosen + ("" if ok else " (typed; no suggestion matched)")))
+        return
+
     el.fill(value)
     drafted.append((label, value))
 
@@ -573,6 +596,76 @@ def _already_has_value(el, value: str) -> bool:
         return (el.input_value() or "").strip() == value.strip()
     except Exception:
         return False
+
+
+def _is_required(el) -> bool:
+    """True if the control is marked required (so we know whether an empty free-
+    text field will block the form). LinkedIn marks these with required /
+    aria-required; unmarked fields are treated as optional."""
+    try:
+        if el.get_attribute("required") is not None:
+            return True
+        if (el.get_attribute("aria-required") or "").lower() == "true":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_typeahead(el) -> bool:
+    """A combobox/autocomplete input (suggestions must be selected, not typed)."""
+    try:
+        if (el.get_attribute("role") or "").lower() == "combobox":
+            return True
+        if (el.get_attribute("aria-autocomplete") or "").lower() in ("list", "both"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_location_label(label: str) -> bool:
+    l = label.lower()
+    return "location" in l or l.strip() in ("city", "current city", "town")
+
+
+def _fill_typeahead(el, value: str) -> tuple[bool, str]:
+    """Type into a LinkedIn typeahead and select a suggestion from the listbox.
+
+    Tries the city (text before the first comma) first — LinkedIn's location
+    suggestions key off the city — then the full value. Scopes the [role=option]
+    search to the modal so we don't click a stray listbox. Returns
+    (selected_a_suggestion?, chosen_text); on no match, leaves the typed text."""
+    page = el.page
+    container = _modal(page) or page
+    city = value.split(",")[0].strip()
+    queries = [q for q in (city, value.strip()) if q]
+    seen: list[str] = []
+    for q in queries:
+        if q in seen:
+            continue
+        seen.append(q)
+        try:
+            el.click()
+            try:
+                el.fill("")
+            except Exception:
+                pass
+            el.type(q, delay=40)
+            page.wait_for_timeout(1200)
+            opts = container.locator("[role='option']")
+            if opts.count() > 0:
+                chosen = " ".join((opts.first.inner_text() or q).split())
+                opts.first.click()
+                page.wait_for_timeout(300)
+                return True, chosen or q
+        except Exception:
+            continue
+    try:
+        el.fill(value)
+    except Exception:
+        pass
+    return False, value
 
 
 def _resume_pdf() -> Path | None:
