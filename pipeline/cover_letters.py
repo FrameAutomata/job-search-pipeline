@@ -45,28 +45,40 @@ def build_prompt(profile: ApplyProfile, cv: str, job, report_text: str) -> tuple
     """(system, user) for one cover letter. Grounded in the CV + report so the
     model can't invent employers, titles, or credentials."""
     system = (
-        "You write concise, specific, honest cover letters for a job applicant. "
-        "Use ONLY facts found in the candidate's CV and the evaluation notes "
-        "below — never invent employers, job titles, dates, degrees, or skills. "
-        "Write in English, 3-4 short paragraphs: (1) the role and a genuine, "
-        "specific hook; (2) two or three concrete achievements from the CV that "
-        "match what this job needs; (3) a brief, warm close. No markdown headings, "
-        "no bracketed placeholders, no buzzword filler. Sound like a real person. "
-        "End with the candidate's name on its own line."
+        "You write concise, specific, HONEST cover letters. Use ONLY facts found "
+        "in the candidate's CV and details below. Never invent or embellish: no "
+        "made-up employers, titles, dates, degrees, skills, or metrics — AND no "
+        "claims about location, relocation, travel, on-site availability, "
+        "willingness, security clearances, or start dates unless they appear "
+        "verbatim in the candidate details. The evaluation notes may flag gaps, "
+        "blockers, or location/seniority requirements — do NOT rebut them and do "
+        "NOT fabricate anything to satisfy them; simply omit what you can't "
+        "truthfully support. If you're unsure whether something is true, leave it "
+        "out. Write in English, 3-4 short paragraphs: (1) the role and a genuine "
+        "hook grounded in the CV; (2) two or three concrete achievements from the "
+        "CV that match the job; (3) a brief, warm close expressing real interest "
+        "(no logistical promises about travel or availability). No markdown "
+        "headings, no bracketed placeholders, no buzzword filler. End with the "
+        "candidate's name on its own line."
     )
     contact = ", ".join(x for x in (profile.full_name, profile.email,
                                     f"{profile.city}, {profile.country}".strip(", ")) if x)
     parts = [
         f"Candidate: {contact}",
+        "(The location above is the ONLY location/availability fact you know — do "
+        "not state or imply any other location, travel, relocation, or on-site "
+        "availability.)",
         f"Applying to: {job.company} — {job.role}".rstrip(" —"),
         "",
         "=== CANDIDATE CV ===",
         cv or "(no CV on file)",
     ]
     if report_text:
-        # The report carries the role summary, match analysis, and phrases the
-        # evaluator tagged for cover-letter use — exactly the tailoring material.
-        parts += ["", "=== EVALUATION NOTES FOR THIS JOB ===", report_text[:6000]]
+        # The report carries proof-point phrases the evaluator tagged for cover-
+        # letter use. It ALSO contains gap/blocker analysis — the system prompt
+        # forbids fabricating mitigations for those.
+        parts += ["", "=== EVALUATION NOTES (use positives only; do not address gaps) ===",
+                  report_text[:6000]]
     parts += ["", "Write the cover letter now."]
     return system, "\n".join(parts)
 
