@@ -197,6 +197,11 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "requiresSponsorship": str(form.get("requires_sponsorship") or "").lower() == "yes",
             "workPermitType": form.get("work_permit_type") or "",
             "eligibleCountries": _split_csv(form.get("eligible_countries")),
+            # Voluntary EEO self-identification — blank = decline on every form.
+            "eeoGender": form.get("eeo_gender") or "",
+            "eeoRace": form.get("eeo_race") or "",
+            "eeoVeteran": form.get("eeo_veteran") or "",
+            "eeoDisability": form.get("eeo_disability") or "",
         },
         "criteria": {
             "targetRoles": _split_csv(form.get("target_roles")),

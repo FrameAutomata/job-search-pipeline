@@ -30,6 +30,25 @@ def main() -> int:
                     help="Parallel workers for --evaluate-batch (default: 3)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
+    ap.add_argument("--apply", action="store_true",
+                    help="Auto-apply to evaluated LinkedIn Easy Apply jobs (local only — "
+                         "needs a logged-in browser). Off by default.")
+    ap.add_argument("--apply-mode", choices=["review", "dry-run", "auto"], default="review",
+                    help="review: fill the form and stop before Submit (default); "
+                         "dry-run: rehearse only; auto: submit unattended (at your own risk).")
+    ap.add_argument("--apply-min-score", type=float, default=4.0,
+                    help="Only apply to jobs scoring >= this (default: 4.0)")
+    ap.add_argument("--apply-limit", type=int, default=0,
+                    help="Max applications to attempt this run (0 = no cap)")
+    ap.add_argument("--apply-url", type=str, default=None,
+                    help="Apply to a single specific job URL, bypassing the tracker "
+                         "queue (one-off apply, or to reproduce a specific posting).")
+    ap.add_argument("--apply-refresh", action=argparse.BooleanOptionalAction, default=True,
+                    help="Pull the latest tracker from the most recent GitHub pipeline "
+                         "artifact before applying (default on; --no-apply-refresh to use "
+                         "the local applications.md). Falls back to local when offline.")
+    ap.add_argument("--headless", action="store_true",
+                    help="Run the apply browser headless (only works once you've logged in once)")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
     pass_group = ap.add_mutually_exclusive_group()
     pass_group.add_argument("--only-pass", type=str, default=None,
@@ -99,6 +118,24 @@ def main() -> int:
             model=args.batch_model,
             concurrency=args.batch_concurrency,
             dry_run=args.dry_run,
+        )
+
+    if args.apply:
+        # Local import: the apply stage pulls in Playwright lazily, so the rest
+        # of the pipeline never pays for it.
+        from pipeline import apply
+        notify.notify("Pipeline", "Applying to qualified jobs...")
+        apply_mode = "dry-run" if args.dry_run else args.apply_mode
+        apply.run(
+            career_ops,
+            mode=apply_mode,
+            min_score=args.apply_min_score,
+            limit=args.apply_limit,
+            headless=args.headless,
+            refresh=args.apply_refresh,
+            target_url=args.apply_url,
+            provider=args.batch_provider,
+            model=args.batch_model,
         )
 
     return 0

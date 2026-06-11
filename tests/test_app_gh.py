@@ -355,3 +355,23 @@ class TestDownloadArtifact:
         mocker.patch("pipeline.app.gh.subprocess.run", return_value=_completed(""))
         with pytest.raises(gh.GhError, match="no reports/ or data/"):
             gh.download_artifact(999, tmp_path / "cache")
+
+    def test_clears_stale_dest_before_download(self, tmp_path, mocker):
+        # A prior extraction left files behind; gh refuses to overwrite, so the
+        # download must start from a clean dest. The stale file must be gone.
+        cache = tmp_path / "cache"
+        stale = cache / "pipeline-output-001" / "reports" / "old.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("stale", encoding="utf-8")
+
+        def fake_run(args, **kwargs):
+            from pathlib import Path
+            dest = Path(args[args.index("--dir") + 1])
+            assert not dest.exists() or not any(dest.iterdir()), "dest not cleared"
+            (dest / "pipeline-output-999" / "data").mkdir(parents=True)
+            return _completed("")
+        mocker.patch("pipeline.app.gh.subprocess.run", side_effect=fake_run)
+
+        result = gh.download_artifact(999, cache)
+        assert result.name == "pipeline-output-999"
+        assert not stale.exists()

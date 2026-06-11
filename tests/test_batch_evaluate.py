@@ -13,8 +13,39 @@ from pipeline.batch_evaluate import (
     _check_provider,
     _detect_provider,
     _is_rate_limit_error,
+    resolve_caller,
     run,
 )
+
+
+class TestResolveCaller:
+    """One shared caller-builder used by apply answers, cover letters, and the
+    apply stage — provider/model precedence in a single place."""
+
+    def test_unknown_provider_raises_clear_error_not_keyerror(self, monkeypatch):
+        # Unknown provider with no model override must raise a helpful RuntimeError,
+        # never a bare KeyError from PROVIDER_DEFAULTS[provider].
+        for v in ("APPLY_MODEL", "BATCH_MODEL", "COVER_MODEL"):
+            monkeypatch.delenv(v, raising=False)
+        with pytest.raises(RuntimeError):
+            resolve_caller("nonsense-provider")
+
+    def test_no_provider_configured_raises(self, monkeypatch):
+        for v in ("BATCH_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
+                  "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            monkeypatch.delenv(v, raising=False)
+        with pytest.raises(RuntimeError):
+            resolve_caller()
+
+    def test_lead_env_takes_precedence(self, monkeypatch):
+        # COVER_MODEL (lead_env) should win over APPLY_MODEL/BATCH_MODEL.
+        captured = {}
+        monkeypatch.setenv("COVER_MODEL", "cover-model")
+        monkeypatch.setenv("APPLY_MODEL", "apply-model")
+        monkeypatch.setattr("pipeline.batch_evaluate._build_caller",
+                            lambda provider, model, **kw: captured.update(provider=provider, model=model))
+        resolve_caller("deepinfra", lead_env="COVER_MODEL")
+        assert captured["model"] == "cover-model"
 
 
 class TestDetectProvider:

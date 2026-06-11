@@ -445,6 +445,18 @@ async function promptForInfo(parsed, autoMode) {
     }
   }
 
+  // Voluntary EEO / self-identification — captured once so the auto-apply engine
+  // answers demographic questions deterministically. Every field is optional;
+  // blank means "prefer not to say" (the default behavior on every form).
+  if (!autoMode && info.eeoGender === undefined) {
+    console.log('\n📋 Voluntary self-identification (optional — press enter to decline any)');
+    console.log('   Used to auto-answer EEO questions. Blank = "prefer not to say".');
+    info.eeoGender = await prompt('Gender (e.g. "Male", "Female", "Non-binary"): ');
+    info.eeoRace = await prompt('Race / ethnicity (e.g. "Asian", "Hispanic or Latino", "White"): ');
+    info.eeoVeteran = await prompt('Veteran status (e.g. "I am not a protected veteran"): ');
+    info.eeoDisability = await prompt('Disability status (e.g. "No, I do not have a disability"): ');
+  }
+
   return info;
 }
 
@@ -1075,6 +1087,12 @@ function generateProfile(info, criteria) {
       work_permit_type: info.workPermitType || '',
       eligible_countries: eligibleCountries,
       eligible_for_remote: info.eligibleForRemote !== false,
+    },
+    voluntary_disclosures: {
+      gender: info.eeoGender || '',
+      race_ethnicity: info.eeoRace || '',
+      veteran_status: info.eeoVeteran || '',
+      disability_status: info.eeoDisability || '',
     },
     cv: {
       output_format: 'html',
