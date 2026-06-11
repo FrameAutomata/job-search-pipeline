@@ -930,13 +930,40 @@ def _upload_as(el, path: Path, display_name: str) -> str:
     except Exception:
         el.set_input_files(str(path))
         return path.name
-    mime = "application/pdf" if path.suffix.lower() == ".pdf" else "application/octet-stream"
+    mime = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+    }.get(path.suffix.lower(), "application/octet-stream")
     try:
         el.set_input_files({"name": display_name, "mimeType": mime, "buffer": data})
         return display_name
     except Exception:
         el.set_input_files(str(path))
         return path.name
+
+
+def _resolve_upload_resume(answers: AnswerEngine, resume_path: Path | None) -> tuple[Path | None, bool]:
+    """The resume file to upload, and whether it's job-tailored. Precedence:
+    the engine's per-job tailored provider (generated lazily, only now that a
+    resume field actually exists) → the caller-resolved path → the default.
+    A provider failure degrades silently to the default resume.
+
+    The 'tailored' flag is by FILE IDENTITY (anything other than the default
+    resume), not by which path resolved it — a pre-existing tailored file
+    arriving via resume_path must not masquerade as the default in the review
+    log."""
+    default = _resume_pdf()
+    if answers.resume_provider is not None:
+        try:
+            p = answers.resume_provider()
+            if p and Path(p).exists():
+                return Path(p), True
+        except Exception:
+            pass
+    if resume_path and Path(resume_path).exists():
+        return Path(resume_path), default is None or Path(resume_path) != default
+    return default, False
 
 
 def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, str]],
@@ -954,7 +981,7 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
     except Exception:
         return
     full_name = getattr(getattr(answers, "profile", None), "full_name", "") or ""
-    resume_pdf = None  # resolved lazily, only if a non-cover file field appears
+    resume_pdf, tailored = None, False  # resolved lazily, only if a non-cover file field appears
     for i in range(count):
         el = files.nth(i)
         try:
@@ -962,7 +989,10 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
         except Exception:
             label = ""
         try:
-            if "cover" in label:
+            # A combined field ("Resume or cover letter") must get the RESUME —
+            # routing it to the cover branch left the form's only file field
+            # empty whenever no letter existed.
+            if "cover" in label and not re.search(r"\bresume\b|\bcv\b", label):
                 pdf = answers.cover_letter_pdf()
                 if pdf is not None:
                     shown = _upload_as(el, pdf, _professional_filename(full_name, "Cover Letter", Path(pdf)))
@@ -971,13 +1001,12 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
                     drafted.append(("Cover letter upload", "(skipped — no letter)"))
                 continue
             if resume_pdf is None:
-                resume_pdf = (resume_path if (resume_path and Path(resume_path).exists())
-                              else _resume_pdf())
+                resume_pdf, tailored = _resolve_upload_resume(answers, resume_path)
             if resume_pdf is None:
                 drafted.append(("Resume upload", "SKIPPED - no resume PDF found (set RESUME_PATH)"))
                 continue
             shown = _upload_as(el, resume_pdf, _professional_filename(full_name, "Resume", resume_pdf))
-            drafted.append((f"Upload ({label or 'resume'})", shown))
+            drafted.append((f"Upload ({label or 'resume'})", shown + (" (tailored)" if tailored else "")))
         except Exception:
             continue
 

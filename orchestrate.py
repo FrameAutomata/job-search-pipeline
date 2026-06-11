@@ -13,6 +13,21 @@ load_dotenv(ROOT / ".env")
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
 
 
+def _env_float(name: str, default: float) -> float:
+    """A float env override that can NEVER crash startup: this runs at
+    argparse-setup time on every invocation (even runs that never touch the
+    flag), so a malformed or set-but-empty value must warn and fall back, not
+    raise and brick every scheduled pipeline run."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[orchestrate] ignoring invalid {name}={raw!r} (using {default})")
+        return default
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the job-search pipeline.")
     ap.add_argument("--skip-scrape", action="store_true", help="Reuse existing output/jobs.csv")
@@ -47,6 +62,11 @@ def main() -> int:
                     help="Pull the latest tracker from the most recent GitHub pipeline "
                          "artifact before applying (default on; --no-apply-refresh to use "
                          "the local applications.md). Falls back to local when offline.")
+    ap.add_argument("--apply-tailor-min-score", type=float,
+                    default=_env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
+                    help="Jobs scoring >= this get a per-job tailored resume (slot-edited "
+                         "copy of resumes/resume.docx, one-page verified). Default 4.0; "
+                         "set high (e.g. 99) to always use the default resume.")
     ap.add_argument("--headless", action="store_true",
                     help="Run the apply browser headless (only works once you've logged in once)")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
@@ -136,6 +156,7 @@ def main() -> int:
             target_url=args.apply_url,
             provider=args.batch_provider,
             model=args.batch_model,
+            tailor_min_score=args.apply_tailor_min_score,
         )
 
     return 0

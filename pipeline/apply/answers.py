@@ -267,6 +267,11 @@ class AnswerEngine:
         # Returns a Path to the cover letter rendered as a PDF (for upload-style
         # cover-letter fields), or None. Set per job by run().
         self.cover_pdf_provider: Callable[[], object] | None = None
+        # Returns a Path to a per-job TAILORED resume (slot-edited copy of the
+        # candidate's own .docx, one-page verified), or None to use the default.
+        # Set per job by run() only when the job's score clears the tailor
+        # threshold; called lazily when a resume-upload field actually appears.
+        self.resume_provider: Callable[[], object] | None = None
 
     def cover_letter(self) -> str:
         """The tailored cover letter for the current job, generated on first
