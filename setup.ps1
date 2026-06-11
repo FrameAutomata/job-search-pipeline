@@ -54,6 +54,14 @@ if (Get-Command claude -ErrorAction SilentlyContinue) {
     Write-Host '      claude mcp add playwright -- npx -y @playwright/mcp@latest' -ForegroundColor Yellow
 }
 
+# Tailored resumes (--apply): python-docx comes from requirements.txt; the
+# one-page verification additionally uses LibreOffice when present.
+if (-not (Test-Path "C:\Program Files\LibreOffice\program\soffice.exe") -and
+    -not (Get-Command soffice -ErrorAction SilentlyContinue)) {
+    Write-Host "    Note: LibreOffice not found - tailored resumes will upload as .docx" -ForegroundColor Yellow
+    Write-Host "    without one-page verification. Install LibreOffice to enable it." -ForegroundColor Yellow
+}
+
 Write-Host "==> Copying example configs"
 if (-not (Test-Path "$root\.env")) { Copy-Item "$root\.env.example" "$root\.env" }
 if (-not (Test-Path "$root\config\search.yml")) { Copy-Item "$root\config\search.example.yml" "$root\config\search.yml" }
