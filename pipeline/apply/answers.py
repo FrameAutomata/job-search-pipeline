@@ -27,9 +27,12 @@ Caller = Callable[[str, str], str]
 _CACHE_NAME = "apply-answers.json"
 
 # EEO / demographic questions are always declined.
+# \w* on prefix tokens so the trailing \b lands at the real word end — without it
+# "disab" / "ethnic" never match "disability" / "ethnicity" (the \b fails between
+# "disab" and "ility"), so those questions skipped the EEO branch entirely.
 _EEO_RE = re.compile(
-    r"\b(gender|sex|race|ethnic|hispanic|latino|veteran|disab|sexual orientation|"
-    r"pronoun)\b", re.IGNORECASE,
+    r"\b(gender|sex|race|ethnic\w*|hispanic|latin[oax]|veterans?|disab\w*|"
+    r"sexual orientation|pronouns?)\b", re.IGNORECASE,
 )
 _DECLINE = "Prefer not to say"
 
@@ -167,6 +170,21 @@ def _match_option_strict(answer: str, options: list[str]) -> str | None:
         if _contains_token(al, ol) or _contains_token(ol, al):
             return opt
     return None
+
+
+def _match_polarity(val: str, options: list[str]) -> str | None:
+    """For a yes/no self-ID (veteran/disability) whose wording doesn't exactly
+    match the form ("I am not a veteran" vs "I am not a protected veteran"), align
+    on negation: return the SINGLE non-decline option with the same polarity as the
+    stored value. None if ambiguous (more than one candidate) so the caller
+    declines rather than guessing."""
+    neg = r"\b(no|not|never|without)\b|n't"
+    decline = r"prefer not|decline|wish|rather not|specify|don.?t answer"
+    val_neg = bool(re.search(neg, val, re.IGNORECASE))
+    cand = [o for o in options
+            if not re.search(decline, o, re.IGNORECASE)
+            and bool(re.search(neg, o, re.IGNORECASE)) == val_neg]
+    return cand[0] if len(cand) == 1 else None
 
 
 class AnswerEngine:
@@ -382,23 +400,32 @@ class AnswerEngine:
         return _match_option("Yes" if verdict == "yes" else "No", options)
 
     def _eeo_answer(self, q: str, options: list[str] | None) -> str:
-        """A voluntary EEO question. Use the candidate's self-ID from the profile
-        (mapped onto the form's options) if they set one; otherwise decline. A
-        stored value that is itself a 'prefer not to say' counts as declining."""
+        """A voluntary EEO question. Map the candidate's self-ID onto the form's
+        options; decline when it's unset or can't be matched confidently. NEVER
+        guesses (options[0]) — a wrong veteran/disability pick asserts the OPPOSITE
+        of the truth. Binary fields fall back to a polarity match so "I am not a
+        veteran" still aligns to the form's "I am not a protected veteran"."""
         p = self.profile
+        binary = False
         if re.search(r"\b(race|ethnic|hispanic|latino)\b", q):
             val = p.eeo_race
         elif "veteran" in q:
-            val = p.eeo_veteran
+            val, binary = p.eeo_veteran, True
         elif "disab" in q:
-            val = p.eeo_disability
+            val, binary = p.eeo_disability, True
         elif re.search(r"\b(gender|sex)\b", q) or "pronoun" in q:
             val = p.eeo_gender
         else:
             val = ""
-        if val and not re.search(r"prefer not|decline|not wish|rather not", val, re.IGNORECASE):
-            return _match_option(val, options) if options else val
-        return self._decline(options)
+        val = val.strip().strip('"').strip("'").strip()   # tolerate quoted setup values
+        if not val or re.search(r"prefer not|decline|not wish|rather not", val, re.IGNORECASE):
+            return self._decline(options)
+        if not options:
+            return val
+        matched = _match_option_strict(val, options)
+        if not matched and binary:
+            matched = _match_polarity(val, options)
+        return matched or self._decline(options)
 
     def _decline(self, options: list[str] | None) -> str:
         if not options:

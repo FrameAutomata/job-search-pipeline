@@ -194,6 +194,31 @@ class TestAnswerEngineDeterministic:
         # race not set → still declines (blank-with-no-decline-option → "")
         assert e.answer("Race/Ethnicity", "select", ["Asian", "White"]) == ""
 
+    def test_eeo_quoted_value_and_polarity_never_picks_opposite(self, tmp_path):
+        # Setup wrote quoted values with slightly different wording than the form.
+        # Must align by polarity (not/yes), never fall back to the opposite option.
+        p = ApplyProfile(full_name="X",
+                         eeo_veteran='"I am not a veteran"',          # quoted, no "protected"
+                         eeo_disability='"Yes, I have a disability"')  # quoted
+        e = AnswerEngine(p, tmp_path / "c.json",
+                         caller=lambda s, u: (_ for _ in ()).throw(AssertionError("no LLM")))
+        vet = e.answer("Veteran status", "select", [
+            "I identify as one or more of the classifications of a protected veteran",
+            "I am not a protected veteran", "I don't wish to answer"])
+        assert vet == "I am not a protected veteran"            # NOT the affirming option
+        dis = e.answer("Disability status", "select", [
+            "No, I do not have a disability", "Yes, I have a disability",
+            "I do not wish to answer"])
+        assert dis == "Yes, I have a disability"               # NOT the "No" option
+
+    def test_eeo_unmappable_self_id_declines_not_guesses(self, tmp_path):
+        # A self-ID that can't be matched must decline, never pick options[0].
+        p = ApplyProfile(full_name="X", eeo_race="Klingon")
+        e = AnswerEngine(p, tmp_path / "c.json",
+                         caller=lambda s, u: (_ for _ in ()).throw(AssertionError("no LLM")))
+        assert e.answer("Race/Ethnicity", "select",
+                        ["Asian", "White", "Prefer not to say"]) == "Prefer not to say"
+
     def test_salary_text_is_negotiable(self, profile, tmp_path):
         # Never reveal the walk-away minimum; a text salary field gets "Negotiable".
         e = self._engine(profile, tmp_path)
