@@ -66,6 +66,22 @@ def fake_popen(tmp_path, monkeypatch):
     local_run._state.clear()
 
 
+class TestChildEnv:
+    def test_fresh_dotenv_overrides_stale_inherited_value(self, tmp_path, monkeypatch):
+        # The server inherited RESUME_PATH at startup; a later .env edit must
+        # win for UI-triggered runs (no server restart needed).
+        monkeypatch.setenv("RESUME_PATH", "stale/old_name.pdf")
+        envfile = tmp_path / ".env"
+        envfile.write_text("RESUME_PATH=resumes/resume.pdf\n", encoding="utf-8")
+        env = local_run._child_env(envfile)
+        assert env["RESUME_PATH"] == "resumes/resume.pdf"
+        assert env["PYTHONUNBUFFERED"] == "1"
+
+    def test_missing_dotenv_is_fine(self, tmp_path):
+        env = local_run._child_env(tmp_path / "absent.env")
+        assert env["PYTHONUNBUFFERED"] == "1"
+
+
 class TestBuildCmd:
     def test_defaults(self):
         cmd = local_run._build_cmd({})

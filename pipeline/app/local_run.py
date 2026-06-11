@@ -48,6 +48,22 @@ def _build_cmd(options: dict) -> list[str]:
     return cmd
 
 
+def _child_env(env_path: Path | None = None) -> dict:
+    """The subprocess environment: the server's env overlaid with a FRESH read
+    of .env. The server loaded .env once at startup and orchestrate's own
+    load_dotenv(override=False) won't replace inherited values — so without
+    this, edits to .env (resume path, model chains, keys) would silently not
+    apply to UI-triggered runs until the server restarts."""
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+    try:
+        from dotenv import dotenv_values
+        fresh = dotenv_values(env_path or (ROOT / ".env"))
+        env.update({k: v for k, v in fresh.items() if v is not None})
+    except Exception:
+        pass
+    return env
+
+
 def is_running() -> bool:
     proc = _state.get("proc")
     return proc is not None and proc.poll() is None
@@ -63,9 +79,9 @@ def start(options: dict | None = None) -> dict:
         cmd = _build_cmd(options)
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(LOG_PATH, "w", encoding="utf-8", errors="replace")
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
         proc = subprocess.Popen(
-            cmd, cwd=str(ROOT), stdout=log_file, stderr=subprocess.STDOUT, env=env,
+            cmd, cwd=str(ROOT), stdout=log_file, stderr=subprocess.STDOUT,
+            env=_child_env(),
         )
         _state.clear()
         _state.update(proc=proc, log_file=log_file, started_at=time.time(),
