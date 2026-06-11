@@ -22,6 +22,7 @@ Only "auto" submits; review/dry-run leave the form filled and unsubmitted.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from pipeline.apply.answers import AnswerEngine
@@ -848,6 +849,38 @@ def _resume_pdf() -> Path | None:
     return None
 
 
+def _professional_filename(full_name: str, kind: str, src: Path) -> str:
+    """A recruiter-facing filename: "<Name> - Cover Letter.pdf" / "<Name> -
+    Resume.pdf". Our internal files are keyed by company ("Acme - cover.pdf") so
+    the engine can find them, but a recruiter sees the upload name — and a
+    per-company name reads as mail-merge. People name attachments after
+    themselves. Falls back to the source name when we have no candidate name."""
+    ext = src.suffix or ".pdf"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", (full_name or "")).strip()
+    name = re.sub(r"\s+", " ", name)
+    return f"{name} - {kind}{ext}" if name else src.name
+
+
+def _upload_as(el, path: Path, display_name: str) -> str:
+    """Upload `path` but present it to the site as `display_name` (via a
+    Playwright FilePayload, so the company-keyed on-disk name never reaches the
+    recruiter). Returns the name actually presented; falls back to the real file
+    on any error."""
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except Exception:
+        el.set_input_files(str(path))
+        return path.name
+    mime = "application/pdf" if path.suffix.lower() == ".pdf" else "application/octet-stream"
+    try:
+        el.set_input_files({"name": display_name, "mimeType": mime, "buffer": data})
+        return display_name
+    except Exception:
+        el.set_input_files(str(path))
+        return path.name
+
+
 def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, str]],
                         resume_path: Path | None = None) -> None:
     """Fill file-upload fields on the visible step.
@@ -862,6 +895,7 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
         count = files.count()
     except Exception:
         return
+    full_name = getattr(getattr(answers, "profile", None), "full_name", "") or ""
     resume_pdf = None  # resolved lazily, only if a non-cover file field appears
     for i in range(count):
         el = files.nth(i)
@@ -873,8 +907,8 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
             if "cover" in label:
                 pdf = answers.cover_letter_pdf()
                 if pdf is not None:
-                    el.set_input_files(str(pdf))
-                    drafted.append(("Upload (cover letter)", Path(pdf).name))
+                    shown = _upload_as(el, pdf, _professional_filename(full_name, "Cover Letter", Path(pdf)))
+                    drafted.append(("Upload (cover letter)", shown))
                 else:
                     drafted.append(("Cover letter upload", "(skipped — no letter)"))
                 continue
@@ -884,8 +918,8 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
             if resume_pdf is None:
                 drafted.append(("Resume upload", "SKIPPED - no resume PDF found (set RESUME_PATH)"))
                 continue
-            el.set_input_files(str(resume_pdf))
-            drafted.append((f"Upload ({label or 'resume'})", resume_pdf.name))
+            shown = _upload_as(el, resume_pdf, _professional_filename(full_name, "Resume", resume_pdf))
+            drafted.append((f"Upload ({label or 'resume'})", shown))
         except Exception:
             continue
 

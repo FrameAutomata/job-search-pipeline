@@ -245,6 +245,27 @@ class TestAnswerEngineCache:
         ]
 
 
+class TestProfessionalFilename:
+    """Uploaded files are presented to recruiters under the candidate's name,
+    not the company-keyed internal filename (which looks mail-merged)."""
+
+    def test_candidate_named(self):
+        from pipeline.apply.linkedin import _professional_filename
+        assert _professional_filename("Thomas Thirlwall", "Cover Letter",
+                                      Path("Parloa - cover.pdf")) == "Thomas Thirlwall - Cover Letter.pdf"
+        assert _professional_filename("Thomas Thirlwall", "Resume",
+                                      Path("resume.pdf")) == "Thomas Thirlwall - Resume.pdf"
+
+    def test_falls_back_without_name(self):
+        from pipeline.apply.linkedin import _professional_filename
+        assert _professional_filename("", "Resume", Path("resume.pdf")) == "resume.pdf"
+
+    def test_sanitizes_illegal_chars(self):
+        from pipeline.apply.linkedin import _professional_filename
+        assert _professional_filename("Tom/Slash", "Resume",
+                                      Path("r.pdf")) == "Tom Slash - Resume.pdf"
+
+
 class TestTailoredResume:
     """_find_tailored_resume must not mistake a cover letter for a resume."""
 
