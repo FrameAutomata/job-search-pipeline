@@ -145,15 +145,53 @@ class TestBuildPrompt:
         system, user = rt.build_prompt(slots, "FULL RESUME TEXT", _job(report=""),
                                        "REPORT NOTES")
         assert "Never invent" in system and "max_chars" in system
+        # Retargeting is the explicit objective, not optional polish.
+        assert "ALWAYS rewrite" in system and "FAILURE" in system
         assert "Acme — Backend Engineer" in user
         assert "REPORT NOTES" in user and "FULL RESUME TEXT" in user
         assert '"s10"' in user
+
+    def test_jd_text_included_when_present(self, resume_docx):
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        _, user = rt.build_prompt(slots, "cv", _job(), "", jd_text="THE ACTUAL JD")
+        assert "JOB DESCRIPTION" in user and "THE ACTUAL JD" in user
 
     def test_shorten_flag_adds_overflow_instruction(self, resume_docx):
         doc = Document(str(resume_docx))
         slots = rt.extract_slots(doc)
         system, _ = rt.build_prompt(slots, "cv", _job(), "", shorten=True)
         assert "OVERFLOWED" in system
+
+
+class TestJdText:
+    def test_prefers_local_jds_file(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "batch" / "jds").mkdir(parents=True)
+        (co / "batch" / "jds" / "7.txt").write_text("CACHED JD", encoding="utf-8")
+        job = ApplyJob(num="7", company="X", role="Y", url="u", score=4.0)
+        assert rt._jd_text(co, None, job) == "CACHED JD"
+
+    def test_falls_back_to_artifact_then_fetch(self, tmp_path, monkeypatch):
+        co = tmp_path / "career-ops"
+        co.mkdir()
+        art = tmp_path / "artifact"
+        (art / "batch" / "jds").mkdir(parents=True)
+        (art / "batch" / "jds" / "7.txt").write_text("ARTIFACT JD", encoding="utf-8")
+        job = ApplyJob(num="7", company="X", role="Y", url="u", score=4.0)
+        assert rt._jd_text(co, art, job) == "ARTIFACT JD"
+        # no files anywhere + a LinkedIn URL → guest-endpoint fetch
+        job2 = ApplyJob(num="8", company="X", role="Y",
+                        url="https://www.linkedin.com/jobs/view/123/", score=4.0)
+        monkeypatch.setattr("pipeline.screen.fetch_and_classify",
+                            lambda url, timeout=8: ("active", "", "<body>FETCHED JD</body>"))
+        assert "FETCHED JD" in rt._jd_text(co, art, job2)
+
+    def test_empty_when_nothing_available(self, tmp_path):
+        co = tmp_path / "career-ops"
+        co.mkdir()
+        job = ApplyJob(num="", company="X", role="Y", url="https://example.com/x", score=4.0)
+        assert rt._jd_text(co, None, job) == ""
 
 
 class TestGenerateForJob:

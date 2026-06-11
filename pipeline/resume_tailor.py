@@ -56,9 +56,13 @@ _HEADERS = {
     "certifications": "education",
 }
 
-# Tolerance over the original slot length. Tight on purpose: growth is the
-# enemy of pagination; the render check is the backstop, not the first line.
-_BUDGET_TOLERANCE = 0.10
+# Tolerance over the original slot length. Generous enough to let the model
+# actually retarget (weave in the JD's terminology), because pagination is
+# enforced by the LibreOffice render check downstream, not by budgets alone.
+_BUDGET_TOLERANCE = 0.20
+
+# Cap on JD text fed to the prompt.
+_JD_MAX = 5000
 
 
 @dataclass
@@ -166,22 +170,32 @@ def _strip_metadata(doc, author: str) -> None:
 # ── LLM prompt / response ────────────────────────────────────────────────────
 
 def build_prompt(slots: list[Slot], full_resume_text: str, job,
-                 report_text: str, shorten: bool = False) -> tuple[str, str]:
+                 report_text: str, jd_text: str = "",
+                 shorten: bool = False) -> tuple[str, str]:
     system = (
         "You tailor a resume toward one specific job by rewriting ONLY the text "
-        "slots provided. HARD RULES:\n"
+        "slots provided.\n"
+        "OBJECTIVE: someone comparing the result to the original must immediately "
+        "see it was written for THIS job — emphasis, ordering, and terminology "
+        "aligned to the job's requirements. Timid micro-edits (swapping a word, "
+        "trimming an article) are a FAILURE.\n"
+        "HARD RULES:\n"
         "- Use ONLY facts already present in the resume below. Never invent or "
         "embellish employers, titles, dates, tools, metrics, degrees, or "
-        "certifications. You may reorder, rephrase, emphasize, and cut.\n"
+        "certifications. You may reorder, rephrase, emphasize, cut, and adopt "
+        "the job's terminology for work the resume already demonstrates.\n"
         "- LENGTH: each replacement MUST be at most max_chars characters for its "
-        "slot — shorter is good, longer is rejected. Do not pad.\n"
-        "- skills slots: reorder the comma-separated values so the most "
-        "job-relevant come first; you may drop the least relevant; never add a "
-        "technology that is not in the resume.\n"
-        "- bullet slots: keep the same underlying facts; sharpen the wording "
-        "toward the job's requirements and front-load matching technologies.\n"
-        "- summary slots: align the emphasis to this role; same facts only.\n"
-        "- Leave out any slot you would not improve.\n"
+        "slot — longer is rejected.\n"
+        "REQUIRED EDITS:\n"
+        "- The summary slot: ALWAYS rewrite it to open toward this role — lead "
+        "with the candidate's experience most relevant to the job's domain and "
+        "stack, using the job's own vocabulary where truthful.\n"
+        "- Every skills slot: reorder the comma-separated values so the job's "
+        "technologies come first; you may drop the least relevant to make room; "
+        "never add one that is not in the resume.\n"
+        "- Bullets: rewrite each one where shifting emphasis or adopting the "
+        "job's terminology makes the relevance obvious; front-load matching "
+        "technologies. Leave a bullet unchanged only if it is already ideal.\n"
         + ("- The previous attempt OVERFLOWED one page: shorten aggressively — "
            "every replacement noticeably shorter than the original.\n" if shorten else "")
         + 'Reply with ONLY a JSON object: {"slot_id": "replacement text", ...}'
@@ -190,6 +204,7 @@ def build_prompt(slots: list[Slot], full_resume_text: str, job,
                 "text": s.text, "max_chars": s.max_chars} for s in slots]
     user = "\n\n".join(filter(None, [
         f"Target job: {job.company} — {job.role}".rstrip(" —"),
+        ("=== JOB DESCRIPTION ===\n" + jd_text[:_JD_MAX]) if jd_text else "",
         ("=== EVALUATION NOTES (requirements / matches) ===\n" + report_text[:6000])
         if report_text else "",
         "=== FULL RESUME (source of truth — facts may only come from here) ===\n"
@@ -310,6 +325,33 @@ def find_existing(career_ops: Path, company: str) -> Path | None:
     return None
 
 
+def _jd_text(career_ops: Path, report_base: Path | None, job) -> str:
+    """The job's description text — the strongest tailoring signal (the report
+    discusses fit but doesn't carry the JD's keyword surface). Sources, in
+    order: the batch-cached JD file (local career-ops, then the refreshed
+    artifact), else a live fetch via the LinkedIn guest endpoint. "" when
+    unavailable; the report alone still works."""
+    num = str(getattr(job, "num", "") or "").strip()
+    if num:
+        for base in (career_ops, report_base):
+            if base is None:
+                continue
+            p = Path(base) / "batch" / "jds" / f"{num}.txt"
+            if p.exists():
+                return read_text(p)[:_JD_MAX]
+    try:
+        from pipeline.screen import (
+            extract_description, fetch_and_classify, linkedin_guest_jd_url,
+        )
+        guest = linkedin_guest_jd_url(getattr(job, "url", "") or "")
+        if guest:
+            _, _, body = fetch_and_classify(guest, timeout=8)
+            return extract_description(body)[:_JD_MAX]
+    except Exception:
+        pass
+    return ""
+
+
 def _resolve_caller(provider: str | None, model: str | None):
     from pipeline.batch_evaluate import resolve_caller
     from pipeline.apply.answers import thinking_disabled
@@ -344,6 +386,7 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
 
     report_path = getattr(job, "report_path", "") or ""
     report_text = read_text(Path(report_base or career_ops) / report_path) if report_path else ""
+    jd_text = _jd_text(career_ops, report_base, job)
 
     if caller is None:
         caller = _resolve_caller(provider, model)
@@ -359,7 +402,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
             docx_out.unlink(missing_ok=True)
             return None
         full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        system, user = build_prompt(slots, full_text, job, report_text, shorten=shorten)
+        system, user = build_prompt(slots, full_text, job, report_text, jd_text,
+                                    shorten=shorten)
         try:
             raw = _call_with_retry(caller, system, user, max_attempts=6, base_delay=1.0)
         except Exception:
@@ -398,7 +442,8 @@ def _author_name(career_ops: Path) -> str:
 
 
 if __name__ == "__main__":
-    # Manual test: python -m pipeline.resume_tailor "<Company>" "<Role>" [report.md]
+    # Manual test:
+    #   python -m pipeline.resume_tailor "<Company>" "<Role>" [report.md] [job_url]
     import sys
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
@@ -406,7 +451,8 @@ if __name__ == "__main__":
     company = sys.argv[1] if len(sys.argv) > 1 else "Test Company"
     role = sys.argv[2] if len(sys.argv) > 2 else "Software Engineer"
     report = sys.argv[3] if len(sys.argv) > 3 else ""
-    job = ApplyJob(num="", company=company, role=role, url="", score=None,
+    url = sys.argv[4] if len(sys.argv) > 4 else ""
+    job = ApplyJob(num="", company=company, role=role, url=url, score=None,
                    report_path=report)
     out = generate_for_job(ROOT / "career-ops", job, force=True)
     print(f"-> {out}" if out else "-> failed (see messages above)")
