@@ -56,10 +56,12 @@ _HEADERS = {
     "certifications": "education",
 }
 
-# Tolerance over the original slot length. Generous enough to let the model
-# actually retarget (weave in the JD's terminology), because pagination is
+# Tolerance over the original slot length, per kind. Generous enough to let the
+# model actually retarget (weave in the JD's terminology) — pagination is
 # enforced by the LibreOffice render check downstream, not by budgets alone.
-_BUDGET_TOLERANCE = 0.20
+# The summary gets extra headroom: it's the most tailorable slot and a rewrite
+# rejected for length means no retargeting where it matters most.
+_TOLERANCE = {"summary": 0.30, "bullet": 0.20, "skills": 0.20}
 
 # Cap on JD text fed to the prompt.
 _JD_MAX = 5000
@@ -75,7 +77,7 @@ class Slot:
 
     @property
     def max_chars(self) -> int:
-        return int(len(self.text) * (1 + _BUDGET_TOLERANCE)) + 5
+        return int(len(self.text) * (1 + _TOLERANCE.get(self.kind, 0.20))) + 5
 
 
 # ── docx slot extraction / patching ──────────────────────────────────────────
@@ -124,33 +126,93 @@ def extract_slots(doc) -> list[Slot]:
     return slots
 
 
-def apply_replacements(doc, slots: list[Slot], replacements: dict[str, str]) -> int:
-    """Patch accepted replacements into the document. A replacement over its
-    slot's budget (or empty) is REJECTED — the original text stays. Returns the
-    number of slots actually changed."""
+def _split_skills(values: str) -> list[str]:
+    """Split a skills list on commas NOT inside parentheses, so a compound
+    skill like "AWS (ECS, DynamoDB)" stays one token."""
+    return [t.strip() for t in re.split(r",(?![^(]*\))", values) if t.strip()]
+
+
+def _skill_in_resume(token: str, resume_text: str) -> bool:
+    """Whether a skill token is grounded in the resume — the deterministic guard
+    against JD keyword-stuffing (the prompt forbids inventing skills, but models
+    add them anyway: "JavaScript" when only TypeScript is on the resume).
+
+    Word-boundary match. A '/'-compound ("Linux/Unix") is alternative naming —
+    ANY part present suffices. A parenthetical ("AWS (ECS, DynamoDB)") enumerates
+    sub-skill claims — the head AND every listed item must be grounded."""
+    m = re.match(r"(.+?)\s*\((.+)\)\s*$", token)
+    if m:
+        head, inner = m.group(1), m.group(2)
+        return (_skill_in_resume(head.strip(), resume_text)
+                and all(_skill_in_resume(p.strip(), resume_text)
+                        for p in inner.split(",") if p.strip()))
+    for part in re.split(r"\s*/\s*", token):
+        part = part.strip()
+        if part and re.search(rf"(?<!\w){re.escape(part)}(?!\w)", resume_text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _fit_prose(new: str, max_chars: int) -> str | None:
+    """Fit a prose replacement to its budget by trimming at a clause boundary
+    instead of rejecting the whole rewrite (a rejected summary = no retargeting
+    where it matters most). None when trimming would gut it."""
+    if len(new) <= max_chars:
+        return new
+    for sep in (". ", "; ", " — ", ", "):
+        cut = new.rfind(sep, 0, max_chars + 1)
+        if cut >= int(max_chars * 0.6):
+            trimmed = new[:cut].rstrip(" ;,")
+            return trimmed if trimmed.endswith(".") else trimmed + "."
+    return None
+
+
+def _fit_skills(tokens: list[str], max_chars: int) -> str | None:
+    """Fit a skills list to budget by dropping trailing (least relevant — the
+    model front-loads) tokens."""
+    while tokens and len(", ".join(tokens)) > max_chars:
+        tokens.pop()
+    return ", ".join(tokens) if tokens else None
+
+
+def apply_replacements(doc, slots: list[Slot], replacements: dict[str, str],
+                       resume_text: str = "") -> tuple[int, list[str]]:
+    """Patch replacements into the document. Skills tokens not grounded in the
+    resume are dropped (anti-keyword-stuffing); over-budget replacements are
+    trimmed at a clause/token boundary rather than discarded; what can't be
+    fitted is rejected (the original text stays). Returns (changed, rejected_ids)."""
     by_id = {s.id: s for s in slots}
-    changed = 0
+    changed, rejected = 0, []
     for sid, new in replacements.items():
         slot = by_id.get(sid)
         if slot is None or not isinstance(new, str):
             continue
         new = new.strip()
-        if not new or len(new) > slot.max_chars or new == slot.text.strip():
+        if slot.kind == "skills":
+            tokens = _split_skills(new)
+            if resume_text:
+                tokens = [t for t in tokens if _skill_in_resume(t, resume_text)]
+            fitted = _fit_skills(tokens, slot.max_chars)
+        else:
+            fitted = _fit_prose(new, slot.max_chars) if new else None
+        if not fitted or fitted == slot.text.strip():
+            if new and new != slot.text.strip():
+                rejected.append(sid)
             continue
         p = doc.paragraphs[slot.para_index]
         if slot.kind == "skills":
             # Keep the bold label run; rewrite the value runs.
-            p.runs[1].text = new
+            p.runs[1].text = fitted
             for r in p.runs[2:]:
                 r.text = ""
         else:
             if not p.runs:
                 continue
-            p.runs[0].text = new
+            p.runs[0].text = fitted
             for r in p.runs[1:]:
                 r.text = ""
         changed += 1
-    return changed
+    return changed, rejected
 
 
 def _strip_metadata(doc, author: str) -> None:
@@ -409,7 +471,10 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
         except Exception:
             docx_out.unlink(missing_ok=True)
             return None
-        changed = apply_replacements(doc, slots, parse_replacements(raw))
+        reps = parse_replacements(raw)
+        changed, rejected = apply_replacements(doc, slots, reps, full_text)
+        print(f"[tailor] {job.company}: {len(reps)} rewrite(s) returned, {changed} applied"
+              + (f", {len(rejected)} rejected ({', '.join(rejected[:4])})" if rejected else ""))
         if not changed:
             docx_out.unlink(missing_ok=True)
             return None

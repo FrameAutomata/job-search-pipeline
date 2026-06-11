@@ -90,11 +90,11 @@ class TestApplyReplacements:
     def test_patches_within_budget_and_preserves_protected(self, resume_docx):
         doc = Document(str(resume_docx))
         slots = rt.extract_slots(doc)
-        n = rt.apply_replacements(doc, slots, {
+        changed, rejected = rt.apply_replacements(doc, slots, {
             "s10": "Built Java REST APIs at 1M req/day; full CI/CD.",
             "s5": "Go, Java, Python, SQL",
         })
-        assert n == 2
+        assert changed == 2 and rejected == []
         assert doc.paragraphs[10].text == "Built Java REST APIs at 1M req/day; full CI/CD."
         # skills: bold label run untouched, values replaced
         assert doc.paragraphs[5].runs[0].text == "Languages: "
@@ -104,25 +104,90 @@ class TestApplyReplacements:
         assert doc.paragraphs[0].text == "Jane Dev"
         assert doc.paragraphs[8].text == "Acme Corp\tJan 2023 – Present"
 
-    def test_over_budget_replacement_rejected(self, resume_docx):
+    def test_unfittable_replacement_rejected(self, resume_docx):
+        # No clause boundary to trim at → whole rewrite rejected, original stays.
         doc = Document(str(resume_docx))
         slots = rt.extract_slots(doc)
         original = doc.paragraphs[11].text
-        too_long = "x" * (next(s.max_chars for s in slots if s.id == "s11") + 1)
-        assert rt.apply_replacements(doc, slots, {"s11": too_long}) == 0
+        too_long = "x" * (next(s.max_chars for s in slots if s.id == "s11") + 50)
+        changed, rejected = rt.apply_replacements(doc, slots, {"s11": too_long})
+        assert changed == 0 and rejected == ["s11"]
         assert doc.paragraphs[11].text == original
+
+    def test_over_budget_prose_trimmed_at_clause_boundary(self, resume_docx):
+        # A summary that overflows its budget is trimmed at a sentence break and
+        # APPLIED — not discarded (a rejected summary = no retargeting at all).
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        s3 = next(s for s in slots if s.id == "s3")
+        first = "Backend-focused engineer with 3 yrs building production systems."
+        new = first + " " + "Extra trailing sentence that pushes well past the budget limit." * 3
+        assert len(new) > s3.max_chars
+        changed, rejected = rt.apply_replacements(doc, slots, {"s3": new})
+        assert changed == 1 and rejected == []
+        assert doc.paragraphs[3].text.startswith("Backend-focused engineer")
+        assert len(doc.paragraphs[3].text) <= s3.max_chars
+
+    def test_skills_fabricated_tokens_dropped(self, resume_docx):
+        # "JavaScript" isn't in the resume → dropped; the rest (grounded) applied.
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        resume_text = "\n".join(p.text for p in doc.paragraphs)
+        changed, rejected = rt.apply_replacements(
+            doc, slots, {"s5": "Python, JavaScript, Go, Java, SQL"}, resume_text)
+        assert changed == 1
+        assert doc.paragraphs[5].text == "Languages: Python, Go, Java, SQL"
+
+    def test_skills_all_fabricated_rejected(self, resume_docx):
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        resume_text = "\n".join(p.text for p in doc.paragraphs)
+        original = doc.paragraphs[5].text
+        changed, rejected = rt.apply_replacements(
+            doc, slots, {"s5": "Rust, Elixir, Haskell"}, resume_text)
+        assert changed == 0 and rejected == ["s5"]
+        assert doc.paragraphs[5].text == original
+
+    def test_skills_paren_compound_semantics(self, resume_docx):
+        # A parenthetical enumerates sub-skill CLAIMS: "AWS (ECS)" is grounded
+        # (the resume bullet says "AWS ECS"), but "AWS (ECS, DynamoDB)" is not
+        # (DynamoDB appears nowhere) — it gets dropped, the grounded rest applied.
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        resume_text = "\n".join(p.text for p in doc.paragraphs)
+        changed, _ = rt.apply_replacements(
+            doc, slots,
+            {"s6": "AWS (ECS), AWS (ECS, DynamoDB), Docker, Kubernetes"}, resume_text)
+        assert changed == 1
+        assert doc.paragraphs[6].text == "Cloud / DevOps: AWS (ECS), Docker, Kubernetes"
+
+    def test_skills_slash_compound_any_part_grounds(self, resume_docx):
+        # '/' is alternative naming: "Java/Kotlin" passes via "Java" alone.
+        doc = Document(str(resume_docx))
+        resume_text = "\n".join(p.text for p in doc.paragraphs)
+        assert rt._skill_in_resume("Java/Kotlin", resume_text) is True
+        assert rt._skill_in_resume("Rust/Elixir", resume_text) is False
 
     def test_unknown_or_unchanged_slots_ignored(self, resume_docx):
         doc = Document(str(resume_docx))
         slots = rt.extract_slots(doc)
         same = doc.paragraphs[10].text
-        assert rt.apply_replacements(doc, slots, {"s10": same, "s999": "x", "s10x": 7}) == 0
+        changed, rejected = rt.apply_replacements(doc, slots, {"s10": same, "s999": "x", "s10x": 7})
+        assert changed == 0 and rejected == []
 
     def test_bullet_style_survives_patch(self, resume_docx):
         doc = Document(str(resume_docx))
         slots = rt.extract_slots(doc)
         rt.apply_replacements(doc, slots, {"s10": "Shorter bullet."})
         assert doc.paragraphs[10].style.name == "List Paragraph"
+
+    def test_summary_gets_extra_headroom(self, resume_docx):
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        s3 = next(s for s in slots if s.kind == "summary")
+        s10 = next(s for s in slots if s.id == "s10")
+        assert s3.max_chars > int(len(s3.text) * 1.25)        # ~+30%
+        assert s10.max_chars <= int(len(s10.text) * 1.25) + 5  # bullets ~+20%
 
 
 class TestParseReplacements:
