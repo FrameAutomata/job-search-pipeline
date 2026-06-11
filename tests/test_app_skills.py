@@ -37,14 +37,17 @@ def client(tmp_path, monkeypatch):
     )
     (career_ops / "config" / "profile.yml").write_text('name: "Jane Dev"\n', encoding="utf-8")
     monkeypatch.setenv("CAREER_OPS_PATH", str(career_ops))
-    # Clean provider/CLI env so detection is deterministic per test.
+
+    from pipeline.app import server
+    importlib.reload(server)
+    # Clean provider/CLI env so detection is deterministic per test. MUST come
+    # after the reload: server.py calls load_dotenv() at module level, which
+    # reload re-runs — re-adding the developer's real .env keys if we cleared
+    # before. (load_dotenv(override=False) repopulates vars we just deleted.)
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "BATCH_CLI", "SKILL_PATH_DEFAULT",
                 "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
                 "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
-
-    from pipeline.app import server
-    importlib.reload(server)
     server.OVERRIDES_FILE = tmp_path / ".ui-cache" / "status-overrides.json"
     server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
     server._active_data_dir = None

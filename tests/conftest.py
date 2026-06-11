@@ -180,6 +180,27 @@ def _clear_keyword_cache(monkeypatch, tmp_path):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_provider_env(monkeypatch):
+    """Keep LLM-provider detection hermetic. Several modules (pipeline.filter,
+    pipeline.app.server) call load_dotenv() at import time, leaking the
+    developer's real .env — e.g. DEEPINFRA_API_KEY and BATCH_PROVIDER=deepinfra —
+    into os.environ. That made no-key / detect-provider assertions pass or fail
+    based on the local .env (and on test order). Force those imports first (so
+    their one-time load_dotenv has already run), then clear the vars before every
+    test; tests that need a provider set it explicitly via monkeypatch.setenv."""
+    import pipeline.filter  # noqa: F401 — its import-time load_dotenv runs once here
+    try:
+        import pipeline.app.server  # noqa: F401 — same; optional UI dep
+    except Exception:
+        pass
+    for var in ("BATCH_PROVIDER", "BATCH_MODEL", "APPLY_MODEL", "COVER_MODEL",
+                "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
+                "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                "OLLAMA_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def patch_bridge_paths(monkeypatch, tmp_path):
     """Patch bridge.FILTERED_PATH to tmp_path and return the path."""
