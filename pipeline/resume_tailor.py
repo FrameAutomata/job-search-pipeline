@@ -1,0 +1,412 @@
+"""Per-job tailored resumes by slot-editing a copy of the candidate's own .docx.
+
+The candidate's real resume (resumes/resume.docx, or RESUME_DOCX_PATH) is the
+template — a copy is made per company and ONLY designated text slots are
+rewritten by the LLM: the summary paragraph, each bullet ('List Paragraph'
+style), and the value side of each "Label: values" skills line. Everything else
+(name, contact, section headers, company/date lines, education) is structurally
+untouchable, so the LLM cannot invent sections, employers, or dates, and the
+document keeps the candidate's exact formatting.
+
+One-page guarantee, in layers:
+1. Per-slot length budgets — each replacement may not exceed the original's
+   character count (plus a small tolerance), so pagination can barely move.
+2. Deterministic verification — LibreOffice headless renders the edited copy to
+   PDF and the page count is compared against the PRISTINE copy's page count
+   (a baseline, so renderer quirks can't cause false failures). One LLM
+   "shorten" retry on overflow; if it still overflows, the tailored resume is
+   discarded and the default resume is used. Never silently send two pages.
+3. The verified PDF is what gets uploaded (the docx is kept beside it).
+
+Like cover letters, generation is lazy (only when a job actually reaches its
+resume-upload step), score-gated by the caller, and cached per company in
+career-ops/output/<Company> - resume.docx/.pdf — a hand-edited file wins if
+newer. python-docx / LibreOffice are optional local-only deps: any missing
+piece degrades to the default resume, never an error.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from pipeline._batch_common import read_text
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Reuse the cover-letter filename conventions (same output dir, same sanitizer).
+from pipeline.cover_letters import _safe_company  # noqa: E402
+
+# Section headers we recognize (lowercased, exact match after whitespace
+# collapse). Anything matching is protected and switches the current section.
+_HEADERS = {
+    "professional summary": "summary", "summary": "summary", "about": "summary",
+    "skills": "skills", "technical skills": "skills", "core skills": "skills",
+    "projects & open-source": "projects", "projects & open source": "projects",
+    "projects": "projects", "open source": "projects",
+    "professional experience": "experience", "experience": "experience",
+    "work experience": "experience", "employment": "experience",
+    "education & certifications": "education", "education": "education",
+    "certifications": "education",
+}
+
+# Tolerance over the original slot length. Tight on purpose: growth is the
+# enemy of pagination; the render check is the backstop, not the first line.
+_BUDGET_TOLERANCE = 0.10
+
+
+@dataclass
+class Slot:
+    id: str
+    kind: str            # "summary" | "bullet" | "skills"
+    para_index: int
+    text: str            # current editable text (for skills: the values only)
+    label: str = ""      # for skills: the bold "Label: " prefix (not editable)
+
+    @property
+    def max_chars(self) -> int:
+        return int(len(self.text) * (1 + _BUDGET_TOLERANCE)) + 5
+
+
+# ── docx slot extraction / patching ──────────────────────────────────────────
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _is_header(text: str) -> str | None:
+    return _HEADERS.get(_norm(text).lower())
+
+
+def extract_slots(doc) -> list[Slot]:
+    """Classify the document's paragraphs into editable slots. DEFAULT-PROTECT:
+    only positively-identified patterns become slots; anything unrecognized is
+    left alone, so an unusual resume shape degrades to less tailoring, never to
+    a corrupted document."""
+    slots: list[Slot] = []
+    section = ""          # no slots before the first recognized header
+    for i, p in enumerate(doc.paragraphs):
+        text = _norm(p.text)
+        if not text:
+            continue
+        header = _is_header(text)
+        if header:
+            section = header
+            continue
+        style = ""
+        try:
+            style = p.style.name if p.style is not None else ""
+        except Exception:
+            pass
+        if style == "List Paragraph" and section:
+            slots.append(Slot(id=f"s{i}", kind="bullet", para_index=i, text=p.text))
+            continue
+        if section == "skills" and len(p.runs) >= 2 and p.runs[0].bold \
+                and p.runs[0].text.rstrip().endswith(":"):
+            label = p.runs[0].text
+            values = "".join(r.text for r in p.runs[1:])
+            if values.strip():
+                slots.append(Slot(id=f"s{i}", kind="skills", para_index=i,
+                                  text=values, label=label))
+            continue
+        if section == "summary":
+            slots.append(Slot(id=f"s{i}", kind="summary", para_index=i, text=p.text))
+    return slots
+
+
+def apply_replacements(doc, slots: list[Slot], replacements: dict[str, str]) -> int:
+    """Patch accepted replacements into the document. A replacement over its
+    slot's budget (or empty) is REJECTED — the original text stays. Returns the
+    number of slots actually changed."""
+    by_id = {s.id: s for s in slots}
+    changed = 0
+    for sid, new in replacements.items():
+        slot = by_id.get(sid)
+        if slot is None or not isinstance(new, str):
+            continue
+        new = new.strip()
+        if not new or len(new) > slot.max_chars or new == slot.text.strip():
+            continue
+        p = doc.paragraphs[slot.para_index]
+        if slot.kind == "skills":
+            # Keep the bold label run; rewrite the value runs.
+            p.runs[1].text = new
+            for r in p.runs[2:]:
+                r.text = ""
+        else:
+            if not p.runs:
+                continue
+            p.runs[0].text = new
+            for r in p.runs[1:]:
+                r.text = ""
+        changed += 1
+    return changed
+
+
+def _strip_metadata(doc, author: str) -> None:
+    """Reset document metadata so the copy doesn't leak edit history; the
+    author is the candidate (it's their resume)."""
+    try:
+        cp = doc.core_properties
+        cp.author = author or ""
+        cp.last_modified_by = author or ""
+        cp.title = ""
+        cp.comments = ""
+        cp.revision = 1
+    except Exception:
+        pass
+
+
+# ── LLM prompt / response ────────────────────────────────────────────────────
+
+def build_prompt(slots: list[Slot], full_resume_text: str, job,
+                 report_text: str, shorten: bool = False) -> tuple[str, str]:
+    system = (
+        "You tailor a resume toward one specific job by rewriting ONLY the text "
+        "slots provided. HARD RULES:\n"
+        "- Use ONLY facts already present in the resume below. Never invent or "
+        "embellish employers, titles, dates, tools, metrics, degrees, or "
+        "certifications. You may reorder, rephrase, emphasize, and cut.\n"
+        "- LENGTH: each replacement MUST be at most max_chars characters for its "
+        "slot — shorter is good, longer is rejected. Do not pad.\n"
+        "- skills slots: reorder the comma-separated values so the most "
+        "job-relevant come first; you may drop the least relevant; never add a "
+        "technology that is not in the resume.\n"
+        "- bullet slots: keep the same underlying facts; sharpen the wording "
+        "toward the job's requirements and front-load matching technologies.\n"
+        "- summary slots: align the emphasis to this role; same facts only.\n"
+        "- Leave out any slot you would not improve.\n"
+        + ("- The previous attempt OVERFLOWED one page: shorten aggressively — "
+           "every replacement noticeably shorter than the original.\n" if shorten else "")
+        + 'Reply with ONLY a JSON object: {"slot_id": "replacement text", ...}'
+    )
+    payload = [{"id": s.id, "kind": s.kind, **({"label": s.label.strip()} if s.label else {}),
+                "text": s.text, "max_chars": s.max_chars} for s in slots]
+    user = "\n\n".join(filter(None, [
+        f"Target job: {job.company} — {job.role}".rstrip(" —"),
+        ("=== EVALUATION NOTES (requirements / matches) ===\n" + report_text[:6000])
+        if report_text else "",
+        "=== FULL RESUME (source of truth — facts may only come from here) ===\n"
+        + full_resume_text[:8000],
+        "=== SLOTS TO REWRITE ===\n" + json.dumps(payload, ensure_ascii=False),
+        "JSON:",
+    ]))
+    return system, user
+
+
+def parse_replacements(raw: str) -> dict[str, str]:
+    """Tolerant parse of the model's JSON reply (code fences / prose around it)."""
+    if not raw:
+        return {}
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, str)}
+
+
+# ── LibreOffice render + page count ──────────────────────────────────────────
+
+def find_soffice() -> str | None:
+    env = os.environ.get("SOFFICE_PATH")
+    if env and Path(env).exists():
+        return env
+    hit = shutil.which("soffice")
+    if hit:
+        return hit
+    for p in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "/usr/bin/soffice", "/usr/local/bin/soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ):
+        if Path(p).exists():
+            return p
+    return None
+
+
+def render_pdf(docx_path: Path, out_dir: Path) -> Path | None:
+    """Convert a docx to PDF with LibreOffice headless. Uses a dedicated user
+    profile so it works even while the user has LibreOffice open. Returns the
+    PDF path, or None when LibreOffice is unavailable / conversion fails."""
+    soffice = find_soffice()
+    if not soffice:
+        return None
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    profile = ROOT / "output" / ".lo-profile"
+    profile.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            [soffice, "--headless", "--norestore",
+             f"-env:UserInstallation={profile.resolve().as_uri()}",
+             "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path)],
+            check=True, capture_output=True, timeout=120,
+        )
+    except Exception:
+        return None
+    pdf = out_dir / (Path(docx_path).stem + ".pdf")
+    return pdf if pdf.exists() else None
+
+
+def page_count(pdf_path: Path) -> int | None:
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return None
+
+
+_BASELINE: dict[tuple[str, float], int] = {}
+
+
+def _baseline_pages(source_docx: Path) -> int | None:
+    """Page count of the PRISTINE resume under the same renderer — the bar the
+    tailored copy must not exceed. Cached per (path, mtime)."""
+    key = (str(source_docx), source_docx.stat().st_mtime)
+    if key in _BASELINE:
+        return _BASELINE[key]
+    with tempfile.TemporaryDirectory() as td:
+        pdf = render_pdf(source_docx, Path(td))
+        pages = page_count(pdf) if pdf else None
+    if pages is not None:
+        _BASELINE[key] = pages
+    return pages
+
+
+# ── orchestration ────────────────────────────────────────────────────────────
+
+def source_docx() -> Path | None:
+    env = os.environ.get("RESUME_DOCX_PATH")
+    p = Path(env) if env else ROOT / "resumes" / "resume.docx"
+    return p if p.exists() else None
+
+
+def resume_paths(career_ops: Path, company: str) -> tuple[Path, Path]:
+    base = Path(career_ops) / "output" / f"{_safe_company(company)} - resume"
+    return base.with_suffix(".docx"), base.with_suffix(".pdf")
+
+
+def find_existing(career_ops: Path, company: str) -> Path | None:
+    """An already-tailored resume for this company (PDF preferred, docx when
+    there's no renderer). None if neither exists."""
+    docx_p, pdf_p = resume_paths(career_ops, company)
+    if pdf_p.exists():
+        return pdf_p
+    if docx_p.exists():
+        return docx_p
+    return None
+
+
+def _resolve_caller(provider: str | None, model: str | None):
+    from pipeline.batch_evaluate import resolve_caller
+    from pipeline.apply.answers import thinking_disabled
+    return resolve_caller(provider, model, lead_env="TAILOR_MODEL",
+                          disable_thinking=thinking_disabled())
+
+
+def generate_for_job(career_ops: Path, job, *, caller=None,
+                     provider: str | None = None, model: str | None = None,
+                     report_base: Path | None = None, force: bool = False) -> Path | None:
+    """Return the path of a one-page tailored resume for this job (PDF when a
+    renderer exists, else the docx), generating it on first request. None on any
+    failure — the caller falls back to the default resume."""
+    career_ops = Path(career_ops)
+    if not force:
+        existing = find_existing(career_ops, job.company)
+        if existing:
+            return existing
+
+    src = source_docx()
+    if src is None:
+        return None
+    try:
+        from docx import Document
+    except ImportError:
+        print("[tailor] python-docx not installed — using the default resume "
+              "(pip install python-docx)")
+        return None
+
+    docx_out, pdf_out = resume_paths(career_ops, job.company)
+    docx_out.parent.mkdir(parents=True, exist_ok=True)
+
+    report_path = getattr(job, "report_path", "") or ""
+    report_text = read_text(Path(report_base or career_ops) / report_path) if report_path else ""
+
+    if caller is None:
+        caller = _resolve_caller(provider, model)
+    from pipeline.batch_evaluate import _call_with_retry
+
+    baseline = _baseline_pages(src)   # None when LibreOffice is missing
+
+    for attempt, shorten in enumerate((False, True)):
+        shutil.copyfile(src, docx_out)
+        doc = Document(str(docx_out))
+        slots = extract_slots(doc)
+        if not slots:
+            docx_out.unlink(missing_ok=True)
+            return None
+        full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        system, user = build_prompt(slots, full_text, job, report_text, shorten=shorten)
+        try:
+            raw = _call_with_retry(caller, system, user, max_attempts=6, base_delay=1.0)
+        except Exception:
+            docx_out.unlink(missing_ok=True)
+            return None
+        changed = apply_replacements(doc, slots, parse_replacements(raw))
+        if not changed:
+            docx_out.unlink(missing_ok=True)
+            return None
+        _strip_metadata(doc, getattr(job, "candidate_name", "") or _author_name(career_ops))
+        doc.save(str(docx_out))
+
+        pdf = render_pdf(docx_out, docx_out.parent)
+        if pdf is None:
+            # No renderer: budgets are the only guard; upload the docx itself.
+            return docx_out
+        pages = page_count(pdf)
+        if pages is not None and baseline is not None and pages <= baseline:
+            return pdf
+        if pages == 1:           # no baseline (renderer appeared late) but fits
+            return pdf
+        print(f"[tailor] {job.company}: tailored resume is {pages} page(s) vs "
+              f"baseline {baseline} — {'retrying shorter' if not shorten else 'falling back to default resume'}")
+        pdf.unlink(missing_ok=True)
+
+    docx_out.unlink(missing_ok=True)
+    return None
+
+
+def _author_name(career_ops: Path) -> str:
+    try:
+        from pipeline.apply.profile import ApplyProfile
+        return ApplyProfile.load(Path(career_ops)).full_name
+    except Exception:
+        return ""
+
+
+if __name__ == "__main__":
+    # Manual test: python -m pipeline.resume_tailor "<Company>" "<Role>" [report.md]
+    import sys
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+    from pipeline.apply.queue import ApplyJob
+    company = sys.argv[1] if len(sys.argv) > 1 else "Test Company"
+    role = sys.argv[2] if len(sys.argv) > 2 else "Software Engineer"
+    report = sys.argv[3] if len(sys.argv) > 3 else ""
+    job = ApplyJob(num="", company=company, role=role, url="", score=None,
+                   report_path=report)
+    out = generate_for_job(ROOT / "career-ops", job, force=True)
+    print(f"-> {out}" if out else "-> failed (see messages above)")

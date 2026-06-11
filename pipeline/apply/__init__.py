@@ -43,6 +43,7 @@ def run(
     target_url: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    tailor_min_score: float = 4.0,
 ) -> int:
     """Apply to qualifying LinkedIn Easy Apply jobs. Returns the count applied
     (auto mode) or filled-and-held (review/dry-run).
@@ -51,7 +52,11 @@ def run(
         one-off apply or to reproduce a specific job). Skips refresh/selection.
     refresh: pull the latest applications.md from the most recent GitHub pipeline
         artifact before selecting (defaults on, since evaluations accumulate in
-        the cloud). Falls back to the local tracker when gh/network is unavailable."""
+        the cloud). Falls back to the local tracker when gh/network is unavailable.
+    tailor_min_score: jobs scoring at or above this get a per-job TAILORED resume
+        (a slot-edited copy of resumes/resume.docx, one-page verified via
+        LibreOffice); below it, the default resume. Raise it to tailor only top
+        matches; set it absurdly high (e.g. 99) to disable tailoring."""
     career_ops = Path(career_ops)
     if mode not in _VALID_MODES:
         mode = "review"
@@ -124,6 +129,18 @@ def run(
                 engine.cover_pdf_provider = (
                     lambda j=job: cover_letters.ensure_cover_pdf(career_ops, j.company)
                 )
+                # Per-job tailored resume (slot-edited copy of the candidate's own
+                # .docx, one-page verified) for jobs clearing the tailor threshold.
+                # Lazy: generated only when a resume-upload field actually appears,
+                # so expired/off-site jobs never burn the LLM call.
+                engine.resume_provider = None
+                if _should_tailor(job, tailor_min_score):
+                    from pipeline import resume_tailor
+                    engine.resume_provider = (
+                        lambda j=job: resume_tailor.generate_for_job(
+                            career_ops, j, report_base=report_root,
+                            provider=provider, model=model)
+                    )
                 resume = _resolve_resume(career_ops, job)
                 try:
                     result = linkedin.apply_to(page, job, engine, mode=mode, resume_path=resume)
@@ -178,6 +195,13 @@ def _report(job, result: ApplyResult, mode: str, applications_md: Path,
     return applied, held, failures
 
 
+def _should_tailor(job, tailor_min_score: float) -> bool:
+    """Tailor only when the job's evaluation score clears the threshold. A
+    target-url one-off has no score → no tailoring (use --apply-url after
+    pre-generating, or the default resume)."""
+    return job.score is not None and job.score >= tailor_min_score
+
+
 def _find_tailored_resume(career_ops: Path, job) -> Path | None:
     """A per-job tailored resume PDF, if one exists. Searches APPLY_TAILORED_DIR
     (default career-ops/output, where career-ops' pdf mode writes tailored CVs)
@@ -193,7 +217,8 @@ def _find_tailored_resume(career_ops: Path, job) -> Path | None:
     # Exclude cover letters: "<Company> - cover.pdf" also contains the company
     # slug. Match 'cover'/'letter' as whole words only — a bare substring wrongly
     # excludes real companies ("Discovery" contains "cover", "Recover" too).
-    matches = [p for p in tdir.glob("*.pdf")
+    # .docx included: the tailor stage caches a docx when no PDF renderer exists.
+    matches = [p for ext in ("*.pdf", "*.docx") for p in tdir.glob(ext)
                if slug in re.sub(r"[^a-z0-9]+", "", p.stem.lower())
                and not re.search(r"\b(cover|letter)\b", p.stem.lower())]
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None

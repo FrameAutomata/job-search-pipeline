@@ -47,6 +47,11 @@ def main() -> int:
                     help="Pull the latest tracker from the most recent GitHub pipeline "
                          "artifact before applying (default on; --no-apply-refresh to use "
                          "the local applications.md). Falls back to local when offline.")
+    ap.add_argument("--apply-tailor-min-score", type=float,
+                    default=float(os.environ.get("APPLY_TAILOR_MIN_SCORE", "4.0")),
+                    help="Jobs scoring >= this get a per-job tailored resume (slot-edited "
+                         "copy of resumes/resume.docx, one-page verified). Default 4.0; "
+                         "set high (e.g. 99) to always use the default resume.")
     ap.add_argument("--headless", action="store_true",
                     help="Run the apply browser headless (only works once you've logged in once)")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
@@ -136,6 +141,7 @@ def main() -> int:
             target_url=args.apply_url,
             provider=args.batch_provider,
             model=args.batch_model,
+            tailor_min_score=args.apply_tailor_min_score,
         )
 
     return 0

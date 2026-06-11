@@ -14,3 +14,7 @@ openai                             # OpenAI, Groq, DeepInfra, and Ollama (all Op
 # so it's never used in the cloud workflows. After installing, fetch the browser:
 #   pip install playwright && playwright install chromium
 # playwright
+
+# Optional — per-job tailored resumes during auto-apply (slot-edits a copy of
+# resumes/resume.docx so the formatting stays exactly yours). LOCAL ONLY.
+# pip install python-docx
