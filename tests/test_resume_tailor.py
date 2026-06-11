@@ -52,8 +52,8 @@ def resume_docx(tmp_path):
     return _build_resume(tmp_path / "resume.docx")
 
 
-def _job(company="Acme", score=4.5, report=""):
-    return ApplyJob(num="1", company=company, role="Backend Engineer",
+def _job(company="Acme", score=4.5, report="", role="Backend Engineer"):
+    return ApplyJob(num="1", company=company, role=role,
                     url="u", score=score, report_path=report)
 
 
@@ -212,6 +212,9 @@ class TestBuildPrompt:
         assert "Never invent" in system and "max_chars" in system
         # Retargeting is the explicit objective, not optional polish.
         assert "ALWAYS rewrite" in system and "FAILURE" in system
+        # Prose-honesty rules (caught live: "3+ years at Bank of America" /
+        # "Expert in Java" / opening with the target job title).
+        assert "PROSE HONESTY" in system and "NEVER with the target" in system
         assert "Acme — Backend Engineer" in user
         assert "REPORT NOTES" in user and "FULL RESUME TEXT" in user
         assert '"s10"' in user
@@ -222,11 +225,51 @@ class TestBuildPrompt:
         _, user = rt.build_prompt(slots, "cv", _job(), "", jd_text="THE ACTUAL JD")
         assert "JOB DESCRIPTION" in user and "THE ACTUAL JD" in user
 
-    def test_shorten_flag_adds_overflow_instruction(self, resume_docx):
+    def test_feedback_appended_to_system(self, resume_docx):
         doc = Document(str(resume_docx))
         slots = rt.extract_slots(doc)
-        system, _ = rt.build_prompt(slots, "cv", _job(), "", shorten=True)
+        system, _ = rt.build_prompt(slots, "cv", _job(), "",
+                                    feedback=rt._OVERFLOW_FEEDBACK)
         assert "OVERFLOWED" in system
+        system2, _ = rt.build_prompt(slots, "cv", _job(), "",
+                                     feedback=rt._TITLE_FEEDBACK)
+        assert "REJECTED" in system2
+
+
+class TestProseRules:
+    """Deterministic backstop: a summary that retitles the candidate as the
+    target job's title is dropped (caught live — the prompt alone didn't hold)."""
+
+    def test_retitled_summary_dropped(self, resume_docx):
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        job = _job(role="Application Support Engineer")
+        reps = {"s3": "Application Support Engineer with production experience.",
+                "s10": "Fine bullet."}
+        out, notes = rt.enforce_prose_rules(reps, slots, job)
+        assert "s3" not in out and "s10" in out
+        assert notes and "target job title" in notes[0]
+
+    def test_matching_original_opener_allowed(self, resume_docx):
+        # Original summary opens "Engineer with 3 yrs..." — a role of "Engineer"
+        # appearing the same way isn't retitling. And a rewrite NOT led by the
+        # title passes untouched.
+        doc = Document(str(resume_docx))
+        slots = rt.extract_slots(doc)
+        job = _job(role="Backend Engineer")
+        reps = {"s3": "Engineer with 3 yrs building backend and DevOps systems for production."}
+        out, notes = rt.enforce_prose_rules(reps, slots, job)
+        assert "s3" in out and notes == []
+
+    def test_leads_with_role_title_helper(self):
+        assert rt._leads_with_role_title(
+            "Application Support Engineer with experience...",
+            "Software engineer (~3 yrs) across backend...",
+            "Application Support Engineer") is True
+        assert rt._leads_with_role_title(
+            "Software engineer (~3 yrs) focused on support tooling...",
+            "Software engineer (~3 yrs) across backend...",
+            "Software Engineer") is False
 
 
 class TestJdText:
@@ -329,6 +372,40 @@ class TestGenerateForJob:
     def test_no_change_returns_none(self, tmp_path, resume_docx, monkeypatch):
         co = self._setup(tmp_path, resume_docx, monkeypatch, pages_seq=[1])
         assert rt.generate_for_job(co, _job(), caller=lambda s, u: "{}") is None
+
+    def test_retitled_summary_retried_with_feedback_then_applied(
+            self, tmp_path, resume_docx, monkeypatch):
+        # Call 1 retitles the summary → validator catches it → ONE corrective
+        # retry with feedback; call 2 complies and is applied.
+        co = self._setup(tmp_path, resume_docx, monkeypatch, pages_seq=[1])
+        job = _job(role="Application Support Engineer")
+        systems = []
+        def caller(system, user):
+            systems.append(system)
+            if len(systems) == 1:
+                return '{"s3": "Application Support Engineer with production experience."}'
+            return '{"s3": "Engineer with 3 yrs of production support across financial systems."}'
+        out = rt.generate_for_job(co, job, caller=caller)
+        assert out is not None
+        assert len(systems) == 2 and "REJECTED" in systems[1]
+        saved = Document(str(co / "output" / "Acme - resume.docx"))
+        assert saved.paragraphs[3].text.startswith("Engineer with 3 yrs")
+
+    def test_retitled_twice_drops_summary_keeps_rest(
+            self, tmp_path, resume_docx, monkeypatch):
+        # Both calls retitle → summary dropped (original stays), grounded bullet
+        # rewrite still applied.
+        co = self._setup(tmp_path, resume_docx, monkeypatch, pages_seq=[1])
+        job = _job(role="Application Support Engineer")
+        original_summary = Document(str(resume_docx)).paragraphs[3].text
+        def caller(system, user):
+            return ('{"s3": "Application Support Engineer with production experience.", '
+                    '"s10": "Built Java REST APIs; production support focus."}')
+        out = rt.generate_for_job(co, job, caller=caller)
+        assert out is not None
+        saved = Document(str(co / "output" / "Acme - resume.docx"))
+        assert saved.paragraphs[3].text == original_summary
+        assert saved.paragraphs[10].text == "Built Java REST APIs; production support focus."
 
     def test_metadata_stripped(self, tmp_path, resume_docx, monkeypatch):
         co = self._setup(tmp_path, resume_docx, monkeypatch, pages_seq=[1])

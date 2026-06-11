@@ -231,9 +231,21 @@ def _strip_metadata(doc, author: str) -> None:
 
 # ── LLM prompt / response ────────────────────────────────────────────────────
 
+# Corrective-retry feedback blocks (appended to the system prompt verbatim).
+_OVERFLOW_FEEDBACK = (
+    "The previous attempt OVERFLOWED one page: shorten aggressively — every "
+    "replacement noticeably shorter than the original."
+)
+_TITLE_FEEDBACK = (
+    "Your previous summary was REJECTED: it opened with the target job's title. "
+    "Begin the summary with the original's own descriptor (keep its opening "
+    "words) and tailor the REST of it toward the job."
+)
+
+
 def build_prompt(slots: list[Slot], full_resume_text: str, job,
                  report_text: str, jd_text: str = "",
-                 shorten: bool = False) -> tuple[str, str]:
+                 feedback: str = "") -> tuple[str, str]:
     system = (
         "You tailor a resume toward one specific job by rewriting ONLY the text "
         "slots provided.\n"
@@ -248,6 +260,13 @@ def build_prompt(slots: list[Slot], full_resume_text: str, job,
         "the job's terminology for work the resume already demonstrates.\n"
         "- LENGTH: each replacement MUST be at most max_chars characters for its "
         "slot — longer is rejected.\n"
+        "- PROSE HONESTY: the summary MUST begin with the original's own "
+        "descriptor (e.g. 'Software engineer (~3 yrs)'), NEVER with the target "
+        "job's title — a summary opening with the job title is rejected by a "
+        "validator. Never attach a duration to a specific employer unless the "
+        "original does (writing '3+ years at <employer>' when the original says "
+        "'~3 yrs' across all roles is a fabrication); never add seniority labels "
+        "(Expert, Senior, Lead, Principal) the original doesn't use.\n"
         "REQUIRED EDITS:\n"
         "- The summary slot: ALWAYS rewrite it to open toward this role — lead "
         "with the candidate's experience most relevant to the job's domain and "
@@ -258,8 +277,7 @@ def build_prompt(slots: list[Slot], full_resume_text: str, job,
         "- Bullets: rewrite each one where shifting emphasis or adopting the "
         "job's terminology makes the relevance obvious; front-load matching "
         "technologies. Leave a bullet unchanged only if it is already ideal.\n"
-        + ("- The previous attempt OVERFLOWED one page: shorten aggressively — "
-           "every replacement noticeably shorter than the original.\n" if shorten else "")
+        + (f"- {feedback}\n" if feedback else "")
         + 'Reply with ONLY a JSON object: {"slot_id": "replacement text", ...}'
     )
     payload = [{"id": s.id, "kind": s.kind, **({"label": s.label.strip()} if s.label else {}),
@@ -275,6 +293,42 @@ def build_prompt(slots: list[Slot], full_resume_text: str, job,
         "JSON:",
     ]))
     return system, user
+
+
+def _leads_with_role_title(new: str, original: str, role: str) -> bool:
+    """True when a summary replacement opens by retitling the candidate as the
+    target job's title (e.g. 'Application Support Engineer with ...'). The title
+    must appear as a CONSECUTIVE phrase in the opening words — scattered matches
+    ('Engineer with ... production support') are legitimate prose, not a
+    retitle. Allowed when the ORIGINAL summary already opens with the same
+    phrase (a 'Software engineer' applying to 'Software Engineer' roles)."""
+    def norm(t: str) -> str:
+        return " ".join(re.findall(r"[a-z]+", (t or "").lower()))
+    phrase = norm(role)
+    if len(phrase.split()) < 2:    # single-word titles are too generic to judge
+        return False
+    head = " ".join(norm(new).split()[:10])
+    if phrase not in head:
+        return False
+    orig_head = " ".join(norm(original).split()[:10])
+    return phrase not in orig_head
+
+
+def enforce_prose_rules(replacements: dict[str, str], slots: list[Slot],
+                        job) -> tuple[dict[str, str], list[str]]:
+    """Deterministic backstop for prose rules the prompt alone doesn't hold:
+    drop a summary replacement that retitles the candidate as the target job's
+    title (the original summary stays — decline beats fabricate). Returns the
+    filtered replacements and human-readable notes for the stats line."""
+    notes: list[str] = []
+    out = dict(replacements)
+    for s in slots:
+        if s.kind != "summary" or s.id not in out:
+            continue
+        if _leads_with_role_title(out[s.id], s.text, getattr(job, "role", "")):
+            del out[s.id]
+            notes.append(f"{s.id} dropped: summary opens with the target job title")
+    return out, notes
 
 
 def parse_replacements(raw: str) -> dict[str, str]:
@@ -456,7 +510,13 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
 
     baseline = _baseline_pages(src)   # None when LibreOffice is missing
 
-    for attempt, shorten in enumerate((False, True)):
+    # Two attempts: the initial pass plus ONE corrective retry. The retry's
+    # feedback is whichever rule was violated — a prose violation (summary
+    # opened with the job title) or a page overflow. A second violation of
+    # either kind isn't retried again: prose violations are dropped by the
+    # validator (the original text stays), overflow falls back to the default.
+    feedback = ""
+    for attempt in (0, 1):
         shutil.copyfile(src, docx_out)
         doc = Document(str(docx_out))
         slots = extract_slots(doc)
@@ -465,16 +525,22 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
             return None
         full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         system, user = build_prompt(slots, full_text, job, report_text, jd_text,
-                                    shorten=shorten)
+                                    feedback=feedback)
         try:
             raw = _call_with_retry(caller, system, user, max_attempts=6, base_delay=1.0)
         except Exception:
             docx_out.unlink(missing_ok=True)
             return None
         reps = parse_replacements(raw)
+        reps, notes = enforce_prose_rules(reps, slots, job)
+        if notes and attempt == 0:
+            print(f"[tailor] {job.company}: {'; '.join(notes)} — retrying with feedback")
+            feedback = _TITLE_FEEDBACK
+            continue
         changed, rejected = apply_replacements(doc, slots, reps, full_text)
         print(f"[tailor] {job.company}: {len(reps)} rewrite(s) returned, {changed} applied"
-              + (f", {len(rejected)} rejected ({', '.join(rejected[:4])})" if rejected else ""))
+              + (f", {len(rejected)} rejected ({', '.join(rejected[:4])})" if rejected else "")
+              + (f" | {'; '.join(notes)}" if notes else ""))
         if not changed:
             docx_out.unlink(missing_ok=True)
             return None
@@ -491,8 +557,10 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
         if pages == 1:           # no baseline (renderer appeared late) but fits
             return pdf
         print(f"[tailor] {job.company}: tailored resume is {pages} page(s) vs "
-              f"baseline {baseline} — {'retrying shorter' if not shorten else 'falling back to default resume'}")
+              f"baseline {baseline} — "
+              f"{'retrying shorter' if attempt == 0 else 'falling back to default resume'}")
         pdf.unlink(missing_ok=True)
+        feedback = _OVERFLOW_FEEDBACK
 
     docx_out.unlink(missing_ok=True)
     return None
