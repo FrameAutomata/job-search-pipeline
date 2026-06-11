@@ -311,6 +311,9 @@ def _fill_visible_fields(page, answers: AnswerEngine, drafted: list[tuple[str, s
     if dialog is None:
         return
 
+    if os.environ.get("APPLY_DEBUG"):
+        _debug_dump_fields(dialog)
+
     # Resume / file-upload step: set the file input directly (Playwright can do
     # this even when the input is visually hidden behind an "Upload resume"
     # button). Uploading also covers the none-selected case; if a previous
@@ -332,7 +335,16 @@ def _fill_visible_fields(page, answers: AnswerEngine, drafted: list[tuple[str, s
     except Exception:
         pass
 
-    # Standalone controls (text / select / textarea / checkbox).
+    # Checkbox groups (single-choice AND multi-select questions rendered as
+    # checkboxes) — grouped by container, answered as a set so a single-choice
+    # question doesn't get every option checked.
+    try:
+        _fill_checkbox_groups(page, answers, drafted)
+    except Exception:
+        pass
+
+    # Standalone controls (text / select / textarea). Checkboxes are handled
+    # above; radios in the fieldset pass.
     fields = dialog.locator("input, select, textarea")
     try:
         n = fields.count()
@@ -456,6 +468,134 @@ def _handle_follow_company(dialog, drafted: list[tuple[str, str]]) -> None:
     drafted.append(("Follow company", state))
 
 
+# JS run in the modal: groups checkboxes by their container (they all share the
+# same name/id, so DOM structure is the only grouping signal), tags each with
+# data-apply-gid / data-apply-oi so Python can address them, and returns each
+# group's question + option labels. The follow-company box is excluded (handled
+# separately). A "group" of one is a lone consent checkbox.
+_GROUP_CHECKBOXES_JS = r"""
+d => {
+  const all = Array.from(d.querySelectorAll("input[type=checkbox]"))
+    .filter(cb => cb.id !== 'follow-company-checkbox');
+  const seen = new Set();
+  const groups = [];
+  let gid = 0;
+  const labelOf = (cb) => {
+    const w = cb.closest('label');
+    if (w && w.innerText) return w.innerText;
+    if (cb.id) { const l = d.querySelector("label[for='" + cb.id + "']"); if (l) return l.innerText; }
+    return '';
+  };
+  for (const cb of all) {
+    if (seen.has(cb)) continue;
+    let container = cb.closest('fieldset');
+    if (!container) {
+      let el = cb.parentElement;
+      while (el && el !== d && el.getAttribute && el.getAttribute('role') !== 'dialog') {
+        if (el.querySelectorAll("input[type=checkbox]").length >= 2) { container = el; break; }
+        el = el.parentElement;
+      }
+    }
+    if (!container) container = cb.parentElement || d;
+    const cbs = Array.from(container.querySelectorAll("input[type=checkbox]"))
+      .filter(b => b.id !== 'follow-company-checkbox');
+    cbs.forEach(b => seen.add(b));
+    const options = cbs.map(labelOf).map(s => (s || '').replace(/\s+/g, ' ').trim());
+    const optset = new Set(options.map(s => s.toLowerCase()));
+    let q = '';
+    const legend = container.querySelector('legend');
+    if (legend) q = legend.innerText;
+    if (!q) {
+      const ll = container.getAttribute && container.getAttribute('aria-labelledby');
+      if (ll) { const e = d.ownerDocument.getElementById(ll); if (e) q = e.innerText; }
+    }
+    if (!q) {
+      const cand = Array.from(container.querySelectorAll('label,legend,span,div,p,h1,h2,h3,h4'))
+        .map(e => (e.innerText || '').replace(/\s+/g, ' ').trim())
+        .filter(t => t && t.length < 180 && !optset.has(t.toLowerCase()));
+      if (cand.length) q = cand[0];
+    }
+    const myGid = gid++;
+    cbs.forEach((b, i) => { b.setAttribute('data-apply-gid', String(myGid)); b.setAttribute('data-apply-oi', String(i)); });
+    groups.push({ gid: myGid, question: (q || '').replace(/\s+/g, ' ').trim().slice(0, 200), options });
+  }
+  return groups;
+}
+"""
+
+
+def _toggle_grouped(cb, want: bool) -> None:
+    """Set a grouped checkbox to `want`. These share an id, so label[for] is
+    ambiguous — toggle via the wrapping <label> (or a forced click)."""
+    try:
+        if cb.is_checked() == want:
+            return
+    except Exception:
+        pass
+    try:
+        lab = cb.locator("xpath=ancestor::label[1]")
+        if lab.count():
+            lab.first.click()
+            return
+    except Exception:
+        pass
+    try:
+        cb.set_checked(want, force=True)
+    except Exception:
+        try:
+            cb.click(force=True)
+        except Exception:
+            pass
+
+
+def _fill_checkbox_groups(page, answers: AnswerEngine, drafted: list[tuple[str, str]]) -> None:
+    """Answer checkbox groups as a set. A multi-option group is sent to the answer
+    engine as a multi-select (one choice for single-choice questions like notice
+    period, several for 'select all that apply'); a lone checkbox is a consent /
+    opt-out box. Fixes single-choice-as-checkboxes getting EVERY option checked."""
+    dialog = _modal(page)
+    if dialog is None:
+        return
+    try:
+        groups = dialog.evaluate(_GROUP_CHECKBOXES_JS)
+    except Exception:
+        return
+
+    for g in groups:
+        gid = g.get("gid")
+        options = [o for o in g.get("options", []) if o]
+        if len(options) >= 2:
+            question = g.get("question") or "Select the option(s) that apply"
+            try:
+                chosen = answers.answer_multi(question, options)
+            except Exception:
+                chosen = []
+            for i, opt in enumerate(g.get("options", [])):
+                cb = dialog.locator(f"input[data-apply-gid='{gid}'][data-apply-oi='{i}']").first
+                try:
+                    if cb.count():
+                        _toggle_grouped(cb, opt in chosen)
+                except Exception:
+                    continue
+            drafted.append((question[:50], ", ".join(chosen) if chosen else "(none)"))
+        else:
+            cb = dialog.locator(f"input[data-apply-gid='{gid}'][data-apply-oi='0']").first
+            try:
+                if not cb.count():
+                    continue
+            except Exception:
+                continue
+            label = (options[0] if options else _field_label(dialog, cb)) or ""
+            if _is_optout_checkbox(label):
+                _toggle_grouped(cb, False)
+                drafted.append((label, "unchecked"))
+            else:
+                verdict = answers.answer(label, "select", ["Yes", "No"])
+                if verdict.strip().lower() in ("yes", "true", "agree", "i agree"):
+                    _toggle_grouped(cb, True)
+                    drafted.append((label, "checked"))
+
+
 def _field_label(dialog, el) -> str:
     """The question for a control. LinkedIn associates labels inconsistently, so
     try several strategies in order: <label for=id>, a wrapping/closest <label>
@@ -513,6 +653,8 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
     typ = (el.get_attribute("type") or "").lower()
     if tag == "input" and typ == "radio":
         return  # handled in the fieldset pass
+    if tag == "input" and typ == "checkbox":
+        return  # handled in the checkbox-group pass
     if typ in ("file", "hidden", "submit", "button", "image"):
         return  # file inputs handled separately; the rest aren't form questions
 
@@ -559,23 +701,6 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
         drafted.append((label, value))
         return
 
-    if typ == "checkbox":
-        eid = (el.get_attribute("id") or "")
-        if eid == "follow-company-checkbox":
-            return  # handled definitively by _handle_follow_company
-        # Marketing / subscription opt-ins are pre-checked by LinkedIn — uncheck
-        # them by default and never ask the LLM. (toggle via label: hidden input.)
-        if _is_optout_checkbox(label):
-            if _set_checkbox_state(dialog, el, False):
-                drafted.append((label, "unchecked"))
-            return
-        # Consent / yes-no checkbox.
-        verdict = answers.answer(label, "select", ["Yes", "No"])
-        if verdict.strip().lower() in ("yes", "true", "agree", "i agree"):
-            _set_checkbox_state(dialog, el, True)
-            drafted.append((label, "checked"))
-        return
-
     # text / email / tel / number
     field_type = "numeric" if typ == "number" else "text"
     value = answers.answer(label, field_type)
@@ -602,6 +727,31 @@ def _already_has_value(el, value: str) -> bool:
         return (el.input_value() or "").strip() == value.strip()
     except Exception:
         return False
+
+
+def _debug_dump_fields(dialog) -> None:
+    """APPLY_DEBUG: dump this step's controls (tag/type/name/id/checked/label) so
+    we can see how a single-choice question rendered as checkboxes is grouped."""
+    try:
+        data = dialog.evaluate(r"""
+        d => Array.from(d.querySelectorAll('input,select,textarea')).map(el => {
+          let label = '';
+          if (el.id) { const l = d.querySelector("label[for='" + el.id + "']"); if (l) label = l.innerText; }
+          if (!label) { const w = el.closest('label'); if (w) label = w.innerText; }
+          return {
+            tag: el.tagName, type: el.getAttribute('type'),
+            name: (el.getAttribute('name') || '').slice(0, 40),
+            id: (el.id || '').slice(0, 40),
+            checked: (el.type === 'checkbox' || el.type === 'radio') ? el.checked : null,
+            label: label.replace(/\s+/g, ' ').trim().slice(0, 50),
+          };
+        })
+        """)
+        print(f"[apply-debug] --- {len(data)} field(s) this step ---", flush=True)
+        for f in data:
+            print(f"[apply-debug] {f}", flush=True)
+    except Exception as e:
+        print(f"[apply-debug] field dump failed: {e}", flush=True)
 
 
 def _is_required(el) -> bool:

@@ -109,6 +109,27 @@ def _match_option(answer: str, options: list[str]) -> str:
     return options[0]
 
 
+def _match_option_strict(answer: str, options: list[str]) -> str | None:
+    """Like _match_option but returns None instead of defaulting to the first
+    option — for multi-select, where an unmatched line must NOT add a spurious
+    checked box."""
+    if not options or not answer.strip():
+        return None
+    a = answer.strip()
+    for opt in options:
+        if a == opt:
+            return opt
+    al = a.lower()
+    for opt in options:
+        if al == opt.strip().lower():
+            return opt
+    for opt in options:
+        ol = opt.strip().lower()
+        if ol and (re.search(rf"\b{re.escape(ol)}\b", al) or re.search(rf"\b{re.escape(al)}\b", ol)):
+            return opt
+    return None
+
+
 class AnswerEngine:
     def __init__(
         self,
@@ -195,6 +216,49 @@ class AnswerEngine:
         self.cache[key] = value
         self._save_cache()
         return value
+
+    def answer_multi(self, question: str, options: list[str]) -> list[str]:
+        """The subset of `options` to check for a checkbox GROUP — one for a
+        single-choice question (notice period), several for multi-select (which
+        have you built), or none. Lets the model decide how many, instead of
+        treating each checkbox as an independent yes/no (which over-checks
+        single-choice questions). Cached like other answers."""
+        if not options:
+            return []
+        if _EEO_RE.search(question or ""):
+            return []  # never auto-check demographic boxes
+        key = _cache_key(question, "multi")
+        if key in self.cache:
+            self.cache_hits += 1
+            return [o for o in options if o in self.cache[key].split("\n")]
+
+        self._ensure_caller()
+        system = (
+            "You answer a multiple-choice application question for the candidate "
+            "below. Reply with ONLY the option(s) that truthfully apply, each on "
+            "its own line, copied verbatim. If it is a single-choice question "
+            "(e.g. notice period, years of experience, a duration), reply with "
+            "EXACTLY ONE. If none apply, reply 'none'. Never invent.\n\n"
+            "CANDIDATE:\n" + "\n".join(self.profile.summary_lines())
+        )
+        user = f"Question: {question}\n\nOptions:\n- " + "\n- ".join(options)
+        if self.job_context:
+            user += f"\n\nJob: {self.job_context}"
+        try:
+            raw = self._llm_raw(system, user)
+        except Exception:
+            return []
+        chosen: list[str] = []
+        for line in raw.splitlines():
+            line = line.strip().lstrip("-*•").strip()
+            if not line or line.lower() == "none":
+                continue
+            m = _match_option_strict(line, options)
+            if m and m not in chosen:
+                chosen.append(m)
+        self.cache[key] = "\n".join(chosen)
+        self._save_cache()
+        return chosen
 
     def _fallback(self, field_type: str, options: list[str] | None) -> str:
         """Best-effort value when the LLM is unavailable — never a fabricated
@@ -290,7 +354,6 @@ class AnswerEngine:
     # ── LLM fallback ───────────────────────────────────────────────────────────
 
     def _llm(self, question: str, field_type: str, options: list[str] | None) -> str:
-        caller = self._ensure_caller()
         system = (
             "You fill job-application forms as the candidate described below. "
             "Answer the single question as the candidate would, truthfully and "
@@ -306,13 +369,15 @@ class AnswerEngine:
         if self.job_context:
             parts.append(f"Job context: {self.job_context}")
         parts.append("Answer:")
+        return self._llm_raw(system, "\n\n".join(parts))
+
+    def _llm_raw(self, system: str, user: str) -> str:
+        """One LLM call with bounded retry (1,2,4,8,16s → ~31s worst case, so a
+        busy provider doesn't appear hung). Caller built/reused from env."""
         self.llm_calls += 1
-        # Reuse the evaluator's retry wrapper. Bounded backoff (1,2,4,8,16s →
-        # ~31s worst case) so a busy provider doesn't make the run appear hung;
-        # past that we fall back to a best-effort answer flagged for review.
         from pipeline.batch_evaluate import _call_with_retry
         return _call_with_retry(
-            caller, system, "\n\n".join(parts), max_attempts=6, base_delay=1.0,
+            self._ensure_caller(), system, user, max_attempts=6, base_delay=1.0,
         ).strip()
 
     def _ensure_caller(self) -> Caller:

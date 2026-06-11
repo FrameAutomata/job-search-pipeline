@@ -245,6 +245,40 @@ class TestAnswerEngineCache:
         ]
 
 
+class TestAnswerMulti:
+    """Checkbox-group answering: one option for single-choice, several for
+    multi-select, none when nothing applies — the model decides how many."""
+
+    def test_single_choice_returns_one(self, profile, tmp_path):
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "2 Weeks")
+        assert e.answer_multi("What is your notice period?",
+                              ["1 Week", "2 Weeks", "3 Weeks", "2 Months"]) == ["2 Weeks"]
+
+    def test_multi_select_returns_several(self, profile, tmp_path):
+        def caller(s, u):
+            return "Automation workflows\nAI/LLM-powered internal tools"
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=caller)
+        opts = ["Internal tools", "Automation workflows", "Prototypes",
+                "AI/LLM-powered internal tools", "None of the above"]
+        assert e.answer_multi("Which have you built?", opts) == [
+            "Automation workflows", "AI/LLM-powered internal tools"]
+
+    def test_none_returns_empty(self, profile, tmp_path):
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "none")
+        assert e.answer_multi("Which apply?", ["A", "B"]) == []
+
+    def test_eeo_group_never_answered(self, profile, tmp_path):
+        def boom(s, u):
+            raise AssertionError("must not call LLM for demographics")
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=boom)
+        assert e.answer_multi("Gender", ["Male", "Female"]) == []
+
+    def test_unmatched_line_adds_nothing(self, profile, tmp_path):
+        # A garbage reply must NOT add a spurious checked box (strict match).
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "something off-list")
+        assert e.answer_multi("Which apply?", ["A", "B"]) == []
+
+
 class TestAnswerHelpers:
     def test_sanitize_normalizes(self):
         assert _sanitize("  How  many YEARS?? ") == "how many years"
