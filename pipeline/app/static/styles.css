@@ -435,3 +435,34 @@ tbody tr.selected { background: #233047; }
   0%, 100% { opacity: 1; }
   50%       { opacity: 0.2; }
 }
+
+/* ── local pipeline run panel ─────────────────────────────────────────────── */
+.local-run-panel {
+  margin-top: 10px; padding: 10px 12px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  display: flex; flex-direction: column; gap: 8px; font-size: 13px;
+}
+.local-run-options { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.local-run-options label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+.local-run-options select {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+}
+.local-run-options button {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer;
+}
+.local-run-options button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.local-run-options .hint { color: var(--muted); font-size: 12px; }
+.local-stages { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.local-stages .stage {
+  padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted);
+}
+.local-stages .stage.seen { color: var(--good); border-color: rgba(63,185,80,0.4); }
+.local-stages .stage.current { color: var(--accent); border-color: var(--accent); }
+.local-stages .stage-sep { color: var(--muted); }
+.local-log {
+  margin: 0; max-height: 180px; overflow: auto; padding: 8px 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  font-size: 11.5px; line-height: 1.45; color: var(--muted); white-space: pre-wrap;
+}

@@ -25,9 +25,27 @@
       <button id="add-job-btn" title="Evaluate a job you found online and add it to the tracker">+ Add job</button>
       <button id="refresh-btn" title="Download the latest results from GitHub">↻ Refresh</button>
       <button id="run-btn" title="Trigger a new pipeline run in the cloud">▶ Run now</button>
+      <button id="run-local-btn" title="Run the pipeline on this machine and show its results">💻 Run local</button>
       <a id="setup-link" href="/onboard" title="Set up or update your profile and search config">⚙ Setup</a>
     </div>
     <div id="action-msg" class="action-msg" hidden></div>
+    <div id="local-run-panel" class="local-run-panel" hidden>
+      <div class="local-run-options">
+        <label>Passes
+          <select id="local-passes">
+            <option value="all">All passes</option>
+            <option value="easy-only">Easy Apply only</option>
+            <option value="no-easy">Non–Easy Apply</option>
+          </select>
+        </label>
+        <label class="local-eval-label"><input id="local-evaluate" type="checkbox" checked /> Evaluate with LLM</label>
+        <button id="local-start">▶ Start</button>
+        <button id="local-cancel" hidden>✕ Cancel run</button>
+        <span class="hint">Runs scrape → filter → screen → bridge → evaluate on this machine; results load here when done.</span>
+      </div>
+      <div id="local-stages" class="local-stages" hidden></div>
+      <pre id="local-log" class="local-log" hidden></pre>
+    </div>
   </header>
 
   <main>

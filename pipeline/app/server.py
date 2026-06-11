@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline.app import data, gh, onboard, skills
+from pipeline.app import data, gh, local_run, onboard, skills
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
@@ -351,6 +351,51 @@ def run_pipeline() -> JSONResponse:
         return JSONResponse({"ok": True, "workflow": DAILY_WORKFLOW})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── local pipeline run ──────────────────────────────────────────────────────
+
+class LocalRunRequest(BaseModel):
+    passes: str = "all"        # "all" | "easy-only" | "no-easy"
+    evaluate: bool = True
+
+
+@app.post("/api/run-local")
+def run_local(req: LocalRunRequest) -> JSONResponse:
+    """Start a local pipeline run (orchestrate.py subprocess). Single-flight:
+    409 when one is already running. Poll /api/run-local/status for progress;
+    on success the UI switches to the local tracker via /api/use-local."""
+    if req.passes not in ("all", "easy-only", "no-easy"):
+        raise HTTPException(status_code=400, detail=f"unknown passes value: {req.passes}")
+    try:
+        state = local_run.start({"passes": req.passes, "evaluate": req.evaluate})
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"could not start the pipeline: {e}")
+    # NB: status()'s own "ok" field means "run succeeded" (None while running) —
+    # the request-level acknowledgement gets its own key.
+    return JSONResponse({"started": True, **state})
+
+
+@app.get("/api/run-local/status")
+def run_local_status() -> JSONResponse:
+    return JSONResponse(local_run.status())
+
+
+@app.post("/api/run-local/cancel")
+def run_local_cancel() -> JSONResponse:
+    return JSONResponse(local_run.cancel())
+
+
+@app.post("/api/use-local")
+def use_local() -> JSONResponse:
+    """Point the data layer back at the LOCAL career-ops (the default source).
+    Used after a local pipeline run so its fresh results are what the UI
+    shows, instead of a previously downloaded cloud artifact."""
+    global _active_data_dir
+    _active_data_dir = None
+    return JSONResponse({"ok": True, "career_ops": str(_career_ops_local())})
 
 
 # ── career-ops skills ──────────────────────────────────────────────────────
