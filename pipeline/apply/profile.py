@@ -77,9 +77,10 @@ class ApplyProfile:
     requires_sponsorship: bool = False
     work_permit_type: str = ""
     eligible_countries: list[str] = field(default_factory=list)
-    # Compensation. salary_floor is the walk-away minimum — NEVER stated on an
-    # application. salary_target is what we put in a numeric salary field.
-    salary_floor: int | None = None
+    # Compensation. Only the DISCLOSABLE figure lives on the profile: salary_target
+    # is what we put in a numeric salary field. The walk-away minimum is
+    # deliberately NOT loaded here — keeping it off the answer-facing model means
+    # no form-filling path can ever state it (structural "never reveal the floor").
     salary_target: int | None = None
     salary_currency: str = "USD"
 
@@ -129,7 +130,6 @@ class ApplyProfile:
             requires_sponsorship=bool(wa.get("requires_sponsorship", False)),
             work_permit_type=str(wa.get("work_permit_type", "")).strip(),
             eligible_countries=eligible,
-            salary_floor=_parse_salary(comp.get("minimum") or comp.get("target_range")),
             salary_target=_parse_salary_target(comp.get("target_range") or comp.get("minimum")),
             salary_currency=str(comp.get("currency", "USD")).strip() or "USD",
         )

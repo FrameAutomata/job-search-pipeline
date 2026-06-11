@@ -50,30 +50,61 @@ def _cache_key(question: str, field_type: str) -> str:
     return f"{field_type}::{_sanitize(question)}"
 
 
-# A salary range in an evaluation report ("$150-220K", "$150K-$220K",
-# "$150,000 to $220,000"). The 30K floor rejects year/headcount ranges.
-_SALARY_RANGE_RE = re.compile(
-    r"\$?\s?(\d{2,3}(?:,\d{3})?)\s*([kK]?)\s*(?:[-–—]|to)\s*\$?\s?(\d{2,3}(?:,\d{3})?)\s*([kK]?)"
+# A $-anchored salary figure ("$150K", "$150,000", "$150000"). The leading $ is
+# REQUIRED — it's what separates real comp from the bare number ranges a report
+# is full of (team sizes "50-200", percentiles "top 10-20%", years "5-10",
+# headcounts) that a $-less scan wrongly grabbed as salary.
+_MONEY = r"\$\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM]?)"
+_SALARY_RANGE_RE = re.compile(_MONEY + r"\s*(?:[-–—]|to)\s*\$?\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM]?)")
+_SALARY_SINGLE_RE = re.compile(r"\$\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM])")
+# Lines about the CANDIDATE's own ask, not the role's posted comp — skip them so
+# we never read back the walk-away/target (which can equal the floor we hide).
+_CANDIDATE_LINE_RE = re.compile(
+    r"\b(candidat\w*|seeking|seeks|walk.?away|your (target|minimum|floor)|"
+    r"target del candidato)\b", re.IGNORECASE,
 )
 
 
 def _to_dollars(digits: str, suffix: str) -> int:
-    x = float(digits.replace(",", ""))
-    if suffix.lower() == "k" or x < 1000:   # "150K" or a bare "150" meaning 150k
-        x *= 1000
+    raw = re.sub(r"[,\s]", "", digits)
+    x = float(raw)
+    if suffix.lower() == "k":
+        x *= 1_000
+    elif suffix.lower() == "m":
+        x *= 1_000_000
+    elif len(raw) <= 3:           # a bare 2-3 digit "$150" in a money context → 150k
+        x *= 1_000
     return int(x)
 
 
 def salary_from_report(report_text: str) -> int | None:
-    """Midpoint of the role's posted comp range as researched by career-ops in
-    its evaluation report (a 'publicly known' figure to state). None if no
-    plausible salary range is found."""
-    for m in _SALARY_RANGE_RE.finditer(report_text or ""):
-        lo = _to_dollars(m.group(1), m.group(2) or m.group(4))
-        hi = _to_dollars(m.group(3), m.group(4) or m.group(2))
-        if 30_000 <= lo <= hi <= 1_000_000:
-            return (lo + hi) // 2
-    return None
+    """The role's posted comp as researched by career-ops in its evaluation
+    report — the midpoint of a $-anchored range, else a single $-figure. Scans
+    only $-bearing lines and skips the candidate's own ask, so it returns a
+    'publicly known' market figure and never echoes the walk-away floor. None if
+    no plausible comp is found."""
+    single: int | None = None
+    for line in (report_text or "").splitlines():
+        if "$" not in line or _CANDIDATE_LINE_RE.search(line):
+            continue
+        m = _SALARY_RANGE_RE.search(line)
+        if m:
+            lo_d, lo_s, hi_d, hi_s = m.groups()
+            # Share a K/M suffix across the range only when the low number is a
+            # bare 2-3 digit value ("$150-220K" → both K); never rescale a number
+            # that's already full ("$95,000-120K" keeps 95,000 as 95,000).
+            if not lo_s and re.fullmatch(r"\d{2,3}", lo_d):
+                lo_s = hi_s
+            lo, hi = _to_dollars(lo_d, lo_s), _to_dollars(hi_d, hi_s or lo_s)
+            if 30_000 <= lo <= hi <= 1_000_000:
+                return (lo + hi) // 2
+        if single is None:
+            ms = _SALARY_SINGLE_RE.search(line)  # single figure must carry a K/M suffix
+            if ms:
+                v = _to_dollars(*ms.groups())
+                if 30_000 <= v <= 1_000_000:
+                    single = v
+    return single
 
 
 def thinking_disabled() -> bool:
@@ -84,12 +115,22 @@ def thinking_disabled() -> bool:
     return os.environ.get("APPLY_ENABLE_THINKING", "").strip().lower() not in ("1", "true", "yes")
 
 
+def _contains_token(haystack: str, needle: str) -> bool:
+    """True if `needle` appears in `haystack` as a standalone token. Uses
+    non-word-char lookarounds instead of \\b so options ending/starting in
+    punctuation still match — \\b fails for "C++"/"C#"/".NET" (no word boundary
+    after '+'/'#'), which dropped or mis-picked those skill options."""
+    if not haystack or not needle:
+        return False
+    return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
+
+
 def _match_option(answer: str, options: list[str]) -> str:
     """Map a free-form answer onto one of the allowed options (exact →
-    case-insensitive → whole-word containment either direction). Falls back to
+    case-insensitive → whole-token containment either direction). Falls back to
     the first option so a select always gets a valid value rather than crashing.
 
-    Containment is matched on word boundaries so a short option like "No" doesn't
+    Containment is matched on token boundaries so a short option like "No" doesn't
     match the "no" inside "I prefer not to say"."""
     if not options:
         return answer
@@ -102,9 +143,7 @@ def _match_option(answer: str, options: list[str]) -> str:
             return opt
     for opt in options:
         ol = opt.strip().lower()
-        if not ol or not al:
-            continue
-        if re.search(rf"\b{re.escape(ol)}\b", al) or re.search(rf"\b{re.escape(al)}\b", ol):
+        if _contains_token(al, ol) or _contains_token(ol, al):
             return opt
     return options[0]
 
@@ -125,7 +164,7 @@ def _match_option_strict(answer: str, options: list[str]) -> str | None:
             return opt
     for opt in options:
         ol = opt.strip().lower()
-        if ol and (re.search(rf"\b{re.escape(ol)}\b", al) or re.search(rf"\b{re.escape(al)}\b", ol)):
+        if _contains_token(al, ol) or _contains_token(ol, al):
             return opt
     return None
 
@@ -262,12 +301,11 @@ class AnswerEngine:
 
     def _fallback(self, field_type: str, options: list[str] | None) -> str:
         """Best-effort value when the LLM is unavailable — never a fabricated
-        credential. Choice fields decline (or take the first option); numeric →
-        0; free text is left blank for the human to complete in review."""
+        credential or number. Choice fields decline (blank if there's no decline
+        option); numeric and free text are left blank for the human to complete
+        in review (a fabricated "0" once submitted a desired salary of $0)."""
         if options:
             return self._decline(options)
-        if field_type == "numeric":
-            return "0"
         return ""
 
     # ── deterministic layer ───────────────────────────────────────────────────
@@ -347,9 +385,12 @@ class AnswerEngine:
             return _DECLINE
         # Prefer an explicit decline-style option if one exists.
         for opt in options:
-            if re.search(r"prefer not|decline|not wish|don.?t wish", opt, re.IGNORECASE):
+            if re.search(r"prefer not|decline|not wish|don.?t wish|rather not", opt, re.IGNORECASE):
                 return opt
-        return _match_option(_DECLINE, options)
+        # No decline option: leave it BLANK. Never fall back to options[0] — for a
+        # demographic question that would affirm the first value (e.g. "Male"),
+        # the exact answer this is meant to avoid. "" makes the fill layer skip.
+        return ""
 
     # ── LLM fallback ───────────────────────────────────────────────────────────
 
@@ -383,18 +424,10 @@ class AnswerEngine:
     def _ensure_caller(self) -> Caller:
         if self._caller is not None:
             return self._caller
-        from pipeline.batch_evaluate import _build_caller, _detect_provider, PROVIDER_DEFAULTS
-        provider = _detect_provider()
-        if not provider:
-            raise RuntimeError(
-                "no LLM provider configured for screening questions — set a "
-                "provider key (GEMINI_API_KEY, etc.) or BATCH_PROVIDER in .env"
-            )
-        # APPLY_MODEL lets these light tasks use a faster/more-available model
-        # than the (possibly heavy/overloaded) evaluation model in BATCH_MODEL.
-        model = (os.environ.get("APPLY_MODEL") or os.environ.get("BATCH_MODEL")
-                 or PROVIDER_DEFAULTS[provider])
-        self._caller = _build_caller(provider, model, disable_thinking=thinking_disabled())
+        # Shared resolver: APPLY_MODEL lets these light tasks use a faster/more-
+        # available model than the (possibly heavy) evaluation model in BATCH_MODEL.
+        from pipeline.batch_evaluate import resolve_caller
+        self._caller = resolve_caller(disable_thinking=thinking_disabled())
         return self._caller
 
     # ── cache persistence ───────────────────────────────────────────────────

@@ -549,6 +549,39 @@ def _toggle_grouped(cb, want: bool) -> None:
             pass
 
 
+_CONSENT_RE = re.compile(
+    r"\b(i (agree|consent|certify|acknowledge|confirm|authorize|authorise|understand|have read)|"
+    r"agree to|consent to|terms|privacy polic|background check)\b", re.IGNORECASE,
+)
+
+
+def _looks_like_consent_set(options: list[str]) -> bool:
+    """True when a 'group' is really independent consent statements bundled by DOM
+    proximity (two separate 'I agree to X' boxes), not the choices of one
+    question. These must each be answered yes/no, not offered to answer_multi —
+    otherwise a required consent gets framed as a menu item and left unchecked."""
+    consenty = sum(1 for o in options if _CONSENT_RE.search(o))
+    return consenty >= 2 or (len(options) >= 2 and all(len(o) > 60 for o in options))
+
+
+def _handle_lone_checkbox(dialog, cb, label: str, answers: AnswerEngine,
+                          drafted: list[tuple[str, str]]) -> None:
+    """A single checkbox: a marketing opt-out (uncheck), or a consent (check only
+    on an affirmative verdict). A declined/blank verdict is RECORDED as left
+    unchecked, so a required consent the candidate can't truthfully accept is
+    visible in review instead of silently blocking submit."""
+    if _is_optout_checkbox(label):
+        _toggle_grouped(cb, False)
+        drafted.append((label[:50], "unchecked"))
+        return
+    verdict = answers.answer(label, "select", ["Yes", "No"]).strip().lower()
+    if verdict in ("yes", "true", "agree", "i agree"):
+        _toggle_grouped(cb, True)
+        drafted.append((label[:50], "checked"))
+    else:
+        drafted.append((label[:50], "left unchecked" + (f" ({verdict})" if verdict else "")))
+
+
 def _fill_checkbox_groups(page, answers: AnswerEngine, drafted: list[tuple[str, str]]) -> None:
     """Answer checkbox groups as a set. A multi-option group is sent to the answer
     engine as a multi-select (one choice for single-choice questions like notice
@@ -564,14 +597,18 @@ def _fill_checkbox_groups(page, answers: AnswerEngine, drafted: list[tuple[str, 
 
     for g in groups:
         gid = g.get("gid")
-        options = [o for o in g.get("options", []) if o]
-        if len(options) >= 2:
+        all_opts = g.get("options", [])
+        options = [o for o in all_opts if o]
+        # A genuine option-group (one question, several choices) → answer_multi.
+        # But DOM proximity can bundle independent consents into a bogus group;
+        # those must be handled as separate yes/no boxes, not menu options.
+        if len(options) >= 2 and not _looks_like_consent_set(options):
             question = g.get("question") or "Select the option(s) that apply"
             try:
                 chosen = answers.answer_multi(question, options)
             except Exception:
                 chosen = []
-            for i, opt in enumerate(g.get("options", [])):
+            for i, opt in enumerate(all_opts):
                 cb = dialog.locator(f"input[data-apply-gid='{gid}'][data-apply-oi='{i}']").first
                 try:
                     if cb.count():
@@ -580,21 +617,15 @@ def _fill_checkbox_groups(page, answers: AnswerEngine, drafted: list[tuple[str, 
                     continue
             drafted.append((question[:50], ", ".join(chosen) if chosen else "(none)"))
         else:
-            cb = dialog.locator(f"input[data-apply-gid='{gid}'][data-apply-oi='0']").first
-            try:
-                if not cb.count():
+            for i, opt in enumerate(all_opts or [""]):
+                cb = dialog.locator(f"input[data-apply-gid='{gid}'][data-apply-oi='{i}']").first
+                try:
+                    if not cb.count():
+                        continue
+                except Exception:
                     continue
-            except Exception:
-                continue
-            label = (options[0] if options else _field_label(dialog, cb)) or ""
-            if _is_optout_checkbox(label):
-                _toggle_grouped(cb, False)
-                drafted.append((label, "unchecked"))
-            else:
-                verdict = answers.answer(label, "select", ["Yes", "No"])
-                if verdict.strip().lower() in ("yes", "true", "agree", "i agree"):
-                    _toggle_grouped(cb, True)
-                    drafted.append((label, "checked"))
+                label = (opt or _field_label(dialog, cb)) or ""
+                _handle_lone_checkbox(dialog, cb, label, answers, drafted)
 
 
 def _field_label(dialog, el) -> str:
@@ -667,6 +698,11 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
         opts = [o for o in el.locator("option").all_inner_texts()
                 if o.strip() and not o.strip().lower().startswith("select")]
         value = answers.answer(label, "select", opts)
+        if not value.strip():
+            # Declined (e.g. an EEO dropdown with no decline option) — leave it
+            # unset rather than selecting the first option.
+            drafted.append((label, "(left blank)"))
+            return
         try:
             el.select_option(label=value)
         except Exception:
@@ -696,6 +732,9 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
             drafted.append((label, "(skipped optional)"))
             return
         value = answers.answer(label, "textarea")
+        if not value.strip():
+            drafted.append((label, "(left blank — review)"))
+            return
         if value and _already_has_value(el, value):
             return  # already correct (e.g. carried over from a prior step)
         el.fill(value)
@@ -705,6 +744,11 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
     # text / email / tel / number
     field_type = "numeric" if typ == "number" else "text"
     value = answers.answer(label, field_type)
+    if not value.strip():
+        # Blank answer (declined, or LLM unavailable) — leave the field empty for
+        # review rather than fabricating a value (e.g. a "0" desired salary).
+        drafted.append((label, "(left blank)"))
+        return
     if value and _already_has_value(el, value):
         return  # LinkedIn carried this value forward — skip the redundant re-fill
 
@@ -925,6 +969,15 @@ def _handle_file_inputs(dialog, answers: AnswerEngine, drafted: list[tuple[str, 
 
 
 def _fill_fieldset(fs, answers: AnswerEngine, drafted: list[tuple[str, str]]) -> None:
+    # Radio groups only. A fieldset of checkboxes is handled by the checkbox-group
+    # pass (answer_multi); processing it here too would double the LLM calls and
+    # emit conflicting drafted rows (the same question shown twice).
+    try:
+        if fs.locator("input[type=checkbox]").count() and not fs.locator("input[type=radio]").count():
+            return
+    except Exception:
+        pass
+
     legend = fs.locator("legend").first
     question = ""
     if legend.count():
@@ -947,27 +1000,47 @@ def _fill_fieldset(fs, answers: AnswerEngine, drafted: list[tuple[str, str]]) ->
         return
 
     value = answers.answer(question, "radio", options)
+    if not value.strip():
+        # Declined (e.g. an EEO question with no "prefer not to say" option) — leave
+        # the group unset rather than clicking the first radio.
+        drafted.append((question, "(left blank)"))
+        return
     _choose_radio(fs, value)
     drafted.append((question, value))
 
 
 def _choose_radio(fs, value: str) -> None:
-    """Click the radio whose label best matches `value`; first option as fallback."""
-    labels = fs.locator("label")
+    """Click the radio whose label matches `value` — EXACT match across all labels
+    first, then a substring fallback. Two passes so an earlier label that merely
+    contains the value ("No longer interested" contains "No") can't beat a later
+    exact "No". Empty value → click nothing (caller declined)."""
     target = value.strip().lower()
+    if not target:
+        return
+    labels = fs.locator("label")
     try:
         count = labels.count()
     except Exception:
         return
+    texts: list[str] = []
     for i in range(count):
         try:
-            lt = " ".join((labels.nth(i).inner_text() or "").split()).lower()
-            if lt == target or (target and target in lt):
-                labels.nth(i).click()
-                return
+            texts.append(" ".join((labels.nth(i).inner_text() or "").split()).lower())
         except Exception:
-            continue
+            texts.append("")
+    for i, lt in enumerate(texts):           # exact match wins, regardless of order
+        if lt == target:
+            _try_click(labels.nth(i))
+            return
+    for i, lt in enumerate(texts):           # then a contains-match
+        if target in lt:
+            _try_click(labels.nth(i))
+            return
+    _try_click(labels.first)                 # last resort: a real value we couldn't place
+
+
+def _try_click(loc) -> None:
     try:
-        labels.first.click()
+        loc.click()
     except Exception:
         pass

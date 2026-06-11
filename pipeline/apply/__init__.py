@@ -98,10 +98,16 @@ def run(
                       "Run windowed (not --headless) and sign in when prompted.")
                 return 0
 
+            # Reports live next to the tracker (career-ops/reports OR the refreshed
+            # artifact's reports/), not necessarily under the local career-ops — so a
+            # cloud-only-evaluated job's report is found rather than read as empty.
+            report_root = applications_md.parent.parent
+
             for job in jobs:
                 engine.job_context = f"{job.company} — {job.role}"
+                engine.unanswered = []   # per-job, so _report surfaces only this job's
                 # Role's researched market comp (from the report) for salary fields.
-                report_text = (read_text(career_ops / job.report_path)
+                report_text = (read_text(report_root / job.report_path)
                                if getattr(job, "report_path", "") else "")
                 engine.role_salary_target = salary_from_report(report_text)
                 # Cover letter generated lazily — only if this form has a cover-
@@ -111,7 +117,7 @@ def run(
                 engine.cover_letter_text = ""
                 engine.cover_letter_provider = (
                     lambda j=job: cover_letters.generate_for_job(
-                        career_ops, j, provider=provider, model=model)
+                        career_ops, j, report_base=report_root, provider=provider, model=model)
                 )
                 # For forms whose cover-letter field is a PDF upload (not a
                 # textarea), render the generated letter to a PDF on demand.
@@ -126,6 +132,7 @@ def run(
 
                 applied, held, failures = _report(
                     job, result, mode, applications_md, applied, held, failures,
+                    unanswered=list(engine.unanswered),
                 )
     except ImportError as e:
         print(f"[apply] {e}")
@@ -144,7 +151,8 @@ def run(
 
 
 def _report(job, result: ApplyResult, mode: str, applications_md: Path,
-            applied: int, held: int, failures: int) -> tuple[int, int, int]:
+            applied: int, held: int, failures: int,
+            unanswered: list[str] | None = None) -> tuple[int, int, int]:
     """Log one job's outcome and, for a real submission, mark the tracker."""
     # ASCII-only markers: Windows consoles default to cp1252, which can't encode
     # glyphs like ✓/✗/→ and would crash the whole run on the print.
@@ -158,6 +166,11 @@ def _report(job, result: ApplyResult, mode: str, applications_md: Path,
         print(f"[apply] [..]   FILLED {tag} -- {len(result.answers)} field(s) drafted, not submitted")
         for q, a in result.answers:
             print(f"               {q[:50]} -> {a[:60]}")
+        if unanswered:
+            # Fields the LLM couldn't answer (left blank/placeholder) — call them
+            # out so they're reviewed, not silently submitted.
+            print(f"               [!] {len(unanswered)} field(s) NEED REVIEW (LLM unavailable): "
+                  + "; ".join(q[:40] for q in unanswered[:5]))
     else:
         failures += 1
         print(f"[apply] [XX]   {result.code.upper()} {tag}"
@@ -178,10 +191,11 @@ def _find_tailored_resume(career_ops: Path, job) -> Path | None:
     if not slug:
         return None
     # Exclude cover letters: "<Company> - cover.pdf" also contains the company
-    # slug, so without this guard the cover letter gets uploaded as the resume.
+    # slug. Match 'cover'/'letter' as whole words only — a bare substring wrongly
+    # excludes real companies ("Discovery" contains "cover", "Recover" too).
     matches = [p for p in tdir.glob("*.pdf")
                if slug in re.sub(r"[^a-z0-9]+", "", p.stem.lower())
-               and not re.search(r"cover|letter", p.stem.lower())]
+               and not re.search(r"\b(cover|letter)\b", p.stem.lower())]
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
 
 
@@ -227,8 +241,6 @@ def _build_caller(provider: str | None, model: str | None):
     auto-detect from env; builds explicitly only when a provider is named."""
     if not provider:
         return None
-    from pipeline.batch_evaluate import _build_caller as _bc, PROVIDER_DEFAULTS
+    from pipeline.batch_evaluate import resolve_caller
     from pipeline.apply.answers import thinking_disabled
-    model = (model or os.environ.get("APPLY_MODEL") or os.environ.get("BATCH_MODEL")
-             or PROVIDER_DEFAULTS[provider])
-    return _bc(provider, model, disable_thinking=thinking_disabled())
+    return resolve_caller(provider, model, disable_thinking=thinking_disabled())

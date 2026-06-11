@@ -89,23 +89,14 @@ def build_prompt(profile: ApplyProfile, cv: str, job, report_text: str) -> tuple
 
 
 def _resolve_caller(provider: str | None, model: str | None):
-    from pipeline.batch_evaluate import _build_caller, _detect_provider, PROVIDER_DEFAULTS
+    # Shared resolver with COVER_MODEL leading the chain (a quality-first model,
+    # since a letter is recruiter-facing). A cover letter is prose, not a reasoning
+    # task — disable thinking so the model writes directly (faster, and avoids the
+    # truncated/garbled tails reasoning models produce when they burn the budget).
+    from pipeline.batch_evaluate import resolve_caller
     from pipeline.apply.answers import thinking_disabled
-    provider = provider or _detect_provider()
-    if not provider:
-        raise RuntimeError(
-            "no LLM provider configured for cover letters — set a provider key "
-            "(DEEPINFRA_API_KEY, etc.) or BATCH_PROVIDER in .env"
-        )
-    # Model precedence for cover letters: COVER_MODEL (a quality-first chain,
-    # since a letter is recruiter-facing) → APPLY_MODEL → BATCH_MODEL → default.
-    # Each may be a comma-separated failover chain.
-    model = (model or os.environ.get("COVER_MODEL") or os.environ.get("APPLY_MODEL")
-             or os.environ.get("BATCH_MODEL") or PROVIDER_DEFAULTS[provider])
-    # A cover letter is prose, not a reasoning task — disable thinking so the
-    # model writes directly (faster, and avoids the truncated/garbled tails MiMo
-    # produces when it spends the token budget thinking).
-    return _build_caller(provider, model, disable_thinking=thinking_disabled())
+    return resolve_caller(provider, model, lead_env="COVER_MODEL",
+                          disable_thinking=thinking_disabled())
 
 
 def find_existing(career_ops: Path, company: str) -> str:
@@ -192,7 +183,7 @@ def ensure_cover_pdf(career_ops: Path, company: str) -> Path | None:
 
 def generate_for_job(career_ops: Path, job, *, caller=None,
                      provider: str | None = None, model: str | None = None,
-                     force: bool = False) -> str:
+                     report_base: Path | None = None, force: bool = False) -> str:
     """Return a tailored cover letter for one job — the existing file if present
     (unless force), otherwise generate one, save it to
     career-ops/output/<company> - cover.md, and return its text. "" on failure.
@@ -210,8 +201,10 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
 
     profile = ApplyProfile.load(career_ops)
     cv = read_text(career_ops / "cv.md")
+    # The CV is local, but the report lives next to the tracker (the refreshed
+    # artifact's reports/ when applying against cloud evaluations).
     report_path = getattr(job, "report_path", "") or ""
-    report_text = read_text(career_ops / report_path) if report_path else ""
+    report_text = read_text(Path(report_base or career_ops) / report_path) if report_path else ""
     system, user = build_prompt(profile, cv, job, report_text)
     from pipeline.batch_evaluate import _call_with_retry
     try:

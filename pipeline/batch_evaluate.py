@@ -360,6 +360,33 @@ def _check_provider(provider: str) -> str | None:
     return None
 
 
+def resolve_caller(provider: str | None = None, model: str | None = None, *,
+                   lead_env: str | None = None, disable_thinking: bool = False):
+    """Build an LLM caller, resolving provider and model from one place (the apply
+    answers, cover letters, and the apply stage all funnel through here instead of
+    each re-implementing the precedence chain).
+
+    provider: explicit, else BATCH_PROVIDER / first provider key found.
+    model: explicit → `lead_env` override (e.g. COVER_MODEL) → APPLY_MODEL →
+        BATCH_MODEL → the provider's default. Each may be a comma-separated
+        failover chain. Raises a clear error (never a bare KeyError) when the
+        provider is unknown/unconfigured."""
+    provider = (provider or _detect_provider() or "").strip()
+    if not provider:
+        raise RuntimeError(
+            "no LLM provider configured — set a provider key (GEMINI_API_KEY, "
+            "DEEPINFRA_API_KEY, ...) or BATCH_PROVIDER in .env"
+        )
+    chain = [model, os.environ.get(lead_env) if lead_env else None,
+             os.environ.get("APPLY_MODEL"), os.environ.get("BATCH_MODEL"),
+             PROVIDER_DEFAULTS.get(provider)]
+    model = next((m for m in chain if m), None)
+    if not model:
+        raise RuntimeError(f"unknown LLM provider '{provider}' — no default model; "
+                           "set APPLY_MODEL/BATCH_MODEL or use a known provider")
+    return _build_caller(provider, model, disable_thinking=disable_thinking)
+
+
 # ── Worker ───────────────────────────────────────────────────────────────────
 
 def _process_one(

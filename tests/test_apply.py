@@ -98,7 +98,7 @@ class TestApplyProfile:
         assert p.phone_digits == "19565253015"
         assert p.requires_sponsorship is False
         assert p.authorized_regions == ["United States"]
-        assert p.salary_floor == 75000
+        assert p.salary_target == 75000   # minimum used as target when no target_range
 
     def test_eligible_countries_default_to_authorized(self, tmp_path):
         co = self._write(tmp_path, """
@@ -112,7 +112,7 @@ class TestApplyProfile:
 
     def test_missing_file_is_empty_defaults(self, tmp_path):
         p = ApplyProfile.load(tmp_path)
-        assert p.full_name == "" and p.salary_floor is None
+        assert p.full_name == "" and p.salary_target is None
 
 
 # ── answers.py ───────────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ def profile():
         full_name="Thomas Thirlwall", email="t@example.com", phone="+1 (956) 525-3015",
         city="Dallas", country="United States", linkedin="linkedin.com/in/x",
         citizenship="US", authorized_regions=["United States"],
-        requires_sponsorship=False, salary_floor=75000, salary_target=150000,
+        requires_sponsorship=False, salary_target=150000,
     )
 
 
@@ -161,6 +161,13 @@ class TestAnswerEngineDeterministic:
         assert e.answer("Gender", "select", ["Male", "Female", "Prefer not to say"]) == "Prefer not to say"
         assert e.answer("Veteran status", "text") == "Prefer not to say"
 
+    def test_eeo_without_decline_option_is_blank_not_first(self, profile, tmp_path):
+        # #2: a demographic field with NO decline option must be left blank — never
+        # fall back to options[0] (which would affirm "Male").
+        e = self._engine(profile, tmp_path)
+        assert e.answer("Gender", "select", ["Male", "Female"]) == ""
+        assert e.answer("Do you identify as Hispanic/Latino?", "select", ["Yes", "No"]) == ""
+
     def test_salary_text_is_negotiable(self, profile, tmp_path):
         # Never reveal the walk-away minimum; a text salary field gets "Negotiable".
         e = self._engine(profile, tmp_path)
@@ -184,12 +191,29 @@ class TestSalaryFromReport:
         ("D) Comp y Demanda — the range is $150-220K, competitive", 185000),
         ("posted $150K-$220K base", 185000),
         ("$150,000 to $220,000", 185000),
-        ("5-10 years of experience required", None),   # not a salary range
-        ("team of 10-20 engineers", None),
+        ("Posted comp: $150000-220000", 185000),       # #13: comma-less 6-digit range
+        ("Base salary is $180K for this role.", 180000),  # single $-figure with suffix
+        # #1: a $ is REQUIRED — bare ranges (team size, percentile, years, headcount)
+        # are no longer scraped as salary.
+        ("5-10 years of experience required", None),
+        ("a team of 50-200 people, doubling in 9-12 months", None),
+        ("rated in the top 10-20% of the index", None),
+        ("$35M raised in Series B", None),             # funding (>1M) is filtered
         ("no compensation info", None),
     ])
     def test_extract(self, text, expected):
         assert salary_from_report(text) == expected
+
+    def test_skips_candidates_own_ask(self):
+        # The candidate's target/floor must never be read back as the role's comp.
+        text = ("Candidate target range: $75K-$500K.\n"
+                "Posted role comp: $150K-$190K.")
+        assert salary_from_report(text) == 170000   # the role line, not the $75K floor
+
+    def test_mixed_full_and_k_range_not_inflated(self):
+        # #12: a 'K' suffix must not be borrowed onto an already-full number
+        # ($95,000 stays $95,000, not $95,000,000 → which used to yield None).
+        assert salary_from_report("comp band $95,000-120K") == 107500
 
 
 class TestAnswerEngineCache:
@@ -235,7 +259,7 @@ class TestAnswerEngineCache:
             raise RuntimeError("provider returned empty content")
         e = AnswerEngine(profile, tmp_path / "c.json", caller=boom)
         assert e.answer("Tell us about a project you led.", "textarea") == ""   # blank free text
-        assert e.answer("Years of experience with Go?", "numeric") == "0"
+        assert e.answer("Years of experience with Go?", "numeric") == ""        # blank, never a fake "0"
         assert e.answer("Are you willing to relocate to Mars?",
                         "select", ["Yes", "No", "Prefer not to say"]) == "Prefer not to say"
         assert e.unanswered == [
@@ -266,28 +290,20 @@ class TestProfessionalFilename:
                                       Path("r.pdf")) == "Tom Slash - Resume.pdf"
 
 
-class TestTailoredResume:
-    """_find_tailored_resume must not mistake a cover letter for a resume."""
+class TestConsentSetDetection:
+    """A bundled checkbox 'group' that's really independent consents must be split
+    back into per-box yes/no handling, not offered to answer_multi as menu items."""
 
-    def test_skips_cover_letter_pdf(self, tmp_path, monkeypatch):
-        from pipeline.apply import _find_tailored_resume
-        monkeypatch.delenv("APPLY_TAILORED_DIR", raising=False)
-        out = tmp_path / "output"
-        out.mkdir()
-        (out / "Parloa - cover.pdf").write_bytes(b"%PDF cover")
-        job = queue.ApplyJob(num="1", company="Parloa", role="Eng", url="u", score=4.0)
-        assert _find_tailored_resume(tmp_path, job) is None  # cover != resume
+    def test_two_consents_is_a_consent_set(self):
+        from pipeline.apply.linkedin import _looks_like_consent_set
+        assert _looks_like_consent_set(
+            ["I agree to the Terms of Service", "I consent to a background check"]) is True
 
-    def test_finds_real_tailored_resume(self, tmp_path, monkeypatch):
-        from pipeline.apply import _find_tailored_resume
-        monkeypatch.delenv("APPLY_TAILORED_DIR", raising=False)
-        out = tmp_path / "output"
-        out.mkdir()
-        (out / "Parloa - cover.pdf").write_bytes(b"%PDF cover")
-        (out / "Parloa - resume.pdf").write_bytes(b"%PDF resume")
-        job = queue.ApplyJob(num="1", company="Parloa", role="Eng", url="u", score=4.0)
-        p = _find_tailored_resume(tmp_path, job)
-        assert p is not None and "resume" in p.name.lower()
+    def test_option_values_are_not_a_consent_set(self):
+        from pipeline.apply.linkedin import _looks_like_consent_set
+        assert _looks_like_consent_set(["1 Week", "2 Weeks", "3 Months"]) is False
+        assert _looks_like_consent_set(
+            ["Automation workflows", "AI/LLM-powered internal tools"]) is False
 
 
 class TestAnswerMulti:
@@ -333,6 +349,13 @@ class TestAnswerHelpers:
         assert _match_option("yes", opts) == "Yes"
         assert _match_option("I prefer not to say", opts) == "Prefer not to say"
         assert _match_option("totally unrelated", opts) == "Yes"  # falls back to first
+
+    def test_match_option_punctuation_skills(self):
+        # #11: options ending in non-word chars must still match (\b fails after
+        # '+'/'#'). 'java' must NOT swallow 'javascript'.
+        assert _match_option("I use C++ daily", ["Java", "C++"]) == "C++"
+        assert _match_option("C#", ["C#", "F#"]) == "C#"
+        assert _match_option("javascript", ["Java", "JavaScript"]) == "JavaScript"
 
 
 # ── queue.py ─────────────────────────────────────────────────────────────────
@@ -459,6 +482,31 @@ class TestTailoredResume:
 
     def test_none_when_dir_absent(self, tmp_path):
         assert apply_pkg._find_tailored_resume(tmp_path, self._job("Apexon")) is None
+
+    def test_skips_cover_letter_pdf(self, tmp_path):
+        # A cover letter shares the company slug ("Parloa - cover.pdf") but must
+        # not be uploaded as the resume.
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "Parloa - cover.pdf").write_bytes(b"%PDF cover")
+        assert apply_pkg._find_tailored_resume(tmp_path, self._job("Parloa")) is None
+
+    def test_finds_resume_alongside_cover(self, tmp_path):
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "Parloa - cover.pdf").write_bytes(b"%PDF cover")
+        (out / "Parloa - resume.pdf").write_bytes(b"%PDF resume")
+        found = apply_pkg._find_tailored_resume(tmp_path, self._job("Parloa"))
+        assert found is not None and "resume" in found.name.lower()
+
+    def test_company_containing_cover_substring_not_excluded(self, tmp_path):
+        # #8: "Discovery"/"Recover" contain "cover" as a substring — the exclusion
+        # is whole-word, so their real tailored resumes are still found.
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "CV - Discovery.pdf").write_bytes(b"%PDF-1.4")
+        found = apply_pkg._find_tailored_resume(tmp_path, self._job("Discovery"))
+        assert found is not None and found.name == "CV - Discovery.pdf"
 
 
 class TestCoverLetterLazy:
