@@ -83,6 +83,13 @@ class ApplyProfile:
     # no form-filling path can ever state it (structural "never reveal the floor").
     salary_target: int | None = None
     salary_currency: str = "USD"
+    # Voluntary EEO / self-identification. Captured once at setup so the apply
+    # engine answers these deterministically (no review-hold). Empty = decline
+    # ("prefer not to say"), the default — set a value only to self-identify.
+    eeo_gender: str = ""
+    eeo_race: str = ""
+    eeo_veteran: str = ""
+    eeo_disability: str = ""
 
     @property
     def first_name(self) -> str:
@@ -113,6 +120,7 @@ class ApplyProfile:
         loc = data.get("location", {}) or {}
         wa = data.get("work_authorization", {}) or {}
         comp = data.get("compensation", {}) or {}
+        eeo = data.get("voluntary_disclosures", {}) or {}
 
         authorized = _as_list(wa.get("legally_authorized_to_work_in"))
         eligible = _as_list(wa.get("eligible_countries")) or authorized
@@ -132,6 +140,10 @@ class ApplyProfile:
             eligible_countries=eligible,
             salary_target=_parse_salary_target(comp.get("target_range") or comp.get("minimum")),
             salary_currency=str(comp.get("currency", "USD")).strip() or "USD",
+            eeo_gender=str(eeo.get("gender", "")).strip(),
+            eeo_race=str(eeo.get("race_ethnicity", "")).strip(),
+            eeo_veteran=str(eeo.get("veteran_status", "")).strip(),
+            eeo_disability=str(eeo.get("disability_status", "")).strip(),
         )
 
     def summary_lines(self) -> list[str]:

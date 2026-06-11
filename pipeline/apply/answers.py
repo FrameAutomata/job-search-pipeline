@@ -317,9 +317,10 @@ class AnswerEngine:
         q = question.lower()
         p = self.profile
 
-        # EEO / demographics → always decline (map onto an option if a select).
+        # EEO / demographics → the candidate's voluntary self-ID from setup, else
+        # decline. Captured once so these don't hit the LLM or hold for review.
         if _EEO_RE.search(q):
-            return self._decline(options)
+            return self._eeo_answer(q, options)
 
         # Work authorization & sponsorship — answer truthfully from the profile.
         # Check authorization BEFORE sponsorship: a question like "authorized to
@@ -379,6 +380,25 @@ class AnswerEngine:
         if not options:
             return "Yes" if verdict == "yes" else "No"
         return _match_option("Yes" if verdict == "yes" else "No", options)
+
+    def _eeo_answer(self, q: str, options: list[str] | None) -> str:
+        """A voluntary EEO question. Use the candidate's self-ID from the profile
+        (mapped onto the form's options) if they set one; otherwise decline. A
+        stored value that is itself a 'prefer not to say' counts as declining."""
+        p = self.profile
+        if re.search(r"\b(race|ethnic|hispanic|latino)\b", q):
+            val = p.eeo_race
+        elif "veteran" in q:
+            val = p.eeo_veteran
+        elif "disab" in q:
+            val = p.eeo_disability
+        elif re.search(r"\b(gender|sex)\b", q) or "pronoun" in q:
+            val = p.eeo_gender
+        else:
+            val = ""
+        if val and not re.search(r"prefer not|decline|not wish|rather not", val, re.IGNORECASE):
+            return _match_option(val, options) if options else val
+        return self._decline(options)
 
     def _decline(self, options: list[str] | None) -> str:
         if not options:

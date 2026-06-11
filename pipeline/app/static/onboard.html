@@ -68,6 +68,27 @@
             <input name="work_permit_type" placeholder='e.g. Citizen, Green Card, H-1B, "Needs sponsorship"' />
           </label>
         </fieldset>
+
+        <fieldset class="workauth">
+          <legend>Voluntary self-identification <span class="muted">(optional — auto-answers EEO questions)</span></legend>
+          <p class="hint">Leave any field blank to decline ("prefer not to say") on every
+            application — the default. Fill one in only to self-identify; it's matched
+            against the form's options, so use the employer's wording.</p>
+          <div class="grid2">
+            <label>Gender
+              <input name="eeo_gender" placeholder="e.g. Male, Female, Non-binary (blank = decline)" />
+            </label>
+            <label>Race / ethnicity
+              <input name="eeo_race" placeholder="e.g. Asian, Hispanic or Latino (blank = decline)" />
+            </label>
+            <label>Veteran status
+              <input name="eeo_veteran" placeholder='e.g. "I am not a protected veteran" (blank = decline)' />
+            </label>
+            <label>Disability status
+              <input name="eeo_disability" placeholder='e.g. "No, I do not have a disability" (blank = decline)' />
+            </label>
+          </div>
+        </fieldset>
       </section>
 
       <!-- 3. Roles & comp -->

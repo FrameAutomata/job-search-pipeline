@@ -76,10 +76,15 @@ class TestBuildOnboardingJson:
             "results_wanted": "100",
             "sites": ["indeed", "linkedin"],
             "include_easy_apply": True,
+            "eeo_gender": "Female",
+            "eeo_disability": "No, I do not have a disability",
         }
         payload = onboard.build_onboarding_json(form, resume_text="resume body")
         assert payload["resumeText"] == "resume body"
         assert payload["info"]["name"] == "Jane Dev"
+        assert payload["info"]["eeoGender"] == "Female"
+        assert payload["info"]["eeoDisability"] == "No, I do not have a disability"
+        assert payload["info"]["eeoVeteran"] == ""        # unset → blank → declines
         assert payload["criteria"]["targetRoles"] == ["Senior Full-Stack Engineer", "Backend Engineer"]
         assert payload["criteria"]["negativeRoles"] == ["Intern", "Manager"]
         locs = payload["searchSettings"]["locations"]

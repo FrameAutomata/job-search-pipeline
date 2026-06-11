@@ -114,6 +114,18 @@ class TestApplyProfile:
         p = ApplyProfile.load(tmp_path)
         assert p.full_name == "" and p.salary_target is None
 
+    def test_loads_voluntary_disclosures(self, tmp_path):
+        co = self._write(tmp_path, """
+            voluntary_disclosures:
+              gender: Female
+              race_ethnicity: Asian
+              disability_status: "No, I do not have a disability"
+        """)
+        p = ApplyProfile.load(co)
+        assert p.eeo_gender == "Female" and p.eeo_race == "Asian"
+        assert p.eeo_disability == "No, I do not have a disability"
+        assert p.eeo_veteran == ""        # unset → blank → declines at apply time
+
 
 # ── answers.py ───────────────────────────────────────────────────────────────
 
@@ -167,6 +179,20 @@ class TestAnswerEngineDeterministic:
         e = self._engine(profile, tmp_path)
         assert e.answer("Gender", "select", ["Male", "Female"]) == ""
         assert e.answer("Do you identify as Hispanic/Latino?", "select", ["Yes", "No"]) == ""
+
+    def test_eeo_self_identifies_when_profile_set(self, tmp_path):
+        # Captured EEO self-ID is used (mapped to the form's options); fields left
+        # blank still decline. No LLM call for any of it.
+        p = ApplyProfile(full_name="X", eeo_gender="Female",
+                         eeo_veteran="I am not a protected veteran")
+        e = AnswerEngine(p, tmp_path / "c.json",
+                         caller=lambda s, u: (_ for _ in ()).throw(AssertionError("no LLM")))
+        assert e.answer("Gender", "select", ["Male", "Female", "Prefer not to say"]) == "Female"
+        assert e.answer("Are you a protected veteran?", "select",
+                        ["I am a protected veteran", "I am not a protected veteran"]) == \
+            "I am not a protected veteran"
+        # race not set → still declines (blank-with-no-decline-option → "")
+        assert e.answer("Race/Ethnicity", "select", ["Asian", "White"]) == ""
 
     def test_salary_text_is_negotiable(self, profile, tmp_path):
         # Never reveal the walk-away minimum; a text salary field gets "Negotiable".
