@@ -556,12 +556,13 @@ _CONSENT_RE = re.compile(
 
 
 def _looks_like_consent_set(options: list[str]) -> bool:
-    """True when a 'group' is really independent consent statements bundled by DOM
-    proximity (two separate 'I agree to X' boxes), not the choices of one
-    question. These must each be answered yes/no, not offered to answer_multi —
-    otherwise a required consent gets framed as a menu item and left unchecked."""
-    consenty = sum(1 for o in options if _CONSENT_RE.search(o))
-    return consenty >= 2 or (len(options) >= 2 and all(len(o) > 60 for o in options))
+    """True when a 'group' is really INDEPENDENT consent statements bundled by DOM
+    proximity (two separate 'I agree to X' boxes), not the choices of one question.
+    Keyed on consent verbs in 2+ options — NOT on label length: a single-choice
+    question with long labels (e.g. 'Yes, I agree to relocate…' / 'No, I cannot…')
+    is NOT a consent set; routing it to answer_multi safely picks ONE, whereas
+    splitting it would auto-check the affirmative pole as a commitment never made."""
+    return sum(1 for o in options if _CONSENT_RE.search(o)) >= 2
 
 
 def _handle_lone_checkbox(dialog, cb, label: str, answers: AnswerEngine,
@@ -579,6 +580,9 @@ def _handle_lone_checkbox(dialog, cb, label: str, answers: AnswerEngine,
         _toggle_grouped(cb, True)
         drafted.append((label[:50], "checked"))
     else:
+        # Declined: actively UNCHECK (the box may be pre-checked) so we never
+        # submit a consent the candidate didn't give, and the log matches the DOM.
+        _toggle_grouped(cb, False)
         drafted.append((label[:50], "left unchecked" + (f" ({verdict})" if verdict else "")))
 
 
@@ -701,7 +705,7 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
         if not value.strip():
             # Declined (e.g. an EEO dropdown with no decline option) — leave it
             # unset rather than selecting the first option.
-            drafted.append((label, "(left blank)"))
+            _record_blank(drafted, label, el=el, answers=answers)
             return
         try:
             el.select_option(label=value)
@@ -733,7 +737,7 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
             return
         value = answers.answer(label, "textarea")
         if not value.strip():
-            drafted.append((label, "(left blank — review)"))
+            _record_blank(drafted, label, el=el, answers=answers, review=True)
             return
         if value and _already_has_value(el, value):
             return  # already correct (e.g. carried over from a prior step)
@@ -747,7 +751,7 @@ def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]
     if not value.strip():
         # Blank answer (declined, or LLM unavailable) — leave the field empty for
         # review rather than fabricating a value (e.g. a "0" desired salary).
-        drafted.append((label, "(left blank)"))
+        _record_blank(drafted, label, el=el, answers=answers)
         return
     if value and _already_has_value(el, value):
         return  # LinkedIn carried this value forward — skip the redundant re-fill
@@ -797,6 +801,16 @@ def _debug_dump_fields(dialog) -> None:
             print(f"[apply-debug] {f}", flush=True)
     except Exception as e:
         print(f"[apply-debug] field dump failed: {e}", flush=True)
+
+
+def _record_blank(drafted, label: str, *, el=None, answers=None, review: bool = False) -> None:
+    """Record a field left blank, and if it's REQUIRED flag it into
+    answers.unanswered so the run's NEED-REVIEW summary surfaces it (previously
+    only per-field LLM failures were flagged). One place for all the fill paths."""
+    required = bool(el is not None and _is_required(el))
+    drafted.append((label, "(left blank — review)" if (review or required) else "(left blank)"))
+    if required and answers is not None and label not in answers.unanswered:
+        answers.unanswered.append(label)
 
 
 def _is_required(el) -> bool:
@@ -1003,7 +1017,7 @@ def _fill_fieldset(fs, answers: AnswerEngine, drafted: list[tuple[str, str]]) ->
     if not value.strip():
         # Declined (e.g. an EEO question with no "prefer not to say" option) — leave
         # the group unset rather than clicking the first radio.
-        drafted.append((question, "(left blank)"))
+        _record_blank(drafted, question, el=fs, answers=answers)
         return
     _choose_radio(fs, value)
     drafted.append((question, value))

@@ -35,6 +35,15 @@ _EEO_RE = re.compile(
     r"sexual orientation|pronouns?)\b", re.IGNORECASE,
 )
 _DECLINE = "Prefer not to say"
+# One place that recognizes a "decline / prefer not to say" phrasing — used to
+# both detect a declining VALUE and identify a declining OPTION. Kept as a single
+# constant so the three call sites (decline, EEO answer, polarity match) can't
+# drift apart and disagree on what counts as a decline.
+_DECLINE_RE = re.compile(
+    r"prefer not|decline|rather not|choose not|"
+    r"(do not|don.?t|does not|would not|wish not)\s+(wish|want|care|choose)|"
+    r"not\s+(to\s+)?(wish|say|answer|disclose|specify|identif)", re.IGNORECASE,
+)
 
 # Affirmative consent-style yes/no questions.
 _AFFIRM_RE = re.compile(
@@ -59,12 +68,18 @@ def _cache_key(question: str, field_type: str) -> str:
 # headcounts) that a $-less scan wrongly grabbed as salary.
 _MONEY = r"\$\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM]?)"
 _SALARY_RANGE_RE = re.compile(_MONEY + r"\s*(?:[-–—]|to)\s*\$?\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM]?)")
-_SALARY_SINGLE_RE = re.compile(r"\$\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM])")
+_SALARY_SINGLE_RE = re.compile(r"\$\s?(\d{2,3}(?:[,\s]?\d{3})*)\s*([kKmM]?)")
 # Lines about the CANDIDATE's own ask, not the role's posted comp — skip them so
 # we never read back the walk-away/target (which can equal the floor we hide).
 _CANDIDATE_LINE_RE = re.compile(
     r"\b(candidat\w*|seeking|seeks|walk.?away|your (target|minimum|floor)|"
     r"target del candidato)\b", re.IGNORECASE,
+)
+# A line that's actually about compensation — preferred over an incidental $-range
+# elsewhere in the report.
+_COMP_KEYWORD_RE = re.compile(
+    r"\b(comp|compensation|salary|salaries|base pay|base salary|pay|posted|offer|"
+    r"band|range|comp y demanda)\b", re.IGNORECASE,
 )
 
 
@@ -80,34 +95,56 @@ def _to_dollars(digits: str, suffix: str) -> int:
     return int(x)
 
 
+def _comp_from_text(text: str) -> int | None:
+    """A salary figure from a single span of text: the midpoint of a $-range, else
+    a single $-figure (which must carry a K/M suffix, a comma, or be 5+ digits so a
+    stray "$50 fee" isn't read as comp). None if neither is present/plausible."""
+    m = _SALARY_RANGE_RE.search(text)
+    if m:
+        lo_d, lo_s, hi_d, hi_s = m.groups()
+        short = lambda d: bool(re.fullmatch(r"\d{2,3}", d))
+        # A bare 2-3 digit side shares the OTHER side's K/M suffix ("$150-220K" →
+        # both K); a full number ("$220,000") keeps its own scale — never inflated.
+        if not lo_s and short(lo_d):
+            lo_s = hi_s
+        if not hi_s and short(hi_d):
+            hi_s = lo_s
+        lo, hi = _to_dollars(lo_d, lo_s), _to_dollars(hi_d, hi_s)
+        if 30_000 <= lo <= hi <= 1_000_000:
+            return (lo + hi) // 2
+    ms = _SALARY_SINGLE_RE.search(text)
+    if ms and (ms.group(2) or "," in ms.group(1) or len(re.sub(r"\D", "", ms.group(1))) >= 5):
+        v = _to_dollars(*ms.groups())
+        if 30_000 <= v <= 1_000_000:
+            return v
+    return None
+
+
 def salary_from_report(report_text: str) -> int | None:
     """The role's posted comp as researched by career-ops in its evaluation
     report — the midpoint of a $-anchored range, else a single $-figure. Scans
     only $-bearing lines and skips the candidate's own ask, so it returns a
-    'publicly known' market figure and never echoes the walk-away floor. None if
-    no plausible comp is found."""
-    single: int | None = None
+    'publicly known' market figure and never echoes the walk-away floor. A line
+    that explicitly mentions comp wins over an incidental $-range elsewhere. None
+    if no plausible comp is found."""
+    fallback: int | None = None
     for line in (report_text or "").splitlines():
-        if "$" not in line or _CANDIDATE_LINE_RE.search(line):
+        if "$" not in line:
             continue
-        m = _SALARY_RANGE_RE.search(line)
-        if m:
-            lo_d, lo_s, hi_d, hi_s = m.groups()
-            # Share a K/M suffix across the range only when the low number is a
-            # bare 2-3 digit value ("$150-220K" → both K); never rescale a number
-            # that's already full ("$95,000-120K" keeps 95,000 as 95,000).
-            if not lo_s and re.fullmatch(r"\d{2,3}", lo_d):
-                lo_s = hi_s
-            lo, hi = _to_dollars(lo_d, lo_s), _to_dollars(hi_d, hi_s or lo_s)
-            if 30_000 <= lo <= hi <= 1_000_000:
-                return (lo + hi) // 2
-        if single is None:
-            ms = _SALARY_SINGLE_RE.search(line)  # single figure must carry a K/M suffix
-            if ms:
-                v = _to_dollars(*ms.groups())
-                if 30_000 <= v <= 1_000_000:
-                    single = v
-    return single
+        # Drop the candidate's own ask in parentheses ("(candidate seeking $150K)")
+        # so the role comp on the SAME line still survives; skip the line entirely
+        # only if a candidate-ask phrase remains outside parentheses.
+        scan = re.sub(r"\([^)]*\)", " ", line)
+        if "$" not in scan or _CANDIDATE_LINE_RE.search(scan):
+            continue
+        v = _comp_from_text(scan)
+        if v is None:
+            continue
+        if _COMP_KEYWORD_RE.search(scan):   # an explicit comp line wins immediately
+            return v
+        if fallback is None:
+            fallback = v
+    return fallback
 
 
 def thinking_disabled() -> bool:
@@ -172,18 +209,31 @@ def _match_option_strict(answer: str, options: list[str]) -> str | None:
     return None
 
 
+def _polarity_is_negative(text: str) -> bool:
+    """Whether a yes/no self-ID NEGATES the category. Only counts a negation that
+    actually applies to being the category ("not a", "am not", "do not have/identify",
+    a leading "no") — NOT an incidental "no longer"/"not currently"/"no active duty"
+    in an otherwise affirmative value ("I am a veteran, no longer on active duty")."""
+    t = text.lower().strip()
+    if re.match(r"no\b(?!\s+(longer|current))", t):              # "No" / "No, ..."
+        return True
+    return bool(re.search(
+        r"\bnot\b(?!\s+(longer|current|recent|presently))|"
+        r"\b(do|does|did|am|is|are|was|were|have|has)\s+not\b|"
+        r"\b(don|doesn|didn|isn|aren|wasn|weren|haven|hasn|won)'?t\b|"
+        r"\bno\s+(disabilit|veteran|histor|impairment|condition)", t))
+
+
 def _match_polarity(val: str, options: list[str]) -> str | None:
     """For a yes/no self-ID (veteran/disability) whose wording doesn't exactly
     match the form ("I am not a veteran" vs "I am not a protected veteran"), align
     on negation: return the SINGLE non-decline option with the same polarity as the
     stored value. None if ambiguous (more than one candidate) so the caller
     declines rather than guessing."""
-    neg = r"\b(no|not|never|without)\b|n't"
-    decline = r"prefer not|decline|wish|rather not|specify|don.?t answer"
-    val_neg = bool(re.search(neg, val, re.IGNORECASE))
+    val_neg = _polarity_is_negative(val)
     cand = [o for o in options
-            if not re.search(decline, o, re.IGNORECASE)
-            and bool(re.search(neg, o, re.IGNORECASE)) == val_neg]
+            if not _DECLINE_RE.search(o)
+            and _polarity_is_negative(o) == val_neg]
     return cand[0] if len(cand) == 1 else None
 
 
@@ -267,7 +317,8 @@ class AnswerEngine:
         try:
             raw = self._llm(question, field_type, options)
         except Exception:
-            self.unanswered.append(question)
+            if question not in self.unanswered:   # a step re-filled after a validation error re-asks
+                self.unanswered.append(question)
             return self._fallback(field_type, options)
         value = _match_option(raw, options) if options else raw
         self.cache[key] = value
@@ -407,18 +458,20 @@ class AnswerEngine:
         veteran" still aligns to the form's "I am not a protected veteran"."""
         p = self.profile
         binary = False
-        if re.search(r"\b(race|ethnic|hispanic|latino)\b", q):
-            val = p.eeo_race
+        # Router breadth must match the widened _EEO_RE gate (ethnic\w*, latin[oax])
+        # or a question that passed the gate falls through here and wrongly declines.
+        if "disab" in q:
+            val, binary = p.eeo_disability, True
         elif "veteran" in q:
             val, binary = p.eeo_veteran, True
-        elif "disab" in q:
-            val, binary = p.eeo_disability, True
+        elif re.search(r"\b(race|ethnic\w*|hispanic|latin[oax])\b", q):
+            val = p.eeo_race
         elif re.search(r"\b(gender|sex)\b", q) or "pronoun" in q:
             val = p.eeo_gender
         else:
             val = ""
         val = val.strip().strip('"').strip("'").strip()   # tolerate quoted setup values
-        if not val or re.search(r"prefer not|decline|not wish|rather not", val, re.IGNORECASE):
+        if not val or _DECLINE_RE.search(val):
             return self._decline(options)
         if not options:
             return val
@@ -432,7 +485,7 @@ class AnswerEngine:
             return _DECLINE
         # Prefer an explicit decline-style option if one exists.
         for opt in options:
-            if re.search(r"prefer not|decline|not wish|don.?t wish|rather not", opt, re.IGNORECASE):
+            if _DECLINE_RE.search(opt):
                 return opt
         # No decline option: leave it BLANK. Never fall back to options[0] — for a
         # demographic question that would affirm the first value (e.g. "Male"),

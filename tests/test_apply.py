@@ -219,6 +219,35 @@ class TestAnswerEngineDeterministic:
         assert e.answer("Race/Ethnicity", "select",
                         ["Asian", "White", "Prefer not to say"]) == "Prefer not to say"
 
+    def test_eeo_ethnicity_and_latinx_route_to_race(self, tmp_path):
+        # Router breadth must match the widened gate: a lone "Ethnicity" / "Latinx"
+        # question uses eeo_race, not decline.
+        p = ApplyProfile(full_name="X", eeo_race="Asian")
+        e = AnswerEngine(p, tmp_path / "c.json",
+                         caller=lambda s, u: (_ for _ in ()).throw(AssertionError("no LLM")))
+        assert e.answer("Ethnicity", "select", ["Asian", "White", "Prefer not to say"]) == "Asian"
+        assert e.answer("Latinx", "select", ["Asian", "White", "Prefer not to say"]) == "Asian"
+
+    def test_eeo_veteran_with_do_not_want_to_answer_option(self, tmp_path):
+        # The decline option "I do not want to answer" must NOT leak into the
+        # polarity candidate pool and drop a truthful self-ID.
+        p = ApplyProfile(full_name="X", eeo_veteran="I am not a veteran")
+        e = AnswerEngine(p, tmp_path / "c.json",
+                         caller=lambda s, u: (_ for _ in ()).throw(AssertionError("no LLM")))
+        assert e.answer("Veteran status", "select", [
+            "I identify as a protected veteran", "I am not a protected veteran",
+            "I do not want to answer"]) == "I am not a protected veteran"
+
+    def test_eeo_affirmative_with_incidental_negation_not_flipped(self, tmp_path):
+        # An affirmative self-ID containing an incidental "no longer" must map to
+        # the affirming option, never the opposite.
+        p = ApplyProfile(full_name="X", eeo_veteran="I am a veteran, no longer on active duty")
+        e = AnswerEngine(p, tmp_path / "c.json",
+                         caller=lambda s, u: (_ for _ in ()).throw(AssertionError("no LLM")))
+        assert e.answer("Veteran status", "select", [
+            "I am a protected veteran", "I am not a protected veteran"]) == "I am a protected veteran"
+
+
     def test_salary_text_is_negotiable(self, profile, tmp_path):
         # Never reveal the walk-away minimum; a text salary field gets "Negotiable".
         e = self._engine(profile, tmp_path)
@@ -235,6 +264,23 @@ class TestAnswerEngineDeterministic:
         e = self._engine(profile, tmp_path)
         e.role_salary_target = 185000
         assert e.answer("Desired salary", "numeric") == "185000"
+
+
+class TestEEOHelpers:
+    def test_polarity_ignores_incidental_negation(self):
+        from pipeline.apply.answers import _polarity_is_negative
+        assert _polarity_is_negative("I am not a veteran") is True
+        assert _polarity_is_negative("No") is True
+        assert _polarity_is_negative("I am a veteran, no longer on active duty") is False
+        assert _polarity_is_negative("Yes, I have a disability") is False
+
+    def test_decline_regex_covers_common_phrasings_not_real_options(self):
+        from pipeline.apply.answers import _DECLINE_RE
+        for s in ["I prefer not to say", "I do not want to answer", "I don't wish to answer",
+                  "Choose not to disclose", "I decline to self-identify", "I'd rather not say"]:
+            assert _DECLINE_RE.search(s), s
+        for s in ["I am not a protected veteran", "Yes, I have a disability", "Male", "Asian"]:
+            assert not _DECLINE_RE.search(s), s
 
 
 class TestSalaryFromReport:
@@ -262,9 +308,25 @@ class TestSalaryFromReport:
         assert salary_from_report(text) == 170000   # the role line, not the $75K floor
 
     def test_mixed_full_and_k_range_not_inflated(self):
-        # #12: a 'K' suffix must not be borrowed onto an already-full number
+        # a 'K' suffix must not be borrowed onto an already-full number
         # ($95,000 stays $95,000, not $95,000,000 → which used to yield None).
         assert salary_from_report("comp band $95,000-120K") == 107500
+
+    def test_k_low_full_high_not_inflated(self):
+        # the OTHER direction: "$150K-$220,000" must not apply K to 220,000.
+        assert salary_from_report("Base comp $150K-$220,000 per year") == 185000
+
+    def test_role_comp_survives_candidate_parenthetical(self):
+        # The candidate's ask in parens is dropped; the role comp on the same line survives.
+        assert salary_from_report(
+            "Compensation: $160,000-$200,000 (candidate seeking $150K+)") == 180000
+
+    def test_single_full_number_without_suffix(self):
+        assert salary_from_report("Base salary is $180,000 annually.") == 180000
+
+    def test_prefers_comp_keyword_line_over_incidental_range(self):
+        text = "Tooling budget is $50-80K for the team.\nSalary range: $150K-$170K."
+        assert salary_from_report(text) == 160000   # the comp line wins, not the $50-80K
 
 
 class TestAnswerEngineCache:
@@ -355,6 +417,15 @@ class TestConsentSetDetection:
         assert _looks_like_consent_set(["1 Week", "2 Weeks", "3 Months"]) is False
         assert _looks_like_consent_set(
             ["Automation workflows", "AI/LLM-powered internal tools"]) is False
+
+    def test_long_single_choice_is_not_a_consent_set(self):
+        # A single-choice question with long labels (one containing "agree to") must
+        # NOT be split into independent consents — it goes to answer_multi (picks one),
+        # never auto-checks the affirmative pole as a commitment never made.
+        from pipeline.apply.linkedin import _looks_like_consent_set
+        assert _looks_like_consent_set([
+            "Yes, I agree to relocate to the Dallas-Fort Worth metroplex within 30 days of an offer",
+            "No, I am not able to relocate and would require a fully remote arrangement"]) is False
 
 
 class TestAnswerMulti:
