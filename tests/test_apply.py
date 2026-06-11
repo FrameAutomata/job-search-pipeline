@@ -245,6 +245,30 @@ class TestAnswerEngineCache:
         ]
 
 
+class TestTailoredResume:
+    """_find_tailored_resume must not mistake a cover letter for a resume."""
+
+    def test_skips_cover_letter_pdf(self, tmp_path, monkeypatch):
+        from pipeline.apply import _find_tailored_resume
+        monkeypatch.delenv("APPLY_TAILORED_DIR", raising=False)
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "Parloa - cover.pdf").write_bytes(b"%PDF cover")
+        job = queue.ApplyJob(num="1", company="Parloa", role="Eng", url="u", score=4.0)
+        assert _find_tailored_resume(tmp_path, job) is None  # cover != resume
+
+    def test_finds_real_tailored_resume(self, tmp_path, monkeypatch):
+        from pipeline.apply import _find_tailored_resume
+        monkeypatch.delenv("APPLY_TAILORED_DIR", raising=False)
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "Parloa - cover.pdf").write_bytes(b"%PDF cover")
+        (out / "Parloa - resume.pdf").write_bytes(b"%PDF resume")
+        job = queue.ApplyJob(num="1", company="Parloa", role="Eng", url="u", score=4.0)
+        p = _find_tailored_resume(tmp_path, job)
+        assert p is not None and "resume" in p.name.lower()
+
+
 class TestAnswerMulti:
     """Checkbox-group answering: one option for single-choice, several for
     multi-select, none when nothing applies — the model decides how many."""

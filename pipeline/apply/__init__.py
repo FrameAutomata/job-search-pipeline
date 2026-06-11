@@ -177,8 +177,11 @@ def _find_tailored_resume(career_ops: Path, job) -> Path | None:
     slug = re.sub(r"[^a-z0-9]+", "", (job.company or "").lower())
     if not slug:
         return None
+    # Exclude cover letters: "<Company> - cover.pdf" also contains the company
+    # slug, so without this guard the cover letter gets uploaded as the resume.
     matches = [p for p in tdir.glob("*.pdf")
-               if slug in re.sub(r"[^a-z0-9]+", "", p.stem.lower())]
+               if slug in re.sub(r"[^a-z0-9]+", "", p.stem.lower())
+               and not re.search(r"cover|letter", p.stem.lower())]
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
 
 
