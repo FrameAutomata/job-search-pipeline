@@ -332,9 +332,16 @@ def push_status() -> JSONResponse:
     # {num: status} (what edit-tracker.yml consumes).
     base_text, cloud_payload, unresolved = data.resolve_overrides_for_push(base_text, overrides)
 
-    # Persist the merged tracker back to where we read it.
-    target_apps.parent.mkdir(parents=True, exist_ok=True)
-    target_apps.write_text(base_text, encoding="utf-8")
+    # Persist the merged tracker ONLY to the durable local tracker. A downloaded
+    # artifact copy is transient (re-downloaded on every Refresh), and editing it
+    # makes the pushed-override bridge self-clean against a copy push itself
+    # changed — so the status would appear to vanish on the next Refresh. For the
+    # refreshed case the pushed-override overlay shows the change in the UI and
+    # persists it until a genuinely fresh pipeline run incorporates it (which is
+    # when the self-clean SHOULD fire). The cloud write goes via edit-tracker below.
+    if base_source == "local":
+        target_apps.parent.mkdir(parents=True, exist_ok=True)
+        target_apps.write_text(base_text, encoding="utf-8")
 
     # Dispatch edit-tracker with only the resolved overrides — avoids GitHub's
     # workflow_dispatch input size limit that the full base64 tracker can exceed.
