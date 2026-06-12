@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 from pipeline.app import data as _data
-from pipeline._batch_common import atomic_write_text, read_text
+from pipeline._batch_common import atomic_write_text, normalize_company, read_text
 from pipeline.apply import browser, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
@@ -227,7 +227,7 @@ def _find_tailored_resume(career_ops: Path, job) -> Path | None:
     tdir = Path(base) if base else career_ops / "output"
     if not tdir.exists():
         return None
-    slug = re.sub(r"[^a-z0-9]+", "", (job.company or "").lower())
+    slug = normalize_company(job.company)
     if not slug:
         return None
     # Exclude cover letters: "<Company> - cover.pdf" also contains the company

@@ -22,17 +22,33 @@ import threading
 import time
 from pathlib import Path
 
-from pipeline._batch_common import pid_alive as _pid_alive
+from pipeline._batch_common import (
+    env_float,
+    pid_alive as _pid_alive,
+    process_lock_active,
+    read_process_lock,
+    write_process_lock,
+)
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 LOG_PATH = ROOT / ".ui-cache" / "local-run.log"
-# Records the orchestrate child's pid so single-flight survives a server
-# restart: the orphaned run keeps going (its stdout is a file), and a fresh
-# server — whose in-memory _state is empty — would otherwise report
-# not-running and let the user launch a SECOND concurrent full pipeline that
-# corrupts shared state. The pid file lets is_running()/start() detect and
-# refuse (or, on cancel, kill) the orphan.
+# Records the orchestrate child's pid (via the shared _batch_common lock format:
+# "pid timestamp") so single-flight survives a server restart: the orphaned run
+# keeps going (its stdout is a file), and a fresh server — whose in-memory
+# _state is empty — would otherwise report not-running and let the user launch a
+# SECOND concurrent full pipeline that corrupts shared state. The lock lets
+# is_running()/start() detect and refuse (or, on cancel, kill) the orphan, and
+# the timestamp makes it self-heal: a recycled-pid lock that has gone un-touched
+# past LOCAL_RUN_LOCK_MAX_AGE is reclaimed instead of wedging forever.
 PID_PATH = ROOT / ".ui-cache" / "local-run.pid"
+
+
+def _lock_max_age() -> float:
+    """Generous (LOCAL_RUN_LOCK_MAX_AGE env, default 6h). After a server restart
+    the orphan child can't heartbeat, so its timestamp freezes; the cap must
+    exceed the longest expected pipeline run so a genuine orphan isn't reclaimed
+    out from under itself — while still bounding a recycled-pid lockout to 6h."""
+    return env_float("LOCAL_RUN_LOCK_MAX_AGE", 6 * 3600)
 
 # Stage markers orchestrate's stages print, in pipeline order — used to report
 # coarse progress without any orchestrate-side changes.
@@ -102,22 +118,10 @@ def _child_env(snapshot: dict | None = None) -> dict:
     return env
 
 
-def _read_pid_file() -> int:
-    try:
-        return int(PID_PATH.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return 0
-
-
-def _write_pid_file(pid: int) -> None:
-    try:
-        PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PID_PATH.write_text(str(pid), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _clear_pid_file() -> None:
+    # The holder recorded in the file is the orchestrate CHILD, not us, so we
+    # unlink directly rather than via release_process_lock (which guards on our
+    # own pid).
     try:
         PID_PATH.unlink(missing_ok=True)
     except OSError:
@@ -126,11 +130,12 @@ def _clear_pid_file() -> None:
 
 def is_running() -> bool:
     """True while a run is in flight — whether we launched it (live Popen) or
-    it's an orphan from a previous server lifetime (live pid in the pid file)."""
+    it's an orphan from a previous server lifetime (a live, non-stale child pid
+    recorded in the lock file)."""
     proc = _state.get("proc")
     if proc is not None:
         return proc.poll() is None
-    return _pid_alive(_read_pid_file())
+    return process_lock_active(PID_PATH, max_age=_lock_max_age())
 
 
 def start(options: dict | None = None) -> dict:
@@ -160,7 +165,7 @@ def start(options: dict | None = None) -> dict:
         _state.clear()
         _state.update(proc=proc, started_at=time.time(), options=options, cmd=cmd,
                       stages_seen=[], log_offset=0, log_carry="")
-        _write_pid_file(proc.pid)
+        write_process_lock(PID_PATH, proc.pid)   # record the child as the holder
     return status()
 
 
@@ -177,8 +182,8 @@ def cancel() -> dict:
             except subprocess.TimeoutExpired:
                 proc.kill()
         else:
-            orphan = _read_pid_file()
-            if _pid_alive(orphan):
+            orphan, _ = read_process_lock(PID_PATH)
+            if orphan and _pid_alive(orphan):
                 try:
                     os.kill(orphan, signal.SIGTERM)
                 except OSError:
@@ -231,6 +236,22 @@ def _read_tail(tail_lines: int, max_bytes: int = 16384) -> str:
     return "\n".join(raw.decode("utf-8", errors="replace").splitlines()[-tail_lines:])
 
 
+def _idle_status() -> dict:
+    """Nothing is running and nothing ran this session — don't parse a leftover
+    log into a phantom finished run."""
+    return {
+        "running": False,
+        "started_at": _state.get("started_at"),
+        "cmd": _state.get("cmd"),
+        "stage": None,
+        "stages": STAGES,
+        "stages_seen": [],
+        "exit_code": None,
+        "ok": None,
+        "log_tail": "",
+    }
+
+
 def status(tail_lines: int = 30) -> dict:
     """Current run state: stage progress parsed from the log's [stage] markers,
     a log tail for display, and the exit code once finished. Takes _lock so a
@@ -241,13 +262,21 @@ def status(tail_lines: int = 30) -> dict:
             code = proc.poll()
             running = code is None
             exit_code = None if running else code
+            if running:
+                write_process_lock(PID_PATH, proc.pid)   # heartbeat while we own it
+            else:
+                _clear_pid_file()
         else:
-            # No handle this lifetime: an orphan (live pid) reads as running but
-            # its exit code is unknowable; otherwise nothing has run.
-            running = _pid_alive(_read_pid_file())
+            # No handle this lifetime: an orphan (a live, non-stale child pid)
+            # reads as running but its exit code is unknowable. Otherwise nothing
+            # is running — and we must NOT scan the leftover log, or a brand-new
+            # server would report a previous lifetime's run as a phantom finished
+            # one (it never launched it).
+            running = process_lock_active(PID_PATH, max_age=_lock_max_age())
             exit_code = None
-        if not running:
-            _clear_pid_file()
+            if not running:
+                _clear_pid_file()
+                return _idle_status()
         seen = _scan_log_for_stages()
         return {
             "running": running,

@@ -326,6 +326,21 @@ class TestTransientProviderErrors:
     def test_connection_refused_is_not_transient(self):
         assert _is_transient_provider_error(Exception("Connection refused")) is False
 
+    def test_server_disconnect_is_transient(self):
+        # #2 regression: a mid-run server disconnect — openai's APIConnectionError
+        # (str 'Connection error.', no status) whose __cause__ is a transient
+        # protocol error — must retry/fail over, NOT fail the job on attempt 1.
+        # Distinct from a dead port (cause 'All connection attempts failed'),
+        # which stays non-transient (test_dead_port_connection_error_is_not_transient).
+        exc = Exception("Connection error.")
+        exc.__cause__ = Exception("Server disconnected without sending a response.")
+        assert _is_transient_provider_error(exc) is True
+
+    def test_bare_connection_error_is_transient(self):
+        # A generic 'Connection error.' with no dead-host cause is a transient
+        # blip, not a config error.
+        assert _is_transient_provider_error(Exception("Connection error.")) is True
+
     def test_400_bad_request_is_not_transient(self):
         class BadReq(Exception):
             status_code = 400

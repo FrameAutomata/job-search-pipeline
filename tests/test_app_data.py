@@ -377,6 +377,49 @@ class TestResolveNumByIdentity:
         assert data.resolve_num_by_identity(self.APPS, "Initech", "QA") is None
 
 
+class TestResolveOverridesForPush:
+    """#1: building the push payload. An identity-anchored override that DOESN'T
+    resolve in the base tracker must NOT fall back to its (foreign) num and mark
+    a different company — and must be reported unresolved so the caller doesn't
+    clear it (losing the real pending Applied forever)."""
+
+    # num 5 is Globex here — an Acme identity override keyed by '5' must not
+    # touch this row.
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 3 | 2026-06-01 | Acme | Engineer | 4.2/5 | Evaluated | ❌ | [003](reports/003.md) | a |\n"
+        "| 5 | 2026-06-01 | Globex | Dev | 4.5/5 | Evaluated | ❌ | [005](reports/005.md) | b |\n"
+    )
+
+    def test_unresolved_identity_is_not_applied_or_dispatched(self):
+        base_no_acme = (
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 5 | 2026-06-01 | Globex | Dev | 4.5/5 | Evaluated | ❌ | [005](reports/005.md) | b |\n"
+        )
+        overrides = {"5": {"status": "Applied", "company": "Acme", "role": "Engineer"}}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(base_no_acme, overrides)
+        assert cloud_payload == {}            # nothing dispatched to the cloud
+        assert unresolved == ["5"]            # flagged so the caller won't clear it
+        assert new_text == base_no_acme       # Globex (num 5) left untouched
+
+    def test_resolved_identity_marks_correct_row(self):
+        overrides = {"99": {"status": "Applied", "company": "Acme", "role": "Engineer"}}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(self.APPS, overrides)
+        assert cloud_payload == {"3": "Applied"}     # resolved to Acme's real num
+        assert unresolved == []
+        assert "| Applied |" in new_text and "Acme" in new_text
+
+    def test_plain_override_applied_by_num(self):
+        overrides = {"5": "SKIP"}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(self.APPS, overrides)
+        assert cloud_payload == {"5": "SKIP"}
+        assert unresolved == []
+
+
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):
         f = tmp_path / "r.md"

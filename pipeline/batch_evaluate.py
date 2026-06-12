@@ -47,6 +47,7 @@ from typing import Callable
 
 from pipeline._batch_common import (
     MAX_TOKENS,
+    acquire_process_lock,
     assign_job_numbers,
     atomic_write_text,
     build_system_prompt,
@@ -58,6 +59,9 @@ from pipeline._batch_common import (
     max_report_num,
     max_tracker_num,
     pid_alive,
+    read_process_lock,
+    refresh_process_lock,
+    release_process_lock,
     read_text,
     run_merge_tracker,
     write_job_result,
@@ -140,8 +144,13 @@ _TRANSIENT_SERVER_MARKERS = (
     "overloaded",
     "timed out",
     "timeout",
+    # A bare "connection error" (openai's APIConnectionError) is a transient
+    # blip by default — a dead host/port is caught FIRST by _CONFIG_ERROR_MARKERS
+    # (checked against __cause__), so this only retries genuine disconnects.
+    "connection error",
     "connection reset",
     "connection aborted",
+    "server disconnected",
     "temporarily unavailable",
     # Our own callers raise "<provider> returned empty content" when a model
     # answers 200 with an empty body — a degraded endpoint, or a reasoning
@@ -196,9 +205,11 @@ def _llm_timeout() -> float:
 
 def _llm_job_budget() -> float:
     """Per-job wall-clock budget in seconds (LLM_JOB_BUDGET env, default 600).
-    Caps how long _call_with_retry will keep re-attempting the (already
-    failover-aware) caller, so a provider-wide outage fails a job in minutes
-    instead of 6 attempts x chain-width x per-call timeout (~tens of minutes)."""
+    Bounds how long _call_with_retry keeps STARTING new attempts: once the next
+    backoff would cross the deadline it gives up. It cannot interrupt a call
+    already in flight, so the true worst case is budget + one more caller
+    invocation (a failover chain = chain-width x per-call timeout). Still far
+    better than the un-budgeted 6 attempts x chain-width x timeout."""
     return env_float("LLM_JOB_BUDGET", 600.0)
 
 
@@ -576,59 +587,12 @@ def _process_one(
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
-# The eval lock stores "pid timestamp". The timestamp bounds the damage from
-# pid REUSE: Ctrl-C exits via os._exit and the UI cancel via TerminateProcess,
-# both of which skip run()'s finally, so a stale lock is the COMMON exit
-# artifact — and if the OS later recycles that dead pid to an unrelated live
-# process, _pid_alive would vouch for it and refuse every future run forever.
-# Reclaiming any lock older than this makes that self-heal. Longer than any sane
-# run, short enough to recover within a working session.
-_EVAL_LOCK_MAX_AGE = 6 * 3600
-
-
-def _read_eval_lock(path: Path) -> tuple[int, float]:
-    """(pid, timestamp) from the lock file; (0, 0.0) when absent/unreadable."""
-    try:
-        parts = path.read_text(encoding="utf-8").split()
-        return int(parts[0]), (float(parts[1]) if len(parts) > 1 else 0.0)
-    except (OSError, ValueError, IndexError):
-        return 0, 0.0
-
-
-def _eval_lock_takeable(path: Path) -> bool:
-    """True when no LIVE holder owns the lock — free, our own, a dead pid, or
-    older than _EVAL_LOCK_MAX_AGE (the pid-reuse safety valve)."""
-    pid, ts = _read_eval_lock(path)
-    if pid in (0, os.getpid()):
-        return True
-    if not _pid_alive(pid):
-        return True
-    return bool(ts) and (time.time() - ts) > _EVAL_LOCK_MAX_AGE
-
-
-def _acquire_eval_lock(path: Path) -> bool:
-    """Atomically take the eval lock. O_CREAT|O_EXCL makes the create-if-absent
-    atomic, so two simultaneous starts can't both pass a read-then-write check
-    (the old TOCTOU). Returns False when a live holder owns it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = f"{os.getpid()} {time.time()}".encode("utf-8")
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            if not _eval_lock_takeable(path):
-                return False
-            try:
-                path.unlink()       # reclaim a dead/stale lock, then retry O_EXCL
-            except OSError:
-                pass
-            continue
-        try:
-            os.write(fd, payload)
-        finally:
-            os.close(fd)
-        return True
-    return False
+def _eval_lock_max_age() -> float:
+    """How long a lock may go un-heartbeated before another run may reclaim it
+    (EVAL_LOCK_MAX_AGE env, default 30 min). The holder refreshes its timestamp
+    after every job, so a genuine live run never approaches this — it's the
+    pid-reuse safety valve, not a run-length cap."""
+    return env_float("EVAL_LOCK_MAX_AGE", 1800.0)
 
 
 def run(
@@ -642,12 +606,12 @@ def run(
 
     Single-flight across processes: two concurrent evaluations (e.g. a
     forgotten background run plus a fresh one — a live incident) contend on the
-    same state file and double-hit the provider. An atomic pid+timestamp lock
-    refuses the second run loudly; a lock whose pid is dead (crash, os._exit on
-    Ctrl-C) or stale is reclaimed automatically."""
+    same state file and double-hit the provider. The shared atomic pid+timestamp
+    lock refuses the second run loudly; a lock whose pid is dead (crash, os._exit
+    on Ctrl-C) or whose heartbeat went stale is reclaimed automatically."""
     lock_path = Path(career_ops) / "batch" / ".eval-lock"
-    if not _acquire_eval_lock(lock_path):
-        pid, _ = _read_eval_lock(lock_path)
+    if not acquire_process_lock(lock_path, max_age=_eval_lock_max_age()):
+        pid, _ = read_process_lock(lock_path)
         print(f"[batch-eval] REFUSED: another evaluation (pid {pid}) is already "
               "running — wait for it to finish or kill it first (concurrent runs "
               "corrupt shared state). Nothing was evaluated this run.",
@@ -656,11 +620,9 @@ def run(
     try:
         return _run_eval(career_ops, provider, model, concurrency, dry_run)
     finally:
-        # Release only if we still hold it — a stale-takeover by another process
-        # may have replaced our pid, and we must not delete its lock.
-        pid, _ = _read_eval_lock(lock_path)
-        if pid == os.getpid():
-            lock_path.unlink(missing_ok=True)
+        # Releases only if we still own it (release_process_lock guards against
+        # deleting a lock a stale-takeover handed to another process).
+        release_process_lock(lock_path)
 
 
 def _run_eval(
@@ -795,6 +757,19 @@ def _run_eval(
     except (ValueError, OSError):
         old_sigint = None
 
+    lock_path = career_ops / "batch" / ".eval-lock"
+    # Heartbeat the lock often enough that even a single slow job (up to the
+    # per-job budget) can't let it look stale to a would-be reclaimer. Throttle
+    # the state flush: the in-memory state is updated per job under state_lock,
+    # but re-serializing the whole growing dict on EVERY job is O(N^2); flushing
+    # at most every FLUSH_S keeps it O(N). The interrupt handler and the final
+    # write below always persist the current state, so a clean exit never loses
+    # a result; only a hard-kill (SIGKILL/power loss) re-runs the <FLUSH_S of
+    # jobs completed since the last flush (numbering stays correct — it's scanned
+    # from the reports dir, not just state).
+    HEARTBEAT_S, FLUSH_S = 5.0, 2.0
+    last_heartbeat = last_flush = time.monotonic()
+
     try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
@@ -819,6 +794,10 @@ def _run_eval(
                     done, remaining = wait(remaining, timeout=0.5, return_when=FIRST_COMPLETED)
                 except KeyboardInterrupt:
                     _save_and_exit()
+                now = time.monotonic()
+                if now - last_heartbeat >= HEARTBEAT_S:
+                    refresh_process_lock(lock_path)
+                    last_heartbeat = now
                 for future in done:
                     meta = futures[future]
                     success, jid, err_msg = future.result()
@@ -830,10 +809,12 @@ def _run_eval(
                     else:
                         print(f"  [{jid}] FAILED: {err_msg}")
                         failed += 1
+                if done and now - last_flush >= FLUSH_S:
                     # Atomic snapshot+write under the lock so concurrent writers
                     # can't interleave or leave a partially-written file.
                     with state_lock:
                         atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
+                    last_flush = now
     finally:
         if old_sigint is not None:
             try:

@@ -211,17 +211,29 @@ def list_jobs() -> JSONResponse:
     # identity-anchored one (from apply, whose num may be from a different
     # tracker) lands on the row matching its company/role — so it marks the row
     # actually applied to, not whichever row coincidentally shares the num.
+    #
+    # Prebuild O(1) lookups so the overlay is O(rows + overrides), not
+    # O(rows x overrides): identity anchors are keyed by (norm_company, norm_role),
+    # with a company-only anchor under (norm_company, "").
     overrides = _load_overrides()
     if overrides:
+        by_num: dict[str, str] = {}
+        by_identity: dict[tuple[str, str], str] = {}
+        for key, value in overrides.items():
+            ident = data.override_identity(value)
+            if ident:
+                company, role = ident
+                by_identity[(data.normalize_company(company),
+                             data.normalize_company(role))] = data.override_status(value)
+            else:
+                by_num[key] = data.override_status(value)
         for row in rows:
-            num = str(row.get("num"))
-            raw = overrides.get(num)
-            value = raw if (raw is not None and data.override_identity(raw) is None) else None
-            if value is None:
-                value = next((v for v in overrides.values()
-                              if data.override_matches_row(v, row)), None)
-            if value is not None:
-                status = data.override_status(value)
+            status = by_num.get(str(row.get("num")))
+            if status is None:
+                nc = data.normalize_company(row.get("company", ""))
+                status = (by_identity.get((nc, data.normalize_company(row.get("role", ""))))
+                          or by_identity.get((nc, "")))
+            if status is not None:
                 row["status"] = status
                 row["status_canonical"] = data.canonical_status(status)
                 row["pending"] = True
@@ -296,20 +308,13 @@ def push_status() -> JSONResponse:
         base_text = apps.read_text(encoding="utf-8")
         target_apps = apps
 
-    # Apply the overrides onto the base (line-level, minimal diff), resolving
-    # each identity-anchored override to the correct num IN THIS base. The cloud
-    # payload is always {num: status} (what edit-tracker.yml consumes).
-    cloud_payload: dict[str, str] = {}
-    for key, value in overrides.items():
-        status = data.override_status(value)
-        identity = data.override_identity(value)
-        num = key
-        if identity:
-            resolved = data.resolve_num_by_identity(base_text, *identity)
-            if resolved:
-                num = resolved
-        base_text = data.set_status_in_text(base_text, num, status)
-        cloud_payload[num] = status
+    # Apply the overrides onto the base, resolving each identity-anchored
+    # override to the correct num IN THIS base. An identity override that
+    # doesn't resolve here (its company isn't in this tracker yet) is returned
+    # in `unresolved` — NOT applied and NOT dispatched, so we never mark a
+    # different company that merely shares the num. The cloud payload is always
+    # {num: status} (what edit-tracker.yml consumes).
+    base_text, cloud_payload, unresolved = data.resolve_overrides_for_push(base_text, overrides)
 
     # Persist the merged tracker back to where we read it.
     target_apps.parent.mkdir(parents=True, exist_ok=True)
@@ -317,20 +322,24 @@ def push_status() -> JSONResponse:
 
     # Dispatch edit-tracker with only the resolved overrides — avoids GitHub's
     # workflow_dispatch input size limit that the full base64 tracker can exceed.
-    try:
-        gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(cloud_payload)})
-    except gh.GhError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    # Clear ONLY the keys we pushed (re-reading under the lock) so an apply
-    # auto-submit recorded during the gh round-trip isn't silently dropped.
-    data.clear_status_overrides(list(overrides.keys()))
-    # Persist dispatched overrides so they survive Refresh and restarts until
-    # the pipeline produces a new artifact that already has the correct statuses.
-    pushed = _load_pushed_overrides()
-    pushed.update(cloud_payload)
-    _save_pushed_overrides(pushed)
-    return JSONResponse({"ok": True, "pushed": len(cloud_payload), "base": base_source})
+    # Nothing resolved → nothing to push (don't fire an empty workflow run).
+    if cloud_payload:
+        try:
+            gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(cloud_payload)})
+        except gh.GhError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        # Clear ONLY the keys we pushed (re-reading under the lock) so an apply
+        # auto-submit recorded during the gh round-trip — and any identity
+        # override that DIDN'T resolve — isn't silently dropped.
+        pushed_keys = [k for k in overrides if k not in unresolved]
+        data.clear_status_overrides(pushed_keys)
+        # Persist dispatched overrides so they survive Refresh and restarts until
+        # the pipeline produces a new artifact that already has the correct statuses.
+        pushed = _load_pushed_overrides()
+        pushed.update(cloud_payload)
+        _save_pushed_overrides(pushed)
+    return JSONResponse({"ok": True, "pushed": len(cloud_payload),
+                         "unresolved": len(unresolved), "base": base_source})
 
 
 @app.get("/api/reports/{report_num}", response_class=HTMLResponse)

@@ -73,6 +73,19 @@ def fake_popen(tmp_path, monkeypatch):
     local_run._state.clear()
 
 
+@pytest.fixture
+def isolate_local_run(tmp_path, monkeypatch):
+    """Redirect the log + pid paths and reset module state WITHOUT patching
+    subprocess.Popen — so the orphan tests can spawn a real, genuinely-live
+    child to act as the lock holder (fake_popen would replace Popen globally and
+    hand back a dead FakeProc)."""
+    monkeypatch.setattr(local_run, "LOG_PATH", tmp_path / "local-run.log")
+    monkeypatch.setattr(local_run, "PID_PATH", tmp_path / "local-run.pid")
+    local_run._state.clear()
+    yield
+    local_run._state.clear()
+
+
 class TestChildEnv:
     """The child (orchestrate.py) runs its own load_dotenv(override=False), so
     _child_env strips the server's STARTUP .env values and lets the child reload
@@ -192,25 +205,60 @@ class TestOrphanGuard:
     otherwise let a SECOND concurrent full pipeline corrupt shared state. The
     pid file lets is_running()/start() detect and refuse the orphan."""
 
-    def test_status_reports_orphan_running(self, fake_popen, tmp_path, monkeypatch):
-        local_run._state.clear()                     # as if the server just restarted
-        (tmp_path / "local-run.pid").write_text("4242", encoding="utf-8")
-        monkeypatch.setattr(local_run, "_pid_alive", lambda pid: pid == 4242)
-        s = local_run.status()
-        assert s["running"] is True and s["exit_code"] is None
+    @staticmethod
+    def _write_lock(tmp_path, pid, age=0.0):
+        import time
+        (tmp_path / "local-run.pid").write_text(
+            f"{pid} {time.time() - age}", encoding="utf-8")
 
-    def test_start_refuses_when_orphan_alive(self, fake_popen, tmp_path, monkeypatch):
-        local_run._state.clear()
-        (tmp_path / "local-run.pid").write_text("4242", encoding="utf-8")
-        monkeypatch.setattr(local_run, "_pid_alive", lambda pid: pid == 4242)
-        with pytest.raises(RuntimeError):
-            local_run.start({})
+    def test_status_reports_orphan_running(self, isolate_local_run, tmp_path):
+        import subprocess, sys
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self._write_lock(tmp_path, child.pid)    # live child, fresh timestamp
+            s = local_run.status()
+            assert s["running"] is True and s["exit_code"] is None
+        finally:
+            child.kill()
 
-    def test_dead_orphan_is_not_running(self, fake_popen, tmp_path, monkeypatch):
-        local_run._state.clear()
-        (tmp_path / "local-run.pid").write_text("4242", encoding="utf-8")
-        monkeypatch.setattr(local_run, "_pid_alive", lambda pid: False)
+    def test_start_refuses_when_orphan_alive(self, isolate_local_run, tmp_path):
+        import subprocess, sys
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self._write_lock(tmp_path, child.pid)
+            with pytest.raises(RuntimeError):
+                local_run.start({})
+        finally:
+            child.kill()
+
+    def test_dead_orphan_is_not_running(self, isolate_local_run, tmp_path):
+        import subprocess, sys
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self._write_lock(tmp_path, dead.pid)
         assert local_run.is_running() is False
+
+    def test_stale_orphan_lock_is_reclaimed(self, isolate_local_run, tmp_path):
+        # #3: a live but un-heartbeated lock older than max_age (a recycled pid)
+        # must NOT wedge single-flight forever — is_running() reads it as free.
+        import subprocess, sys
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self._write_lock(tmp_path, child.pid, age=10 * 3600)   # 10h stale
+            assert local_run.is_running() is False                 # reclaimable
+        finally:
+            child.kill()
+
+    def test_fresh_server_ignores_stale_log(self, isolate_local_run, tmp_path):
+        # #8: a brand-new server (empty _state, no live pid) must NOT parse the
+        # leftover local-run.log from a previous lifetime and report a phantom
+        # finished run's stages before anything has been launched.
+        (tmp_path / "local-run.log").write_text(
+            "[scrape] a\n[filter] b\n[batch-eval] c\n", encoding="utf-8")
+        s = local_run.status()
+        assert s["running"] is False
+        assert s["stage"] is None
+        assert s["stages_seen"] == []
 
 
 class TestAddJobGuard:

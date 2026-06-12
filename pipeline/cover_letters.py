@@ -18,7 +18,7 @@ import os
 import re
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text, read_text
+from pipeline._batch_common import atomic_write_text, normalize_company, read_text
 from pipeline.apply import queue
 from pipeline.apply.profile import ApplyProfile
 
@@ -146,14 +146,14 @@ def find_existing(career_ops: Path, company: str) -> str:
     filename contains the company slug and 'cover'. Most recent wins."""
     base = os.environ.get("APPLY_COVER_DIR")
     cdir = Path(base) if base else Path(career_ops) / "output"
-    slug = re.sub(r"[^a-z0-9]+", "", (company or "").lower())
+    slug = normalize_company(company)
     if not cdir.exists() or not slug:
         return ""
     matches = []
     for p in cdir.glob("*"):
         if p.suffix.lower() not in (".txt", ".md"):
             continue
-        name = re.sub(r"[^a-z0-9]+", "", p.stem.lower())
+        name = normalize_company(p.stem)
         if slug in name and "cover" in name:
             matches.append(p)
     if not matches:

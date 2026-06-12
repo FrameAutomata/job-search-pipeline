@@ -10,7 +10,7 @@ import re
 import threading
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text
+from pipeline._batch_common import atomic_write_text, normalize_company
 
 # The UI's pending-status-changes channel: {row key: status-or-record}. Kanban
 # drags and the apply stage's auto-submits both write here; /api/jobs overlays
@@ -98,10 +98,10 @@ def override_matches_row(value, row: dict) -> bool:
     if not identity:
         return False
     company, role = identity
-    if _norm_identity(row.get("company", "")) != _norm_identity(company):
+    if normalize_company(row.get("company", "")) != normalize_company(company):
         return False
-    want_role = _norm_identity(role)
-    return not want_role or _norm_identity(row.get("role", "")) == want_role
+    want_role = normalize_company(role)
+    return not want_role or normalize_company(row.get("role", "")) == want_role
 
 
 def record_status_override(num: str, status: str, path: Path | None = None,
@@ -128,22 +128,16 @@ def record_status_override(num: str, status: str, path: Path | None = None,
         pass
 
 
-def _norm_identity(s: str) -> str:
-    """Normalize a company/role for identity matching (mirrors merge-tracker's
-    normalizeCompany: lowercase, strip everything non-alphanumeric)."""
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
-
-
 def resolve_num_by_identity(applications_md_text: str, company: str, role: str) -> str | None:
     """Find the tracker row matching company (+ role when given) and return its
     num. Used to re-anchor an identity-carrying override onto the correct row of
     whatever tracker it's being applied to. Matches on the first four cells
     (num, date, company, role), which are stable even when a stray pipe in the
     role shifts later columns. Returns None when no row matches."""
-    want_company = _norm_identity(company)
+    want_company = normalize_company(company)
     if not want_company:
         return None
-    want_role = _norm_identity(role)
+    want_role = normalize_company(role)
     for line in applications_md_text.splitlines():
         if not line.lstrip().startswith("|"):
             continue
@@ -154,11 +148,42 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str) 
             continue
         if cells[0].lower() in ("#", "num"):
             continue
-        if _norm_identity(cells[2]) == want_company and (
-            not want_role or _norm_identity(cells[3]) == want_role
+        if normalize_company(cells[2]) == want_company and (
+            not want_role or normalize_company(cells[3]) == want_role
         ):
             return cells[0].strip()
     return None
+
+
+def resolve_overrides_for_push(applications_md_text: str, overrides: dict):
+    """Build the cloud push payload from the pending overrides, applied onto the
+    base tracker.
+
+    Returns (new_text, cloud_payload, unresolved):
+      - new_text: the base with each applied override's Status cell rewritten.
+      - cloud_payload: {num: status} for edit-tracker.yml (always num-keyed).
+      - unresolved: keys of identity-anchored overrides whose company/role isn't
+        in THIS base. Those are NOT applied and NOT dispatched — falling back to
+        the (foreign) num would mark a different company that merely shares it,
+        and the caller must keep (not clear) them so they reach the right row on
+        a later push once the company appears.
+    """
+    new_text = applications_md_text
+    cloud_payload: dict[str, str] = {}
+    unresolved: list[str] = []
+    for key, value in overrides.items():
+        status = override_status(value)
+        identity = override_identity(value)
+        if identity:
+            num = resolve_num_by_identity(new_text, *identity)
+            if num is None:
+                unresolved.append(key)
+                continue
+        else:
+            num = key
+        new_text = set_status_in_text(new_text, num, status)
+        cloud_payload[num] = status
+    return new_text, cloud_payload, unresolved
 
 
 # Canonical applications.md statuses (mirror of career-ops templates/states.yml
