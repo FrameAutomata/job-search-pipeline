@@ -316,6 +316,75 @@ class TestTransientProviderErrors:
         assert len(calls) == 2
 
 
+class TestClientHardening:
+    """Live incident: a hung endpoint + the SDK's 600s default timeout and 2
+    hidden internal retries froze a 16-worker run for hours with zero output."""
+
+    def test_openai_client_gets_timeout_and_no_sdk_retries(self, monkeypatch):
+        import types
+        captured = {}
+        def fake_openai(**kw):
+            captured.update(kw)
+            return types.SimpleNamespace(chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=lambda **k: None)))
+        monkeypatch.setattr("openai.OpenAI", fake_openai)
+        from pipeline.batch_evaluate import _build_openai_compat_caller
+        _build_openai_compat_caller("m", "key", base_url="https://x/v1")
+        assert captured["timeout"] == 180.0
+        assert captured["max_retries"] == 0
+
+    def test_llm_timeout_env(self, monkeypatch):
+        from pipeline.batch_evaluate import _llm_timeout
+        monkeypatch.setenv("LLM_TIMEOUT", "90")
+        assert _llm_timeout() == 90.0
+        monkeypatch.setenv("LLM_TIMEOUT", "garbage")
+        assert _llm_timeout() == 180.0
+
+
+class TestEvalLock:
+    """Single-flight across processes — two concurrent evaluations (a forgotten
+    background run + a fresh one) contend on the state file."""
+
+    def test_refuses_when_lock_held_by_live_pid(self, tmp_path, capsys):
+        import os
+        lock = tmp_path / "batch" / ".eval-lock"
+        lock.parent.mkdir(parents=True)
+        # A pid that is definitely alive and is NOT us: use our parent's? Use a
+        # real child process held open briefly.
+        import subprocess, sys, textwrap
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
+        try:
+            lock.write_text(str(child.pid), encoding="utf-8")
+            assert run(tmp_path) == 0
+            assert "already running" in capsys.readouterr().err
+            assert lock.exists()          # we must not remove someone else's lock
+        finally:
+            child.kill()
+
+    def test_stale_lock_taken_over_and_released(self, tmp_path, monkeypatch, capsys):
+        import subprocess, sys
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        lock = tmp_path / "batch" / ".eval-lock"
+        lock.parent.mkdir(parents=True)
+        lock.write_text(str(dead.pid), encoding="utf-8")
+        monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        assert run(tmp_path) == 0          # proceeds to "no batch-input.tsv"
+        out = capsys.readouterr()
+        assert "already running" not in out.err
+        assert not lock.exists()           # released on exit
+
+    def test_pid_alive(self):
+        import os, subprocess, sys
+        from pipeline.batch_evaluate import _pid_alive
+        assert _pid_alive(os.getpid()) is True
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        assert _pid_alive(dead.pid) is False
+        assert _pid_alive(0) is False
+
+
 class TestCallWithRetry:
     """Test the exponential-backoff retry wrapper."""
 

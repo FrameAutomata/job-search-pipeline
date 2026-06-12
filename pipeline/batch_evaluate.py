@@ -150,6 +150,17 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
 
 
+def _llm_timeout() -> float:
+    """Per-request timeout in seconds (LLM_TIMEOUT env, default 180). Long
+    enough for a reasoning model writing a full evaluation, short enough that
+    a dead endpoint fails over instead of freezing a worker."""
+    raw = (os.environ.get("LLM_TIMEOUT") or "").strip()
+    try:
+        return float(raw) if raw else 180.0
+    except ValueError:
+        return 180.0
+
+
 def _is_transient_provider_error(exc: BaseException) -> bool:
     """Rate limits PLUS server-side failures (5xx, timeouts, 'inference
     error'): everything where a retry or a failover to a sibling model makes
@@ -257,7 +268,13 @@ _THINKING_TOGGLE_PROVIDERS = frozenset({"deepinfra", "openrouter", "ollama"})
 def _build_openai_compat_caller(model: str, api_key: str, base_url: str | None = None,
                                 disable_thinking: bool = False) -> Caller:
     from openai import OpenAI  # type: ignore[import]
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    # Explicit timeout: the SDK default is 600s, so a hung endpoint silently
+    # stalls a worker for 10 minutes per attempt (a live MiMo outage froze a
+    # 16-worker run for hours with zero output). max_retries=0 because OUR
+    # retry/failover layer owns recovery — the SDK's hidden 2 retries
+    # multiplied every wait.
+    client = OpenAI(api_key=api_key, base_url=base_url,
+                    timeout=_llm_timeout(), max_retries=0)
     # Reasoning models (MiMo, Qwen3, DeepSeek-R1) emit long <think> traces by
     # default — slow, and they can exhaust max_tokens before producing the answer
     # (→ empty content). For short/direct outputs we don't need it, so pass
@@ -465,6 +482,37 @@ def _process_one(
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for the eval lock (cross-platform; on
+    Windows os.kill(pid, 0) would SEND CTRL_C_EVENT, so use OpenProcess)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            # OpenProcess succeeds on a zombie while any handle to it is held —
+            # only an exit code of STILL_ACTIVE means actually running.
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def run(
     career_ops: Path,
     provider: str | None = None,
@@ -472,7 +520,38 @@ def run(
     concurrency: int = 3,
     dry_run: bool = False,
 ) -> int:
-    """Evaluate pending jobs synchronously. Returns number of jobs processed."""
+    """Evaluate pending jobs synchronously. Returns number of jobs processed.
+
+    Single-flight across processes: two concurrent evaluations (e.g. a
+    forgotten background run plus a fresh one — a live incident) contend on
+    the same state file and double-hit the provider. A pid lock file refuses
+    the second run; a lock whose pid is dead (crash, os._exit on Ctrl-C) is
+    taken over."""
+    lock_path = Path(career_ops) / "batch" / ".eval-lock"
+    try:
+        holder = int(lock_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        holder = 0
+    if holder and holder != os.getpid() and _pid_alive(holder):
+        print(f"[batch-eval] another evaluation (pid {holder}) is already running — "
+              "wait for it to finish or kill it first (concurrent runs corrupt "
+              "shared state)", file=sys.stderr)
+        return 0
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        return _run_eval(career_ops, provider, model, concurrency, dry_run)
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _run_eval(
+    career_ops: Path,
+    provider: str | None = None,
+    model: str | None = None,
+    concurrency: int = 3,
+    dry_run: bool = False,
+) -> int:
     provider = (provider or _detect_provider() or "").strip().lower()
     if not provider:
         print(
@@ -567,23 +646,34 @@ def run(
             ): meta
             for meta in jobs
         }
-        for future in as_completed(futures):
-            meta = futures[future]
-            success, jid, err_msg = future.result()
-            if success:
-                report = state["jobs"][jid].get("report", "")
-                score = state["jobs"][jid].get("score", "?")
-                print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report or '(no report)'}")
-                processed += 1
-            else:
-                print(f"  [{jid}] FAILED: {err_msg}")
-                failed += 1
+        try:
+            for future in as_completed(futures):
+                meta = futures[future]
+                success, jid, err_msg = future.result()
+                if success:
+                    report = state["jobs"][jid].get("report", "")
+                    score = state["jobs"][jid].get("score", "?")
+                    print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report or '(no report)'}")
+                    processed += 1
+                else:
+                    print(f"  [{jid}] FAILED: {err_msg}")
+                    failed += 1
 
-            # Atomic snapshot+write under the lock so concurrent writers can't
-            # interleave or leave a partially-written file.
+                # Atomic snapshot+write under the lock so concurrent writers can't
+                # interleave or leave a partially-written file.
+                with state_lock:
+                    snapshot = json.dumps(state, indent=2, ensure_ascii=False)
+                    atomic_write_text(state_path, snapshot)
+        except KeyboardInterrupt:
+            # Worker threads may sit in long HTTP waits; they're non-daemon, so
+            # a normal exit would block on them — the exact "Ctrl-C does
+            # nothing" hang this handles. State was saved after every finished
+            # job and unfinished jobs stay pending, so a hard exit is safe.
             with state_lock:
-                snapshot = json.dumps(state, indent=2, ensure_ascii=False)
-                atomic_write_text(state_path, snapshot)
+                atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
+            print(f"\n[batch-eval] interrupted — {processed} processed, {failed} failed; "
+                  "remaining jobs stay pending for the next run.", flush=True)
+            os._exit(130)
 
     state["status"] = "completed"
     state["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
