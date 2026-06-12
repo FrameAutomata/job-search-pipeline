@@ -315,6 +315,62 @@ class TestTransientProviderErrors:
         assert _call_with_retry(flaky, "s", "u", sleep=lambda _: None) == "recovered"
         assert len(calls) == 2
 
+    def test_dead_port_connection_error_is_not_transient(self):
+        # openai's APIConnectionError prints a bare "Connection error." but the
+        # real cause is on __cause__ — a dead OLLAMA_BASE_URL/port is a config
+        # error that must fail loudly on job 1, not retry the full chain forever.
+        exc = Exception("Connection error.")
+        exc.__cause__ = OSError("All connection attempts failed")
+        assert _is_transient_provider_error(exc) is False
+
+    def test_connection_refused_is_not_transient(self):
+        assert _is_transient_provider_error(Exception("Connection refused")) is False
+
+    def test_400_bad_request_is_not_transient(self):
+        class BadReq(Exception):
+            status_code = 400
+        assert _is_transient_provider_error(BadReq("bad request")) is False
+
+    def test_408_request_timeout_is_transient(self):
+        class ReqTimeout(Exception):
+            status_code = 408
+        assert _is_transient_provider_error(ReqTimeout("slow")) is True
+
+    def test_connection_reset_stays_transient(self):
+        # A genuine mid-run network blip (reset/aborted) should still retry.
+        assert _is_transient_provider_error(Exception("Connection reset by peer")) is True
+
+    def test_empty_content_in_place_retries_are_capped(self):
+        # Deterministic empty content (single model, no chain) must NOT re-run the
+        # identical prompt 6x — cap it (still fails over inside a chain `caller`).
+        from pipeline.batch_evaluate import _EMPTY_CONTENT_MAX_ATTEMPTS
+        calls = []
+        def empty(system, user):
+            calls.append(1)
+            raise RuntimeError("provider returned empty content")
+        with pytest.raises(RuntimeError, match="empty content"):
+            _call_with_retry(empty, "s", "u", max_attempts=6, sleep=lambda _: None)
+        assert len(calls) == _EMPTY_CONTENT_MAX_ATTEMPTS    # not 6
+
+    def test_budget_stops_retrying_before_timeout(self):
+        # A provider-wide outage must not burn the full max_attempts x backoff —
+        # the per-job wall-clock budget cuts it off. Fake monotonic jumps past
+        # the budget after the first failure.
+        clock = [0.0]
+        def fake_monotonic():
+            return clock[0]
+        def always_500(system, user):
+            clock[0] += 1000.0      # each call "takes" 1000s of wall-clock
+            raise Exception("Error code: 500 - inference error")
+        calls = []
+        def counted(system, user):
+            calls.append(1)
+            return always_500(system, user)
+        with pytest.raises(Exception, match="inference error"):
+            _call_with_retry(counted, "s", "u", max_attempts=6, budget=600.0,
+                             sleep=lambda _: None, monotonic=fake_monotonic)
+        assert len(calls) == 1      # gave up after the budget was blown, not 6
+
 
 class TestClientHardening:
     """Live incident: a hung endpoint + the SDK's 600s default timeout and 2
@@ -339,6 +395,94 @@ class TestClientHardening:
         assert _llm_timeout() == 90.0
         monkeypatch.setenv("LLM_TIMEOUT", "garbage")
         assert _llm_timeout() == 180.0
+
+    def test_anthropic_client_gets_timeout_and_no_sdk_retries(self, monkeypatch):
+        # The anthropic SDK also defaults to 600s + 2 hidden retries; harden it
+        # the same way as the openai-compat client.
+        import types
+        anthropic = pytest.importorskip("anthropic")
+        captured = {}
+        def fake(**kw):
+            captured.update(kw)
+            return types.SimpleNamespace(
+                messages=types.SimpleNamespace(create=lambda **k: None))
+        monkeypatch.setattr(anthropic, "Anthropic", fake)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        from pipeline.batch_evaluate import _build_anthropic_caller
+        _build_anthropic_caller("claude-x")
+        assert captured["timeout"] == 180.0
+        assert captured["max_retries"] == 0
+
+    def test_gemini_client_gets_http_timeout(self, monkeypatch):
+        import types
+        genai = pytest.importorskip("google.genai")
+        captured = {}
+        def fake_client(**kw):
+            captured.update(kw)
+            return types.SimpleNamespace(
+                models=types.SimpleNamespace(generate_content=lambda **k: None))
+        monkeypatch.setattr(genai, "Client", fake_client)
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        from pipeline.batch_evaluate import _build_gemini_caller
+        _build_gemini_caller("gemini-x")
+        # http_options.timeout is in milliseconds (180s → 180000ms).
+        assert captured.get("http_options") is not None
+        assert int(captured["http_options"].timeout) == 180000
+
+
+class TestMergeAndConcurrency:
+    """The interrupted-eval merge gap (#4) and the BATCH_CONCURRENCY=0 floor."""
+
+    def _career_ops(self, tmp_path, *, state_jobs=None, additions=None):
+        career_ops = tmp_path / "career-ops"
+        batch = career_ops / "batch"
+        (batch / "tracker-additions").mkdir(parents=True)
+        with open(batch / "batch-input.tsv", "w", newline="", encoding="utf-8") as f:
+            f.write("id\turl\tsource\tnotes\n1\thttps://a.com\tAcme\tEng\n2\thttps://b.com\tGlobex\tDev\n")
+        (career_ops / "cv.md").write_text("# CV", encoding="utf-8")
+        if state_jobs is not None:
+            (batch / "batch-api-state.json").write_text(
+                json.dumps({"jobs": state_jobs}), encoding="utf-8")
+        for name in (additions or []):
+            (batch / "tracker-additions" / name).write_text("1\t2026-06-01\tAcme\n", encoding="utf-8")
+        return career_ops
+
+    def test_merge_runs_when_unmerged_additions_and_zero_pending(self, tmp_path, monkeypatch):
+        # Both jobs "completed" → 0 pending, but a TSV is still unmerged (an
+        # interrupted prior run). The early return must heal it by merging.
+        career_ops = self._career_ops(
+            tmp_path,
+            state_jobs={"1": {"status": "completed"}, "2": {"status": "completed"}},
+            additions=["1.tsv"],
+        )
+        monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
+        called = []
+        monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker",
+                            lambda co: called.append(co) or True)
+        assert run(career_ops, provider="anthropic") == 0
+        assert called == [career_ops]
+
+    def test_no_merge_when_zero_pending_and_no_additions(self, tmp_path, monkeypatch):
+        career_ops = self._career_ops(
+            tmp_path,
+            state_jobs={"1": {"status": "completed"}, "2": {"status": "completed"}},
+            additions=[],
+        )
+        monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
+        called = []
+        monkeypatch.setattr("pipeline.batch_evaluate.run_merge_tracker",
+                            lambda co: called.append(co) or True)
+        assert run(career_ops, provider="anthropic") == 0
+        assert called == []
+
+    def test_concurrency_floored_to_one(self, tmp_path, monkeypatch, capsys):
+        # BATCH_CONCURRENCY=0 would crash ThreadPoolExecutor(max_workers=0); the
+        # floor keeps the eval stage from tracebacking after the expensive
+        # earlier stages. Verified via the dry-run worker count.
+        career_ops = self._career_ops(tmp_path)
+        monkeypatch.setenv("BATCH_PROVIDER", "anthropic")
+        run(career_ops, provider="anthropic", concurrency=0, dry_run=True)
+        assert "workers=1" in capsys.readouterr().out
 
 
 class TestEvalLock:

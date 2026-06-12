@@ -444,6 +444,10 @@ async function pollLocalRun() {
 
 localRun.start.addEventListener("click", async () => {
   localRun.start.disabled = true;
+  // Fresh run: clear any stale cancel flag from a prior run so it can't swallow
+  // THIS run's failure toast (the flag is only meant to suppress the toast for
+  // the run the user actually cancelled).
+  localRun.wasCancelled = false;
   try {
     const resp = await fetch("/api/run-local", {
       method: "POST",

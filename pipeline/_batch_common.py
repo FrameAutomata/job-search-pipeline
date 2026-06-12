@@ -39,6 +39,67 @@ def read_text(path: Path, default: str = "") -> str:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    """A float env override that can NEVER crash startup: a malformed or
+    set-but-empty value warns and falls back rather than raising. Shared by
+    orchestrate's flag defaults and batch_evaluate's timeout/budget knobs so
+    they parse env the same way."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[config] ignoring invalid {name}={raw!r} (using {default})")
+        return default
+
+
+def pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a process id (used by the cross-process
+    eval lock and the UI's local-run orphan guard).
+
+    On Windows os.kill(pid, 0) would SEND CTRL_C_EVENT, so use OpenProcess +
+    GetExitCodeProcess — OpenProcess succeeds on a zombie while any handle to
+    it is held, so only an exit code of STILL_ACTIVE means actually running."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def has_pending_tracker_additions(tracker_dir: Path) -> bool:
+    """True when career-ops/batch/tracker-additions holds un-merged TSVs.
+
+    merge-tracker.mjs MOVES each TSV into tracker-additions/merged/ once it has
+    folded it into applications.md, so a top-level *.tsv means "evaluated but
+    not yet merged" — the signal that lets an interrupted run heal on a later
+    invocation even when it processes zero new jobs."""
+    try:
+        return any(tracker_dir.glob("*.tsv"))
+    except OSError:
+        return False
+
+
 def load_state(state_path: Path) -> dict:
     if state_path.exists():
         try:

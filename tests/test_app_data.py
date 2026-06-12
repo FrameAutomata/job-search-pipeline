@@ -307,6 +307,75 @@ class TestRecordStatusOverride:
         data.record_status_override("7", "Applied", p)
         assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
 
+    def test_non_dict_top_level_tolerated(self, tmp_path):
+        # A JSON array (or any non-object) must not poison index access — the
+        # torn-read-wipe path the consolidation guards against.
+        import json
+        p = tmp_path / "overrides.json"
+        p.write_text("[1, 2, 3]", encoding="utf-8")
+        assert data.load_status_overrides(p) == {}
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+
+    def test_identity_anchored_value(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Applied", p, company="Acme", role="Eng")
+        v = json.loads(p.read_text(encoding="utf-8"))["7"]
+        assert v == {"status": "Applied", "company": "Acme", "role": "Eng"}
+        assert data.override_status(v) == "Applied"
+        assert data.override_identity(v) == ("Acme", "Eng")
+
+    def test_plain_value_has_no_identity(self):
+        assert data.override_status("Applied") == "Applied"
+        assert data.override_identity("Applied") is None
+
+    def test_clear_only_named_keys(self, tmp_path):
+        # Selective clear keeps an entry written between a push's snapshot and now.
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("1", "Applied", p)
+        data.record_status_override("2", "Rejected", p)
+        data.clear_status_overrides(["1"], p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"2": "Rejected"}
+
+
+class TestOverrideMatchesRow:
+    def test_identity_matches_by_company_and_role(self):
+        row = {"company": "Acme Inc.", "role": "Senior Engineer", "num": "9"}
+        v = {"status": "Applied", "company": "acme inc", "role": "senior engineer"}
+        assert data.override_matches_row(v, row) is True
+
+    def test_company_only_anchor_matches_any_role(self):
+        row = {"company": "Acme", "role": "Whatever", "num": "9"}
+        assert data.override_matches_row({"status": "Applied", "company": "Acme", "role": ""}, row) is True
+
+    def test_wrong_company_does_not_match(self):
+        row = {"company": "Globex", "role": "Eng", "num": "9"}
+        assert data.override_matches_row({"status": "Applied", "company": "Acme", "role": "Eng"}, row) is False
+
+    def test_plain_value_never_matches(self):
+        assert data.override_matches_row("Applied", {"company": "Acme", "role": "Eng"}) is False
+
+
+class TestResolveNumByIdentity:
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 11 | 2026-06-01 | Acme | Eng | 4.0/5 | Evaluated | ❌ | [011](reports/011.md) | x |\n"
+        "| 12 | 2026-06-01 | Globex | Dev | 4.5/5 | Evaluated | ❌ | [012](reports/012.md) | y |\n"
+    )
+
+    def test_resolves_to_correct_num(self):
+        assert data.resolve_num_by_identity(self.APPS, "Globex", "Dev") == "12"
+
+    def test_company_only(self):
+        assert data.resolve_num_by_identity(self.APPS, "Acme", "") == "11"
+
+    def test_no_match_returns_none(self):
+        assert data.resolve_num_by_identity(self.APPS, "Initech", "QA") is None
+
 
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):

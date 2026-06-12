@@ -36,10 +36,11 @@ import argparse
 import json
 import os
 import random
+import signal
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -50,14 +51,21 @@ from pipeline._batch_common import (
     atomic_write_text,
     build_system_prompt,
     build_user_message,
+    env_float,
+    has_pending_tracker_additions,
     load_pending,
     load_state,
     max_report_num,
     max_tracker_num,
+    pid_alive,
     read_text,
     run_merge_tracker,
     write_job_result,
 )
+
+# Hoisted to _batch_common (shared with the UI's local-run orphan guard); kept
+# under the old private name for callers/tests that import it from here.
+_pid_alive = pid_alive
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -118,6 +126,12 @@ _RATE_LIMIT_MARKERS = (
 # rate-limits triggered failover, so 183 jobs failed against a configured
 # 3-model chain.) Distinct from 4xx caller errors (bad model id, auth), which
 # must keep raising immediately.
+#
+# NB: a bare "connection error" is deliberately NOT here — openai's
+# APIConnectionError stringifies to exactly that for a DEAD endpoint (wrong
+# OLLAMA_BASE_URL/port), which is a config error that must fail loudly, not
+# retry the full backoff x chain for every job (see _CONFIG_ERROR_MARKERS).
+# Genuine mid-run network blips (reset/aborted) stay transient.
 _TRANSIENT_SERVER_MARKERS = (
     "inference error",
     "internal server error",
@@ -126,13 +140,36 @@ _TRANSIENT_SERVER_MARKERS = (
     "overloaded",
     "timed out",
     "timeout",
-    "connection error",
+    "connection reset",
+    "connection aborted",
+    "temporarily unavailable",
     # Our own callers raise "<provider> returned empty content" when a model
     # answers 200 with an empty body — a degraded endpoint, or a reasoning
     # model that burned its whole token budget thinking. Either way the model
     # is unusable for this call: retry, and above all FAIL OVER to a sibling.
     "empty content",
 )
+
+# Definitive misconfiguration: a dead host/port or unresolvable name. Retrying
+# these for every job just burns ~31s x chain-width x backlog on an error that
+# won't self-heal — fail on job 1 instead. openai's APIConnectionError prints a
+# bare "Connection error." but carries the real cause ("All connection attempts
+# failed" / "Connection refused") on __cause__, so we match against both.
+_CONFIG_ERROR_MARKERS = (
+    "connection refused",
+    "all connection attempts failed",
+    "failed to establish a new connection",
+    "nodename nor servname",
+    "name or service not known",
+    "getaddrinfo failed",
+    "no address associated with hostname",
+)
+
+# An empty-content failure is deterministic on a single model (a reasoning model
+# exhausting MAX_TOKENS, a safety block) — failover to a SIBLING is the right
+# move, but re-running the identical prompt against the SAME model many times is
+# near-pure waste (each is a full-length generation). Cap the in-place retries.
+_EMPTY_CONTENT_MAX_ATTEMPTS = 2
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -154,30 +191,50 @@ def _llm_timeout() -> float:
     """Per-request timeout in seconds (LLM_TIMEOUT env, default 180). Long
     enough for a reasoning model writing a full evaluation, short enough that
     a dead endpoint fails over instead of freezing a worker."""
-    raw = (os.environ.get("LLM_TIMEOUT") or "").strip()
-    try:
-        return float(raw) if raw else 180.0
-    except ValueError:
-        return 180.0
+    return env_float("LLM_TIMEOUT", 180.0)
+
+
+def _llm_job_budget() -> float:
+    """Per-job wall-clock budget in seconds (LLM_JOB_BUDGET env, default 600).
+    Caps how long _call_with_retry will keep re-attempting the (already
+    failover-aware) caller, so a provider-wide outage fails a job in minutes
+    instead of 6 attempts x chain-width x per-call timeout (~tens of minutes)."""
+    return env_float("LLM_JOB_BUDGET", 600.0)
+
+
+def _is_empty_content_error(exc: BaseException) -> bool:
+    return "empty content" in str(exc).lower()
 
 
 def _is_transient_provider_error(exc: BaseException) -> bool:
     """Rate limits PLUS server-side failures (5xx, timeouts, 'inference
     error'): everything where a retry or a failover to a sibling model makes
-    sense. Caller errors (401 auth, 404 bad model id) stay non-transient so a
-    misconfiguration still fails loudly instead of burning the whole chain."""
+    sense. Definitive caller/config errors (401 auth, 404 bad model id, a dead
+    host/port) stay non-transient so a misconfiguration fails loudly on job 1
+    instead of burning the whole chain x backlog."""
+    # Combine the message with its __cause__ — openai's APIConnectionError
+    # stringifies to a bare "Connection error." and puts the real reason
+    # ("All connection attempts failed") on the cause.
+    text = (str(exc) + " " + str(getattr(exc, "__cause__", "") or "")).lower()
+    if any(marker in text for marker in _CONFIG_ERROR_MARKERS):
+        return False
     if _is_rate_limit_error(exc):
         return True
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(exc, "code", None)
     try:
-        if status is not None and 500 <= int(status) <= 599:
-            return True
+        code = int(status) if status is not None else None
     except (TypeError, ValueError):
-        pass
-    msg = str(exc).lower()
-    return any(marker in msg for marker in _TRANSIENT_SERVER_MARKERS)
+        code = None
+    if code is not None:
+        if code in (408, 429):     # request timeout / too many requests — transient
+            return True
+        if 400 <= code < 500:      # other 4xx is the caller's fault — never retry
+            return False
+        if 500 <= code <= 599:
+            return True
+    return any(marker in text for marker in _TRANSIENT_SERVER_MARKERS)
 
 
 def _call_with_retry(
@@ -188,25 +245,45 @@ def _call_with_retry(
     max_attempts: int = 6,
     base_delay: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
+    budget: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> str:
     """Invoke `caller(system, user)` with exponential backoff on transient
     provider errors (rate limits, 5xx/'inference error', timeouts). Caller
-    errors (auth, bad model id) raise immediately — no retry.
+    errors (auth, bad model id, a dead host/port) raise immediately — no retry.
 
-    Backoff: 1, 2, 4, 8, 16 seconds, each with up to 0.5s of random jitter
-    to avoid thundering-herd when multiple workers throttle simultaneously.
-    With max_attempts=6 the total worst-case wait before giving up is ~31s
-    plus 5 calls — comfortably under any reasonable per-job timeout.
+    Two bounds keep a provider outage from freezing a worker for tens of
+    minutes (`caller` may itself be a multi-model failover chain, so a naive
+    `max_attempts x chain-width x per-call timeout` is the worst case):
 
-    `sleep` is parameterized so tests don't have to actually wait."""
+      * `budget` — a per-job wall-clock deadline (default `_llm_job_budget()`):
+        once the next backoff sleep would cross it, give up now.
+      * empty-content is capped at `_EMPTY_CONTENT_MAX_ATTEMPTS` in place — it's
+        deterministic per model, so re-running the same prompt is near-pure
+        waste (the failover to a sibling already happened inside `caller`).
+
+    Backoff: 1, 2, 4, 8, 16 seconds, each with up to 0.5s of random jitter to
+    avoid thundering-herd when multiple workers throttle simultaneously.
+
+    `sleep`/`monotonic` are parameterized so tests don't have to actually wait."""
+    if budget is None:
+        budget = _llm_job_budget()
+    deadline = monotonic() + budget
     delay = base_delay
+    empty_attempts = 0
     for attempt in range(1, max_attempts + 1):
         try:
             return caller(system, user)
         except Exception as exc:
             if not _is_transient_provider_error(exc) or attempt == max_attempts:
                 raise
+            if _is_empty_content_error(exc):
+                empty_attempts += 1
+                if empty_attempts >= _EMPTY_CONTENT_MAX_ATTEMPTS:
+                    raise
             jittered = delay + random.uniform(0, 0.5)
+            if monotonic() + jittered >= deadline:
+                raise  # the next wait would blow the per-job budget
             print(
                 f"  provider busy (attempt {attempt}/{max_attempts}): "
                 f"sleeping {jittered:.1f}s — {exc}",
@@ -220,7 +297,12 @@ def _call_with_retry(
 
 def _build_anthropic_caller(model: str) -> Caller:
     import anthropic as _a
-    client = _a.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # Same hardening as the openai-compat client: an explicit timeout (the SDK
+    # default is 600s) and max_retries=0 so OUR retry/failover layer owns
+    # recovery instead of the SDK silently multiplying every wait by its
+    # built-in 2 retries.
+    client = _a.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"],
+                          timeout=_llm_timeout(), max_retries=0)
 
     def call(system: str, user: str) -> str:
         msg = client.messages.create(
@@ -243,7 +325,13 @@ def _build_gemini_caller(model: str) -> Caller:
     # works but logs a FutureWarning and won't get bug fixes.
     from google import genai  # type: ignore[import]
     from google.genai import types  # type: ignore[import]
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    # http_options.timeout is in MILLISECONDS. Without it the client has no
+    # request timeout, so a hung endpoint blocks the worker forever and our
+    # retry/failover never gets a chance to fire (LLM_TIMEOUT silently ignored).
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"],
+        http_options=types.HttpOptions(timeout=int(_llm_timeout() * 1000)),
+    )
 
     def call(system: str, user: str) -> str:
         resp = client.models.generate_content(
@@ -458,11 +546,17 @@ def _process_one(
     today: str,
     state: dict,
     state_lock: threading.Lock,
+    *,
+    max_attempts: int = 6,
+    budget: float | None = None,
 ) -> tuple[bool, str, str | None]:
     """Evaluate one job. Returns (success, job_id, error_or_None)."""
     jid = job_meta["id"]
     try:
-        response = _call_with_retry(caller, system_prompt, build_user_message(job_meta, today))
+        response = _call_with_retry(
+            caller, system_prompt, build_user_message(job_meta, today),
+            max_attempts=max_attempts, budget=budget,
+        )
         out = write_job_result(response, job_meta, reports_dir, tracker_dir, today)
 
         with state_lock:
@@ -482,35 +576,59 @@ def _process_one(
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
-def _pid_alive(pid: int) -> bool:
-    """Best-effort liveness check for the eval lock (cross-platform; on
-    Windows os.kill(pid, 0) would SEND CTRL_C_EVENT, so use OpenProcess)."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            # OpenProcess succeeds on a zombie while any handle to it is held —
-            # only an exit code of STILL_ACTIVE means actually running.
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
+# The eval lock stores "pid timestamp". The timestamp bounds the damage from
+# pid REUSE: Ctrl-C exits via os._exit and the UI cancel via TerminateProcess,
+# both of which skip run()'s finally, so a stale lock is the COMMON exit
+# artifact — and if the OS later recycles that dead pid to an unrelated live
+# process, _pid_alive would vouch for it and refuse every future run forever.
+# Reclaiming any lock older than this makes that self-heal. Longer than any sane
+# run, short enough to recover within a working session.
+_EVAL_LOCK_MAX_AGE = 6 * 3600
+
+
+def _read_eval_lock(path: Path) -> tuple[int, float]:
+    """(pid, timestamp) from the lock file; (0, 0.0) when absent/unreadable."""
     try:
-        os.kill(pid, 0)
+        parts = path.read_text(encoding="utf-8").split()
+        return int(parts[0]), (float(parts[1]) if len(parts) > 1 else 0.0)
+    except (OSError, ValueError, IndexError):
+        return 0, 0.0
+
+
+def _eval_lock_takeable(path: Path) -> bool:
+    """True when no LIVE holder owns the lock — free, our own, a dead pid, or
+    older than _EVAL_LOCK_MAX_AGE (the pid-reuse safety valve)."""
+    pid, ts = _read_eval_lock(path)
+    if pid in (0, os.getpid()):
         return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+    if not _pid_alive(pid):
         return True
+    return bool(ts) and (time.time() - ts) > _EVAL_LOCK_MAX_AGE
+
+
+def _acquire_eval_lock(path: Path) -> bool:
+    """Atomically take the eval lock. O_CREAT|O_EXCL makes the create-if-absent
+    atomic, so two simultaneous starts can't both pass a read-then-write check
+    (the old TOCTOU). Returns False when a live holder owns it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = f"{os.getpid()} {time.time()}".encode("utf-8")
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if not _eval_lock_takeable(path):
+                return False
+            try:
+                path.unlink()       # reclaim a dead/stale lock, then retry O_EXCL
+            except OSError:
+                pass
+            continue
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        return True
+    return False
 
 
 def run(
@@ -523,26 +641,26 @@ def run(
     """Evaluate pending jobs synchronously. Returns number of jobs processed.
 
     Single-flight across processes: two concurrent evaluations (e.g. a
-    forgotten background run plus a fresh one — a live incident) contend on
-    the same state file and double-hit the provider. A pid lock file refuses
-    the second run; a lock whose pid is dead (crash, os._exit on Ctrl-C) is
-    taken over."""
+    forgotten background run plus a fresh one — a live incident) contend on the
+    same state file and double-hit the provider. An atomic pid+timestamp lock
+    refuses the second run loudly; a lock whose pid is dead (crash, os._exit on
+    Ctrl-C) or stale is reclaimed automatically."""
     lock_path = Path(career_ops) / "batch" / ".eval-lock"
-    try:
-        holder = int(lock_path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        holder = 0
-    if holder and holder != os.getpid() and _pid_alive(holder):
-        print(f"[batch-eval] another evaluation (pid {holder}) is already running — "
-              "wait for it to finish or kill it first (concurrent runs corrupt "
-              "shared state)", file=sys.stderr)
+    if not _acquire_eval_lock(lock_path):
+        pid, _ = _read_eval_lock(lock_path)
+        print(f"[batch-eval] REFUSED: another evaluation (pid {pid}) is already "
+              "running — wait for it to finish or kill it first (concurrent runs "
+              "corrupt shared state). Nothing was evaluated this run.",
+              file=sys.stderr)
         return 0
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.write_text(str(os.getpid()), encoding="utf-8")
     try:
         return _run_eval(career_ops, provider, model, concurrency, dry_run)
     finally:
-        lock_path.unlink(missing_ok=True)
+        # Release only if we still hold it — a stale-takeover by another process
+        # may have replaced our pid, and we must not delete its lock.
+        pid, _ = _read_eval_lock(lock_path)
+        if pid == os.getpid():
+            lock_path.unlink(missing_ok=True)
 
 
 def _run_eval(
@@ -591,7 +709,20 @@ def _run_eval(
 
     if not pending:
         print("[batch-eval] all jobs already evaluated — nothing to do")
+        # A previous run may have been interrupted (Ctrl-C os._exit / UI cancel)
+        # after writing reports + tracker TSVs but BEFORE merging. With zero
+        # pending we'd otherwise skip the merge forever, leaving those
+        # evaluations invisible in applications.md until some future run happens
+        # to process ≥1 new job. Heal it here — merge-tracker moves merged TSVs
+        # out, so this is a no-op once they're folded in.
+        if not dry_run and has_pending_tracker_additions(tracker_dir):
+            run_merge_tracker(career_ops)
         return 0
+
+    # ThreadPoolExecutor(max_workers=0) raises ValueError; a typo'd
+    # BATCH_CONCURRENCY ("0", "0.9"→0) shouldn't traceback the eval stage after
+    # scrape/filter/screen/bridge already did the expensive work.
+    concurrency = max(1, int(concurrency))
 
     print(f"[batch-eval] {len(pending)} job(s) | provider={provider} | model={model} | workers={concurrency}")
 
@@ -632,55 +763,93 @@ def _run_eval(
     state["status"] = "in_progress"
 
     caller = _build_caller(provider, model)
+    # A configured failover chain already tries each sibling within one call, so
+    # it needs far fewer whole-chain retries than a single model (which has no
+    # sibling to fall over to). Bounds the worst case alongside the per-job budget.
+    attempts = 3 if len(_split_models(model)) > 1 else 6
+    job_budget = _llm_job_budget()
 
     state_lock = threading.Lock()
     processed = failed = 0
+    interrupted = {"flag": False}
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {
-            pool.submit(
-                _process_one,
-                meta, system_prompt, caller,
-                reports_dir, tracker_dir, today,
-                state, state_lock,
-            ): meta
-            for meta in jobs
-        }
-        try:
-            for future in as_completed(futures):
-                meta = futures[future]
-                success, jid, err_msg = future.result()
-                if success:
-                    report = state["jobs"][jid].get("report", "")
-                    score = state["jobs"][jid].get("score", "?")
-                    print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report or '(no report)'}")
-                    processed += 1
-                else:
-                    print(f"  [{jid}] FAILED: {err_msg}")
-                    failed += 1
-
-                # Atomic snapshot+write under the lock so concurrent writers can't
-                # interleave or leave a partially-written file.
-                with state_lock:
-                    snapshot = json.dumps(state, indent=2, ensure_ascii=False)
-                    atomic_write_text(state_path, snapshot)
-        except KeyboardInterrupt:
-            # Worker threads may sit in long HTTP waits; they're non-daemon, so
-            # a normal exit would block on them — the exact "Ctrl-C does
-            # nothing" hang this handles. State was saved after every finished
-            # job and unfinished jobs stay pending, so a hard exit is safe.
-            with state_lock:
-                atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
-            print(f"\n[batch-eval] interrupted — {processed} processed, {failed} failed; "
-                  "remaining jobs stay pending for the next run.", flush=True)
+    def _save_and_exit(*_a) -> None:
+        # Re-entrant: a SECOND Ctrl-C while we're still saving goes straight to a
+        # hard exit, instead of falling back into the blocking thread-join that
+        # froze the old code. State was persisted after every finished job and
+        # unfinished jobs stay pending, so a hard exit loses nothing.
+        if interrupted["flag"]:
             os._exit(130)
+        interrupted["flag"] = True
+        with state_lock:
+            atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
+        print(f"\n[batch-eval] interrupted — {processed} processed, {failed} failed; "
+              "remaining jobs stay pending for the next run.", flush=True)
+        os._exit(130)
+
+    # Install a SIGINT handler so a second Ctrl-C re-enters cleanly. Only works
+    # from the main thread; if we're not on it (ValueError), the timed-wait loop
+    # below still catches KeyboardInterrupt.
+    try:
+        old_sigint = signal.signal(signal.SIGINT, _save_and_exit)
+    except (ValueError, OSError):
+        old_sigint = None
+
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(
+                    _process_one,
+                    meta, system_prompt, caller,
+                    reports_dir, tracker_dir, today,
+                    state, state_lock,
+                    max_attempts=attempts, budget=job_budget,
+                ): meta
+                for meta in jobs
+            }
+            remaining = set(futures)
+            while remaining:
+                # TIMED wait, not an unbounded as_completed(): the latter sits in
+                # a lock.acquire that CPython only makes signal-interruptible on
+                # POSIX, so on Windows a Ctrl-C is deferred until the next future
+                # resolves (up to a whole per-job budget). A short timed wait
+                # returns to Python bytecode every 0.5s, where the pending signal
+                # (or KeyboardInterrupt) is delivered promptly.
+                try:
+                    done, remaining = wait(remaining, timeout=0.5, return_when=FIRST_COMPLETED)
+                except KeyboardInterrupt:
+                    _save_and_exit()
+                for future in done:
+                    meta = futures[future]
+                    success, jid, err_msg = future.result()
+                    if success:
+                        report = state["jobs"][jid].get("report", "")
+                        score = state["jobs"][jid].get("score", "?")
+                        print(f"  [{jid}] {meta['company'] or '?'} -> score={score} {report or '(no report)'}")
+                        processed += 1
+                    else:
+                        print(f"  [{jid}] FAILED: {err_msg}")
+                        failed += 1
+                    # Atomic snapshot+write under the lock so concurrent writers
+                    # can't interleave or leave a partially-written file.
+                    with state_lock:
+                        atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
+    finally:
+        if old_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, old_sigint)
+            except (ValueError, OSError):
+                pass
 
     state["status"] = "completed"
     state["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
     print(f"[batch-eval] done — processed={processed} failed={failed}")
 
-    if processed > 0:
+    # Merge when we produced results OR when unmerged TSVs are sitting around
+    # from an earlier interrupted run. merge-tracker moves merged files out, so
+    # a clean run won't re-merge endlessly.
+    if processed > 0 or has_pending_tracker_additions(tracker_dir):
         run_merge_tracker(career_ops)
 
     return processed

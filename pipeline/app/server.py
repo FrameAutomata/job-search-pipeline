@@ -57,8 +57,13 @@ load_dotenv(ROOT / ".env", override=False)
 UI_CACHE = ROOT / ".ui-cache" / "latest"
 
 # Set by /api/refresh to the artifact subdir gh extracted, so subsequent reads
-# use freshly-downloaded data without restarting the server.
+# use freshly-downloaded data without restarting the server. Guarded by a lock
+# because push_status mutates it across a multi-second gh download while
+# /api/use-local (auto-fired when a local run finishes) can null it — an
+# unsynchronized interleave could make push write cloud data over the LOCAL
+# tracker.
 _active_data_dir: Path | None = None
+_data_dir_lock = threading.Lock()
 
 # Background add-job tasks: job_id → {status, result?, error?}
 _add_job_tasks: dict[str, dict] = {}
@@ -74,11 +79,11 @@ EDIT_WORKFLOW = "edit-tracker.yml"
 # several times a day, so it's frequently newer than the daily one.
 PIPELINE_WORKFLOWS = [DAILY_WORKFLOW, EASY_APPLY_WORKFLOW]
 
-# Pending status changes the user hasn't pushed yet, keyed by tracker number →
-# canonical status. Written by kanban drags here AND by the apply stage when it
-# auto-submits (data.record_status_override) — one channel, one path constant.
-# Persisted so they survive a server restart mid-triage; cleared on push.
-OVERRIDES_FILE = data.STATUS_OVERRIDES_FILE
+# Pending status changes the user hasn't pushed yet. Written by kanban drags
+# here AND by the apply stage when it auto-submits — one channel, owned by
+# pipeline.app.data (atomic writes + an in-process lock). The server delegates
+# rather than re-implementing read/modify/write, and resolves the path at call
+# time so tests that redirect data.STATUS_OVERRIDES_FILE take effect.
 # Overrides that have been dispatched to the cloud but aren't yet reflected in
 # a pipeline artifact. Applied on every job load so statuses survive Refresh
 # and restarts; self-cleans entry-by-entry once the artifact catches up.
@@ -86,17 +91,11 @@ PUSHED_OVERRIDES_FILE = ROOT / ".ui-cache" / "pushed-overrides.json"
 
 
 def _load_overrides() -> dict:
-    if OVERRIDES_FILE.exists():
-        try:
-            return json.loads(OVERRIDES_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    return data.load_status_overrides()
 
 
 def _save_overrides(d: dict) -> None:
-    OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OVERRIDES_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    data.save_status_overrides(d)
 
 
 def _load_pushed_overrides() -> dict:
@@ -132,6 +131,19 @@ def _career_ops() -> Path:
     """Resolve the data directory for reads (jobs, reports). A successful
     Refresh wins; otherwise the local install."""
     return _active_data_dir if _active_data_dir is not None else _career_ops_local()
+
+
+def _refuse_during_local_run() -> None:
+    """409 if a local pipeline run is in progress. Add-job mints the next
+    report/tracker number in THIS process while a local run's eval stage mints
+    them in its subprocess — running both at once collides the numbering
+    (overwritten reports, duplicate tracker rows). They must not overlap."""
+    if local_run.is_running():
+        raise HTTPException(
+            status_code=409,
+            detail="A local pipeline run is in progress. Wait for it to finish — "
+                   "adding a job now would collide on report/tracker numbering.",
+        )
 
 
 app = FastAPI(title="job-search-pipeline UI")
@@ -194,14 +206,24 @@ def list_jobs() -> JSONResponse:
                 del pushed[num]
             _save_pushed_overrides(pushed)
 
-    # Apply pending-overrides: local kanban drags not yet pushed.
+    # Apply pending-overrides: local kanban drags + apply auto-submits not yet
+    # pushed. A plain (num-keyed) override lands on the row with that num; an
+    # identity-anchored one (from apply, whose num may be from a different
+    # tracker) lands on the row matching its company/role — so it marks the row
+    # actually applied to, not whichever row coincidentally shares the num.
     overrides = _load_overrides()
     if overrides:
         for row in rows:
-            ov = overrides.get(str(row.get("num")))
-            if ov:
-                row["status"] = ov
-                row["status_canonical"] = data.canonical_status(ov)
+            num = str(row.get("num"))
+            raw = overrides.get(num)
+            value = raw if (raw is not None and data.override_identity(raw) is None) else None
+            if value is None:
+                value = next((v for v in overrides.values()
+                              if data.override_matches_row(v, row)), None)
+            if value is not None:
+                status = data.override_status(value)
+                row["status"] = status
+                row["status_canonical"] = data.canonical_status(status)
                 row["pending"] = True
     payload["pending"] = len(overrides)
     return JSONResponse(payload)
@@ -217,10 +239,10 @@ def set_status(change: StatusChange) -> JSONResponse:
             status_code=400,
             detail=f"Unknown status {change.status!r}. Valid: {', '.join(data.CANONICAL_STATES)}",
         )
-    overrides = _load_overrides()
-    overrides[str(change.num)] = change.status
-    _save_overrides(overrides)
-    return JSONResponse({"ok": True, "pending": len(overrides)})
+    # Through the locked read/modify/write accessor so a concurrent push or
+    # apply auto-submit can't lose this drag (or be lost by it).
+    data.record_status_override(str(change.num), change.status)
+    return JSONResponse({"ok": True, "pending": len(_load_overrides())})
 
 
 @app.post("/api/push-status")
@@ -241,6 +263,7 @@ def push_status() -> JSONResponse:
     global _active_data_dir
     base_text = None
     base_source = "local"
+    target_apps: Path | None = None   # the exact file base_text came from
 
     # Try to refresh a fresh base first (the clobber guard).
     try:
@@ -249,47 +272,65 @@ def push_status() -> JSONResponse:
             if UI_CACHE.exists():
                 shutil.rmtree(UI_CACHE)
             data_dir = gh.download_artifact(run["databaseId"], UI_CACHE)
-            _active_data_dir = data_dir
+            with _data_dir_lock:
+                _active_data_dir = data_dir
             apps = data_dir / "data" / "applications.md"
             if apps.exists():
                 base_text = apps.read_text(encoding="utf-8")
                 base_source = "refreshed"
+                target_apps = apps
     except gh.GhError:
         pass  # fall through to local base
 
     if base_text is None:
-        apps = _career_ops() / "data" / "applications.md"
+        # Write back to the LOCAL install — never via _career_ops(), whose
+        # _active_data_dir can flip to a cloud artifact mid-request (the
+        # use-local auto-fire) and turn this persist into cloud-over-local
+        # data loss. Capturing target_apps == the file we read pins the write.
+        apps = _career_ops_local() / "data" / "applications.md"
         if not apps.exists():
             raise HTTPException(
                 status_code=409,
                 detail="No applications.md to update (run the pipeline so the tracker exists).",
             )
         base_text = apps.read_text(encoding="utf-8")
+        target_apps = apps
 
-    # Apply the pending overrides onto the base (line-level, minimal diff).
-    for num, status in overrides.items():
+    # Apply the overrides onto the base (line-level, minimal diff), resolving
+    # each identity-anchored override to the correct num IN THIS base. The cloud
+    # payload is always {num: status} (what edit-tracker.yml consumes).
+    cloud_payload: dict[str, str] = {}
+    for key, value in overrides.items():
+        status = data.override_status(value)
+        identity = data.override_identity(value)
+        num = key
+        if identity:
+            resolved = data.resolve_num_by_identity(base_text, *identity)
+            if resolved:
+                num = resolved
         base_text = data.set_status_in_text(base_text, num, status)
+        cloud_payload[num] = status
 
-    # Persist the merged tracker locally so the UI is consistent post-push.
-    apps = _career_ops() / "data" / "applications.md"
-    apps.parent.mkdir(parents=True, exist_ok=True)
-    apps.write_text(base_text, encoding="utf-8")
+    # Persist the merged tracker back to where we read it.
+    target_apps.parent.mkdir(parents=True, exist_ok=True)
+    target_apps.write_text(base_text, encoding="utf-8")
 
-    # Dispatch edit-tracker with only the pending overrides — avoids GitHub's
+    # Dispatch edit-tracker with only the resolved overrides — avoids GitHub's
     # workflow_dispatch input size limit that the full base64 tracker can exceed.
     try:
-        gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(overrides)})
+        gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(cloud_payload)})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    count = len(overrides)
-    _save_overrides({})  # clear pending on success
+    # Clear ONLY the keys we pushed (re-reading under the lock) so an apply
+    # auto-submit recorded during the gh round-trip isn't silently dropped.
+    data.clear_status_overrides(list(overrides.keys()))
     # Persist dispatched overrides so they survive Refresh and restarts until
     # the pipeline produces a new artifact that already has the correct statuses.
     pushed = _load_pushed_overrides()
-    pushed.update(overrides)
+    pushed.update(cloud_payload)
     _save_pushed_overrides(pushed)
-    return JSONResponse({"ok": True, "pushed": count, "base": base_source})
+    return JSONResponse({"ok": True, "pushed": len(cloud_payload), "base": base_source})
 
 
 @app.get("/api/reports/{report_num}", response_class=HTMLResponse)
@@ -331,7 +372,8 @@ def refresh() -> JSONResponse:
             import shutil
             shutil.rmtree(UI_CACHE)
         data_dir = gh.download_artifact(run["databaseId"], UI_CACHE)
-        _active_data_dir = data_dir
+        with _data_dir_lock:
+            _active_data_dir = data_dir
         return JSONResponse({
             "ok": True,
             "run_id": run["databaseId"],
@@ -366,7 +408,7 @@ def run_local(req: LocalRunRequest) -> JSONResponse:
     """Start a local pipeline run (orchestrate.py subprocess). Single-flight:
     409 when one is already running. Poll /api/run-local/status for progress;
     on success the UI switches to the local tracker via /api/use-local."""
-    if req.passes not in ("all", "easy-only", "no-easy"):
+    if req.passes not in local_run.VALID_PASSES:
         raise HTTPException(status_code=400, detail=f"unknown passes value: {req.passes}")
     try:
         state = local_run.start({"passes": req.passes, "evaluate": req.evaluate})
@@ -395,7 +437,8 @@ def use_local() -> JSONResponse:
     Used after a local pipeline run so its fresh results are what the UI
     shows, instead of a previously downloaded cloud artifact."""
     global _active_data_dir
-    _active_data_dir = None
+    with _data_dir_lock:
+        _active_data_dir = None
     return JSONResponse({"ok": True, "career_ops": str(_career_ops_local())})
 
 
@@ -855,6 +898,7 @@ def add_job(req: AddJobRequest) -> JSONResponse:
     the provider."""
     if not req.url.strip():
         raise HTTPException(status_code=400, detail="url is required")
+    _refuse_during_local_run()
 
     provider = _detect_provider()
     if not provider:
@@ -995,6 +1039,7 @@ def add_job_async(req: AddJobRequest) -> JSONResponse:
     """Start a background add-job evaluation and return immediately."""
     if not req.url.strip():
         raise HTTPException(status_code=400, detail="url is required")
+    _refuse_during_local_run()
 
     provider = _detect_provider()
     if not provider:

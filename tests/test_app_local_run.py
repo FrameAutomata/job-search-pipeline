@@ -12,8 +12,12 @@ from pipeline.app import local_run
 
 
 class FakeProc:
+    # A dead-but-fixed pid: start() writes proc.pid to the pid file, but every
+    # test keeps a live Popen in _state, so the orphan (pid-file) path is never
+    # the running signal here — the value just has to exist.
     def __init__(self, cmd):
         self.cmd = cmd
+        self.pid = 424242
         self._exit = None
         self.terminated = False
 
@@ -61,24 +65,42 @@ def fake_popen(tmp_path, monkeypatch):
 
     monkeypatch.setattr(local_run.subprocess, "Popen", popen)
     monkeypatch.setattr(local_run, "LOG_PATH", tmp_path / "local-run.log")
+    monkeypatch.setattr(local_run, "PID_PATH", tmp_path / "local-run.pid")
     local_run._state.clear()
     yield spawned
     local_run._state.clear()
 
 
 class TestChildEnv:
-    def test_fresh_dotenv_overrides_stale_inherited_value(self, tmp_path, monkeypatch):
-        # The server inherited RESUME_PATH at startup; a later .env edit must
-        # win for UI-triggered runs (no server restart needed).
-        monkeypatch.setenv("RESUME_PATH", "stale/old_name.pdf")
-        envfile = tmp_path / ".env"
-        envfile.write_text("RESUME_PATH=resumes/resume.pdf\n", encoding="utf-8")
-        env = local_run._child_env(envfile)
-        assert env["RESUME_PATH"] == "resumes/resume.pdf"
+    """The child (orchestrate.py) runs its own load_dotenv(override=False), so
+    _child_env strips the server's STARTUP .env values and lets the child reload
+    the CURRENT .env — picking up edits, honoring removals, and preserving
+    shell-export precedence."""
+
+    def test_strips_dotenv_origin_value_so_child_reloads(self, monkeypatch):
+        # A value still equal to the startup snapshot came from .env (not a shell
+        # export) → stripped, so the child's own load_dotenv re-reads current .env.
+        monkeypatch.setenv("BATCH_MODEL", "startup-model")
+        env = local_run._child_env(snapshot={"BATCH_MODEL": "startup-model"})
+        assert "BATCH_MODEL" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
-    def test_missing_dotenv_is_fine(self, tmp_path):
-        env = local_run._child_env(tmp_path / "absent.env")
+    def test_preserves_shell_override(self, monkeypatch):
+        # Inherited value differs from the snapshot → it's a shell export, which
+        # must keep beating .env (matching load_dotenv(override=False)).
+        monkeypatch.setenv("BATCH_MODEL", "shell-value")
+        env = local_run._child_env(snapshot={"BATCH_MODEL": "dotenv-value"})
+        assert env["BATCH_MODEL"] == "shell-value"
+
+    def test_removed_key_is_stripped(self, monkeypatch):
+        # Key was .env-origin at startup, still inherited, now removed from .env:
+        # stripping unsets it in the child (an overlay never could).
+        monkeypatch.setenv("OLD_KEY", "v")
+        env = local_run._child_env(snapshot={"OLD_KEY": "v"})
+        assert "OLD_KEY" not in env
+
+    def test_missing_snapshot_keeps_environment(self):
+        env = local_run._child_env(snapshot={})
         assert env["PYTHONUNBUFFERED"] == "1"
 
 
@@ -160,3 +182,43 @@ class TestUseLocal:
         assert r.status_code == 200
         assert server._active_data_dir is None
         assert r.json()["ok"] is True
+
+
+class TestOrphanGuard:
+    """Single-flight must survive a server restart: the orchestrate child keeps
+    running (its stdout is a file), so a fresh server — empty _state — would
+    otherwise let a SECOND concurrent full pipeline corrupt shared state. The
+    pid file lets is_running()/start() detect and refuse the orphan."""
+
+    def test_status_reports_orphan_running(self, fake_popen, tmp_path, monkeypatch):
+        local_run._state.clear()                     # as if the server just restarted
+        (tmp_path / "local-run.pid").write_text("4242", encoding="utf-8")
+        monkeypatch.setattr(local_run, "_pid_alive", lambda pid: pid == 4242)
+        s = local_run.status()
+        assert s["running"] is True and s["exit_code"] is None
+
+    def test_start_refuses_when_orphan_alive(self, fake_popen, tmp_path, monkeypatch):
+        local_run._state.clear()
+        (tmp_path / "local-run.pid").write_text("4242", encoding="utf-8")
+        monkeypatch.setattr(local_run, "_pid_alive", lambda pid: pid == 4242)
+        with pytest.raises(RuntimeError):
+            local_run.start({})
+
+    def test_dead_orphan_is_not_running(self, fake_popen, tmp_path, monkeypatch):
+        local_run._state.clear()
+        (tmp_path / "local-run.pid").write_text("4242", encoding="utf-8")
+        monkeypatch.setattr(local_run, "_pid_alive", lambda pid: False)
+        assert local_run.is_running() is False
+
+
+class TestAddJobGuard:
+    """Add-job mints the next report/tracker number in the server process while
+    a local run's eval stage mints them in its subprocess — they must not
+    overlap, or the numbering collides."""
+
+    def test_add_job_refused_during_local_run(self, client, fake_popen):
+        assert client.post("/api/run-local", json={}).status_code == 200
+        r = client.post("/api/jobs/add", json={"url": "https://example.com/job"})
+        assert r.status_code == 409
+        r2 = client.post("/api/jobs/add-async", json={"url": "https://example.com/job"})
+        assert r2.status_code == 409
