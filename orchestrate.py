@@ -41,8 +41,11 @@ def main() -> int:
                     help="LLM provider for --evaluate-batch: anthropic|gemini|openai|groq|ollama")
     ap.add_argument("--batch-model", type=str, default=None,
                     help="Model name (overrides BATCH_MODEL env var)")
-    ap.add_argument("--batch-concurrency", type=int, default=3,
-                    help="Parallel workers for --evaluate-batch (default: 3)")
+    ap.add_argument("--batch-concurrency", type=int,
+                    default=int(_env_float("BATCH_CONCURRENCY", 3)),
+                    help="Parallel workers for --evaluate-batch (default: 3, or the "
+                         "BATCH_CONCURRENCY env var). Size to your provider's limits — "
+                         "e.g. DeepInfra allows 200 concurrent requests per model.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--apply", action="store_true",
