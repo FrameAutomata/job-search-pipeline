@@ -271,6 +271,27 @@ class TestTransientProviderErrors:
             status_code = 404
         assert not _is_transient_provider_error(NotFound("no such model"))
 
+    def test_empty_content_is_transient(self):
+        # A 200-with-empty-body (degraded endpoint, or a reasoning model that
+        # burned its budget thinking) must fail over, not kill the job — a live
+        # rerun lost jobs to "provider returned empty content" with two healthy
+        # fallback models configured.
+        assert _is_transient_provider_error(RuntimeError("provider returned empty content"))
+        assert _is_transient_provider_error(RuntimeError("anthropic returned empty content"))
+
+    def test_failover_swaps_on_empty_content(self, monkeypatch):
+        from pipeline.batch_evaluate import _build_failover_caller
+        def empty(system, user):
+            raise RuntimeError("provider returned empty content")
+        def alive(system, user):
+            return "from-backup"
+        monkeypatch.setattr(
+            "pipeline.batch_evaluate._build_single_caller",
+            lambda provider, model, disable_thinking=False:
+                empty if model == "primary" else alive)
+        call = _build_failover_caller("deepinfra", ["primary", "backup"])
+        assert call("s", "u") == "from-backup"
+
     def test_failover_swaps_on_500(self, monkeypatch):
         from pipeline.batch_evaluate import _build_failover_caller
         def dead(system, user):

@@ -127,6 +127,11 @@ _TRANSIENT_SERVER_MARKERS = (
     "timed out",
     "timeout",
     "connection error",
+    # Our own callers raise "<provider> returned empty content" when a model
+    # answers 200 with an empty body — a degraded endpoint, or a reasoning
+    # model that burned its whole token budget thinking. Either way the model
+    # is unusable for this call: retry, and above all FAIL OVER to a sibling.
+    "empty content",
 )
 
 
