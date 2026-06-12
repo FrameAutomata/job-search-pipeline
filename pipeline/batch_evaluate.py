@@ -112,6 +112,23 @@ _RATE_LIMIT_MARKERS = (
     "too many requests",
 )
 
+# Server-side trouble that is NOT the caller's fault: worth retrying in place
+# and worth failing over to a sibling model. (A live run hit a deepinfra model
+# endpoint returning HTTP 500 "inference error" for every request — only
+# rate-limits triggered failover, so 183 jobs failed against a configured
+# 3-model chain.) Distinct from 4xx caller errors (bad model id, auth), which
+# must keep raising immediately.
+_TRANSIENT_SERVER_MARKERS = (
+    "inference error",
+    "internal server error",
+    "service unavailable",
+    "bad gateway",
+    "overloaded",
+    "timed out",
+    "timeout",
+    "connection error",
+)
+
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
     """Best-effort detection of provider rate-limit errors.
@@ -128,6 +145,25 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
 
 
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    """Rate limits PLUS server-side failures (5xx, timeouts, 'inference
+    error'): everything where a retry or a failover to a sibling model makes
+    sense. Caller errors (401 auth, 404 bad model id) stay non-transient so a
+    misconfiguration still fails loudly instead of burning the whole chain."""
+    if _is_rate_limit_error(exc):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "code", None)
+    try:
+        if status is not None and 500 <= int(status) <= 599:
+            return True
+    except (TypeError, ValueError):
+        pass
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_SERVER_MARKERS)
+
+
 def _call_with_retry(
     caller: Caller,
     system: str,
@@ -137,8 +173,9 @@ def _call_with_retry(
     base_delay: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
 ) -> str:
-    """Invoke `caller(system, user)` with exponential backoff on rate-limit
-    errors. Non-rate-limit exceptions raise immediately (no retry).
+    """Invoke `caller(system, user)` with exponential backoff on transient
+    provider errors (rate limits, 5xx/'inference error', timeouts). Caller
+    errors (auth, bad model id) raise immediately — no retry.
 
     Backoff: 1, 2, 4, 8, 16 seconds, each with up to 0.5s of random jitter
     to avoid thundering-herd when multiple workers throttle simultaneously.
@@ -151,11 +188,11 @@ def _call_with_retry(
         try:
             return caller(system, user)
         except Exception as exc:
-            if not _is_rate_limit_error(exc) or attempt == max_attempts:
+            if not _is_transient_provider_error(exc) or attempt == max_attempts:
                 raise
             jittered = delay + random.uniform(0, 0.5)
             print(
-                f"  rate-limited (attempt {attempt}/{max_attempts}): "
+                f"  provider busy (attempt {attempt}/{max_attempts}): "
                 f"sleeping {jittered:.1f}s — {exc}",
                 flush=True,
             )
@@ -262,11 +299,12 @@ def _build_failover_caller(provider: str, models: list[str], *,
             try:
                 return caller(system, user)
             except Exception as exc:
-                if not _is_rate_limit_error(exc):
+                if not _is_transient_provider_error(exc):
                     raise
                 last_exc = exc
                 if i + 1 < len(built):
-                    print(f"  model busy ({model}) — failing over to {built[i + 1][0]}", flush=True)
+                    print(f"  model unavailable ({model}: {str(exc)[:60]}) — "
+                          f"failing over to {built[i + 1][0]}", flush=True)
         raise last_exc if last_exc else RuntimeError("no models configured")
 
     return call

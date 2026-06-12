@@ -13,6 +13,7 @@ from pipeline.batch_evaluate import (
     _check_provider,
     _detect_provider,
     _is_rate_limit_error,
+    _is_transient_provider_error,
     resolve_caller,
     run,
 )
@@ -240,6 +241,58 @@ class TestIsRateLimitError:
         assert not _is_rate_limit_error(Exception("model not found"))
         assert not _is_rate_limit_error(Exception("connection refused"))
         assert not _is_rate_limit_error(ValueError("bad input"))
+
+
+class TestTransientProviderErrors:
+    """5xx / 'inference error' / timeouts must trigger retry AND model
+    failover — a live run lost 183/200 jobs to a deepinfra endpoint returning
+    HTTP 500 'inference error' while a 3-model failover chain sat unused
+    (only rate-limits swapped)."""
+
+    def test_500_status_attribute(self):
+        class HttpErr(Exception):
+            status_code = 500
+        assert _is_transient_provider_error(HttpErr("boom"))
+
+    def test_deepinfra_inference_error_message(self):
+        assert _is_transient_provider_error(
+            Exception("Error code: 500 - {'error': {'message': 'inference error', "
+                      "'type': 'api_error', 'param': None, 'code': None}}"))
+
+    def test_timeout_and_rate_limit_also_transient(self):
+        assert _is_transient_provider_error(Exception("Request timed out."))
+        assert _is_transient_provider_error(Exception("429 Too Many Requests"))
+
+    def test_caller_errors_still_raise(self):
+        # Auth/bad-model must NOT burn the failover chain or retry budget.
+        assert not _is_transient_provider_error(Exception("Invalid API key"))
+        assert not _is_transient_provider_error(Exception("model not found"))
+        class NotFound(Exception):
+            status_code = 404
+        assert not _is_transient_provider_error(NotFound("no such model"))
+
+    def test_failover_swaps_on_500(self, monkeypatch):
+        from pipeline.batch_evaluate import _build_failover_caller
+        def dead(system, user):
+            raise Exception("Error code: 500 - inference error")
+        def alive(system, user):
+            return "from-backup"
+        monkeypatch.setattr(
+            "pipeline.batch_evaluate._build_single_caller",
+            lambda provider, model, disable_thinking=False:
+                dead if model == "primary" else alive)
+        call = _build_failover_caller("deepinfra", ["primary", "backup"])
+        assert call("s", "u") == "from-backup"
+
+    def test_retry_backs_off_on_500_then_succeeds(self):
+        calls = []
+        def flaky(system, user):
+            calls.append(1)
+            if len(calls) == 1:
+                raise Exception("Error code: 500 - inference error")
+            return "recovered"
+        assert _call_with_retry(flaky, "s", "u", sleep=lambda _: None) == "recovered"
+        assert len(calls) == 2
 
 
 class TestCallWithRetry:
