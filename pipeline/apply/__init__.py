@@ -287,13 +287,22 @@ def _refresh_tracker(career_ops: Path) -> Path:
 
 
 def _mark_applied(applications_md: Path, num: str) -> None:
-    """Set the tracker row's status to Applied (reuses the UI's editor)."""
-    if not num or not applications_md.exists():
+    """Record an auto-submitted application's status everywhere it matters:
+
+    1. The tracker copy this run selected from (direct Status-cell edit) — but
+       with refresh on that's the downloaded artifact copy, which nothing else
+       reads, so on its own the change was effectively invisible.
+    2. The UI's status-override channel (same one a kanban drag uses) — the UI
+       immediately shows the row as Applied (pending), and the existing Push
+       button carries it to the cloud tracker."""
+    if not num:
         return
-    text = applications_md.read_text(encoding="utf-8")
-    updated = _data.set_status_in_text(text, num, "Applied")
-    if updated != text:
-        atomic_write_text(applications_md, updated)
+    if applications_md.exists():
+        text = applications_md.read_text(encoding="utf-8")
+        updated = _data.set_status_in_text(text, num, "Applied")
+        if updated != text:
+            atomic_write_text(applications_md, updated)
+    _data.record_status_override(num, "Applied")
 
 
 def _build_caller(provider: str | None, model: str | None):

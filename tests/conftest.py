@@ -181,6 +181,16 @@ def _clear_keyword_cache(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_status_overrides(monkeypatch, tmp_path):
+    """Redirect the UI's pending-status override file to tmp so tests (e.g.
+    apply auto-submit paths) never write the real .ui-cache state."""
+    from pipeline.app import data as app_data
+    monkeypatch.setattr(
+        app_data, "STATUS_OVERRIDES_FILE", tmp_path / "_status-overrides.json"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_provider_env(monkeypatch):
     """Keep LLM-provider detection hermetic. Several modules (pipeline.filter,
     pipeline.app.server) call load_dotenv() at import time, leaking the

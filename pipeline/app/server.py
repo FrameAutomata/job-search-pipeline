@@ -74,10 +74,11 @@ EDIT_WORKFLOW = "edit-tracker.yml"
 # several times a day, so it's frequently newer than the daily one.
 PIPELINE_WORKFLOWS = [DAILY_WORKFLOW, EASY_APPLY_WORKFLOW]
 
-# Pending status changes (kanban drags) the user hasn't pushed yet, keyed by
-# tracker number → canonical status. Persisted so they survive a server
-# restart mid-triage; cleared on a successful push.
-OVERRIDES_FILE = ROOT / ".ui-cache" / "status-overrides.json"
+# Pending status changes the user hasn't pushed yet, keyed by tracker number →
+# canonical status. Written by kanban drags here AND by the apply stage when it
+# auto-submits (data.record_status_override) — one channel, one path constant.
+# Persisted so they survive a server restart mid-triage; cleared on push.
+OVERRIDES_FILE = data.STATUS_OVERRIDES_FILE
 # Overrides that have been dispatched to the cloud but aren't yet reflected in
 # a pipeline artifact. Applied on every job load so statuses survive Refresh
 # and restarts; self-cleans entry-by-entry once the artifact catches up.

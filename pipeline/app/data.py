@@ -5,8 +5,37 @@ renders individual report markdown files to HTML. Pure functions, no FastAPI
 import — so they're unit-testable without standing up a server.
 """
 
+import json
 import re
 from pathlib import Path
+
+# The UI's pending-status-changes channel: {row num: status}. Kanban drags and
+# the apply stage's auto-submits both write here; /api/jobs overlays it onto the
+# rows and the Push button sends it to the cloud tracker. Defined once — both
+# server.py and the apply stage import this path rather than re-deriving it.
+STATUS_OVERRIDES_FILE = (
+    Path(__file__).resolve().parent.parent.parent / ".ui-cache" / "status-overrides.json"
+)
+
+
+def record_status_override(num: str, status: str, path: Path | None = None) -> None:
+    """Record a pending status change in the UI's override file — the same
+    channel a kanban drag uses. Best-effort: a failure here must never break
+    the caller (the tracker-file write is the primary record)."""
+    p = path or STATUS_OVERRIDES_FILE
+    try:
+        try:
+            overrides = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(overrides, dict):
+                overrides = {}
+        except (OSError, json.JSONDecodeError):
+            overrides = {}
+        overrides[str(num)] = status
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(overrides, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
 
 # Canonical applications.md statuses (mirror of career-ops templates/states.yml
 # + merge-tracker.mjs). The kanban board uses these as its columns.

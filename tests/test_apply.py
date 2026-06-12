@@ -583,6 +583,42 @@ class TestResumeResolution:
         assert r is None or r.name == "resume.pdf"
 
 
+class TestMarkApplied:
+    """An auto-submitted role must surface as Applied in BOTH the tracker copy
+    the run used and the UI's pending-status channel (which the Push button
+    carries to the cloud) — the tracker copy alone is invisible when it's the
+    downloaded artifact."""
+
+    _TRACKER = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 7 | 2026-06-01 | Acme | Eng | 4.2/5 | Evaluated | ❌ | [007](reports/007.md) | x |\n"
+    )
+
+    def test_marks_tracker_and_records_override(self, tmp_path):
+        import json
+        from pipeline.app import data as app_data
+        apps = tmp_path / "applications.md"
+        apps.write_text(self._TRACKER, encoding="utf-8")
+        apply_pkg._mark_applied(apps, "7")
+        assert "| Applied |" in apps.read_text(encoding="utf-8")
+        ov = json.loads(app_data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))
+        assert ov == {"7": "Applied"}
+
+    def test_override_recorded_even_when_tracker_missing(self, tmp_path):
+        import json
+        from pipeline.app import data as app_data
+        apply_pkg._mark_applied(tmp_path / "absent.md", "7")
+        ov = json.loads(app_data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))
+        assert ov == {"7": "Applied"}
+
+    def test_no_num_is_noop(self, tmp_path):
+        from pipeline.app import data as app_data
+        apply_pkg._mark_applied(tmp_path / "absent.md", "")
+        assert not app_data.STATUS_OVERRIDES_FILE.exists()
+
+
 class TestTailoredResume:
     def _job(self, company):
         return queue.ApplyJob(num="1", company=company, role="Eng",

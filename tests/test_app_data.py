@@ -283,6 +283,31 @@ class TestSetStatusInText:
         assert data.set_status_in_text(self.APPS, "#", "Applied") == self.APPS
 
 
+class TestRecordStatusOverride:
+    """The shared pending-status channel (kanban drags + apply auto-submits)."""
+
+    def test_creates_and_merges(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Applied", p)
+        data.record_status_override("9", "Rejected", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied", "9": "Rejected"}
+
+    def test_overwrites_same_num(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Evaluated", p)
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+
+    def test_corrupt_file_tolerated(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        p.write_text("not json{", encoding="utf-8")
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+
+
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):
         f = tmp_path / "r.md"
