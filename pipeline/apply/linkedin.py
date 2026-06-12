@@ -119,6 +119,28 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
     return failed("max_steps_exceeded")
 
 
+def submit_application(page) -> ApplyResult:
+    """Click the held Submit button after a review-mode fill.
+
+    apply_to(mode="review") leaves the modal parked on the Submit step; the UI
+    holds the browser open until the user confirms, then calls this. We re-verify
+    the primary action really is 'Submit application' so a relabeled Next can
+    never be clicked as a submit (the whole point of the review gate)."""
+    if not _modal_open(page):
+        return failed("modal_closed_before_submit")
+    primary = _primary_button(page)
+    if primary is None:
+        return failed("no_primary_button")
+    if "submit application" not in _btn_label(primary):
+        return failed("not_on_submit_step")
+    try:
+        primary.click()
+    except Exception:
+        return failed("submit_click_failed")
+    page.wait_for_timeout(2000)
+    return ApplyResult(code=APPLIED, submitted=True)
+
+
 # ── page probes ──────────────────────────────────────────────────────────────
 
 def _text(page, selector: str) -> str:

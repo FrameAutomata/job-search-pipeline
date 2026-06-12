@@ -23,7 +23,7 @@ from pipeline._batch_common import atomic_write_text, normalize_company, read_te
 from pipeline.apply import browser, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
-from pipeline.apply.result import ApplyResult, failed
+from pipeline.apply.result import ApplyResult, EXPIRED, failed
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 _VALID_MODES = ("review", "dry-run", "auto")
@@ -86,13 +86,7 @@ def run(
     print(f"[apply] {len(jobs)} candidate(s) | mode={mode} | "
           f"{'headless' if headless else 'windowed'}")
 
-    profile = ApplyProfile.load(career_ops)
-    caller = _build_caller(provider, model)
-    engine = AnswerEngine(
-        profile=profile,
-        cache_path=career_ops / "batch" / "apply-answers.json",
-        caller=caller,
-    )
+    engine = build_engine(career_ops, provider=provider, model=model)
 
     applied = held = failures = 0
 
@@ -109,43 +103,10 @@ def run(
             report_root = applications_md.parent.parent
 
             for job in jobs:
-                engine.job_context = f"{job.company} — {job.role}"
-                engine.unanswered = []   # per-job, so _report surfaces only this job's
-                # Role's researched market comp (from the report) for salary fields.
-                report_text = (read_text(report_root / job.report_path)
-                               if getattr(job, "report_path", "") else "")
-                engine.role_salary_target = salary_from_report(report_text)
-                # Cover letter generated lazily — only if this form has a cover-
-                # letter field (request-gated). Builds its own caller so it can
-                # use COVER_MODEL (quality-first) rather than the speed-first
-                # APPLY_MODEL chain the short answers use.
-                engine.cover_letter_text = ""
-                engine.cover_letter_provider = (
-                    lambda j=job: cover_letters.generate_for_job(
-                        career_ops, j, report_base=report_root, provider=provider, model=model)
+                configure_engine_for_job(
+                    engine, job, career_ops=career_ops, report_root=report_root,
+                    provider=provider, model=model, tailor_min_score=tailor_min_score,
                 )
-                # For forms whose cover-letter field is a PDF upload (not a
-                # textarea), render the generated letter to a PDF on demand.
-                engine.cover_pdf_provider = (
-                    lambda j=job: cover_letters.ensure_cover_pdf(career_ops, j.company)
-                )
-                # Per-job tailored resume (slot-edited copy of the candidate's own
-                # .docx, one-page verified) for jobs clearing the tailor threshold.
-                # Lazy: generated only when a resume-upload field actually appears,
-                # so expired/off-site jobs never burn the LLM call.
-                engine.resume_provider = None
-                if _should_tailor(job, tailor_min_score):
-                    from pipeline import resume_tailor
-                    # Memoized: _handle_file_inputs runs per form step (and again
-                    # after a validation error), and while a SUCCESSFUL generation
-                    # is cheap to repeat (cache hit), a FAILING one would re-run
-                    # the full LLM-call-with-backoff every time — minutes per job
-                    # with the provider down.
-                    engine.resume_provider = _memoized(
-                        lambda j=job: resume_tailor.generate_for_job(
-                            career_ops, j, report_base=report_root,
-                            provider=provider, model=model)
-                    )
                 resume = _resolve_resume(career_ops, job)
                 try:
                     result = linkedin.apply_to(page, job, engine, mode=mode, resume_path=resume)
@@ -172,6 +133,52 @@ def run(
     return applied if mode == "auto" else held
 
 
+def build_engine(career_ops: Path, *, provider: str | None, model: str | None) -> AnswerEngine:
+    """The shared answer engine (profile + cache + LLM caller). One per session;
+    reconfigured per job by configure_engine_for_job. Used by both the CLI run()
+    loop and the UI review worker so the two apply paths wire it identically."""
+    return AnswerEngine(
+        profile=ApplyProfile.load(career_ops),
+        cache_path=career_ops / "batch" / "apply-answers.json",
+        caller=_build_caller(provider, model),
+    )
+
+
+def configure_engine_for_job(engine: AnswerEngine, job, *, career_ops: Path, report_root: Path,
+                             provider: str | None, model: str | None,
+                             tailor_min_score: float) -> None:
+    """Set the per-job fields on a shared engine: role context, the role's
+    researched market comp (from its report) for salary fields, and the lazy
+    cover-letter / tailored-resume providers (generated only if the form asks).
+    Extracted so the CLI loop and the UI review worker don't drift."""
+    from pipeline import cover_letters
+    engine.job_context = f"{job.company} — {job.role}"
+    engine.unanswered = []   # per-job, so the review surfaces only this job's
+    report_text = (read_text(report_root / job.report_path)
+                   if getattr(job, "report_path", "") else "")
+    engine.role_salary_target = salary_from_report(report_text)
+    # Cover letter generated lazily — only if this form has a cover-letter field
+    # (request-gated); it builds its own quality-first COVER_MODEL caller.
+    engine.cover_letter_text = ""
+    engine.cover_letter_provider = (
+        lambda j=job: cover_letters.generate_for_job(
+            career_ops, j, report_base=report_root, provider=provider, model=model)
+    )
+    # For forms whose cover-letter field is a PDF upload, render on demand.
+    engine.cover_pdf_provider = (
+        lambda j=job: cover_letters.ensure_cover_pdf(career_ops, j.company)
+    )
+    # Per-job tailored resume for jobs clearing the threshold. Lazy + memoized so
+    # a failing generation doesn't re-run the full LLM backoff on every form step.
+    engine.resume_provider = None
+    if _should_tailor(job, tailor_min_score):
+        from pipeline import resume_tailor
+        engine.resume_provider = _memoized(
+            lambda j=job: resume_tailor.generate_for_job(
+                career_ops, j, report_base=report_root, provider=provider, model=model)
+        )
+
+
 def _report(job, result: ApplyResult, mode: str, applications_md: Path,
             applied: int, held: int, failures: int,
             unanswered: list[str] | None = None) -> tuple[int, int, int]:
@@ -195,6 +202,10 @@ def _report(job, result: ApplyResult, mode: str, applications_md: Path,
                   + "; ".join(q[:40] for q in unanswered[:5]))
     else:
         failures += 1
+        if result.code == EXPIRED:
+            # The posting is no longer accepting applications — mark it Discarded
+            # so it leaves the active queue (parallel to submit -> Applied).
+            _mark_status(applications_md, job, "Discarded")
         print(f"[apply] [XX]   {result.code.upper()} {tag}"
               + (f" ({result.reason})" if result.reason else ""))
     return applied, held, failures
@@ -286,35 +297,41 @@ def _refresh_tracker(career_ops: Path) -> Path:
     return local
 
 
-def _mark_applied(applications_md: Path, job) -> None:
-    """Record an auto-submitted application's status everywhere it matters:
+def _mark_status(applications_md: Path, job, status: str) -> None:
+    """Record `status` for a job everywhere it matters:
 
     1. The tracker copy this run selected from (direct Status-cell edit) — but
        with refresh on that's the downloaded artifact copy, which nothing else
        reads, so on its own the change was effectively invisible.
     2. The UI's status-override channel (same one a kanban drag uses) — the UI
-       immediately shows the row as Applied (pending), and the existing Push
+       immediately shows the row's new status (pending), and the existing Push
        button carries it to the cloud tracker.
 
     The override carries the job's company/role identity, not just its num: the
     num came from whatever tracker this run read (a refreshed cloud artifact, or
     the local fallback when gh was down), and the cloud tracker the override is
     eventually pushed to mints its numbers independently. Anchoring on identity
-    means the Push marks the row that was actually applied to — never a
-    different company that happens to share the num."""
+    means the Push marks the row that was actually acted on — never a different
+    company that happens to share the num. Used for submit -> Applied and for a
+    closed posting -> Discarded."""
     num = getattr(job, "num", "") or ""
     if not num:
         return
     if applications_md.exists():
         text = applications_md.read_text(encoding="utf-8")
-        updated = _data.set_status_in_text(text, num, "Applied")
+        updated = _data.set_status_in_text(text, num, status)
         if updated != text:
             atomic_write_text(applications_md, updated)
     _data.record_status_override(
-        num, "Applied",
+        num, status,
         company=getattr(job, "company", "") or "",
         role=getattr(job, "role", "") or "",
     )
+
+
+def _mark_applied(applications_md: Path, job) -> None:
+    """An auto-submitted application -> Applied (thin wrapper over _mark_status)."""
+    _mark_status(applications_md, job, "Applied")
 
 
 def _build_caller(provider: str | None, model: str | None):
