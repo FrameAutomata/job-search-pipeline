@@ -419,6 +419,17 @@ class TestResolveOverridesForPush:
         assert cloud_payload == {"5": "SKIP"}
         assert unresolved == []
 
+    def test_build_text_false_keeps_payload_but_skips_rebuild(self):
+        # The refreshed-artifact push only needs cloud_payload (it doesn't persist
+        # the merged text), so build_text=False leaves the base unchanged while
+        # still resolving + dispatching the same payload.
+        overrides = {"99": {"status": "Applied", "company": "Acme", "role": "Engineer"}}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(
+            self.APPS, overrides, build_text=False)
+        assert cloud_payload == {"3": "Applied"}   # resolution unaffected
+        assert unresolved == []
+        assert new_text == self.APPS               # base text untouched
+
 
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):

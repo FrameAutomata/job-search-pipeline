@@ -492,14 +492,24 @@ fetch("/api/run-local/status").then((r) => r.json()).then((s) => {
 
 els.pushBtn.addEventListener("click", async () => {
   els.pushBtn.disabled = true;
-  showAction("Refreshing latest tracker, applying your changes, pushing to GitHub…", "");
+  showAction("Applying your changes onto the latest cloud tracker and pushing to GitHub…", "");
   try {
     const r = await postAction("/api/push-status");
-    await loadJobs();  // reflects the merged/cleared state
-    const note = r.base === "refreshed"
-      ? "applied onto the latest cloud tracker"
-      : "pushed from the local tracker (couldn't refresh first)";
-    showAction(`Pushed ${r.pushed} status change${r.pushed === 1 ? "" : "s"} — ${note}.`, "ok");
+    await loadJobs();  // the pushed-override overlay keeps the change shown here
+    let msg;
+    if (r.pushed > 0) {
+      // The cloud cache is updated immediately by edit-tracker, but it only
+      // shows up in a downloaded artifact after the next pipeline run — so set
+      // that expectation instead of implying it's instantly visible on Refresh.
+      msg = `Pushed ${r.pushed} change${r.pushed === 1 ? "" : "s"} to the cloud tracker. ` +
+            "They stay shown here and will appear in the tracker after the next pipeline run.";
+    } else {
+      msg = "Nothing pushed — none of the pending changes matched a row in the current cloud tracker.";
+    }
+    if (r.unresolved) {
+      msg += ` (${r.unresolved} couldn't be matched to a current row and were kept for a later push.)`;
+    }
+    showAction(msg, r.pushed > 0 ? "ok" : "");
   } catch (e) {
     showAction(String(e.message || e), "error");
   } finally {

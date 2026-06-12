@@ -155,18 +155,25 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str) 
     return None
 
 
-def resolve_overrides_for_push(applications_md_text: str, overrides: dict):
+def resolve_overrides_for_push(applications_md_text: str, overrides: dict,
+                               *, build_text: bool = True):
     """Build the cloud push payload from the pending overrides, applied onto the
     base tracker.
 
     Returns (new_text, cloud_payload, unresolved):
-      - new_text: the base with each applied override's Status cell rewritten.
+      - new_text: the base with each applied override's Status cell rewritten
+        (identical to the input when build_text is False).
       - cloud_payload: {num: status} for edit-tracker.yml (always num-keyed).
       - unresolved: keys of identity-anchored overrides whose company/role isn't
         in THIS base. Those are NOT applied and NOT dispatched — falling back to
         the (foreign) num would mark a different company that merely shares it,
         and the caller must keep (not clear) them so they reach the right row on
         a later push once the company appears.
+
+    build_text=False skips rewriting the (potentially large) merged tracker text
+    when the caller won't persist it — e.g. a refreshed-artifact push only needs
+    cloud_payload (the artifact copy is transient and isn't written). Status-cell
+    edits don't affect identity resolution, so the payload is unchanged.
     """
     new_text = applications_md_text
     cloud_payload: dict[str, str] = {}
@@ -181,7 +188,8 @@ def resolve_overrides_for_push(applications_md_text: str, overrides: dict):
                 continue
         else:
             num = key
-        new_text = set_status_in_text(new_text, num, status)
+        if build_text:
+            new_text = set_status_in_text(new_text, num, status)
         cloud_payload[num] = status
     return new_text, cloud_payload, unresolved
 

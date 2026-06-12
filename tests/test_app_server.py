@@ -36,8 +36,9 @@ def client(tmp_path, monkeypatch):
     from pipeline.app import server
     importlib.reload(server)
     # Isolate mutable module state into tmp so tests don't leak into each other
-    # or touch the real repo's .ui-cache.
-    server.OVERRIDES_FILE = tmp_path / ".ui-cache" / "status-overrides.json"
+    # or touch the real repo's .ui-cache. (status-overrides is isolated by the
+    # autouse conftest fixture via data.STATUS_OVERRIDES_FILE.)
+    server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
     server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
     server._active_data_dir = None
     return TestClient(server.app)
@@ -194,6 +195,47 @@ def test_push_status_refreshes_applies_and_dispatches(client, tmp_path, mocker):
 
     # Pending cleared after a successful push.
     assert client.get("/api/jobs").json()["pending"] == 0
+
+
+def test_pushed_change_survives_post_push_reload_and_refresh(client, tmp_path, mocker):
+    """A pushed status must stay visible across the post-push board reload AND a
+    later Refresh, until a genuinely fresh pipeline run incorporates it. The bug:
+    push edits the downloaded artifact copy, so the post-push /api/jobs reload
+    self-cleans the pushed-override bridge against a copy push itself changed —
+    and the next Refresh (re-downloading the still-unchanged cloud artifact) then
+    shows the status reverting (it 'vanishes')."""
+    from pipeline.app import server
+    import json
+
+    def artifact(name):
+        # The cloud tracker still shows #1 as Evaluated (it hasn't incorporated
+        # the pushed change yet — that happens on the next pipeline run).
+        d = tmp_path / name / "pipeline-output-9"
+        (d / "data").mkdir(parents=True)
+        (d / "data" / "applications.md").write_text(
+            "# Applications Tracker\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-05-27 | Acme | Eng | 4.2/5 | Evaluated | ❌ | [001](reports/001-acme.md) | APPLY |\n",
+            encoding="utf-8")
+        return d
+
+    client.post("/api/status", json={"num": "1", "status": "Applied"})
+    mocker.patch.object(server.gh, "latest_successful_run", return_value={"databaseId": 9})
+    mocker.patch.object(server.gh, "download_artifact", return_value=artifact("push"))
+    mocker.patch.object(server.gh, "trigger_workflow")
+    assert client.post("/api/push-status").json()["pushed"] == 1
+
+    client.get("/api/jobs")  # the UI reloads the board right after a push
+
+    # User clicks Refresh to check the remote — re-downloads the (unchanged) artifact.
+    mocker.patch.object(server.gh, "download_artifact", return_value=artifact("refresh"))
+    client.post("/api/refresh")
+
+    rows = {r["num"]: r for r in client.get("/api/jobs").json()["rows"]}
+    assert rows["1"]["status_canonical"] == "Applied"        # must NOT have vanished
+    pushed = json.loads((tmp_path / ".ui-cache" / "pushed-overrides.json").read_text())
+    assert pushed == {"1": "Applied"}                        # bridge retained until a fresh run
 
 
 def test_push_status_falls_back_to_local_when_refresh_fails(client, mocker):

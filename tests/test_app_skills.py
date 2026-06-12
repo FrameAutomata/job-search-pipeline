@@ -48,7 +48,10 @@ def client(tmp_path, monkeypatch):
                 "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
                 "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
-    server.OVERRIDES_FILE = tmp_path / ".ui-cache" / "status-overrides.json"
+    # status-overrides is isolated by the autouse _isolate_status_overrides
+    # conftest fixture; isolate the pushed-overrides + cache paths here so no
+    # push-touching test can write the developer's real (gitignored) .ui-cache.
+    server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
     server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
     server._active_data_dir = None
     return TestClient(server.app)
