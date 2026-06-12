@@ -271,9 +271,28 @@ def test_launch_macos_opens_terminal_app(client, mocker, monkeypatch):
     assert os.access(cmd[3], os.X_OK)
     script = open(cmd[3], encoding="utf-8").read()
     assert "#!/usr/bin/env bash" in script
-    assert "cd '" in script  # POSIX-quoted cwd
+    assert "cd " in script and "|| exit 1" in script   # cd guard present
     assert "claude" in script
     assert "read -n 1" in script
+
+
+def test_write_unix_script_quotes_cwd_with_spaces():
+    # The real safety property, asserted deterministically (controls the cwd, so
+    # it holds on every OS — unlike asserting quoting on an env-dependent runtime
+    # cwd, which only contains shell-special chars on Windows).
+    from pipeline.app import skills
+    path = skills._write_unix_script("claude run", "/home/me/My Projects/x")
+    script = open(path, encoding="utf-8").read()
+    assert "cd '/home/me/My Projects/x' || exit 1" in script   # space → quoted
+
+
+def test_write_unix_script_leaves_clean_path_unquoted():
+    # A path with no shell-special chars is valid unquoted; shlex.quote leaves it
+    # alone, which is exactly why the old "cd '" assertion failed on POSIX CI.
+    from pipeline.app import skills
+    path = skills._write_unix_script("claude run", "/home/runner/work/x")
+    script = open(path, encoding="utf-8").read()
+    assert "cd /home/runner/work/x || exit 1" in script
 
 
 def test_launch_linux_uses_first_resolved_terminal(client, mocker, monkeypatch):
