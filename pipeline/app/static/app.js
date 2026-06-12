@@ -233,6 +233,9 @@ async function openReport(job) {
   selectedNum = job.report_num;
   selectedJob = job;
   resetSkillPanel();
+  resetApplyPanel();
+  applyEls.btn.hidden = !isLinkedInJob(job);
+  applyEls.btn.disabled = false;
   render();
   els.reportLink.href = extractUrl(job) || "#";
   els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : "Evaluated";
@@ -299,6 +302,7 @@ els.hideActionedChk.addEventListener("change", () => {
   render();
 });
 els.reportClose.addEventListener("click", () => {
+  resetApplyPanel();   // cancel any live apply session + stop its poll loop
   els.reportPane.hidden = true;
   selectedNum = null;
   render();
@@ -666,6 +670,165 @@ function showSkill(text, kind) {
 // easy to spot-copy).
 function renderPrereq(note) {
   return escapeHtml(note).replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+// ── apply review-and-submit ─────────────────────────────────────────────────
+// Open a visible browser, fill the LinkedIn Easy Apply form, review the drafted
+// answers, then Submit (or Cancel). The server holds the browser open between
+// fill and submit; we just poll status and surface Submit/Cancel.
+
+const applyEls = {
+  btn: document.getElementById("apply-btn"),
+  panel: document.getElementById("apply-panel"),
+  jobId: null,
+  timer: null,
+  deciding: false,   // a Submit/Cancel POST is in flight — don't rebuild the panel
+};
+
+applyEls.btn.addEventListener("click", startApply);
+
+function isLinkedInJob(job) {
+  return /linkedin\.com\/jobs\/view\//i.test(extractUrl(job) || "");
+}
+
+function resetApplyPanel() {
+  clearTimeout(applyEls.timer);
+  // Cancel a still-live session so navigating away doesn't orphan the held
+  // browser and 409-block the next apply until the hold timeout (a terminal /
+  // submitting session 409s here, which is fine — the .catch swallows it).
+  if (applyEls.jobId) {
+    fetch(`/api/jobs/apply-cancel/${applyEls.jobId}`, { method: "POST" }).catch(() => {});
+  }
+  applyEls.jobId = null;
+  applyEls.deciding = false;
+  applyEls.panel.hidden = true;
+  applyEls.panel.innerHTML = "";
+}
+
+async function startApply() {
+  if (!selectedJob) return;
+  applyEls.btn.disabled = true;
+  applyEls.panel.hidden = false;
+  applyEls.panel.className = "apply-panel";
+  applyEls.panel.innerHTML = "<p>Opening a browser and filling the form — watch the window…</p>";
+  try {
+    const resp = await fetch("/api/jobs/apply-async", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ num: String(selectedJob.num) }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `apply failed (${resp.status})`);
+    applyEls.jobId = body.job_id;
+    pollApply();
+  } catch (e) {
+    applyEls.panel.className = "apply-panel error";
+    applyEls.panel.innerHTML = `<p>${escapeHtml(String(e.message || e))}</p>`;
+    applyEls.btn.disabled = false;
+  }
+}
+
+async function pollApply() {
+  clearTimeout(applyEls.timer);
+  if (!applyEls.jobId) return;
+  let s;
+  try {
+    s = await (await fetch(`/api/jobs/apply-status/${applyEls.jobId}`)).json();
+  } catch (_) {
+    applyEls.timer = setTimeout(pollApply, 1500);  // network blip — keep polling
+    return;
+  }
+  renderApply(s);
+  if (["pending", "ready", "submitting", "cancelling"].includes(s.status)) {
+    applyEls.timer = setTimeout(pollApply, s.status === "ready" ? 2500 : 1000);
+  }
+}
+
+function renderApply(s) {
+  const p = applyEls.panel;
+  p.hidden = false;
+  if (s.status === "pending") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Opening a browser and filling the form — watch the window…</p>";
+    return;
+  }
+  if (s.status === "submitting") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Submitting…</p>";
+    return;
+  }
+  if (s.status === "cancelling") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Cancelling…</p>";
+    return;
+  }
+  if (s.status === "ready") {
+    // A decision is in flight (we already showed "Submitting…/Cancelling…") —
+    // don't rebuild the form with live buttons before the worker flips status.
+    if (applyEls.deciding) return;
+    p.className = "apply-panel";
+    const rows = (s.answers || [])
+      .map((a) => `<tr><td>${escapeHtml(a[0])}</td><td>${escapeHtml(a[1])}</td></tr>`)
+      .join("");
+    const review = (s.needs_review || []).length
+      ? `<p class="warn">⚠ ${s.needs_review.length} field(s) need your review: ${escapeHtml(s.needs_review.join("; "))}</p>`
+      : "";
+    p.innerHTML =
+      `<p><b>Review the drafted answers, then submit.</b> Nothing is sent until you click Submit.</p>
+       ${review}
+       <table class="apply-answers"><tbody>${rows || "<tr><td>(no fields drafted)</td><td></td></tr>"}</tbody></table>
+       <div class="apply-actions">
+         <button id="apply-do-submit" class="primary">Submit application</button>
+         <button id="apply-do-cancel">Cancel</button>
+       </div>`;
+    document.getElementById("apply-do-submit").addEventListener("click", () => decideApply("submit"));
+    document.getElementById("apply-do-cancel").addEventListener("click", () => decideApply("cancel"));
+    return;
+  }
+  // Terminal states.
+  applyEls.btn.disabled = false;
+  applyEls.deciding = false;
+  applyEls.jobId = null;   // session is over — don't cancel it again on navigate-away
+  if (s.status === "submitted") {
+    p.className = "apply-panel ok";
+    p.innerHTML = "<p>✓ Submitted — marked Applied.</p>";
+    loadJobs();
+  } else if (s.status === "expired") {
+    p.className = "apply-panel warn";
+    p.innerHTML = "<p>This posting is no longer accepting applications — marked Discarded.</p>";
+    loadJobs();
+  } else if (s.status === "cancelled") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Cancelled — nothing was submitted.</p>";
+  } else if (s.status === "timeout") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Timed out waiting for a decision — the browser was closed. Click Apply to retry.</p>";
+  } else {
+    p.className = "apply-panel error";
+    p.innerHTML = `<p>Couldn't apply: ${escapeHtml(s.code || "failed")}${s.reason ? " — " + escapeHtml(s.reason) : ""}</p>`;
+  }
+}
+
+async function decideApply(decision) {
+  if (!applyEls.jobId) return;
+  applyEls.deciding = true;   // suppress the ready-panel rebuild until the worker flips
+  applyEls.panel.innerHTML = `<p>${decision === "submit" ? "Submitting" : "Cancelling"}…</p>`;
+  try {
+    const resp = await fetch(`/api/jobs/apply-${decision}/${applyEls.jobId}`, { method: "POST" });
+    if (!resp.ok) {
+      const b = await resp.json().catch(() => ({}));
+      throw new Error(b.detail || `failed (${resp.status})`);
+    }
+    pollApply();  // the worker moves to submitting -> submitted/cancelled; poll surfaces it
+  } catch (e) {
+    // The POST didn't take — the session is still as it was. Clear `deciding`
+    // and resume polling so the reviewable form (with buttons) returns.
+    applyEls.deciding = false;
+    applyEls.panel.className = "apply-panel error";
+    applyEls.panel.innerHTML =
+      `<p>${escapeHtml(String(e.message || e))} — the form is still open; restoring…</p>`;
+    applyEls.timer = setTimeout(pollApply, 1500);
+  }
 }
 
 loadCaps();

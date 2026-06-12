@@ -624,6 +624,43 @@ class TestMarkApplied:
         assert not app_data.STATUS_OVERRIDES_FILE.exists()
 
 
+class TestMarkClosedDiscarded:
+    """A posting no longer accepting applications (EXPIRED) marks the role
+    Discarded in the tracker + override channel — the apply-time sibling of
+    submit -> Applied. A generic failure marks nothing."""
+
+    _TRACKER = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 7 | 2026-06-01 | Acme | Eng | 4.2/5 | Evaluated | ❌ | [007](reports/007.md) | x |\n"
+    )
+
+    def _job(self, num="7", company="Acme", role="Eng"):
+        return queue.ApplyJob(num=num, company=company, role=role,
+                              url="https://www.linkedin.com/jobs/view/7", score=4.2)
+
+    def test_report_marks_expired_role_discarded(self, tmp_path):
+        import json
+        from pipeline.app import data as app_data
+        apps = tmp_path / "applications.md"
+        apps.write_text(self._TRACKER, encoding="utf-8")
+        apply_pkg._report(self._job(), result.ApplyResult(code=result.EXPIRED, reason="closed"),
+                          "review", apps, 0, 0, 0)
+        assert "| Discarded |" in apps.read_text(encoding="utf-8")
+        ov = json.loads(app_data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))
+        assert ov == {"7": {"status": "Discarded", "company": "Acme", "role": "Eng"}}
+
+    def test_generic_failure_does_not_mark(self, tmp_path):
+        from pipeline.app import data as app_data
+        apps = tmp_path / "applications.md"
+        apps.write_text(self._TRACKER, encoding="utf-8")
+        apply_pkg._report(self._job(), result.failed("modal_did_not_open"),
+                          "review", apps, 0, 0, 0)
+        assert "| Evaluated |" in apps.read_text(encoding="utf-8")   # unchanged
+        assert not app_data.STATUS_OVERRIDES_FILE.exists()
+
+
 class TestTailoredResume:
     def _job(self, company):
         return queue.ApplyJob(num="1", company=company, role="Eng",

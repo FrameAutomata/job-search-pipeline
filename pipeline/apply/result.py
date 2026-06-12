@@ -19,6 +19,7 @@ CAPTCHA = "captcha"            # blocked by an unsolved challenge
 LOGIN_ISSUE = "login_issue"    # not signed in / session expired
 NOT_ELIGIBLE = "not_eligible"  # a screening answer disqualified the candidate
 SKIPPED = "skipped"            # user/queue skipped it (not an attempt)
+CANCELLED = "cancelled"        # the user aborted the fill before it finished (UI review)
 
 # Failures that will never succeed on retry — recording them as permanent keeps
 # the worker from re-attempting the same dead job every run.
