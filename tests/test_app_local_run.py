@@ -6,9 +6,11 @@ use-local data-source switch."""
 import importlib
 
 import pytest
-from fastapi.testclient import TestClient
 
-from pipeline.app import local_run
+pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from pipeline.app import local_run  # noqa: E402
 
 
 class FakeProc:
