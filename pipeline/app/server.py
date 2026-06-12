@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline.app import data, gh, onboard, skills
+from pipeline.app import data, gh, local_run, onboard, skills
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
@@ -57,8 +57,13 @@ load_dotenv(ROOT / ".env", override=False)
 UI_CACHE = ROOT / ".ui-cache" / "latest"
 
 # Set by /api/refresh to the artifact subdir gh extracted, so subsequent reads
-# use freshly-downloaded data without restarting the server.
+# use freshly-downloaded data without restarting the server. Guarded by a lock
+# because push_status mutates it across a multi-second gh download while
+# /api/use-local (auto-fired when a local run finishes) can null it — an
+# unsynchronized interleave could make push write cloud data over the LOCAL
+# tracker.
 _active_data_dir: Path | None = None
+_data_dir_lock = threading.Lock()
 
 # Background add-job tasks: job_id → {status, result?, error?}
 _add_job_tasks: dict[str, dict] = {}
@@ -74,10 +79,11 @@ EDIT_WORKFLOW = "edit-tracker.yml"
 # several times a day, so it's frequently newer than the daily one.
 PIPELINE_WORKFLOWS = [DAILY_WORKFLOW, EASY_APPLY_WORKFLOW]
 
-# Pending status changes (kanban drags) the user hasn't pushed yet, keyed by
-# tracker number → canonical status. Persisted so they survive a server
-# restart mid-triage; cleared on a successful push.
-OVERRIDES_FILE = ROOT / ".ui-cache" / "status-overrides.json"
+# Pending status changes the user hasn't pushed yet. Written by kanban drags
+# here AND by the apply stage when it auto-submits — one channel, owned by
+# pipeline.app.data (atomic writes + an in-process lock). The server delegates
+# rather than re-implementing read/modify/write, and resolves the path at call
+# time so tests that redirect data.STATUS_OVERRIDES_FILE take effect.
 # Overrides that have been dispatched to the cloud but aren't yet reflected in
 # a pipeline artifact. Applied on every job load so statuses survive Refresh
 # and restarts; self-cleans entry-by-entry once the artifact catches up.
@@ -85,17 +91,11 @@ PUSHED_OVERRIDES_FILE = ROOT / ".ui-cache" / "pushed-overrides.json"
 
 
 def _load_overrides() -> dict:
-    if OVERRIDES_FILE.exists():
-        try:
-            return json.loads(OVERRIDES_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    return data.load_status_overrides()
 
 
 def _save_overrides(d: dict) -> None:
-    OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OVERRIDES_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    data.save_status_overrides(d)
 
 
 def _load_pushed_overrides() -> dict:
@@ -131,6 +131,19 @@ def _career_ops() -> Path:
     """Resolve the data directory for reads (jobs, reports). A successful
     Refresh wins; otherwise the local install."""
     return _active_data_dir if _active_data_dir is not None else _career_ops_local()
+
+
+def _refuse_during_local_run() -> None:
+    """409 if a local pipeline run is in progress. Add-job mints the next
+    report/tracker number in THIS process while a local run's eval stage mints
+    them in its subprocess — running both at once collides the numbering
+    (overwritten reports, duplicate tracker rows). They must not overlap."""
+    if local_run.is_running():
+        raise HTTPException(
+            status_code=409,
+            detail="A local pipeline run is in progress. Wait for it to finish — "
+                   "adding a job now would collide on report/tracker numbering.",
+        )
 
 
 app = FastAPI(title="job-search-pipeline UI")
@@ -193,14 +206,36 @@ def list_jobs() -> JSONResponse:
                 del pushed[num]
             _save_pushed_overrides(pushed)
 
-    # Apply pending-overrides: local kanban drags not yet pushed.
+    # Apply pending-overrides: local kanban drags + apply auto-submits not yet
+    # pushed. A plain (num-keyed) override lands on the row with that num; an
+    # identity-anchored one (from apply, whose num may be from a different
+    # tracker) lands on the row matching its company/role — so it marks the row
+    # actually applied to, not whichever row coincidentally shares the num.
+    #
+    # Prebuild O(1) lookups so the overlay is O(rows + overrides), not
+    # O(rows x overrides): identity anchors are keyed by (norm_company, norm_role),
+    # with a company-only anchor under (norm_company, "").
     overrides = _load_overrides()
     if overrides:
+        by_num: dict[str, str] = {}
+        by_identity: dict[tuple[str, str], str] = {}
+        for key, value in overrides.items():
+            ident = data.override_identity(value)
+            if ident:
+                company, role = ident
+                by_identity[(data.normalize_company(company),
+                             data.normalize_company(role))] = data.override_status(value)
+            else:
+                by_num[key] = data.override_status(value)
         for row in rows:
-            ov = overrides.get(str(row.get("num")))
-            if ov:
-                row["status"] = ov
-                row["status_canonical"] = data.canonical_status(ov)
+            status = by_num.get(str(row.get("num")))
+            if status is None:
+                nc = data.normalize_company(row.get("company", ""))
+                status = (by_identity.get((nc, data.normalize_company(row.get("role", ""))))
+                          or by_identity.get((nc, "")))
+            if status is not None:
+                row["status"] = status
+                row["status_canonical"] = data.canonical_status(status)
                 row["pending"] = True
     payload["pending"] = len(overrides)
     return JSONResponse(payload)
@@ -216,10 +251,10 @@ def set_status(change: StatusChange) -> JSONResponse:
             status_code=400,
             detail=f"Unknown status {change.status!r}. Valid: {', '.join(data.CANONICAL_STATES)}",
         )
-    overrides = _load_overrides()
-    overrides[str(change.num)] = change.status
-    _save_overrides(overrides)
-    return JSONResponse({"ok": True, "pending": len(overrides)})
+    # Through the locked read/modify/write accessor so a concurrent push or
+    # apply auto-submit can't lose this drag (or be lost by it).
+    data.record_status_override(str(change.num), change.status)
+    return JSONResponse({"ok": True, "pending": len(_load_overrides())})
 
 
 @app.post("/api/push-status")
@@ -240,6 +275,7 @@ def push_status() -> JSONResponse:
     global _active_data_dir
     base_text = None
     base_source = "local"
+    target_apps: Path | None = None   # the exact file base_text came from
 
     # Try to refresh a fresh base first (the clobber guard).
     try:
@@ -248,47 +284,62 @@ def push_status() -> JSONResponse:
             if UI_CACHE.exists():
                 shutil.rmtree(UI_CACHE)
             data_dir = gh.download_artifact(run["databaseId"], UI_CACHE)
-            _active_data_dir = data_dir
+            with _data_dir_lock:
+                _active_data_dir = data_dir
             apps = data_dir / "data" / "applications.md"
             if apps.exists():
                 base_text = apps.read_text(encoding="utf-8")
                 base_source = "refreshed"
+                target_apps = apps
     except gh.GhError:
         pass  # fall through to local base
 
     if base_text is None:
-        apps = _career_ops() / "data" / "applications.md"
+        # Write back to the LOCAL install — never via _career_ops(), whose
+        # _active_data_dir can flip to a cloud artifact mid-request (the
+        # use-local auto-fire) and turn this persist into cloud-over-local
+        # data loss. Capturing target_apps == the file we read pins the write.
+        apps = _career_ops_local() / "data" / "applications.md"
         if not apps.exists():
             raise HTTPException(
                 status_code=409,
                 detail="No applications.md to update (run the pipeline so the tracker exists).",
             )
         base_text = apps.read_text(encoding="utf-8")
+        target_apps = apps
 
-    # Apply the pending overrides onto the base (line-level, minimal diff).
-    for num, status in overrides.items():
-        base_text = data.set_status_in_text(base_text, num, status)
+    # Apply the overrides onto the base, resolving each identity-anchored
+    # override to the correct num IN THIS base. An identity override that
+    # doesn't resolve here (its company isn't in this tracker yet) is returned
+    # in `unresolved` — NOT applied and NOT dispatched, so we never mark a
+    # different company that merely shares the num. The cloud payload is always
+    # {num: status} (what edit-tracker.yml consumes).
+    base_text, cloud_payload, unresolved = data.resolve_overrides_for_push(base_text, overrides)
 
-    # Persist the merged tracker locally so the UI is consistent post-push.
-    apps = _career_ops() / "data" / "applications.md"
-    apps.parent.mkdir(parents=True, exist_ok=True)
-    apps.write_text(base_text, encoding="utf-8")
+    # Persist the merged tracker back to where we read it.
+    target_apps.parent.mkdir(parents=True, exist_ok=True)
+    target_apps.write_text(base_text, encoding="utf-8")
 
-    # Dispatch edit-tracker with only the pending overrides — avoids GitHub's
+    # Dispatch edit-tracker with only the resolved overrides — avoids GitHub's
     # workflow_dispatch input size limit that the full base64 tracker can exceed.
-    try:
-        gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(overrides)})
-    except gh.GhError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    count = len(overrides)
-    _save_overrides({})  # clear pending on success
-    # Persist dispatched overrides so they survive Refresh and restarts until
-    # the pipeline produces a new artifact that already has the correct statuses.
-    pushed = _load_pushed_overrides()
-    pushed.update(overrides)
-    _save_pushed_overrides(pushed)
-    return JSONResponse({"ok": True, "pushed": count, "base": base_source})
+    # Nothing resolved → nothing to push (don't fire an empty workflow run).
+    if cloud_payload:
+        try:
+            gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(cloud_payload)})
+        except gh.GhError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        # Clear ONLY the keys we pushed (re-reading under the lock) so an apply
+        # auto-submit recorded during the gh round-trip — and any identity
+        # override that DIDN'T resolve — isn't silently dropped.
+        pushed_keys = [k for k in overrides if k not in unresolved]
+        data.clear_status_overrides(pushed_keys)
+        # Persist dispatched overrides so they survive Refresh and restarts until
+        # the pipeline produces a new artifact that already has the correct statuses.
+        pushed = _load_pushed_overrides()
+        pushed.update(cloud_payload)
+        _save_pushed_overrides(pushed)
+    return JSONResponse({"ok": True, "pushed": len(cloud_payload),
+                         "unresolved": len(unresolved), "base": base_source})
 
 
 @app.get("/api/reports/{report_num}", response_class=HTMLResponse)
@@ -330,7 +381,8 @@ def refresh() -> JSONResponse:
             import shutil
             shutil.rmtree(UI_CACHE)
         data_dir = gh.download_artifact(run["databaseId"], UI_CACHE)
-        _active_data_dir = data_dir
+        with _data_dir_lock:
+            _active_data_dir = data_dir
         return JSONResponse({
             "ok": True,
             "run_id": run["databaseId"],
@@ -351,6 +403,52 @@ def run_pipeline() -> JSONResponse:
         return JSONResponse({"ok": True, "workflow": DAILY_WORKFLOW})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── local pipeline run ──────────────────────────────────────────────────────
+
+class LocalRunRequest(BaseModel):
+    passes: str = "all"        # "all" | "easy-only" | "no-easy"
+    evaluate: bool = True
+
+
+@app.post("/api/run-local")
+def run_local(req: LocalRunRequest) -> JSONResponse:
+    """Start a local pipeline run (orchestrate.py subprocess). Single-flight:
+    409 when one is already running. Poll /api/run-local/status for progress;
+    on success the UI switches to the local tracker via /api/use-local."""
+    if req.passes not in local_run.VALID_PASSES:
+        raise HTTPException(status_code=400, detail=f"unknown passes value: {req.passes}")
+    try:
+        state = local_run.start({"passes": req.passes, "evaluate": req.evaluate})
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"could not start the pipeline: {e}")
+    # NB: status()'s own "ok" field means "run succeeded" (None while running) —
+    # the request-level acknowledgement gets its own key.
+    return JSONResponse({"started": True, **state})
+
+
+@app.get("/api/run-local/status")
+def run_local_status() -> JSONResponse:
+    return JSONResponse(local_run.status())
+
+
+@app.post("/api/run-local/cancel")
+def run_local_cancel() -> JSONResponse:
+    return JSONResponse(local_run.cancel())
+
+
+@app.post("/api/use-local")
+def use_local() -> JSONResponse:
+    """Point the data layer back at the LOCAL career-ops (the default source).
+    Used after a local pipeline run so its fresh results are what the UI
+    shows, instead of a previously downloaded cloud artifact."""
+    global _active_data_dir
+    with _data_dir_lock:
+        _active_data_dir = None
+    return JSONResponse({"ok": True, "career_ops": str(_career_ops_local())})
 
 
 # ── career-ops skills ──────────────────────────────────────────────────────
@@ -809,6 +907,7 @@ def add_job(req: AddJobRequest) -> JSONResponse:
     the provider."""
     if not req.url.strip():
         raise HTTPException(status_code=400, detail="url is required")
+    _refuse_during_local_run()
 
     provider = _detect_provider()
     if not provider:
@@ -949,6 +1048,7 @@ def add_job_async(req: AddJobRequest) -> JSONResponse:
     """Start a background add-job evaluation and return immediately."""
     if not req.url.strip():
         raise HTTPException(status_code=400, detail="url is required")
+    _refuse_during_local_run()
 
     provider = _detect_provider()
     if not provider:

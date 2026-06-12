@@ -26,12 +26,16 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
+            requirements-ui.txt
 
       - name: Install runtime dependencies
         run: pip install -r requirements.txt
 
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
+
+      - name: Install UI dependencies
+        run: pip install -r requirements-ui.txt
 
       - name: Run tests
         run: pytest tests/ -v --tb=short

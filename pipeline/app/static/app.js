@@ -369,6 +369,123 @@ runBtn.addEventListener("click", async () => {
   }
 });
 
+// ── local pipeline run ─────────────────────────────────────────────────────
+
+const localRun = {
+  btn: document.getElementById("run-local-btn"),
+  panel: document.getElementById("local-run-panel"),
+  passes: document.getElementById("local-passes"),
+  evaluate: document.getElementById("local-evaluate"),
+  start: document.getElementById("local-start"),
+  cancel: document.getElementById("local-cancel"),
+  stages: document.getElementById("local-stages"),
+  log: document.getElementById("local-log"),
+  timer: null,
+};
+
+localRun.btn.addEventListener("click", () => {
+  localRun.panel.hidden = !localRun.panel.hidden;
+});
+
+function renderLocalStatus(s) {
+  const running = s.running;
+  localRun.start.hidden = running;
+  localRun.cancel.hidden = !running;
+  localRun.passes.disabled = running;
+  localRun.evaluate.disabled = running;
+  localRun.btn.textContent = running ? `⏳ ${s.stage || "starting"}…` : "💻 Run local";
+  if (s.stages && (running || s.exit_code !== null)) {
+    localRun.stages.hidden = false;
+    localRun.stages.innerHTML = s.stages.map((st) => {
+      const seen = (s.stages_seen || []).includes(st);
+      const current = st === s.stage && running;
+      return `<span class="stage${seen ? " seen" : ""}${current ? " current" : ""}">${st}</span>`;
+    }).join("<span class=\"stage-sep\">→</span>");
+  }
+  localRun.log.hidden = !s.log_tail;
+  if (s.log_tail) {
+    const atBottom = localRun.log.scrollTop + localRun.log.clientHeight >= localRun.log.scrollHeight - 8;
+    localRun.log.textContent = s.log_tail;
+    if (atBottom) localRun.log.scrollTop = localRun.log.scrollHeight;
+  }
+}
+
+async function pollLocalRun() {
+  clearTimeout(localRun.timer);
+  let s;
+  try {
+    const resp = await fetch("/api/run-local/status");
+    s = await resp.json();
+  } catch (_) {
+    localRun.timer = setTimeout(pollLocalRun, 4000);  // network blip — keep polling
+    return;
+  }
+  renderLocalStatus(s);
+  if (s.running) {
+    localRun.timer = setTimeout(pollLocalRun, 2500);
+    return;
+  }
+  if (s.exit_code === null) return;        // never started this session
+  if (s.ok) {
+    try {
+      await postAction("/api/use-local");  // show the fresh local results
+      await loadJobs();
+      showAction("Local pipeline run finished — showing local results.", "ok");
+    } catch (e) {
+      showAction(String(e.message || e), "error");
+    }
+  } else if (localRun.wasCancelled) {
+    localRun.wasCancelled = false;         // cancel already showed its message
+  } else {
+    showAction(`Local pipeline run failed (exit ${s.exit_code}) — see the log below the toolbar.`, "error");
+    localRun.panel.hidden = false;
+  }
+}
+
+localRun.start.addEventListener("click", async () => {
+  localRun.start.disabled = true;
+  // Fresh run: clear any stale cancel flag from a prior run so it can't swallow
+  // THIS run's failure toast (the flag is only meant to suppress the toast for
+  // the run the user actually cancelled).
+  localRun.wasCancelled = false;
+  try {
+    const resp = await fetch("/api/run-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passes: localRun.passes.value, evaluate: localRun.evaluate.checked }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `run-local failed (${resp.status})`);
+    showAction("Local pipeline run started.", "ok");
+    pollLocalRun();
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  } finally {
+    localRun.start.disabled = false;
+  }
+});
+
+localRun.cancel.addEventListener("click", async () => {
+  if (!confirm("Cancel the running local pipeline?")) return;
+  try {
+    localRun.wasCancelled = true;
+    await postAction("/api/run-local/cancel");
+    showAction("Local pipeline run cancelled.", "");
+  } catch (e) {
+    showAction(String(e.message || e), "error");
+  }
+  pollLocalRun();
+});
+
+// Resume polling if a run is already in progress (e.g. the page was reloaded).
+fetch("/api/run-local/status").then((r) => r.json()).then((s) => {
+  if (s.running) {
+    localRun.panel.hidden = false;
+    renderLocalStatus(s);
+    localRun.timer = setTimeout(pollLocalRun, 2500);
+  }
+}).catch(() => {});
+
 els.pushBtn.addEventListener("click", async () => {
   els.pushBtn.disabled = true;
   showAction("Refreshing latest tracker, applying your changes, pushing to GitHub…", "");

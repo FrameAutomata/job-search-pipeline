@@ -11,21 +11,7 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
-
-
-def _env_float(name: str, default: float) -> float:
-    """A float env override that can NEVER crash startup: this runs at
-    argparse-setup time on every invocation (even runs that never touch the
-    flag), so a malformed or set-but-empty value must warn and fall back, not
-    raise and brick every scheduled pipeline run."""
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"[orchestrate] ignoring invalid {name}={raw!r} (using {default})")
-        return default
+from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_evaluate's timeout/budget knobs)
 
 
 def main() -> int:
@@ -41,8 +27,12 @@ def main() -> int:
                     help="LLM provider for --evaluate-batch: anthropic|gemini|openai|groq|ollama")
     ap.add_argument("--batch-model", type=str, default=None,
                     help="Model name (overrides BATCH_MODEL env var)")
-    ap.add_argument("--batch-concurrency", type=int, default=3,
-                    help="Parallel workers for --evaluate-batch (default: 3)")
+    ap.add_argument("--batch-concurrency", type=int,
+                    default=max(1, int(env_float("BATCH_CONCURRENCY", 3))),
+                    help="Parallel workers for --evaluate-batch (default: 3, or the "
+                         "BATCH_CONCURRENCY env var; floored at 1). Size to your "
+                         "provider's limits — e.g. DeepInfra allows 200 concurrent "
+                         "requests per model.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--apply", action="store_true",
@@ -63,7 +53,7 @@ def main() -> int:
                          "artifact before applying (default on; --no-apply-refresh to use "
                          "the local applications.md). Falls back to local when offline.")
     ap.add_argument("--apply-tailor-min-score", type=float,
-                    default=_env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
+                    default=env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
                     help="Jobs scoring >= this get a per-job tailored resume (slot-edited "
                          "copy of resumes/resume.docx, one-page verified). Default 4.0; "
                          "set high (e.g. 99) to always use the default resume.")

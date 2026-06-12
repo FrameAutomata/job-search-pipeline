@@ -5,8 +5,186 @@ renders individual report markdown files to HTML. Pure functions, no FastAPI
 import — so they're unit-testable without standing up a server.
 """
 
+import json
 import re
+import threading
 from pathlib import Path
+
+from pipeline._batch_common import atomic_write_text, normalize_company
+
+# The UI's pending-status-changes channel: {row key: status-or-record}. Kanban
+# drags and the apply stage's auto-submits both write here; /api/jobs overlays
+# it onto the rows and the Push button sends it to the cloud tracker. Defined
+# once — both server.py and the apply stage go through the accessors below
+# rather than re-deriving the path or re-implementing read/modify/write.
+#
+# A value is EITHER a plain status string (kanban drags — the row is known by
+# its num) OR a record {"status", "company", "role"} (apply auto-submits — the
+# num came from whatever tracker the apply run read, which may not be the one
+# the override is later applied against, so it carries an identity anchor the
+# consumers re-resolve to the correct row). See override_status/override_identity.
+STATUS_OVERRIDES_FILE = (
+    Path(__file__).resolve().parent.parent.parent / ".ui-cache" / "status-overrides.json"
+)
+
+# One in-process lock around every read/modify/write of the override file, so
+# concurrent server requests (a kanban drag + a push) can't lose each other's
+# update. Cross-process torn reads are handled separately by atomic_write_text
+# (a reader sees either the whole old file or the whole new one, never a
+# half-written one that would parse as {} and wipe the user's pending triage).
+_status_lock = threading.Lock()
+
+
+def load_status_overrides(path: Path | None = None) -> dict:
+    """Read the override map. Tolerates a missing/corrupt file (returns {}),
+    and guards against a non-dict top-level so a malformed file can't poison
+    callers that index it."""
+    p = path or STATUS_OVERRIDES_FILE
+    try:
+        overrides = json.loads(p.read_text(encoding="utf-8"))
+        return overrides if isinstance(overrides, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_status_overrides(overrides: dict, path: Path | None = None) -> None:
+    """Atomically persist the override map. Best-effort on OSError."""
+    p = path or STATUS_OVERRIDES_FILE
+    try:
+        atomic_write_text(p, json.dumps(overrides, indent=2))
+    except OSError:
+        pass
+
+
+def override_status(value) -> str:
+    """The status string from an override value, whichever shape it is."""
+    if isinstance(value, dict):
+        return str(value.get("status", ""))
+    return str(value)
+
+
+def override_identity(value) -> tuple[str, str] | None:
+    """The (company, role) identity anchor from an override value, or None for
+    a plain-string (num-keyed) override."""
+    if isinstance(value, dict):
+        company = (value.get("company") or "").strip()
+        role = (value.get("role") or "").strip()
+        if company or role:
+            return company, role
+    return None
+
+
+def clear_status_overrides(keys, path: Path | None = None) -> None:
+    """Remove the given keys from the override map (used after a push). Re-reads
+    under the lock and removes ONLY those keys, so anything written between the
+    push's snapshot and now (e.g. an apply auto-submit) survives — unlike a
+    blanket overwrite-with-{} which would silently drop it."""
+    p = path or STATUS_OVERRIDES_FILE
+    try:
+        with _status_lock:
+            overrides = load_status_overrides(p)
+            for k in keys:
+                overrides.pop(str(k), None)
+            save_status_overrides(overrides, p)
+    except OSError:
+        pass
+
+
+def override_matches_row(value, row: dict) -> bool:
+    """Whether an identity-anchored override targets this tracker row (matched
+    by normalized company, and role when the anchor carries one). Plain-string
+    overrides are matched by num at the call site, not here."""
+    identity = override_identity(value)
+    if not identity:
+        return False
+    company, role = identity
+    if normalize_company(row.get("company", "")) != normalize_company(company):
+        return False
+    want_role = normalize_company(role)
+    return not want_role or normalize_company(row.get("role", "")) == want_role
+
+
+def record_status_override(num: str, status: str, path: Path | None = None,
+                           *, company: str | None = None, role: str | None = None) -> None:
+    """Record a pending status change in the UI's override file — the same
+    channel a kanban drag uses. Best-effort: a failure here must never break
+    the caller (the tracker-file write is the primary record).
+
+    Pass company/role when the num's tracker identity is uncertain (the apply
+    stage, whose num comes from a refreshed-or-local tracker that may use
+    different numbering than the one this override is later applied against):
+    the value then carries an identity anchor so consumers mark the RIGHT row,
+    not whichever row coincidentally shares the num."""
+    p = path or STATUS_OVERRIDES_FILE
+    value: object = status
+    if company or role:
+        value = {"status": status, "company": company or "", "role": role or ""}
+    try:
+        with _status_lock:
+            overrides = load_status_overrides(p)
+            overrides[str(num)] = value
+            save_status_overrides(overrides, p)
+    except OSError:
+        pass
+
+
+def resolve_num_by_identity(applications_md_text: str, company: str, role: str) -> str | None:
+    """Find the tracker row matching company (+ role when given) and return its
+    num. Used to re-anchor an identity-carrying override onto the correct row of
+    whatever tracker it's being applied to. Matches on the first four cells
+    (num, date, company, role), which are stable even when a stray pipe in the
+    role shifts later columns. Returns None when no row matches."""
+    want_company = normalize_company(company)
+    if not want_company:
+        return None
+    want_role = normalize_company(role)
+    for line in applications_md_text.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        if _SEPARATOR_RE.match(line.strip()):
+            continue
+        cells = _split_row(line)
+        if len(cells) < len(_COLUMNS):
+            continue
+        if cells[0].lower() in ("#", "num"):
+            continue
+        if normalize_company(cells[2]) == want_company and (
+            not want_role or normalize_company(cells[3]) == want_role
+        ):
+            return cells[0].strip()
+    return None
+
+
+def resolve_overrides_for_push(applications_md_text: str, overrides: dict):
+    """Build the cloud push payload from the pending overrides, applied onto the
+    base tracker.
+
+    Returns (new_text, cloud_payload, unresolved):
+      - new_text: the base with each applied override's Status cell rewritten.
+      - cloud_payload: {num: status} for edit-tracker.yml (always num-keyed).
+      - unresolved: keys of identity-anchored overrides whose company/role isn't
+        in THIS base. Those are NOT applied and NOT dispatched — falling back to
+        the (foreign) num would mark a different company that merely shares it,
+        and the caller must keep (not clear) them so they reach the right row on
+        a later push once the company appears.
+    """
+    new_text = applications_md_text
+    cloud_payload: dict[str, str] = {}
+    unresolved: list[str] = []
+    for key, value in overrides.items():
+        status = override_status(value)
+        identity = override_identity(value)
+        if identity:
+            num = resolve_num_by_identity(new_text, *identity)
+            if num is None:
+                unresolved.append(key)
+                continue
+        else:
+            num = key
+        new_text = set_status_in_text(new_text, num, status)
+        cloud_payload[num] = status
+    return new_text, cloud_payload, unresolved
+
 
 # Canonical applications.md statuses (mirror of career-ops templates/states.yml
 # + merge-tracker.mjs). The kanban board uses these as its columns.

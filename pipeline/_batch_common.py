@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,182 @@ def read_text(path: Path, default: str = "") -> str:
         return path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return default
+
+
+def env_float(name: str, default: float) -> float:
+    """A float env override that can NEVER crash startup: a malformed or
+    set-but-empty value warns and falls back rather than raising. Shared by
+    orchestrate's flag defaults and batch_evaluate's timeout/budget knobs so
+    they parse env the same way."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[config] ignoring invalid {name}={raw!r} (using {default})")
+        return default
+
+
+def pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a process id (used by the cross-process
+    eval lock and the UI's local-run orphan guard).
+
+    On Windows os.kill(pid, 0) would SEND CTRL_C_EVENT, so use OpenProcess +
+    GetExitCodeProcess — OpenProcess succeeds on a zombie while any handle to
+    it is held, so only an exit code of STILL_ACTIVE means actually running."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def has_pending_tracker_additions(tracker_dir: Path) -> bool:
+    """True when career-ops/batch/tracker-additions holds un-merged TSVs.
+
+    merge-tracker.mjs MOVES each TSV into tracker-additions/merged/ once it has
+    folded it into applications.md, so a top-level *.tsv means "evaluated but
+    not yet merged" — the signal that lets an interrupted run heal on a later
+    invocation even when it processes zero new jobs."""
+    try:
+        return any(tracker_dir.glob("*.tsv"))
+    except OSError:
+        return False
+
+
+def normalize_company(s: str) -> str:
+    """Lowercase + strip everything non-alphanumeric — the canonical company
+    key used for identity matching (mirrors merge-tracker.mjs's normalizeCompany).
+    One definition so filename lookup, cover-letter caching, and tracker
+    re-anchoring can't drift apart."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+# ── Cross-process lock ────────────────────────────────────────────────────────
+# One mechanism for every pid-based guard (the batch-eval single-flight lock and
+# the UI local-run orphan guard). A lock file holds "pid timestamp". It is
+# reclaimable only when its holder is DEAD or its timestamp is older than
+# max_age — and a live holder REFRESHES its timestamp (heartbeat) so a long,
+# progressing run never looks stale and is never stolen. The timestamp is the
+# pid-reuse safety valve: if the holder died and the OS recycled its pid to an
+# unrelated live process, the frozen timestamp eventually goes stale and the
+# lock is reclaimed instead of wedging forever.
+
+# An empty lock file is a racer caught between the O_EXCL create and its pid
+# write — NOT free. Only treat it as reclaimable once it has sat empty past this
+# grace window (i.e. the writer crashed mid-create).
+_EMPTY_LOCK_GRACE = 5.0
+
+
+def read_process_lock(path: Path) -> tuple[int, float]:
+    """(pid, timestamp) from a lock file; (0, 0.0) when absent/empty/unparseable."""
+    try:
+        parts = path.read_text(encoding="utf-8").split()
+        return int(parts[0]), (float(parts[1]) if len(parts) > 1 else 0.0)
+    except (OSError, ValueError, IndexError):
+        return 0, 0.0
+
+
+def write_process_lock(path: Path, pid: int) -> None:
+    """Atomically record `pid` as the lock holder with a fresh timestamp. Used
+    to register a CHILD process (the local-run orchestrate subprocess) as the
+    holder, and internally by acquire/refresh."""
+    try:
+        atomic_write_text(path, f"{pid} {time.time()}")
+    except OSError:
+        pass
+
+
+def _lock_reclaimable(path: Path, max_age: float) -> bool:
+    """True when no LIVE, non-stale holder owns the lock."""
+    pid, ts = read_process_lock(path)
+    if pid == 0:
+        # Empty/unparseable: a racer mid-create (don't steal) unless it has sat
+        # untouched past the grace window (writer crashed mid-create).
+        try:
+            return (time.time() - path.stat().st_mtime) > _EMPTY_LOCK_GRACE
+        except OSError:
+            return True
+    if pid == os.getpid():
+        return True
+    if not pid_alive(pid):
+        return True
+    # Live holder: reclaim only if its heartbeat went stale — a genuine,
+    # progressing run keeps its timestamp fresh.
+    return ts > 0 and (time.time() - ts) > max_age
+
+
+def acquire_process_lock(path: Path, *, max_age: float) -> bool:
+    """Atomically take a self-lock (the current process becomes the holder).
+    O_CREAT|O_EXCL makes the create-if-absent atomic so two simultaneous starts
+    can't both pass a read-then-write check. Returns False when a live, non-stale
+    holder owns it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = f"{os.getpid()} {time.time()}".encode("utf-8")
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if not _lock_reclaimable(path, max_age):
+                return False
+            try:
+                path.unlink()       # reclaim a dead/stale lock, then retry O_EXCL
+            except OSError:
+                pass
+            continue
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        return True
+    return False
+
+
+def refresh_process_lock(path: Path) -> None:
+    """Heartbeat: rewrite our timestamp so a long live run never looks stale.
+    No-op unless we own the lock."""
+    pid, _ = read_process_lock(path)
+    if pid == os.getpid():
+        write_process_lock(path, os.getpid())
+
+
+def release_process_lock(path: Path) -> None:
+    """Delete the lock, but only if we still own it (a stale-takeover may have
+    replaced our pid, and we must not delete another process's lock)."""
+    pid, _ = read_process_lock(path)
+    if pid == os.getpid():
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def process_lock_active(path: Path, *, max_age: float) -> bool:
+    """True if a LIVE, non-stale holder owns the lock — the non-acquiring probe
+    behind is_running()-style checks (where the holder is a CHILD pid, not us)."""
+    if not path.exists():
+        return False
+    return not _lock_reclaimable(path, max_age)
 
 
 def load_state(state_path: Path) -> dict:

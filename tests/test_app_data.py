@@ -283,6 +283,143 @@ class TestSetStatusInText:
         assert data.set_status_in_text(self.APPS, "#", "Applied") == self.APPS
 
 
+class TestRecordStatusOverride:
+    """The shared pending-status channel (kanban drags + apply auto-submits)."""
+
+    def test_creates_and_merges(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Applied", p)
+        data.record_status_override("9", "Rejected", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied", "9": "Rejected"}
+
+    def test_overwrites_same_num(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Evaluated", p)
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+
+    def test_corrupt_file_tolerated(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        p.write_text("not json{", encoding="utf-8")
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+
+    def test_non_dict_top_level_tolerated(self, tmp_path):
+        # A JSON array (or any non-object) must not poison index access — the
+        # torn-read-wipe path the consolidation guards against.
+        import json
+        p = tmp_path / "overrides.json"
+        p.write_text("[1, 2, 3]", encoding="utf-8")
+        assert data.load_status_overrides(p) == {}
+        data.record_status_override("7", "Applied", p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"7": "Applied"}
+
+    def test_identity_anchored_value(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Applied", p, company="Acme", role="Eng")
+        v = json.loads(p.read_text(encoding="utf-8"))["7"]
+        assert v == {"status": "Applied", "company": "Acme", "role": "Eng"}
+        assert data.override_status(v) == "Applied"
+        assert data.override_identity(v) == ("Acme", "Eng")
+
+    def test_plain_value_has_no_identity(self):
+        assert data.override_status("Applied") == "Applied"
+        assert data.override_identity("Applied") is None
+
+    def test_clear_only_named_keys(self, tmp_path):
+        # Selective clear keeps an entry written between a push's snapshot and now.
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("1", "Applied", p)
+        data.record_status_override("2", "Rejected", p)
+        data.clear_status_overrides(["1"], p)
+        assert json.loads(p.read_text(encoding="utf-8")) == {"2": "Rejected"}
+
+
+class TestOverrideMatchesRow:
+    def test_identity_matches_by_company_and_role(self):
+        row = {"company": "Acme Inc.", "role": "Senior Engineer", "num": "9"}
+        v = {"status": "Applied", "company": "acme inc", "role": "senior engineer"}
+        assert data.override_matches_row(v, row) is True
+
+    def test_company_only_anchor_matches_any_role(self):
+        row = {"company": "Acme", "role": "Whatever", "num": "9"}
+        assert data.override_matches_row({"status": "Applied", "company": "Acme", "role": ""}, row) is True
+
+    def test_wrong_company_does_not_match(self):
+        row = {"company": "Globex", "role": "Eng", "num": "9"}
+        assert data.override_matches_row({"status": "Applied", "company": "Acme", "role": "Eng"}, row) is False
+
+    def test_plain_value_never_matches(self):
+        assert data.override_matches_row("Applied", {"company": "Acme", "role": "Eng"}) is False
+
+
+class TestResolveNumByIdentity:
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 11 | 2026-06-01 | Acme | Eng | 4.0/5 | Evaluated | ❌ | [011](reports/011.md) | x |\n"
+        "| 12 | 2026-06-01 | Globex | Dev | 4.5/5 | Evaluated | ❌ | [012](reports/012.md) | y |\n"
+    )
+
+    def test_resolves_to_correct_num(self):
+        assert data.resolve_num_by_identity(self.APPS, "Globex", "Dev") == "12"
+
+    def test_company_only(self):
+        assert data.resolve_num_by_identity(self.APPS, "Acme", "") == "11"
+
+    def test_no_match_returns_none(self):
+        assert data.resolve_num_by_identity(self.APPS, "Initech", "QA") is None
+
+
+class TestResolveOverridesForPush:
+    """#1: building the push payload. An identity-anchored override that DOESN'T
+    resolve in the base tracker must NOT fall back to its (foreign) num and mark
+    a different company — and must be reported unresolved so the caller doesn't
+    clear it (losing the real pending Applied forever)."""
+
+    # num 5 is Globex here — an Acme identity override keyed by '5' must not
+    # touch this row.
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 3 | 2026-06-01 | Acme | Engineer | 4.2/5 | Evaluated | ❌ | [003](reports/003.md) | a |\n"
+        "| 5 | 2026-06-01 | Globex | Dev | 4.5/5 | Evaluated | ❌ | [005](reports/005.md) | b |\n"
+    )
+
+    def test_unresolved_identity_is_not_applied_or_dispatched(self):
+        base_no_acme = (
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 5 | 2026-06-01 | Globex | Dev | 4.5/5 | Evaluated | ❌ | [005](reports/005.md) | b |\n"
+        )
+        overrides = {"5": {"status": "Applied", "company": "Acme", "role": "Engineer"}}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(base_no_acme, overrides)
+        assert cloud_payload == {}            # nothing dispatched to the cloud
+        assert unresolved == ["5"]            # flagged so the caller won't clear it
+        assert new_text == base_no_acme       # Globex (num 5) left untouched
+
+    def test_resolved_identity_marks_correct_row(self):
+        overrides = {"99": {"status": "Applied", "company": "Acme", "role": "Engineer"}}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(self.APPS, overrides)
+        assert cloud_payload == {"3": "Applied"}     # resolved to Acme's real num
+        assert unresolved == []
+        assert "| Applied |" in new_text and "Acme" in new_text
+
+    def test_plain_override_applied_by_num(self):
+        overrides = {"5": "SKIP"}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(self.APPS, overrides)
+        assert cloud_payload == {"5": "SKIP"}
+        assert unresolved == []
+
+
 class TestRenderReportHtml:
     def test_renders_markdown_or_falls_back(self, tmp_path):
         f = tmp_path / "r.md"

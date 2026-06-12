@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 from pipeline.app import data as _data
-from pipeline._batch_common import atomic_write_text, read_text
+from pipeline._batch_common import atomic_write_text, normalize_company, read_text
 from pipeline.apply import browser, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
@@ -180,7 +180,7 @@ def _report(job, result: ApplyResult, mode: str, applications_md: Path,
     # glyphs like ✓/✗/→ and would crash the whole run on the print.
     tag = f"#{job.num} {job.company} / {job.role}"[:60]
     if result.applied and result.submitted:
-        _mark_applied(applications_md, job.num)
+        _mark_applied(applications_md, job)
         applied += 1
         print(f"[apply] [OK]   SUBMITTED {tag}")
     elif result.applied:  # filled but held (review/dry-run)
@@ -227,7 +227,7 @@ def _find_tailored_resume(career_ops: Path, job) -> Path | None:
     tdir = Path(base) if base else career_ops / "output"
     if not tdir.exists():
         return None
-    slug = re.sub(r"[^a-z0-9]+", "", (job.company or "").lower())
+    slug = normalize_company(job.company)
     if not slug:
         return None
     # Exclude cover letters: "<Company> - cover.pdf" also contains the company
@@ -286,14 +286,35 @@ def _refresh_tracker(career_ops: Path) -> Path:
     return local
 
 
-def _mark_applied(applications_md: Path, num: str) -> None:
-    """Set the tracker row's status to Applied (reuses the UI's editor)."""
-    if not num or not applications_md.exists():
+def _mark_applied(applications_md: Path, job) -> None:
+    """Record an auto-submitted application's status everywhere it matters:
+
+    1. The tracker copy this run selected from (direct Status-cell edit) — but
+       with refresh on that's the downloaded artifact copy, which nothing else
+       reads, so on its own the change was effectively invisible.
+    2. The UI's status-override channel (same one a kanban drag uses) — the UI
+       immediately shows the row as Applied (pending), and the existing Push
+       button carries it to the cloud tracker.
+
+    The override carries the job's company/role identity, not just its num: the
+    num came from whatever tracker this run read (a refreshed cloud artifact, or
+    the local fallback when gh was down), and the cloud tracker the override is
+    eventually pushed to mints its numbers independently. Anchoring on identity
+    means the Push marks the row that was actually applied to — never a
+    different company that happens to share the num."""
+    num = getattr(job, "num", "") or ""
+    if not num:
         return
-    text = applications_md.read_text(encoding="utf-8")
-    updated = _data.set_status_in_text(text, num, "Applied")
-    if updated != text:
-        atomic_write_text(applications_md, updated)
+    if applications_md.exists():
+        text = applications_md.read_text(encoding="utf-8")
+        updated = _data.set_status_in_text(text, num, "Applied")
+        if updated != text:
+            atomic_write_text(applications_md, updated)
+    _data.record_status_override(
+        num, "Applied",
+        company=getattr(job, "company", "") or "",
+        role=getattr(job, "role", "") or "",
+    )
 
 
 def _build_caller(provider: str | None, model: str | None):
