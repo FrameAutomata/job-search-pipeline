@@ -60,8 +60,6 @@ def run(
     career_ops = Path(career_ops)
     if mode not in _VALID_MODES:
         mode = "review"
-    # Lazy import: avoids a circular import (cover_letters imports pipeline.apply).
-    from pipeline import cover_letters
 
     # Always bound (used by _report/_mark_applied). For a --apply-url one-off it
     # stays the local default and is effectively unused (the synthetic job has no

@@ -76,7 +76,14 @@ _add_job_lock = threading.Lock()
 # only one session may be non-terminal at a time (one visible browser).
 _apply_tasks: dict[str, dict] = {}
 _apply_lock = threading.Lock()
-_APPLY_ACTIVE = frozenset({"pending", "ready"})
+# Non-terminal statuses (block a new session AND are never evicted). "submitting"
+# / "cancelling" are transient states the worker sets, under the lock, between
+# the hold and the Playwright action — so a Cancel that races an in-flight submit
+# sees a non-"ready" status and is rejected.
+_APPLY_ACTIVE = frozenset({"pending", "ready", "submitting", "cancelling"})
+# Cap on retained TERMINAL tasks so _apply_tasks doesn't grow unbounded over a
+# long-lived server; apply_async prunes the oldest on each new session.
+_APPLY_TASK_CAP = 50
 
 # Cloud workflow filenames (must match .github/workflows/*.yml).
 DAILY_WORKFLOW = "daily-pipeline.yml"
@@ -1121,6 +1128,23 @@ def _set_apply(job_id: str, **fields) -> None:
             task.update(fields)
 
 
+def _apply_decision(job_id: str) -> str | None:
+    """The recorded decision for a session (read under the lock) — backs the
+    worker's should_cancel hook."""
+    with _apply_lock:
+        task = _apply_tasks.get(job_id)
+        return task.get("decision") if task else None
+
+
+def _evict_apply_tasks() -> None:
+    """Drop the oldest TERMINAL tasks beyond _APPLY_TASK_CAP. Called under
+    _apply_lock; active sessions (pending/ready/submitting/cancelling) are kept."""
+    terminal = [jid for jid, t in _apply_tasks.items()
+                if t.get("status") not in _APPLY_ACTIVE]
+    for jid in terminal[:max(0, len(terminal) - _APPLY_TASK_CAP)]:
+        _apply_tasks.pop(jid, None)
+
+
 # Only these task fields are returned to the client (the held ApplyJob / Event
 # aren't JSON-serializable and stay server-side).
 _APPLY_PUBLIC = ("status", "num", "company", "role", "answers", "needs_review", "code", "reason")
@@ -1131,18 +1155,20 @@ def _apply_public(task: dict) -> dict:
 
 
 def _run_apply_review(job_id: str) -> None:
-    """Worker: launch a visible browser, fill the Easy Apply form, stop at the
-    Submit step and surface the drafted answers, then block until the user
-    submits/cancels (or the hold times out). Submit clicks Submit and marks the
-    row Applied; a closed posting marks it Discarded."""
+    """Worker: launch a visible browser, fill the Easy Apply form (bailing early
+    if the user cancels mid-fill), stop at the Submit step and surface the
+    drafted answers, then block until the user submits/cancels (or the hold times
+    out). Submit clicks Submit and marks the row Applied; a closed posting marks
+    it Discarded. The tracker path + local career-ops are captured at session
+    start, so a mid-hold use-local/refresh flip can't misdirect the write."""
     task = _apply_tasks[job_id]
     job = task["job"]
-    applications_md = _career_ops() / "data" / "applications.md"
+    applications_md = task["applications_md"]
+    co_local = task["co_local"]
     try:
         from pipeline.apply import browser, linkedin
-        from pipeline.apply.result import EXPIRED
+        from pipeline.apply.result import CANCELLED, EXPIRED
         from pipeline import apply as apply_pkg
-        co_local = _career_ops_local()
         report_root = applications_md.parent.parent
         with browser.launch(headless=False) as page:
             if not browser.ensure_logged_in(page, headless=False):
@@ -1157,8 +1183,14 @@ def _run_apply_review(job_id: str) -> None:
                 tailor_min_score=env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
             )
             resume = apply_pkg._resolve_resume(co_local, job)
-            result = linkedin.apply_to(page, job, engine, mode="review", resume_path=resume)
+            result = linkedin.apply_to(
+                page, job, engine, mode="review", resume_path=resume,
+                should_cancel=lambda: _apply_decision(job_id) == "cancel",
+            )
 
+            if result.code == CANCELLED:
+                _set_apply(job_id, status="cancelled")
+                return
             if result.code == EXPIRED:
                 apply_pkg._mark_status(applications_md, job, "Discarded")
                 _set_apply(job_id, status="expired", code=result.code, reason=result.reason)
@@ -1171,18 +1203,27 @@ def _run_apply_review(job_id: str) -> None:
                        answers=[list(a) for a in result.answers],
                        needs_review=list(getattr(engine, "unanswered", [])))
 
-            if not task["event"].wait(timeout=_apply_hold_timeout()):
-                _set_apply(job_id, status="timeout")
-                return
-            if task.get("decision") == "submit":
+            task["event"].wait(timeout=_apply_hold_timeout())
+            # Resolve the outcome atomically: an endpoint may have raced the
+            # timeout, so the RECORDED decision (not wait()'s return) is truth.
+            # Moving to a transient status under the lock means a later
+            # submit/cancel sees a non-"ready" status and is rejected.
+            with _apply_lock:
+                decision = task.get("decision")
+                task["status"] = {"submit": "submitting",
+                                  "cancel": "cancelling"}.get(decision, "timeout")
+                final = task["status"]
+
+            if final == "submitting":
                 sub = linkedin.submit_application(page)
                 if sub.submitted:
                     apply_pkg._mark_status(applications_md, job, "Applied")
                     _set_apply(job_id, status="submitted")
                 else:
                     _set_apply(job_id, status="failed", code=sub.code, reason=sub.reason)
-            else:
+            elif final == "cancelling":
                 _set_apply(job_id, status="cancelled")
+            # else: timeout — just close the browser (the `with` exits).
     except ImportError as e:
         _set_apply(job_id, status="failed", code="playwright_missing", reason=str(e))
     except Exception as e:  # never let a browser hiccup wedge the session in "pending"
@@ -1206,19 +1247,24 @@ def apply_async(req: ApplyAsyncRequest) -> JSONResponse:
     if not is_linkedin_job(job.url):
         raise HTTPException(
             status_code=400,
-            detail="This role isn't a LinkedIn Easy Apply posting — the review-and-"
-                   "submit flow handles LinkedIn Easy Apply only.",
+            detail="This role has no LinkedIn job URL — the review-and-submit flow "
+                   "opens LinkedIn postings (Easy Apply is confirmed once the page loads).",
         )
     with _apply_lock:
         if any(t["status"] in _APPLY_ACTIVE for t in _apply_tasks.values()):
             raise HTTPException(status_code=409,
                                 detail="An apply review session is already in progress. "
                                        "Finish or cancel it first.")
+        _evict_apply_tasks()
         job_id = str(uuid.uuid4())
         _apply_tasks[job_id] = {
             "status": "pending", "num": job.num, "company": job.company,
             "role": job.role, "answers": [], "needs_review": [], "code": None,
             "reason": None, "job": job, "event": threading.Event(), "decision": None,
+            # Pin the tracker + local career-ops at session start so a mid-hold
+            # use-local/refresh flip can't redirect the Applied/Discarded write.
+            "applications_md": _career_ops() / "data" / "applications.md",
+            "co_local": _career_ops_local(),
         }
     threading.Thread(target=_run_apply_review, args=(job_id,), daemon=True).start()
     return JSONResponse({"job_id": job_id})
@@ -1251,11 +1297,16 @@ def apply_submit(job_id: str) -> JSONResponse:
 
 @app.post("/api/jobs/apply-cancel/{job_id}")
 def apply_cancel(job_id: str) -> JSONResponse:
-    """Signal the held worker to close the browser without submitting."""
+    """Signal the worker to stop — interrupts the fill (pending) or the review
+    hold (ready). Rejected once the worker has committed to a submit/cancel or
+    finished (an in-flight submit can't be un-clicked)."""
     with _apply_lock:
         task = _apply_tasks.get(job_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Unknown apply session.")
+        if task["status"] not in ("pending", "ready"):
+            raise HTTPException(status_code=409,
+                                detail=f"Session can't be cancelled now (status={task['status']}).")
         task["decision"] = "cancel"
         task["event"].set()
     return JSONResponse({"ok": True})

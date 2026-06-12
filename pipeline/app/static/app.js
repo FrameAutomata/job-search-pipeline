@@ -234,7 +234,7 @@ async function openReport(job) {
   selectedJob = job;
   resetSkillPanel();
   resetApplyPanel();
-  applyEls.btn.hidden = !isLinkedInEasyApply(job);
+  applyEls.btn.hidden = !isLinkedInJob(job);
   applyEls.btn.disabled = false;
   render();
   els.reportLink.href = extractUrl(job) || "#";
@@ -302,6 +302,7 @@ els.hideActionedChk.addEventListener("change", () => {
   render();
 });
 els.reportClose.addEventListener("click", () => {
+  resetApplyPanel();   // cancel any live apply session + stop its poll loop
   els.reportPane.hidden = true;
   selectedNum = null;
   render();
@@ -681,17 +682,25 @@ const applyEls = {
   panel: document.getElementById("apply-panel"),
   jobId: null,
   timer: null,
+  deciding: false,   // a Submit/Cancel POST is in flight — don't rebuild the panel
 };
 
 applyEls.btn.addEventListener("click", startApply);
 
-function isLinkedInEasyApply(job) {
+function isLinkedInJob(job) {
   return /linkedin\.com\/jobs\/view\//i.test(extractUrl(job) || "");
 }
 
 function resetApplyPanel() {
   clearTimeout(applyEls.timer);
+  // Cancel a still-live session so navigating away doesn't orphan the held
+  // browser and 409-block the next apply until the hold timeout (a terminal /
+  // submitting session 409s here, which is fine — the .catch swallows it).
+  if (applyEls.jobId) {
+    fetch(`/api/jobs/apply-cancel/${applyEls.jobId}`, { method: "POST" }).catch(() => {});
+  }
   applyEls.jobId = null;
+  applyEls.deciding = false;
   applyEls.panel.hidden = true;
   applyEls.panel.innerHTML = "";
 }
@@ -730,7 +739,7 @@ async function pollApply() {
     return;
   }
   renderApply(s);
-  if (s.status === "pending" || s.status === "ready") {
+  if (["pending", "ready", "submitting", "cancelling"].includes(s.status)) {
     applyEls.timer = setTimeout(pollApply, s.status === "ready" ? 2500 : 1000);
   }
 }
@@ -743,7 +752,20 @@ function renderApply(s) {
     p.innerHTML = "<p>Opening a browser and filling the form — watch the window…</p>";
     return;
   }
+  if (s.status === "submitting") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Submitting…</p>";
+    return;
+  }
+  if (s.status === "cancelling") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Cancelling…</p>";
+    return;
+  }
   if (s.status === "ready") {
+    // A decision is in flight (we already showed "Submitting…/Cancelling…") —
+    // don't rebuild the form with live buttons before the worker flips status.
+    if (applyEls.deciding) return;
     p.className = "apply-panel";
     const rows = (s.answers || [])
       .map((a) => `<tr><td>${escapeHtml(a[0])}</td><td>${escapeHtml(a[1])}</td></tr>`)
@@ -765,6 +787,8 @@ function renderApply(s) {
   }
   // Terminal states.
   applyEls.btn.disabled = false;
+  applyEls.deciding = false;
+  applyEls.jobId = null;   // session is over — don't cancel it again on navigate-away
   if (s.status === "submitted") {
     p.className = "apply-panel ok";
     p.innerHTML = "<p>✓ Submitted — marked Applied.</p>";
@@ -787,7 +811,7 @@ function renderApply(s) {
 
 async function decideApply(decision) {
   if (!applyEls.jobId) return;
-  applyEls.panel.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  applyEls.deciding = true;   // suppress the ready-panel rebuild until the worker flips
   applyEls.panel.innerHTML = `<p>${decision === "submit" ? "Submitting" : "Cancelling"}…</p>`;
   try {
     const resp = await fetch(`/api/jobs/apply-${decision}/${applyEls.jobId}`, { method: "POST" });
@@ -795,10 +819,15 @@ async function decideApply(decision) {
       const b = await resp.json().catch(() => ({}));
       throw new Error(b.detail || `failed (${resp.status})`);
     }
-    pollApply();  // the worker moves to submitted/cancelled; the poll surfaces it
+    pollApply();  // the worker moves to submitting -> submitted/cancelled; poll surfaces it
   } catch (e) {
+    // The POST didn't take — the session is still as it was. Clear `deciding`
+    // and resume polling so the reviewable form (with buttons) returns.
+    applyEls.deciding = false;
     applyEls.panel.className = "apply-panel error";
-    applyEls.panel.innerHTML = `<p>${escapeHtml(String(e.message || e))}</p>`;
+    applyEls.panel.innerHTML =
+      `<p>${escapeHtml(String(e.message || e))} — the form is still open; restoring…</p>`;
+    applyEls.timer = setTimeout(pollApply, 1500);
   }
 }
 

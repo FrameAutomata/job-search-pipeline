@@ -70,19 +70,43 @@ def engine(monkeypatch):
         finally:
             state["calls"].append(("close", None))
 
+    def fake_apply_to(page, job, eng, *, mode, resume_path=None, should_cancel=None):
+        state["calls"].append(("apply_to", mode))
+        # cancellable_fill: simulate a long multi-step fill that bails at the next
+        # step boundary when the worker's should_cancel hook fires (#2).
+        if state.get("cancellable_fill"):
+            for _ in range(500):
+                if should_cancel and should_cancel():
+                    return ApplyResult(code="cancelled", reason="cancelled during fill")
+                time.sleep(0.01)
+        return state["result"]
+
+    def fake_submit(page):
+        state["calls"].append(("submit", None))
+        fn = state.get("submit_fn")
+        return fn(page) if fn else state["submit_result"]
+
     monkeypatch.setattr(browser_mod, "launch", fake_launch)
     monkeypatch.setattr(browser_mod, "ensure_logged_in",
                         lambda page, *, headless, **kw: state["logged_in"])
-    monkeypatch.setattr(linkedin_mod, "apply_to",
-                        lambda page, job, eng, *, mode, resume_path=None:
-                            state["calls"].append(("apply_to", mode)) or state["result"])
-    monkeypatch.setattr(linkedin_mod, "submit_application",
-                        lambda page: state["calls"].append(("submit", None)) or state["submit_result"],
-                        raising=False)
+    monkeypatch.setattr(linkedin_mod, "apply_to", fake_apply_to)
+    monkeypatch.setattr(linkedin_mod, "submit_application", fake_submit, raising=False)
     # Short hold so a worker left blocking on the decision Event (a test that
     # asserts "ready" but never submits/cancels) dies fast instead of lingering.
     monkeypatch.setenv("APPLY_HOLD_TIMEOUT", "2")
-    return state
+    yield state
+    # Drain any worker still blocked on the hold so daemon threads don't linger
+    # past the test (the mocked browser closes instantly once they wake).
+    try:
+        from pipeline.app import server
+        with server._apply_lock:
+            for t in server._apply_tasks.values():
+                ev = t.get("event")
+                if ev is not None and t.get("status") in server._APPLY_ACTIVE:
+                    t["decision"] = "cancel"
+                    ev.set()
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -208,3 +232,68 @@ class TestSingleFlightAndBails:
 
     def test_unknown_job_id_status_404(self, client, engine):
         assert client.get("/api/jobs/apply-status/nope").status_code == 404
+
+
+class TestCancelDuringFill:
+    """#2: a Cancel while the form is still being filled (status pending) bails
+    the fill via the worker's should_cancel hook and ends as 'cancelled', instead
+    of the browser finishing the whole application before honoring the cancel."""
+
+    def test_cancel_during_fill_bails(self, client, engine):
+        engine["cancellable_fill"] = True   # mock apply_to loops until should_cancel
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        client.post(f"/api/jobs/apply-cancel/{job_id}")     # accepted while pending
+        s = _wait_status(client, job_id, {"cancelled", "ready", "failed"})
+        assert s["status"] == "cancelled"
+        assert ("submit", None) not in engine["calls"]
+
+
+class TestSubmitCancelGuards:
+    """The worker transitions ready -> submitting before clicking Submit, so a
+    Cancel racing an in-flight submit is rejected (#6); apply_cancel is accepted
+    only from pending/ready and apply_submit only from ready (#6/#8)."""
+
+    def _ready(self, client):
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        _wait_status(client, job_id, {"ready"})
+        return job_id
+
+    def test_cancel_during_submit_is_rejected(self, client, engine):
+        import threading
+        gate = threading.Event()
+        def blocking_submit(page):
+            gate.wait(timeout=5)
+            return ApplyResult(code=APPLIED, submitted=True)
+        engine["submit_fn"] = blocking_submit
+        job_id = self._ready(client)
+        assert client.post(f"/api/jobs/apply-submit/{job_id}").status_code == 200
+        s = _wait_status(client, job_id, {"submitting"})         # transient, exposed
+        assert s["status"] == "submitting"
+        assert client.post(f"/api/jobs/apply-cancel/{job_id}").status_code == 409
+        gate.set()
+        assert _wait_status(client, job_id, {"submitted"})["status"] == "submitted"
+
+    def test_cancel_rejected_from_terminal(self, client, engine):
+        engine["logged_in"] = False
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        _wait_status(client, job_id, {"failed"})
+        assert client.post(f"/api/jobs/apply-cancel/{job_id}").status_code == 409
+
+    def test_submit_after_timeout_is_rejected(self, client, engine, monkeypatch):
+        monkeypatch.setenv("APPLY_HOLD_TIMEOUT", "0.2")   # short hold -> times out
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        assert _wait_status(client, job_id, {"timeout"})["status"] == "timeout"
+        assert client.post(f"/api/jobs/apply-submit/{job_id}").status_code == 409
+
+
+class TestApplyTaskEviction:
+    """#4: terminal apply tasks are evicted so _apply_tasks doesn't grow without
+    bound over the server's lifetime."""
+
+    def test_terminal_tasks_capped(self, client, engine):
+        from pipeline.app import server
+        cap = server._APPLY_TASK_CAP
+        for i in range(cap + 5):
+            server._apply_tasks[f"old-{i}"] = {"status": "submitted"}
+        client.post("/api/jobs/apply-async", json={"num": "1"})  # prunes on create
+        assert len(server._apply_tasks) <= cap + 1   # at most `cap` terminal + 1 active

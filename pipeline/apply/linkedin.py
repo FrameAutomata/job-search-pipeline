@@ -27,7 +27,7 @@ from pathlib import Path
 
 from pipeline.apply.answers import AnswerEngine
 from pipeline.apply.queue import ApplyJob
-from pipeline.apply.result import ApplyResult, APPLIED, EXPIRED, failed
+from pipeline.apply.result import ApplyResult, APPLIED, CANCELLED, EXPIRED, failed
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -36,11 +36,14 @@ _MAX_STEPS = 14  # generous cap; real Easy Apply flows are 1-5 steps
 
 
 def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review",
-             resume_path: Path | None = None) -> ApplyResult:
+             resume_path: Path | None = None, should_cancel=None) -> ApplyResult:
     """Drive one LinkedIn Easy Apply application. Pure side effect on `page`.
 
     resume_path: the PDF to upload (a per-job tailored resume when the caller
-    found one); falls back to the configured default resume if None."""
+    found one); falls back to the configured default resume if None.
+    should_cancel: an optional predicate checked at each form step; when it
+    returns True the fill bails with a CANCELLED result (the UI review flow uses
+    this so a user's Cancel stops the in-progress fill instead of finishing it)."""
     submit = mode == "auto"
     page.goto(job.url, wait_until="domcontentloaded")
     _wait_for_apply_cta(page)
@@ -75,6 +78,10 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
 
     drafted: list[tuple[str, str]] = []
     for _ in range(_MAX_STEPS):
+        # Cooperative cancel: honored at step boundaries so a UI Cancel stops the
+        # fill promptly rather than driving the whole application to completion.
+        if should_cancel is not None and should_cancel():
+            return ApplyResult(code=CANCELLED, reason="cancelled during fill")
         if not _modal_open(page):
             return failed("modal_closed_unexpectedly")
 
