@@ -1,0 +1,63 @@
+"""Wiring tests for orchestrate.py's optional stages.
+
+These don't exercise the stages themselves (each has its own test module) — they
+pin the argparse-to-call wiring so the opt-in liveness re-check actually runs in
+the pipeline (and therefore in the cloud workflow that invokes orchestrate),
+and stays OFF by default so existing runs are unchanged.
+"""
+
+import sys
+
+import pytest
+
+import orchestrate
+from pipeline import recheck
+
+
+@pytest.fixture
+def quiet_pipeline(monkeypatch, tmp_path):
+    """Neutralise the real stages so main() reaches the optional blocks cheaply:
+    a tmp config that exists, a tmp career-ops, no toasts, an empty bridge."""
+    cfg = tmp_path / "search.yml"
+    cfg.write_text("searches: []\n", encoding="utf-8")
+    co = tmp_path / "career-ops"
+    (co / "data").mkdir(parents=True)
+    monkeypatch.setenv("CAREER_OPS_PATH", str(co))
+    monkeypatch.setattr(orchestrate.notify, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrate.bridge, "run", lambda *a, **k: [])
+    return cfg, co
+
+
+def _argv(cfg, *extra):
+    # Skip every always-on stage; we only care about the optional tail.
+    return ["orchestrate.py", "--config", str(cfg), "--skip-scrape", "--skip-filter",
+            "--skip-screen", "--skip-bridge", "--skip-batch-prep", *extra]
+
+
+class TestRecheckWiring:
+    def test_flag_runs_recheck(self, quiet_pipeline, monkeypatch):
+        cfg, co = quiet_pipeline
+        calls = []
+        monkeypatch.setattr(recheck, "run", lambda career_ops, **kw: calls.append((career_ops, kw)))
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--recheck-liveness"))
+        assert orchestrate.main() == 0
+        assert len(calls) == 1
+        career_ops, kw = calls[0]
+        assert career_ops == co.resolve()
+        assert kw.get("timeout") == 8        # default --recheck-timeout
+
+    def test_recheck_timeout_forwarded(self, quiet_pipeline, monkeypatch):
+        cfg, _ = quiet_pipeline
+        calls = []
+        monkeypatch.setattr(recheck, "run", lambda career_ops, **kw: calls.append(kw))
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--recheck-liveness", "--recheck-timeout", "20"))
+        orchestrate.main()
+        assert calls and calls[0].get("timeout") == 20
+
+    def test_off_by_default(self, quiet_pipeline, monkeypatch):
+        cfg, _ = quiet_pipeline
+        called = []
+        monkeypatch.setattr(recheck, "run", lambda *a, **k: called.append(True))
+        monkeypatch.setattr(sys, "argv", _argv(cfg))   # no --recheck-liveness
+        assert orchestrate.main() == 0
+        assert called == []

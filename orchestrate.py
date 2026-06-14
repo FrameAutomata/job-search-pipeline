@@ -59,6 +59,12 @@ def main() -> int:
                          "set high (e.g. 99) to always use the default resume.")
     ap.add_argument("--headless", action="store_true",
                     help="Run the apply browser headless (only works once you've logged in once)")
+    ap.add_argument("--recheck-liveness", action="store_true",
+                    help="Re-check liveness of evaluated tracker roles and mark "
+                         "closed/gone ones Discarded. Off by default; the daily "
+                         "cloud workflow turns it on.")
+    ap.add_argument("--recheck-timeout", type=int, default=8,
+                    help="Per-request timeout (seconds) for --recheck-liveness (default: 8)")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
     pass_group = ap.add_mutually_exclusive_group()
     pass_group.add_argument("--only-pass", type=str, default=None,
@@ -129,6 +135,16 @@ def main() -> int:
             concurrency=args.batch_concurrency,
             dry_run=args.dry_run,
         )
+
+    if args.recheck_liveness:
+        # Re-check the tracker's still-open roles and Discard the ones whose
+        # posting has closed. Runs before --apply, but that only keeps a dead
+        # role out of the apply queue under --no-apply-refresh: with refresh on
+        # (the default) apply re-downloads the cloud tracker and won't see these
+        # local Discards. recheck.run prints its own summary.
+        from pipeline import recheck
+        notify.notify("Pipeline", "Re-checking tracker liveness...")
+        recheck.run(career_ops, timeout=args.recheck_timeout)
 
     if args.apply:
         # Local import: the apply stage pulls in Playwright lazily, so the rest

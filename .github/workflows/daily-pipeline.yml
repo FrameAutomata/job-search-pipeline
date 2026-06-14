@@ -203,8 +203,12 @@ jobs:
           # --no-easy-apply selects every pass in search.yml whose JobSpy
           # easy_apply field is not true. Routes by config field (not pass
           # name) so user-defined pass names work without editing this YAML.
+          # --recheck-liveness re-checks the tracker's still-open roles once a
+          # day and Discards any whose posting has since closed (the every-4h
+          # easy-apply workflow deliberately omits it to stay lean).
           python -u orchestrate.py --evaluate-batch \
             --no-easy-apply \
+            --recheck-liveness \
             --batch-concurrency "$BATCH_CONCURRENCY"
 
       - name: Save pipeline state cache

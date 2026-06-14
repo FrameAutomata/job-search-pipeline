@@ -490,6 +490,71 @@ fetch("/api/run-local/status").then((r) => r.json()).then((s) => {
   }
 }).catch(() => {});
 
+// ── tracker liveness re-check ──────────────────────────────────────────────
+
+const recheckUi = {
+  btn: document.getElementById("recheck-btn"),
+  label: "🩺 Re-check liveness",
+  timer: null,
+};
+
+function renderRecheck(s) {
+  recheckUi.btn.disabled = s.running;
+  // Number.isFinite so a total of 0 still shows "0/0" (a `?` falsy-test would
+  // drop the denominator); total is null only before the first progress tick.
+  recheckUi.btn.textContent = s.running
+    ? `⏳ Re-checking ${Number.isFinite(s.total) ? `${s.checked}/${s.total}` : s.checked}…`
+    : recheckUi.label;
+}
+
+async function pollRecheck() {
+  clearTimeout(recheckUi.timer);
+  let s;
+  try {
+    s = await (await fetch("/api/recheck-liveness/status")).json();
+  } catch (_) {
+    recheckUi.timer = setTimeout(pollRecheck, 4000);   // network blip — keep polling
+    return;
+  }
+  renderRecheck(s);
+  if (s.running) {
+    recheckUi.timer = setTimeout(pollRecheck, 2000);
+    return;
+  }
+  if (!s.done) return;                                 // nothing ran this session
+  if (s.ok) {
+    await loadJobs().catch(() => {});                  // surface the new Discarded rows
+    const n = s.discarded;
+    const unc = s.unconfirmed ? ` ${s.unconfirmed} couldn't be reached.` : "";
+    showAction(
+      n
+        ? `Liveness re-check: ${n} closed posting${n === 1 ? "" : "s"} marked Discarded (of ${s.checked} checked).${unc}`
+        : `Liveness re-check: all ${s.checked} role${s.checked === 1 ? "" : "s"} still open.${unc}`,
+      "ok");
+  } else {
+    showAction(`Liveness re-check failed${s.error ? `: ${s.error}` : ""}.`, "error");
+  }
+}
+
+recheckUi.btn.addEventListener("click", async () => {
+  recheckUi.btn.disabled = true;
+  try {
+    const resp = await fetch("/api/recheck-liveness", { method: "POST" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `re-check failed (${resp.status})`);
+    showAction("Liveness re-check started…", "ok");
+    pollRecheck();
+  } catch (e) {
+    recheckUi.btn.disabled = false;
+    showAction(String(e.message || e), "error");
+  }
+});
+
+// Resume polling if a sweep is already in progress (e.g. the page was reloaded).
+fetch("/api/recheck-liveness/status").then((r) => r.json()).then((s) => {
+  if (s.running) { renderRecheck(s); recheckUi.timer = setTimeout(pollRecheck, 2000); }
+}).catch(() => {});
+
 els.pushBtn.addEventListener("click", async () => {
   els.pushBtn.disabled = true;
   showAction("Applying your changes onto the latest cloud tracker and pushing to GitHub…", "");

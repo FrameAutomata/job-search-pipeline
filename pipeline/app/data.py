@@ -104,6 +104,15 @@ def override_matches_row(value, row: dict) -> bool:
     return not want_role or normalize_company(row.get("role", "")) == want_role
 
 
+def _override_value(status: str, company: str | None, role: str | None):
+    """An override-map value: a bare status string, or a {status, company, role}
+    record carrying an identity anchor when company/role are known — so consumers
+    re-resolve the right row even if the num differs across trackers."""
+    if company or role:
+        return {"status": status, "company": company or "", "role": role or ""}
+    return status
+
+
 def record_status_override(num: str, status: str, path: Path | None = None,
                            *, company: str | None = None, role: str | None = None) -> None:
     """Record a pending status change in the UI's override file — the same
@@ -116,16 +125,59 @@ def record_status_override(num: str, status: str, path: Path | None = None,
     the value then carries an identity anchor so consumers mark the RIGHT row,
     not whichever row coincidentally shares the num."""
     p = path or STATUS_OVERRIDES_FILE
-    value: object = status
-    if company or role:
-        value = {"status": status, "company": company or "", "role": role or ""}
     try:
         with _status_lock:
             overrides = load_status_overrides(p)
-            overrides[str(num)] = value
+            overrides[str(num)] = _override_value(status, company, role)
             save_status_overrides(overrides, p)
     except OSError:
         pass
+
+
+def record_status_changes(applications_md: Path, changes) -> None:
+    """Batch dual-write: apply many (num, status, company, role) edits with a
+    SINGLE read-modify-write of the tracker file and a SINGLE overrides-file
+    update. The liveness re-check uses this to Discard many roles at once;
+    record_status_change is the one-row case. Entries with an empty num are
+    skipped; an all-empty/empty list is a no-op.
+
+    Writes BOTH places that matter:
+      1. The tracker file's Status cells (minimal in-place edits), so the file
+         on disk / a local run reflects them.
+      2. The UI's identity-anchored override channel, so the UI shows them
+         immediately and the Push button carries them to the cloud tracker.
+
+    The override carries company/role, not just num: the num came from whatever
+    tracker the caller read (a refreshed cloud artifact, or the local copy), and
+    the cloud tracker mints numbers independently — anchoring on identity marks
+    the row actually acted on, never a different company sharing the num."""
+    items = [(str(n).strip(), s, c, r) for (n, s, c, r) in changes if str(n).strip()]
+    if not items:
+        return
+    applications_md = Path(applications_md)
+    if applications_md.exists():
+        text = applications_md.read_text(encoding="utf-8")
+        new = text
+        for num, status, _company, _role in items:
+            new = set_status_in_text(new, num, status)
+        if new != text:
+            atomic_write_text(applications_md, new)
+    try:
+        with _status_lock:
+            overrides = load_status_overrides()
+            for num, status, company, role in items:
+                overrides[num] = _override_value(status, company, role)
+            save_status_overrides(overrides)
+    except OSError:
+        pass
+
+
+def record_status_change(applications_md: Path, num: str, status: str, *,
+                         company: str | None = None, role: str | None = None) -> None:
+    """Record `status` for a single tracker row `num` (tracker cell + override).
+    One-row convenience over record_status_changes; no-ops on an empty num. Used
+    by the apply stage (submit -> Applied, closed posting -> Discarded)."""
+    record_status_changes(applications_md, [(num, status, company, role)])
 
 
 def resolve_num_by_identity(applications_md_text: str, company: str, role: str) -> str | None:
@@ -295,6 +347,19 @@ def _split_row(line: str) -> list[str]:
     if s.endswith("|"):
         s = s[:-1]
     return [c.strip() for c in s.split("|")]
+
+
+# A bare posting URL inside a tracker row's Notes cell (the link the bridge
+# stores there). Trailing sentence punctuation is trimmed so "...a/b, fits"
+# yields the clean URL.
+_NOTES_URL_RE = re.compile(r"https?://\S+")
+
+
+def extract_url(notes: str) -> str:
+    """The first URL in a Notes cell, or "" if none. Shared by the apply queue
+    (pick a posting to apply to) and the liveness re-check (re-fetch it)."""
+    m = _NOTES_URL_RE.search(notes or "")
+    return m.group(0).rstrip(".,);]") if m else ""
 
 
 def parse_applications(applications_md: Path) -> list[dict]:

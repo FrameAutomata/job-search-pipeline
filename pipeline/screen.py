@@ -216,6 +216,35 @@ def check_liveness(url: str, timeout: int = 8) -> tuple[str, str]:
     return result, reason
 
 
+def classify_each(items, url_of, *, timeout: int = 8, max_workers: int = 8):
+    """Fetch + classify each item's URL in parallel, yielding (item, result,
+    reason, body) as each completes.
+
+    `url_of(item)` returns the item's posting URL. LinkedIn /jobs/view/ URLs are
+    fetched through the guest endpoint (the regular page is login-walled from
+    datacenter IPs); the CSV/tracker URL is never mutated, only the fetch target.
+    An item with no URL yields ('uncertain', '', ''); a fetch that raises is
+    caught and yields ('uncertain', 'fetch error: ...', '') so one bad URL can't
+    abort the whole sweep. Shared by the scrape-time screen and the tracker
+    liveness re-check (pipeline/recheck.py) so the parallel-fetch + guest-mapping
+    mechanics live in exactly one place."""
+    def _one(item):
+        url = (url_of(item) or "").strip()
+        if not url:
+            return item, "uncertain", "", ""
+        fetch_url = linkedin_guest_jd_url(url) or url
+        try:
+            result, reason, body = fetch_and_classify(fetch_url, timeout)
+            return item, result, reason, body
+        except Exception as exc:
+            return item, "uncertain", f"fetch error: {exc}", ""
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_one, it) for it in items]
+        for fut in as_completed(futures):
+            yield fut.result()
+
+
 # ── Main entry point ────────────────────────────────────────────────────────
 
 def run(config_path: Path, career_ops_path: Path | None = None) -> int:
@@ -285,47 +314,36 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
         print(f"[screen] all {skipped_seen} job(s) already seen — nothing new to screen")
         return 0
 
-    def _check(job: dict) -> tuple[dict, str, str, str]:
-        url = (job.get("job_url") or "").strip()
-        if not url:
-            return job, "uncertain", "", ""
-        # For LinkedIn, fetch the guest job-posting endpoint instead of the
-        # login-walled /jobs/view/ page. It serves the complete JD reliably
-        # and gives a cleaner liveness signal (404 = gone, JD present = live).
-        # Non-LinkedIn URLs fetch normally. job_url in the CSV is unchanged —
-        # only the fetch target differs.
-        fetch_url = linkedin_guest_jd_url(url) or url
-        result, reason, body = fetch_and_classify(fetch_url, liveness_timeout)
-        return job, result, reason, body
-
     kept: list[dict] = []
     dead_entries: list[dict] = []
     dropped = 0
     backfilled = 0
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(_check, job) for job in jobs]
-        for future in as_completed(futures):
-            job, result, reason, body = future.result()
-            title = (job.get("title") or "?")[:60]
-            if result == "expired":
-                dropped += 1
-                print(f"  SKIP {title} -- liveness: {reason}", flush=True)
-                url = (job.get("job_url") or "").strip()
-                if url:
-                    dead_entries.append({
-                        "url": url,
-                        "title": (job.get("title") or "").strip(),
-                        "company": (job.get("company") or "").strip(),
-                    })
-                continue
-            # Backfill missing description from the page body we already fetched.
-            if not (job.get("description") or "").strip() and body:
-                extracted = extract_description(body)
-                if extracted:
-                    job["description"] = extracted
-                    backfilled += 1
-            kept.append(job)
+    # classify_each fetches each job_url in parallel (LinkedIn -> guest endpoint)
+    # and yields as results land; the same helper drives the tracker liveness
+    # re-check (pipeline/recheck.py).
+    for job, result, reason, body in classify_each(
+        jobs, lambda j: j.get("job_url") or "", timeout=liveness_timeout
+    ):
+        title = (job.get("title") or "?")[:60]
+        if result == "expired":
+            dropped += 1
+            print(f"  SKIP {title} -- liveness: {reason}", flush=True)
+            url = (job.get("job_url") or "").strip()
+            if url:
+                dead_entries.append({
+                    "url": url,
+                    "title": (job.get("title") or "").strip(),
+                    "company": (job.get("company") or "").strip(),
+                })
+            continue
+        # Backfill missing description from the page body we already fetched.
+        if not (job.get("description") or "").strip() and body:
+            extracted = extract_description(body)
+            if extracted:
+                job["description"] = extracted
+                backfilled += 1
+        kept.append(job)
 
     with open(FILTERED_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

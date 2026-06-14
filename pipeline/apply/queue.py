@@ -8,14 +8,11 @@ open; this stage just picks plausible candidates."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from pipeline.app import data as _data
-
-_URL_RE = re.compile(r"https?://\S+")
 
 # Statuses that mean "evaluated, not yet acted on". Anything else (Applied,
 # Rejected, Interview, Offer, Discarded, SKIP) is intentionally left alone.
@@ -30,11 +27,6 @@ class ApplyJob:
     url: str
     score: float | None
     report_path: str = ""
-
-
-def _extract_url(notes: str) -> str:
-    m = _URL_RE.search(notes or "")
-    return m.group(0).rstrip(".,);]") if m else ""
 
 
 def is_linkedin_job(url: str) -> bool:
@@ -72,7 +64,7 @@ def select(
         score = row.get("score_value")
         if score is None or score < min_score:
             continue
-        url = _extract_url(row.get("notes", ""))
+        url = _data.extract_url(row.get("notes", ""))
         if not url:
             continue
         if linkedin_only and not is_linkedin_job(url):
