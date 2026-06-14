@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 from pipeline.app import data as _data
-from pipeline._batch_common import atomic_write_text, normalize_company, read_text
+from pipeline._batch_common import normalize_company, read_text
 from pipeline.apply import browser, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
@@ -296,32 +296,12 @@ def _refresh_tracker(career_ops: Path) -> Path:
 
 
 def _mark_status(applications_md: Path, job, status: str) -> None:
-    """Record `status` for a job everywhere it matters:
-
-    1. The tracker copy this run selected from (direct Status-cell edit) — but
-       with refresh on that's the downloaded artifact copy, which nothing else
-       reads, so on its own the change was effectively invisible.
-    2. The UI's status-override channel (same one a kanban drag uses) — the UI
-       immediately shows the row's new status (pending), and the existing Push
-       button carries it to the cloud tracker.
-
-    The override carries the job's company/role identity, not just its num: the
-    num came from whatever tracker this run read (a refreshed cloud artifact, or
-    the local fallback when gh was down), and the cloud tracker the override is
-    eventually pushed to mints its numbers independently. Anchoring on identity
-    means the Push marks the row that was actually acted on — never a different
-    company that happens to share the num. Used for submit -> Applied and for a
-    closed posting -> Discarded."""
-    num = getattr(job, "num", "") or ""
-    if not num:
-        return
-    if applications_md.exists():
-        text = applications_md.read_text(encoding="utf-8")
-        updated = _data.set_status_in_text(text, num, status)
-        if updated != text:
-            atomic_write_text(applications_md, updated)
-    _data.record_status_override(
-        num, status,
+    """Record `status` for `job` in the tracker file + the UI override channel.
+    Thin wrapper over the shared dual-write (data.record_status_change has the
+    identity-anchor rationale). Used for submit -> Applied and a closed posting
+    -> Discarded; the same write the liveness re-check uses for gone -> Discarded."""
+    _data.record_status_change(
+        applications_md, getattr(job, "num", "") or "", status,
         company=getattr(job, "company", "") or "",
         role=getattr(job, "role", "") or "",
     )

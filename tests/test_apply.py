@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import pipeline.apply as apply_pkg
+from pipeline.app import data as app_data
 from pipeline.apply import linkedin, queue, result
 from pipeline.apply.answers import AnswerEngine, _match_option, _sanitize, salary_from_report
 from pipeline.apply.profile import ApplyProfile, _parse_salary, _parse_salary_target
@@ -545,7 +546,8 @@ class TestQueueHelpers:
         assert queue.is_linkedin_job("not a url") is False
 
     def test_extract_url_strips_trailing_punctuation(self):
-        assert queue._extract_url("see https://x.com/a/b, fits") == "https://x.com/a/b"
+        # extract_url now lives in data.py (shared by the apply queue + recheck).
+        assert app_data.extract_url("see https://x.com/a/b, fits") == "https://x.com/a/b"
 
 
 # ── linkedin.py pure helpers (no browser) ────────────────────────────────────

@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -41,6 +42,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
+from pipeline import recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -443,6 +445,13 @@ def run_local(req: LocalRunRequest) -> JSONResponse:
     on success the UI switches to the local tracker via /api/use-local."""
     if req.passes not in local_run.VALID_PASSES:
         raise HTTPException(status_code=400, detail=f"unknown passes value: {req.passes}")
+    # A pipeline run rewrites the tracker wholesale; a recheck sweep edits it
+    # concurrently. Refuse to overlap (recheck refuses during a run too).
+    with _recheck_lock:
+        if _recheck_state.get("running"):
+            raise HTTPException(status_code=409,
+                                detail="A liveness re-check is in progress. Wait for it to "
+                                       "finish — both write the tracker.")
     try:
         state = local_run.start({"passes": req.passes, "evaluate": req.evaluate})
     except RuntimeError as e:
@@ -473,6 +482,62 @@ def use_local() -> JSONResponse:
     with _data_dir_lock:
         _active_data_dir = None
     return JSONResponse({"ok": True, "career_ops": str(_career_ops_local())})
+
+
+# ── tracker liveness re-check ───────────────────────────────────────────────
+# A background sweep that re-checks every Evaluated tracker role's liveness and
+# marks closed ones Discarded — the UI counterpart of orchestrate's
+# --recheck-liveness. Single-flight (one sweep at a time) and refused while a
+# local pipeline run holds the tracker, since both mutate applications.md.
+_recheck_lock = threading.Lock()
+_recheck_state: dict = {}
+
+
+def _recheck_idle() -> dict:
+    return {"running": False, "started_at": None, "checked": 0, "total": None,
+            "discarded": 0, "unconfirmed": 0, "dead": [], "done": False,
+            "ok": None, "error": None}
+
+
+def _run_recheck() -> None:
+    """Worker: run the core sweep against the active tracker, folding live
+    progress and the final summary into _recheck_state for the status poll."""
+    def _progress(checked, total, discarded):
+        with _recheck_lock:
+            _recheck_state.update(checked=checked, total=total, discarded=discarded)
+    try:
+        summary = recheck.run(_career_ops(), progress=_progress)
+        with _recheck_lock:
+            _recheck_state.update(
+                running=False, done=True, ok=True,
+                checked=summary["checked"], discarded=summary["discarded"],
+                unconfirmed=summary.get("unconfirmed", 0), dead=summary["dead"])
+    except Exception as e:  # surface failure to the UI rather than hang on running
+        with _recheck_lock:
+            _recheck_state.update(running=False, done=True, ok=False, error=str(e))
+
+
+@app.post("/api/recheck-liveness")
+def recheck_liveness() -> JSONResponse:
+    """Start a background liveness sweep of the Evaluated tracker roles. 409 if
+    one is already running or a local pipeline run is in progress. Poll
+    /api/recheck-liveness/status for progress + the dead list."""
+    _refuse_during_local_run()
+    with _recheck_lock:
+        if _recheck_state.get("running"):
+            raise HTTPException(status_code=409, detail="A liveness re-check is already running.")
+        _recheck_state.clear()
+        _recheck_state.update(_recheck_idle())
+        _recheck_state.update(running=True, started_at=time.time())
+        snapshot = dict(_recheck_state)
+    threading.Thread(target=_run_recheck, daemon=True).start()
+    return JSONResponse(snapshot)
+
+
+@app.get("/api/recheck-liveness/status")
+def recheck_liveness_status() -> JSONResponse:
+    with _recheck_lock:
+        return JSONResponse(dict(_recheck_state) if _recheck_state else _recheck_idle())
 
 
 # ── career-ops skills ──────────────────────────────────────────────────────
@@ -1115,14 +1180,14 @@ def _apply_hold_timeout() -> float:
 def _apply_job_for_num(num: str):
     """Build an ApplyJob from the tracker row with this num (the active data
     dir), pulling the posting URL from the notes cell. None if no such row."""
-    from pipeline.apply.queue import ApplyJob, _extract_url
+    from pipeline.apply.queue import ApplyJob
     for row in data.load_jobs(_career_ops())["rows"]:
         if str(row.get("num")) == str(num):
             return ApplyJob(
                 num=str(row.get("num")),
                 company=row.get("company", ""),
                 role=row.get("role", ""),
-                url=_extract_url(row.get("notes", "")),
+                url=data.extract_url(row.get("notes", "")),
                 score=row.get("score_value"),
                 report_path=row.get("report_path", ""),
             )
