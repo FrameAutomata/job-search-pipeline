@@ -146,6 +146,26 @@ class TestRecheckTrigger:
         assert done["deferred"] == 5
         assert done["unverifiable"] == 7
 
+    def test_drain_error_surfaces_partial_counts(self, client, monkeypatch):
+        """A mid-drain failure reports ok=False with the error, but still
+        surfaces the partial checked/discarded the completed cycles achieved
+        (and already wrote to disk) — not a zeroed 'failed' result."""
+        def fake_drain(career_ops, *, progress=None, **kw):
+            if progress:
+                progress(50, None, 3)
+            return {"checked": 50, "discarded": 3, "skipped": 0, "unconfirmed": 0,
+                    "throttled": 0, "deferred": 0, "unverifiable": 0,
+                    "dead": [{"num": "7", "company": "Acme", "role": "Eng",
+                              "url": "u", "reason": "HTTP 404"}],
+                    "error": "disk full"}
+        monkeypatch.setattr(recheck_mod, "drain", fake_drain)
+        client.post("/api/recheck-liveness")
+        done = _wait_done(client)
+        assert done["ok"] is False
+        assert done["error"] == "disk full"
+        assert done["checked"] == 50 and done["discarded"] == 3   # partial work surfaced
+        assert [d["num"] for d in done["dead"]] == ["7"]
+
     def test_ui_drains_multi_cycle_when_over_budget(self, client, monkeypatch):
         """The UI sweep drains: when the backlog exceeds the budget it runs
         budgeted cycles until covered and surfaces the CUMULATIVE result — so a

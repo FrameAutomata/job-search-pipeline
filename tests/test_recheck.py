@@ -502,3 +502,55 @@ class TestRecheckDrain:
         agg = recheck.drain(object(), budget=100, cooldown=5, max_cycles=10)
         assert agg["unconfirmed"] == 5     # 3 + 2, not just the last cycle's 2
         assert agg["deferred"] == 0        # last cycle underfilled → none still due
+
+    def test_partial_aggregate_preserved_on_cycle_error(self, monkeypatch):
+        """A run() exception in a later cycle must NOT discard the completed
+        cycles' work: drain returns the partial aggregate (which the UI already
+        wrote to disk) with an `error` set, rather than raising and losing it."""
+        seq = iter([self._summary(100, discarded=2, dead=[{"num": "1"}, {"num": "2"}])])
+
+        def fake_run(co, **kw):
+            try:
+                return next(seq)
+            except StopIteration:
+                raise RuntimeError("disk full") from None
+        monkeypatch.setattr(recheck, "run", fake_run)
+        monkeypatch.setattr(recheck.time, "sleep", lambda *_: None)
+
+        agg = recheck.drain(object(), budget=100, cooldown=5, max_cycles=10)
+        assert agg["error"] == "disk full"
+        assert agg["cycles"] == 1                 # only the first cycle completed
+        assert agg["checked"] == 100              # its work is preserved, not zeroed
+        assert [d["num"] for d in agg["dead"]] == ["1", "2"]
+
+    def test_clamps_nonpositive_budget(self, monkeypatch):
+        """A 0 or negative RECHECK_BUDGET would disable or invert the slice and
+        make the stop condition unreachable; drain clamps budget to >= 1."""
+        seen = []
+        monkeypatch.setattr(recheck, "run",
+                            lambda co, **kw: seen.append(kw["budget"]) or self._summary(0))
+        monkeypatch.setattr(recheck.time, "sleep", lambda *_: None)
+        recheck.drain(object(), budget=-5, cooldown=0, max_cycles=3)
+        assert seen and seen[0] == 1              # clamped to 1, not -5
+
+    def test_dry_run_does_a_single_cycle(self, monkeypatch):
+        """Under dry_run, run() persists no state, so a cycle can't advance —
+        drain must not loop (it would re-check the same budget every cycle)."""
+        calls = []
+        monkeypatch.setattr(recheck, "run",
+                            lambda co, **kw: calls.append(1) or self._summary(100))  # always full
+        monkeypatch.setattr(recheck.time, "sleep", lambda *_: None)
+        recheck.drain(object(), budget=100, cooldown=0, max_cycles=10, dry_run=True)
+        assert len(calls) == 1                    # single sweep despite a full-budget result
+
+    def test_advances_through_backlog_with_real_run(self, tracker, fake_fetch, tmp_path):
+        """Integration: with the REAL run() (only the HTTP layer faked), a budget
+        smaller than the backlog drives drain across cycles, and the per-role
+        state makes each cycle skip the prior cycle's roles — so every verifiable
+        role is fetched exactly once, none re-checked."""
+        co, apps = tracker
+        sp = tmp_path / "recheck-state.tsv"
+        agg = recheck.drain(co, applications_md=apps, state_path=sp,
+                            budget=1, cooldown=0, max_cycles=10)
+        assert agg["checked"] == 3                # rows 1, 2, 6 (verifiable), one each
+        assert len(fake_fetch["urls"]) == len(set(fake_fetch["urls"])) == 3   # no re-fetch

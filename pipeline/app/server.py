@@ -525,8 +525,12 @@ def _run_recheck() -> None:
         # instead of stopping at one budget with hundreds deferred.
         summary = recheck.drain(_career_ops(), progress=_progress)
         with _recheck_lock:
+            # A drain that hit an error mid-way still returns the completed
+            # cycles' partial counts (already written to disk) — surface those
+            # AND ok=False, rather than a zeroed failure.
             _recheck_state.update(
-                running=False, done=True, ok=True,
+                running=False, done=True, ok=not summary.get("error"),
+                error=summary.get("error"),
                 checked=summary["checked"], discarded=summary["discarded"],
                 unconfirmed=summary.get("unconfirmed", 0),
                 throttled=summary.get("throttled", 0),

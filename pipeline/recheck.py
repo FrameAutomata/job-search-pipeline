@@ -153,6 +153,16 @@ def select_for_recheck(applications_md, *, state, now, min_age_hours, budget):
                             min_age_hours=min_age_hours, budget=budget)
 
 
+def _resolve_budget(budget) -> int:
+    """The per-run budget — env-resolved when unset, clamped to >= 1. A 0 or
+    negative `RECHECK_BUDGET` would otherwise disable the sweep or, via the
+    `due[:budget]` slice, drop the STALEST roles and make drain's
+    `checked < budget` stop unreachable. Shared by run() and drain() so the two
+    can't resolve it differently."""
+    resolved = int(env_float("RECHECK_BUDGET", _DEFAULT_BUDGET)) if budget is None else budget
+    return max(1, resolved)
+
+
 def run(
     career_ops: Path,
     *,
@@ -188,7 +198,7 @@ def run(
     """
     apps = Path(applications_md) if applications_md else Path(career_ops) / "data" / "applications.md"
     sp = Path(state_path) if state_path else Path(career_ops) / "data" / "recheck-state.tsv"
-    budget = int(env_float("RECHECK_BUDGET", _DEFAULT_BUDGET)) if budget is None else budget
+    budget = _resolve_budget(budget)
     min_age_hours = (env_float("RECHECK_MIN_AGE_HOURS", _DEFAULT_MIN_AGE_HOURS)
                      if min_age_hours is None else min_age_hours)
 
@@ -271,13 +281,19 @@ def drain(career_ops, *, budget=None, cooldown=None, max_cycles=None,
 
     A backlog that already fits in one budget returns after a single cycle with
     no cooldown — so a caller (the UI) can always drain() and only actually loop
-    when there's more than a budget of roles to get through.
-    """
-    budget = int(env_float("RECHECK_BUDGET", _DEFAULT_BUDGET)) if budget is None else budget
+    when there's more than a budget of roles to get through. `dry_run` forces a
+    single sweep (no state is persisted, so cycles can't advance). If a sweep
+    raises, drain stops and returns the partial aggregate with `error` set rather
+    than losing the completed cycles' work."""
+    budget = _resolve_budget(budget)
     cooldown = (env_float("RECHECK_DRAIN_COOLDOWN", _DEFAULT_DRAIN_COOLDOWN)
                 if cooldown is None else cooldown)
     max_cycles = (int(env_float("RECHECK_DRAIN_MAX_CYCLES", _DEFAULT_DRAIN_MAX_CYCLES))
                   if max_cycles is None else max_cycles)
+    # Under dry_run run() persists no state, so a cycle can't advance to fresh
+    # roles — looping would just re-check the same budget. Do a single sweep.
+    if run_kw.get("dry_run"):
+        max_cycles = 1
 
     agg = {"cycles": 0, "checked": 0, "discarded": 0, "dead": [],
            "unconfirmed": 0, "throttled": 0, "deferred": 0, "skipped": 0,
@@ -290,18 +306,25 @@ def drain(career_ops, *, budget=None, cooldown=None, max_cycles=None,
         if progress:
             progress(agg["checked"] + checked, None, agg["discarded"] + cycle_dead)
 
+    # A run() failure in a later cycle must not discard the completed cycles'
+    # aggregate — those Discards are already on disk. Catch it, record the error,
+    # and return what we have so the caller reports partial progress, not a
+    # zeroed failure.
     last = None
-    for cycle in range(max(1, max_cycles)):
-        last = run(career_ops, budget=budget, progress=cycle_progress, **run_kw)
-        agg["cycles"] += 1
-        agg["checked"] += last["checked"]
-        agg["discarded"] += last["discarded"]
-        agg["unconfirmed"] += last.get("unconfirmed", 0)   # cumulative: stamped, not re-checked
-        agg["dead"].extend(last["dead"])
-        if last["checked"] < budget or last["checked"] == 0:
-            break
-        if cycle < max_cycles - 1:
-            time.sleep(cooldown)
+    try:
+        for cycle in range(max(1, max_cycles)):
+            last = run(career_ops, budget=budget, progress=cycle_progress, **run_kw)
+            agg["cycles"] += 1
+            agg["checked"] += last["checked"]
+            agg["discarded"] += last["discarded"]
+            agg["unconfirmed"] += last.get("unconfirmed", 0)   # cumulative: stamped, not re-checked
+            agg["dead"].extend(last["dead"])
+            if last["checked"] < budget:   # budget >= 1, so 0 (empty sweep) also breaks
+                break
+            if cycle < max_cycles - 1:
+                time.sleep(cooldown)
+    except Exception as exc:
+        agg["error"] = str(exc)
 
     if last is not None:
         # throttled/deferred are the FINAL cycle's still-unresolved state: a
