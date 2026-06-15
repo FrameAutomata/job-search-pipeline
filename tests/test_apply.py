@@ -310,11 +310,14 @@ class TestAnswerEngineNumeric:
             "Because I admire the team's work."
 
     def test_cached_numeric_prose_is_coerced_on_hit(self, profile, tmp_path):
-        # A cache entry holding prose under a numeric:: key (e.g. from before this
-        # fix) must be coerced on the cache-HIT path too, not typed verbatim.
+        # A cache entry holding prose under a numeric:: key must be coerced on the
+        # cache-HIT path too, not typed verbatim. The seed carries a matching CV
+        # fingerprint so the entry isn't discarded as stale.
+        from pipeline.apply.answers import _cv_fingerprint
         cache = tmp_path / "c.json"
         cache.write_text(
-            json.dumps({"numeric::years of professional experience": "I have about 5 years"}),
+            json.dumps({"__cv__": _cv_fingerprint(""),
+                        "numeric::years of professional experience": "I have about 5 years"}),
             encoding="utf-8")
 
         def boom(s, u):
@@ -431,6 +434,56 @@ class TestCandidateContext:
         # cv_text defaults to "" → context is the profile block only; still answers.
         e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "5")
         assert e.answer("Years of experience with Python", "numeric") == "5"
+
+    def test_salary_field_stays_deterministic_with_cv(self, profile, tmp_path):
+        # Even with a comp figure in the CV, a salary field is answered
+        # deterministically — it never reaches the LLM, so the CV can't leak it.
+        def boom(s, u):
+            raise AssertionError("a salary field must not reach the LLM")
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=boom,
+                         cv_text="Compensation note: target $185,000")
+        assert e.answer("What are your salary expectations?", "text") == "Negotiable"
+
+    def test_llm_prompt_forbids_salary_disclosure(self, profile, tmp_path):
+        # Belt-and-suspenders: any free-text answer reaching the LLM — with the CV
+        # (which could carry comp) in context — is instructed never to state a
+        # figure. (A question that matched the deterministic salary regex would
+        # never reach the LLM in the first place, so we use a neutral one.)
+        captured = {}
+        def caller(system, user):
+            captured["system"] = system
+            return "ok"
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=caller,
+                         cv_text="Compensation: $185,000")
+        e.answer("Why are you a strong fit for this role?", "textarea")
+        sys_l = captured["system"].lower()
+        assert "salary" in sys_l and "negotiable" in sys_l
+
+
+class TestAnswerCacheInvalidation:
+    """A CV-grounded answer must not outlive the CV it was derived from: when
+    cv.md changes, cached LLM answers are stale and must be re-asked — otherwise
+    editing your résumé silently has no effect until the cache file is deleted
+    (which we tripped over during verification)."""
+
+    def test_cv_edit_invalidates_cached_answers(self, profile, tmp_path):
+        cache = tmp_path / "c.json"
+        e1 = AnswerEngine(profile, cache, caller=lambda s, u: "5", cv_text="Java since 2021")
+        assert e1.answer("How many years with Java?", "numeric") == "5"
+        # CV changed → the cached "5" must NOT be replayed; the re-ask yields "9".
+        e2 = AnswerEngine(profile, cache, caller=lambda s, u: "9", cv_text="Java since 2017")
+        assert e2.answer("How many years with Java?", "numeric") == "9"
+
+    def test_same_cv_reuses_cache(self, profile, tmp_path):
+        cache = tmp_path / "c.json"
+        calls = []
+        def caller(s, u):
+            calls.append(1)
+            return "5"
+        AnswerEngine(profile, cache, caller=caller, cv_text="CV").answer("Years with Java?", "numeric")
+        # Same CV → the second engine reuses the cache (no second LLM call).
+        v = AnswerEngine(profile, cache, caller=caller, cv_text="CV").answer("Years with Java?", "numeric")
+        assert v == "5" and len(calls) == 1
 
 
 class TestEEOHelpers:
