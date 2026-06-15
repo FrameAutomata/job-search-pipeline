@@ -264,6 +264,61 @@ def test_push_status_surfaces_gh_error(client, mocker):
     assert "edit-tracker" in r.json()["detail"]
 
 
+def _fresh_base_with_acme(tmp_path):
+    """A cloud base containing only Acme/Eng (row 1) — used to make foreign-
+    identity overrides resolve (Acme) or not (anything else)."""
+    fresh = tmp_path / "fresh" / "pipeline-output-9"
+    (fresh / "data").mkdir(parents=True)
+    (fresh / "data" / "applications.md").write_text(
+        "# Applications Tracker\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 1 | 2026-05-27 | Acme | Eng | 4.2/5 | Evaluated | ❌ | [001](reports/001-acme.md) | x |\n",
+        encoding="utf-8")
+    return fresh
+
+
+def test_push_clears_unresolved_discards_but_keeps_other_unresolved(client, tmp_path, mocker):
+    """An unresolved DISCARD override (a closed role absent from the cloud
+    tracker) is dropped on push — it's already applied locally, a closed role
+    won't reappear to match later, and the cloud's own recheck is the backstop.
+    An unresolved non-Discard (e.g. Applied) is still KEPT for a later push."""
+    from pipeline.app import server, data
+    import json
+    data.record_status_override("1", "Applied", company="Acme", role="Eng")          # resolves
+    data.record_status_override("90", "Discarded", company="GhostCo", role="Closed")  # unresolved Discard
+    data.record_status_override("91", "Applied", company="OtherCo", role="Dev")       # unresolved non-Discard
+
+    mocker.patch.object(server.gh, "latest_successful_run", return_value={"databaseId": 9})
+    mocker.patch.object(server.gh, "download_artifact", return_value=_fresh_base_with_acme(tmp_path))
+    mocker.patch.object(server.gh, "trigger_workflow")
+
+    body = client.post("/api/push-status").json()
+    assert body["pushed"] == 1            # Acme/Eng resolved + dispatched
+    assert body["unresolved"] == 1        # only the kept Applied (91) — NOT the Discard
+    remaining = json.loads(data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))
+    assert set(remaining) == {"91"}       # 1 pushed+cleared, 90 (Discard) cleared, 91 kept
+
+
+def test_push_clears_unresolved_discards_when_nothing_resolves(client, tmp_path, mocker):
+    """The real-world case: only unresolved Discards, none match the cloud base.
+    They're still cleared (not kept forever to nag every push) and no empty
+    edit-tracker run is dispatched."""
+    from pipeline.app import server, data
+    import json
+    data.record_status_override("90", "Discarded", company="GhostCo", role="Closed")
+
+    mocker.patch.object(server.gh, "latest_successful_run", return_value={"databaseId": 9})
+    mocker.patch.object(server.gh, "download_artifact", return_value=_fresh_base_with_acme(tmp_path))
+    trigger = mocker.patch.object(server.gh, "trigger_workflow")
+
+    body = client.post("/api/push-status").json()
+    assert body["pushed"] == 0
+    assert body["unresolved"] == 0        # the stale Discard was cleared, not kept
+    assert json.loads(data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8")) == {}
+    trigger.assert_not_called()           # nothing resolved → no dispatch
+
+
 # ── Onboarding (Phase 3) ───────────────────────────────────────────────────
 
 def test_onboard_status_reports_readiness(client, mocker):
