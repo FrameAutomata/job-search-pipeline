@@ -543,7 +543,14 @@ async function pollRecheck() {
           : `Liveness re-check: all ${s.checked} role${s.checked === 1 ? "" : "s"} still open.`,
       "ok");
   } else {
-    showAction(`Liveness re-check failed${s.error ? `: ${s.error}` : ""}.`, "error");
+    // A drain can fail mid-way after earlier cycles already marked closed roles
+    // Discarded (those writes are on disk) — surface that partial progress and
+    // refresh the board so the rows show, rather than a bare "failed".
+    if (s.discarded) await loadJobs().catch(() => {});
+    const partial = s.discarded
+      ? ` ${s.discarded} closed posting${s.discarded === 1 ? "" : "s"} marked Discarded before it stopped.`
+      : "";
+    showAction(`Liveness re-check failed${s.error ? `: ${s.error}` : ""}.${partial}`, "error");
   }
 }
 
