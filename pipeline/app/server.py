@@ -496,7 +496,7 @@ _recheck_state: dict = {}
 def _recheck_idle() -> dict:
     return {"running": False, "started_at": None, "checked": 0, "total": None,
             "discarded": 0, "unconfirmed": 0, "throttled": 0, "deferred": 0,
-            "dead": [], "done": False, "ok": None, "error": None}
+            "unverifiable": 0, "dead": [], "done": False, "ok": None, "error": None}
 
 
 def _run_recheck() -> None:
@@ -506,14 +506,19 @@ def _run_recheck() -> None:
         with _recheck_lock:
             _recheck_state.update(checked=checked, total=total, discarded=discarded)
     try:
-        summary = recheck.run(_career_ops(), progress=_progress)
+        # drain() loops budgeted sweeps until the backlog is covered (it
+        # self-limits to a single sweep when there are <= budget roles), so a
+        # backlog larger than one budget is fully gone through from the UI
+        # instead of stopping at one budget with hundreds deferred.
+        summary = recheck.drain(_career_ops(), progress=_progress)
         with _recheck_lock:
             _recheck_state.update(
                 running=False, done=True, ok=True,
                 checked=summary["checked"], discarded=summary["discarded"],
                 unconfirmed=summary.get("unconfirmed", 0),
                 throttled=summary.get("throttled", 0),
-                deferred=summary.get("deferred", 0), dead=summary["dead"])
+                deferred=summary.get("deferred", 0),
+                unverifiable=summary.get("unverifiable", 0), dead=summary["dead"])
     except Exception as e:  # surface failure to the UI rather than hang on running
         with _recheck_lock:
             _recheck_state.update(running=False, done=True, ok=False, error=str(e))

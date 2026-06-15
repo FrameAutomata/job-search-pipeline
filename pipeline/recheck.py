@@ -19,6 +19,7 @@ and exposed in the UI as a background sweep. Both go through `run()`.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,13 @@ from pipeline.app import data
 _DEFAULT_BUDGET = 100
 _DEFAULT_MIN_AGE_HOURS = 6.0
 
+# drain() (the manual catch-up over a backlog larger than one budget) loops
+# budgeted sweeps with this cooldown between bursts so the per-IP limiter can
+# recover, bounded by this many cycles so persistent throttling can't loop
+# forever. Both env-overridable.
+_DEFAULT_DRAIN_COOLDOWN = 60.0
+_DEFAULT_DRAIN_MAX_CYCLES = 20
+
 
 @dataclass(frozen=True)
 class RecheckJob:
@@ -44,11 +52,14 @@ class RecheckJob:
     url: str
 
 
-def _select(applications_md: Path) -> tuple[list[RecheckJob], int]:
-    """(jobs, skipped): every Evaluated row that has a posting URL, plus a count
-    of Evaluated rows that carried no URL to re-check."""
+def _select(applications_md: Path) -> tuple[list[RecheckJob], int, int]:
+    """(jobs, skipped, unverifiable): the Evaluated roles we can actually
+    liveness-check, plus counts of Evaluated rows with no URL (`skipped`) and
+    with a URL on a site we have no liveness path for (`unverifiable` — e.g.
+    Indeed/Glassdoor anti-bot walls, which a plain fetch can't classify). The
+    unverifiable ones are never fetched; restoring them is a tracked follow-up."""
     jobs: list[RecheckJob] = []
-    skipped = 0
+    skipped = unverifiable = 0
     for row in data.parse_applications(applications_md):
         if row.get("status_canonical") != "Evaluated":
             continue
@@ -56,18 +67,22 @@ def _select(applications_md: Path) -> tuple[list[RecheckJob], int]:
         if not url:
             skipped += 1
             continue
+        if not screen.is_liveness_verifiable(url):
+            unverifiable += 1
+            continue
         jobs.append(RecheckJob(
             num=row.get("num", ""), company=row.get("company", ""),
             role=row.get("role", ""), url=url,
         ))
-    return jobs, skipped
+    return jobs, skipped, unverifiable
 
 
 def select_evaluated(applications_md: Path) -> list[RecheckJob]:
-    """Every Evaluated tracker role with a posting URL to re-check. Unlike the
-    apply queue this is neither score-gated nor LinkedIn-only — liveness applies
-    to every site and every score."""
-    jobs, _ = _select(Path(applications_md))
+    """Every Evaluated tracker role we can liveness-check (has a posting URL on a
+    verifiable site). Not score-gated — liveness applies at every score — but it
+    IS site-gated: only sites with a working unauthenticated liveness path
+    (currently LinkedIn via the guest endpoint) are returned."""
+    jobs, _, _ = _select(Path(applications_md))
     return jobs
 
 
@@ -109,27 +124,31 @@ def _save_state(path, state) -> None:
     atomic_write_text(Path(path), "".join(f"{ln}\n" for ln in lines))
 
 
-def _filter_by_state(jobs, *, state, now, min_age_hours, budget):
-    """The subset of `jobs` to re-check this run: drop any checked within
-    `min_age_hours`, then take the `budget` least-recently-checked (unseen roles
-    sort oldest, so they go first). Stable on ties, so file order breaks them."""
+def _eligible(jobs, *, state, now, min_age_hours):
+    """Roles due a re-check — never checked, or last checked more than
+    `min_age_hours` ago — sorted stalest-first (unseen sort oldest). No budget
+    cap, so callers can both pick the budget and count the genuine remainder."""
     # Stored timestamps are always tz-aware; coerce a naive `now` (e.g. an
     # external caller passing datetime.now()) to UTC so the comparison below
     # can't raise "can't compare offset-naive and offset-aware".
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     cutoff = now - timedelta(hours=min_age_hours)
-    eligible = [j for j in jobs
-                if state.get(j.url) is None or state[j.url] <= cutoff]
-    eligible.sort(key=lambda j: state.get(j.url) or _EPOCH)
-    return eligible[:budget]
+    due = [j for j in jobs if state.get(j.url) is None or state[j.url] <= cutoff]
+    due.sort(key=lambda j: state.get(j.url) or _EPOCH)
+    return due
+
+
+def _filter_by_state(jobs, *, state, now, min_age_hours, budget):
+    """The stalest `budget` of the roles due a re-check (see _eligible)."""
+    return _eligible(jobs, state=state, now=now, min_age_hours=min_age_hours)[:budget]
 
 
 def select_for_recheck(applications_md, *, state, now, min_age_hours, budget):
     """Every Evaluated+URL role, narrowed to this run's budget of the stalest
     (the selection `run()` actually fetches). Separated out so the budget/age
     logic is unit-testable without the HTTP layer."""
-    jobs, _ = _select(Path(applications_md))
+    jobs, _, _ = _select(Path(applications_md))
     return _filter_by_state(jobs, state=state, now=now,
                             min_age_hours=min_age_hours, budget=budget)
 
@@ -150,11 +169,14 @@ def run(
     Discarded.
 
     Returns {checked, discarded, dead, skipped, unconfirmed, throttled,
-    deferred}: `dead` is a list of {num, company, role, url, reason};
+    deferred, unverifiable}: `unverifiable` counts Evaluated roles on sites with
+    no liveness path (Indeed/Glassdoor anti-bot walls) — never fetched, just
+    reported; `dead` is a list of {num, company, role, url, reason};
     `unconfirmed` counts roles we read but couldn't call live-or-dead (ambiguous
     page / fetch error); `throttled` counts roles LinkedIn rate-limited (no real
-    read — retried next run, NEVER discarded); `deferred` counts Evaluated roles
-    skipped this run by the budget / min-age window. `progress(checked, total,
+    read — retried next run, NEVER discarded); `deferred` counts roles DUE a
+    re-check but cut by the per-run budget (the backlog remainder for a later
+    run — not roles merely inside the min-age window). `progress(checked, total,
     dead_so_far)` fires once per checked role. `dry_run` reports without writing.
 
     Per-role last-checked state lives in `state_path` (default
@@ -172,10 +194,13 @@ def run(
 
     now = datetime.now(timezone.utc)
     state = _load_state(sp)
-    all_jobs, skipped = _select(apps)
-    jobs = _filter_by_state(all_jobs, state=state, now=now,
-                            min_age_hours=min_age_hours, budget=budget)
-    deferred = len(all_jobs) - len(jobs)
+    all_jobs, skipped, unverifiable = _select(apps)
+    due = _eligible(all_jobs, state=state, now=now, min_age_hours=min_age_hours)
+    jobs = due[:budget]
+    # Deferred = roles DUE a re-check but cut by the budget (the genuine backlog
+    # remainder, drained over future runs) — NOT roles merely inside the min-age
+    # window. This is what makes a fully-drained backlog report deferred=0.
+    deferred = len(due) - len(jobs)
     total = len(jobs)
 
     checked = unconfirmed = throttled = 0
@@ -219,9 +244,72 @@ def run(
 
     summary = {"checked": checked, "discarded": discarded, "dead": dead,
                "skipped": skipped, "unconfirmed": unconfirmed,
-               "throttled": throttled, "deferred": deferred}
+               "throttled": throttled, "deferred": deferred,
+               "unverifiable": unverifiable}
     print(f"[recheck] checked {checked}, discarded {discarded}, "
           f"{unconfirmed} unconfirmed, {throttled} throttled, "
-          f"{deferred} deferred, {skipped} without URL"
+          f"{deferred} deferred, {unverifiable} unverifiable, {skipped} without URL"
           + (" [dry-run]" if dry_run else ""), flush=True)
     return summary
+
+
+def drain(career_ops, *, budget=None, cooldown=None, max_cycles=None,
+          progress=None, **run_kw) -> dict:
+    """Repeatedly run() budgeted sweeps until the eligible backlog is covered.
+
+    A single sweep only re-checks `budget` of the stalest roles, so a backlog
+    larger than one budget needs several. This loops them — each cycle skips the
+    roles the previous one stamped (run's per-role min-age state), so it advances
+    through fresh roles — with a `cooldown` between bursts so LinkedIn's per-IP
+    limiter can recover.
+
+    Stops when a sweep checks FEWER than `budget` (the eligible pool fit in one
+    sweep → the backlog is drained to its tail) or after `max_cycles` (a hard cap
+    so persistent throttling can't loop forever). `checked`/`discarded`/`dead`
+    aggregate across cycles; `throttled`/`unconfirmed`/`deferred` report the final
+    cycle's still-unresolved counts. Forwards timeout/dry_run/etc. to run().
+
+    A backlog that already fits in one budget returns after a single cycle with
+    no cooldown — so a caller (the UI) can always drain() and only actually loop
+    when there's more than a budget of roles to get through.
+    """
+    budget = int(env_float("RECHECK_BUDGET", _DEFAULT_BUDGET)) if budget is None else budget
+    cooldown = (env_float("RECHECK_DRAIN_COOLDOWN", _DEFAULT_DRAIN_COOLDOWN)
+                if cooldown is None else cooldown)
+    max_cycles = (int(env_float("RECHECK_DRAIN_MAX_CYCLES", _DEFAULT_DRAIN_MAX_CYCLES))
+                  if max_cycles is None else max_cycles)
+
+    agg = {"cycles": 0, "checked": 0, "discarded": 0, "dead": [],
+           "unconfirmed": 0, "throttled": 0, "deferred": 0, "skipped": 0,
+           "unverifiable": 0}
+
+    def cycle_progress(checked, _total, cycle_dead):
+        # Cumulative across cycles; total is left open (the backlog shrinks each
+        # cycle) so the UI shows a running count, not a per-cycle denominator
+        # that resets every loop. agg holds the completed-cycle totals here.
+        if progress:
+            progress(agg["checked"] + checked, None, agg["discarded"] + cycle_dead)
+
+    last = None
+    for cycle in range(max(1, max_cycles)):
+        last = run(career_ops, budget=budget, progress=cycle_progress, **run_kw)
+        agg["cycles"] += 1
+        agg["checked"] += last["checked"]
+        agg["discarded"] += last["discarded"]
+        agg["unconfirmed"] += last.get("unconfirmed", 0)   # cumulative: stamped, not re-checked
+        agg["dead"].extend(last["dead"])
+        if last["checked"] < budget or last["checked"] == 0:
+            break
+        if cycle < max_cycles - 1:
+            time.sleep(cooldown)
+
+    if last is not None:
+        # throttled/deferred are the FINAL cycle's still-unresolved state: a
+        # throttled role bubbles and is retried in later cycles, and deferred is
+        # the genuine remainder after the last sweep (0 once fully drained).
+        for k in ("throttled", "deferred", "skipped", "unverifiable"):
+            agg[k] = last.get(k, 0)
+    print(f"[recheck:drain] {agg['cycles']} cycle(s): checked {agg['checked']}, "
+          f"discarded {agg['discarded']}; last cycle {agg['throttled']} throttled, "
+          f"{agg['deferred']} deferred", flush=True)
+    return agg

@@ -149,6 +149,18 @@ def linkedin_guest_jd_url(url: str) -> str | None:
     return f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}"
 
 
+def is_liveness_verifiable(url: str | None) -> bool:
+    """Whether a posting URL has a working unauthenticated liveness path.
+
+    Today that's exactly LinkedIn /jobs/view/ URLs (mappable to the guest JD
+    endpoint). Indeed and Glassdoor serve JS / anti-bot interstitials (e.g.
+    Indeed's "Authenticating…" page) to a plain HTTP fetch — no JD, no apply
+    control, no closed-marker — so liveness can't be determined and the re-check
+    skips them rather than burning a fetch on a page it can't classify. Restoring
+    those sites (via a CAPTCHA solver / headless browser) is a tracked follow-up."""
+    return linkedin_guest_jd_url(url) is not None
+
+
 def _clean_html(s: str) -> str:
     """Strip scripts/styles + all HTML tags, decode entities, collapse whitespace."""
     s = _SCRIPT_STYLE_RE.sub(" ", s)

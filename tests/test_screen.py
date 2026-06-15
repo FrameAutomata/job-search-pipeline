@@ -701,3 +701,28 @@ class TestClassifyEachRetry:
         monkeypatch.setattr(screen_mod.time, "sleep", lambda *_: None)
         rows = list(screen_mod.classify_each(["https://x"], lambda u: u, timeout=8, max_workers=1))
         assert rows[0][1] == "throttled"
+
+
+class TestIsLivenessVerifiable:
+    """A URL is liveness-verifiable only if we have a working unauthenticated way
+    to read it. Today that's LinkedIn /jobs/view (the guest JD endpoint); Indeed
+    and Glassdoor serve JS/anti-bot pages a plain fetch can't classify, so the
+    re-check skips them (see issue: Indeed support via CAPTCHA solving)."""
+
+    def test_linkedin_view_is_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert is_liveness_verifiable("https://www.linkedin.com/jobs/view/4342114687/")
+        assert is_liveness_verifiable("https://linkedin.com/jobs/view/eng-at-acme-555")
+
+    def test_indeed_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("https://www.indeed.com/viewjob?jk=abc123")
+
+    def test_glassdoor_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("https://www.glassdoor.com/job-listing/123")
+
+    def test_empty_or_none_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("")
+        assert not is_liveness_verifiable(None)

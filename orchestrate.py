@@ -65,6 +65,11 @@ def main() -> int:
                          "cloud workflow turns it on.")
     ap.add_argument("--recheck-timeout", type=int, default=8,
                     help="Per-request timeout (seconds) for --recheck-liveness (default: 8)")
+    ap.add_argument("--recheck-drain", action="store_true",
+                    help="With --recheck-liveness: loop budgeted sweeps (cooldown "
+                         "between bursts) until the whole Evaluated backlog is "
+                         "covered, instead of one budgeted sweep. For a manual "
+                         "catch-up; the cloud workflow stays single-sweep.")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
     pass_group = ap.add_mutually_exclusive_group()
     pass_group.add_argument("--only-pass", type=str, default=None,
@@ -144,7 +149,10 @@ def main() -> int:
         # local Discards. recheck.run prints its own summary.
         from pipeline import recheck
         notify.notify("Pipeline", "Re-checking tracker liveness...")
-        recheck.run(career_ops, timeout=args.recheck_timeout)
+        if args.recheck_drain:
+            recheck.drain(career_ops, timeout=args.recheck_timeout)
+        else:
+            recheck.run(career_ops, timeout=args.recheck_timeout)
 
     if args.apply:
         # Local import: the apply stage pulls in Playwright lazily, so the rest
