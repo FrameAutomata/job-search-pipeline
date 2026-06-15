@@ -525,11 +525,21 @@ async function pollRecheck() {
   if (s.ok) {
     await loadJobs().catch(() => {});                  // surface the new Discarded rows
     const n = s.discarded;
-    const unc = s.unconfirmed ? ` ${s.unconfirmed} couldn't be reached.` : "";
+    // Roles fetched this run but not conclusively read (uncertain or
+    // rate-limited) aren't "still open" — subtract them so a throttled sweep
+    // can't masquerade as a clean all-open result.
+    const caveats = [];
+    if (s.unconfirmed) caveats.push(`${s.unconfirmed} couldn't be reached`);
+    if (s.throttled) caveats.push(`${s.throttled} rate-limited (will retry)`);
+    if (s.deferred) caveats.push(`${s.deferred} deferred to a later run`);
+    const tail = caveats.length ? ` ${caveats.join(", ")}.` : "";
+    const open = s.checked - (s.unconfirmed || 0) - (s.throttled || 0);
     showAction(
       n
-        ? `Liveness re-check: ${n} closed posting${n === 1 ? "" : "s"} marked Discarded (of ${s.checked} checked).${unc}`
-        : `Liveness re-check: all ${s.checked} role${s.checked === 1 ? "" : "s"} still open.${unc}`,
+        ? `Liveness re-check: ${n} closed posting${n === 1 ? "" : "s"} marked Discarded (of ${s.checked} checked).${tail}`
+        : tail
+          ? `Liveness re-check: ${open} role${open === 1 ? "" : "s"} confirmed still open.${tail}`
+          : `Liveness re-check: all ${s.checked} role${s.checked === 1 ? "" : "s"} still open.`,
       "ok");
   } else {
     showAction(`Liveness re-check failed${s.error ? `: ${s.error}` : ""}.`, "error");

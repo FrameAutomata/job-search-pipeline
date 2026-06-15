@@ -22,6 +22,7 @@ import csv
 import html
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
@@ -60,7 +61,22 @@ _LISTING_PAGE = [
     re.compile(r"search for jobs page is loaded", re.I),
 ]
 
-_EXPIRED_URL = re.compile(r"[?&]error=true", re.I)
+# A closed posting's URL signal. `error=true` is the generic redirect; LinkedIn
+# 302s a closed /jobs/view/ human page to a search page tagged
+# `expired_jd_redirect` (the non-guest fallback path still sees this).
+_EXPIRED_URL = re.compile(r"[?&]error=true|expired_jd_redirect", re.I)
+
+# HTTP statuses that mean "LinkedIn rate-limited / sign-in-walled this fetch",
+# not "the posting is gone". A burst of guest-endpoint fetches trips the per-IP
+# limiter, which answers 403/429/999 with the same anti-bot sign-in chrome a
+# real live JD carries — so this is decided on STATUS, never body, and must
+# resolve to `throttled` (couldn't read it), never active/expired.
+_THROTTLE_STATUSES = frozenset({403, 429, 999})
+
+# classify_each retries a throttled fetch this many times (a transient limit may
+# clear on a re-fetch) with linear backoff between attempts.
+_THROTTLE_RETRIES = 2
+_THROTTLE_BACKOFF = 1.5
 
 _APPLY = [
     re.compile(r"\bapply\b", re.I),
@@ -165,9 +181,16 @@ def extract_description(html_body: str) -> str:
 # ── Liveness check ──────────────────────────────────────────────────────────
 
 def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]:
-    """Return (result, reason): result is 'active', 'expired', or 'uncertain'."""
+    """Return (result, reason): result is 'active', 'expired', 'throttled', or
+    'uncertain'. `throttled` is a rate-limit/sign-in wall we couldn't read —
+    distinct from a confirmed-gone `expired` and from a transient `uncertain`."""
     if status in (404, 410):
         return "expired", f"HTTP {status}"
+    # Status-based throttle decision comes BEFORE any body/URL inspection: a
+    # 403/429/999 wall carries the same apply chrome a live JD does, so trusting
+    # the body here would misread a wall as active (or its emptiness as expired).
+    if status in _THROTTLE_STATUSES:
+        return "throttled", f"HTTP {status} (rate-limited / sign-in wall)"
     if _EXPIRED_URL.search(final_url):
         return "expired", f"error redirect: {final_url}"
     for pat in _HARD_EXPIRED:
@@ -234,8 +257,14 @@ def classify_each(items, url_of, *, timeout: int = 8, max_workers: int = 8):
             return item, "uncertain", "", ""
         fetch_url = linkedin_guest_jd_url(url) or url
         try:
-            result, reason, body = fetch_and_classify(fetch_url, timeout)
-            return item, result, reason, body
+            # Retry a `throttled` result (transient rate-limit) with linear
+            # backoff; a raised error is NOT retried (it's an immediate
+            # uncertain) and a conclusive result returns at once.
+            for attempt in range(_THROTTLE_RETRIES + 1):
+                result, reason, body = fetch_and_classify(fetch_url, timeout)
+                if result != "throttled" or attempt == _THROTTLE_RETRIES:
+                    return item, result, reason, body
+                time.sleep(_THROTTLE_BACKOFF * (attempt + 1))
         except Exception as exc:
             return item, "uncertain", f"fetch error: {exc}", ""
 
@@ -317,6 +346,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     kept: list[dict] = []
     dead_entries: list[dict] = []
     dropped = 0
+    held = 0
     backfilled = 0
 
     # classify_each fetches each job_url in parallel (LinkedIn -> guest endpoint)
@@ -337,7 +367,19 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
                     "company": (job.get("company") or "").strip(),
                 })
             continue
-        # Backfill missing description from the page body we already fetched.
+        if result == "throttled":
+            # Rate-limited / sign-in wall — we couldn't actually read it. HOLD it
+            # for the next run rather than finalizing on no signal: don't keep it
+            # (its body is the wall, not a JD, so it'd reach evaluation with an
+            # empty description) and don't record it screened-dead (it's not
+            # gone). Recording neither means its URL never enters scan-history,
+            # so the next scrape re-finds and re-checks it — same "retry next
+            # run" stance the tracker re-check (pipeline/recheck.py) takes.
+            held += 1
+            print(f"  HOLD {title} -- {reason} (retry next run)", flush=True)
+            continue
+        # Backfill missing description from the page body we already fetched
+        # (throttled bodies are held above, so anything here is a real page).
         if not (job.get("description") or "").strip() and body:
             extracted = extract_description(body)
             if extracted:
@@ -360,7 +402,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
 
     print(
         f"[screen] kept {len(kept)}, dropped {dropped} of {len(jobs)} new "
-        f"(backfilled: {backfilled}, skipped-seen: {skipped_seen})"
+        f"(held: {held}, backfilled: {backfilled}, skipped-seen: {skipped_seen})"
     )
     return dropped
 

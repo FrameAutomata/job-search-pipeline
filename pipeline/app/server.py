@@ -495,8 +495,8 @@ _recheck_state: dict = {}
 
 def _recheck_idle() -> dict:
     return {"running": False, "started_at": None, "checked": 0, "total": None,
-            "discarded": 0, "unconfirmed": 0, "dead": [], "done": False,
-            "ok": None, "error": None}
+            "discarded": 0, "unconfirmed": 0, "throttled": 0, "deferred": 0,
+            "dead": [], "done": False, "ok": None, "error": None}
 
 
 def _run_recheck() -> None:
@@ -511,7 +511,9 @@ def _run_recheck() -> None:
             _recheck_state.update(
                 running=False, done=True, ok=True,
                 checked=summary["checked"], discarded=summary["discarded"],
-                unconfirmed=summary.get("unconfirmed", 0), dead=summary["dead"])
+                unconfirmed=summary.get("unconfirmed", 0),
+                throttled=summary.get("throttled", 0),
+                deferred=summary.get("deferred", 0), dead=summary["dead"])
     except Exception as e:  # surface failure to the UI rather than hang on running
         with _recheck_lock:
             _recheck_state.update(running=False, done=True, ok=False, error=str(e))

@@ -54,7 +54,7 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | `run-ui.ps1` / `run-ui.sh`              | Launch the local triage UI (`pipeline/app`, FastAPI on localhost) — read-only results view       |
 | `pipeline/app/`                         | Local web UI — `server.py` (FastAPI routes + a localhost-only cross-origin guard), `data.py` (parse applications.md + render reports), `skills.py` (career-ops skill launchpad: capability detection + a skill registry — résumé-markdown via API or CLI, and PDF / interview-prep / apply via CLI hand-off), `static/` (SPA). Deps in `requirements-ui.txt`. |
 | `config/search.yml`                     | **Edit this** — searches, filters, screening config                                              |
-| `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`, `SKILL_PATH_DEFAULT`; tailoring: `RESUME_DOCX_PATH` (default `resumes/resume.docx`), `APPLY_TAILOR_MIN_SCORE` (default 4.0), `TAILOR_MODEL`, `SOFFICE_PATH`; UI apply review: `APPLY_HOLD_TIMEOUT` (seconds the browser is held open awaiting Submit/Cancel, default 300) |
+| `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`, `SKILL_PATH_DEFAULT`; tailoring: `RESUME_DOCX_PATH` (default `resumes/resume.docx`), `APPLY_TAILOR_MIN_SCORE` (default 4.0), `TAILOR_MODEL`, `SOFFICE_PATH`; UI apply review: `APPLY_HOLD_TIMEOUT` (seconds the browser is held open awaiting Submit/Cancel, default 300); liveness recheck (`--recheck-liveness`): `RECHECK_BUDGET` (stalest roles re-checked per run, default 100), `RECHECK_MIN_AGE_HOURS` (don't re-check a role confirmed within this window, default 6) — together they cap the per-run fetch burst that trips LinkedIn's rate limiter |
 | `resumes/resume.pdf`                    | Resume used to extract scoring keywords                                                          |
 | `resumes/resume.docx`                   | Source for per-job **tailored resumes** (`pipeline/resume_tailor.py`) — the apply stage slot-edits a copy per company (summary / bullets / skills values only; headers, employers, dates untouchable), verifies one page via LibreOffice against the pristine copy's baseline, and uploads the verified PDF. Jobs scoring below `APPLY_TAILOR_MIN_SCORE` (or `--apply-tailor-min-score`) use the default resume. Cached as `career-ops/output/<Company> - resume.docx/.pdf`; hand-edited files win if newer. |
 | `output/jobs.csv`                       | Raw scrape output                                                                                |
@@ -66,7 +66,7 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | `career-ops/batch/batch-api-state.json` | `--evaluate-batch` state — per-job metadata, report/tracker numbers, completion status           |
 | `career-ops/config/profile.yml`         | Candidate profile (created by setup-profile.mjs)                                                |
 | `career-ops/batch/batch-runner.sh`      | Interactive batch evaluator — `--cli claude\|opencode\|gemini\|qwen`, `--model`, `--skip-pdf`   |
-| GHA Cache (key `pipeline-state-v1`)     | Per-fork runtime state (scan-history, applications.md, batch state). Never committed.            |
+| GHA Cache (key `pipeline-state-v1`)     | Per-fork runtime state (scan-history, applications.md, recheck-state, batch state). Never committed. |
 
 ---
 
@@ -195,7 +195,7 @@ Three workflows make up the cloud automation:
 **Storage model — no user data is ever committed:**
 
 - **Setup data** (CV, profile, search config) → repository **Secrets** (encrypted at rest, not visible to forkers)
-- **Runtime state** (scan-history, applications.md, pipeline.md, batch state, cached JDs) → **`actions/cache@v4`** keyed `pipeline-state-v1`. Per-fork, restored at workflow start, saved at workflow end. Invisible to anyone but the fork owner.
+- **Runtime state** (scan-history, applications.md, pipeline.md, recheck-state, batch state, cached JDs) → **`actions/cache@v4`** keyed `pipeline-state-v1`. Per-fork, restored at workflow start, saved at workflow end. Invisible to anyone but the fork owner.
 - **Outputs** (reports, tracker snapshot) → **`actions/upload-artifact@v4`**. Downloadable from the Actions tab for 90 days.
 
 **Pass selection flags** (mutually exclusive): `--only-pass "name1,name2"` (case-insensitive name match, errors on no match), `--easy-apply-only` (passes with `easy_apply: true`, no-ops if none), `--no-easy-apply` (passes without `easy_apply: true`). The cloud workflows route by `easy_apply` field rather than name so user-renamed passes still work.

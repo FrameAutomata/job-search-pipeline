@@ -121,3 +121,25 @@ class TestRecheckTrigger:
     def test_status_idle_before_any_run(self, client):
         body = client.get("/api/recheck-liveness/status").json()
         assert body.get("running") is False
+
+    def test_idle_status_includes_throttled_and_deferred(self, client):
+        """The idle shape must carry the throttled/deferred keys so the UI can
+        render them before the first sweep returns a summary."""
+        body = client.get("/api/recheck-liveness/status").json()
+        assert body["throttled"] == 0
+        assert body["deferred"] == 0
+
+    def test_status_surfaces_throttled_and_deferred(self, client, monkeypatch):
+        """A fully rate-limited sweep must not look like a clean 'all open' run:
+        the throttled (no real read) and deferred (budget-skipped) counts from
+        the core summary reach the UI status."""
+        def fake_run(career_ops, *, progress=None, **kw):
+            if progress:
+                progress(2, 2, 0)
+            return {"checked": 2, "discarded": 0, "skipped": 0, "unconfirmed": 0,
+                    "dead": [], "throttled": 2, "deferred": 5}
+        monkeypatch.setattr(recheck_mod, "run", fake_run)
+        client.post("/api/recheck-liveness")
+        done = _wait_done(client)
+        assert done["throttled"] == 2
+        assert done["deferred"] == 5

@@ -23,6 +23,7 @@ Design under test:
   calls progress(checked, total, discarded) once per role.
 """
 
+import datetime as dt
 import json
 
 import pytest
@@ -90,6 +91,7 @@ def fake_fetch(monkeypatch):
         return "active", "apply control visible", "<html/>"
 
     monkeypatch.setattr(screen, "fetch_and_classify", _fetch)
+    monkeypatch.setattr(screen.time, "sleep", lambda *_: None)  # don't sleep on throttle retries
     return state
 
 
@@ -271,5 +273,111 @@ class TestRunReporting:
             encoding="utf-8",
         )
         summary = recheck.run(co, applications_md=apps)
-        assert summary == {"checked": 0, "discarded": 0, "dead": [], "skipped": 0, "unconfirmed": 0}
+        assert summary == {"checked": 0, "discarded": 0, "dead": [], "skipped": 0,
+                           "unconfirmed": 0, "throttled": 0, "deferred": 0}
         assert fake_fetch["urls"] == []
+
+
+class TestRecheckState:
+    """Per-role last-checked state + per-run budget: the recheck re-fetches only
+    a budget of the least-recently-checked roles, and only a CONCLUSIVE
+    (non-throttled) result stamps the timestamp — so a throttled/closed posting
+    stays stale and is retried next run instead of being marked done. This caps
+    the per-run request burst that trips LinkedIn's rate limiter."""
+
+    def _now(self):
+        return dt.datetime(2026, 6, 15, 12, 0, tzinfo=dt.timezone.utc)
+
+    def test_skips_recently_checked_within_min_age(self, tracker):
+        _, apps = tracker
+        now = self._now()
+        state = {
+            "https://www.linkedin.com/jobs/view/111": now - dt.timedelta(hours=1),   # row 1, fresh
+            "https://www.indeed.com/viewjob?jk=222": now - dt.timedelta(hours=10),    # row 2, stale
+        }
+        nums = {j.num for j in recheck.select_for_recheck(
+            apps, state=state, now=now, min_age_hours=6, budget=100)}
+        assert "1" not in nums                 # checked 1h ago (< 6h) → skipped
+        assert {"2", "6"} <= nums              # 10h ago + unseen → included
+
+    def test_budget_caps_and_prefers_stalest(self, tracker):
+        _, apps = tracker
+        now = self._now()
+        state = {
+            "https://www.linkedin.com/jobs/view/111": now - dt.timedelta(hours=20),  # row 1
+            "https://www.indeed.com/viewjob?jk=222": now - dt.timedelta(hours=30),    # row 2 (stalest seen)
+            # row 6 unseen → treated as oldest
+        }
+        nums = [j.num for j in recheck.select_for_recheck(
+            apps, state=state, now=now, min_age_hours=6, budget=2)]
+        assert len(nums) == 2
+        assert set(nums) == {"6", "2"}         # unseen(6) + stalest(2); row 1 dropped by budget
+
+    def test_state_round_trip(self, tmp_path):
+        now = self._now()
+        p = tmp_path / "recheck-state.tsv"
+        recheck._save_state(p, {"https://x/1": now})
+        loaded = recheck._load_state(p)
+        assert "https://x/1" in loaded
+        assert abs((loaded["https://x/1"] - now).total_seconds()) < 1
+
+    def test_run_stamps_conclusive_not_throttled(self, tracker, fake_fetch, tmp_path):
+        co, apps = tracker
+        state_path = tmp_path / "recheck-state.tsv"
+        fake_fetch["results"] = {
+            "111": ("active", "ok"),            # conclusive → stamp
+            "222": ("throttled", "HTTP 403"),   # NOT conclusive → no stamp, retry next run
+            "666": ("expired", "gone"),         # conclusive → stamp
+        }
+        recheck.run(co, applications_md=apps, state_path=state_path)
+        state = recheck._load_state(state_path)
+        assert "https://www.linkedin.com/jobs/view/111" in state
+        assert "https://www.glassdoor.com/job-listing/666" in state
+        assert "https://www.indeed.com/viewjob?jk=222" not in state   # throttled → unstamped
+
+    def test_run_reports_throttled_count(self, tracker, fake_fetch):
+        co, apps = tracker
+        fake_fetch["results"] = {"111": ("throttled", "HTTP 429")}
+        summary = recheck.run(co, applications_md=apps)
+        assert summary["throttled"] == 1
+        assert summary["discarded"] == 0          # a throttle is never a discard
+
+    def test_save_prunes_urls_no_longer_evaluated(self, tracker, fake_fetch, tmp_path):
+        """State entries for URLs that are no longer Evaluated roles (an old
+        discard, or a role since marked Applied) are pruned on save instead of
+        accumulating in the file forever."""
+        co, apps = tracker
+        state_path = tmp_path / "recheck-state.tsv"
+        recheck._save_state(state_path, {"https://gone.example/stale": self._now()})
+        recheck.run(co, applications_md=apps, state_path=state_path)
+        state = recheck._load_state(state_path)
+        assert "https://gone.example/stale" not in state            # pruned
+        assert "https://www.linkedin.com/jobs/view/111" in state    # live role kept
+
+    def test_empty_tracker_does_not_wipe_state(self, tmp_path, fake_fetch):
+        """Pruning must be safe: a transiently empty/unreadable tracker (zero
+        Evaluated rows) must NOT wipe the accumulated cadence state."""
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        apps = co / "data" / "applications.md"
+        apps.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n",
+            encoding="utf-8",
+        )
+        state_path = tmp_path / "recheck-state.tsv"
+        recheck._save_state(state_path, {"https://www.linkedin.com/jobs/view/keep": self._now()})
+        recheck.run(co, applications_md=apps, state_path=state_path)
+        assert "https://www.linkedin.com/jobs/view/keep" in recheck._load_state(state_path)
+
+    def test_select_for_recheck_tolerates_naive_now(self, tracker):
+        """The exported seam coerces a naive `now` to UTC rather than raising
+        TypeError against the always-tz-aware stored timestamps."""
+        _, apps = tracker
+        aware = self._now()
+        state = {"https://www.linkedin.com/jobs/view/111": aware - dt.timedelta(hours=1)}
+        naive_now = dt.datetime(2026, 6, 15, 12, 0)   # no tzinfo
+        nums = {j.num for j in recheck.select_for_recheck(
+            apps, state=state, now=naive_now, min_age_hours=6, budget=100)}
+        assert "1" not in nums           # checked 1h ago → still skipped
+        assert {"2", "6"} <= nums        # unseen included (no crash)
