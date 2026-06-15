@@ -210,6 +210,40 @@ class TestRunScreen:
             rows = list(csv.DictReader(f))
         assert len(rows) == 1
 
+    def test_throttled_job_held_not_kept_and_not_recorded_dead(self, tmp_path, monkeypatch, mocker):
+        """A rate-limited (throttled) fetch is HELD for the next run, not
+        finalized this run: the job is dropped from the output (otherwise it
+        reaches evaluation with an empty JD, since a throttle wall isn't
+        backfillable) AND it is NOT recorded screened-dead (it's not gone). With
+        neither the kept nor the dead path recording its URL, the next scrape
+        re-finds and re-checks it — mirroring recheck's 'retry next run'."""
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        cfg = tmp_path / "search.yml"
+        self._write_config(cfg, liveness=True)
+        filtered = tmp_path / "filtered_jobs.csv"
+        self._write_filtered_csv(filtered, [
+            {"title": "Active Job", "company": "Acme", "job_url": "https://active.com", "relevance_score": 8},
+            {"title": "Throttled Job", "company": "Globex", "job_url": "https://throttled.com", "relevance_score": 6},
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        monkeypatch.setattr(screen_mod.time, "sleep", lambda *_: None)  # skip retry backoff
+
+        def mock_fetch(url, timeout=8):
+            if "active" in url:
+                return "active", "apply control visible", ""
+            return "throttled", "HTTP 403 (rate-limited / sign-in wall)", ""
+        mocker.patch.object(screen_mod, "fetch_and_classify", side_effect=mock_fetch)
+
+        run(cfg, career_ops_path=co)
+
+        with open(filtered, newline="", encoding="utf-8") as f:
+            titles = {r["title"] for r in csv.DictReader(f)}
+        assert titles == {"Active Job"}   # throttled job held back, not kept
+        sh = co / "data" / "scan-history.tsv"
+        sh_text = sh.read_text(encoding="utf-8") if sh.exists() else ""
+        assert "throttled.com" not in sh_text   # not recorded screened-dead
+
 
 class TestExtractDescription:
     """Test screen.extract_description — site-specific selectors + body fallback."""
@@ -610,3 +644,85 @@ class TestBackfillDescription:
             assert "description" in (reader.fieldnames or [])
             rows = list(reader)
         assert rows[0]["description"] == "JD body."
+
+
+class TestClassifyThrottle:
+    """LinkedIn rate-limits a burst of guest-endpoint fetches with a 403/429/999
+    anti-bot sign-in wall. classify_liveness must report that as `throttled`
+    (couldn't read it) — NEVER active/expired — so a wall can't be read as live
+    or cause a false discard, and the retry/skip layers can react."""
+
+    def test_throttle_statuses_are_throttled(self):
+        from pipeline.screen import classify_liveness
+        for st in (403, 429, 999):
+            # Body even contains apply text — the throttle status must still win.
+            res, _ = classify_liveness(st, "https://www.linkedin.com/x", "Easy Apply " * 50)
+            assert res == "throttled", (st, res)
+
+    def test_404_410_still_expired(self):
+        from pipeline.screen import classify_liveness
+        assert classify_liveness(404, "https://x", "")[0] == "expired"
+        assert classify_liveness(410, "https://x", "")[0] == "expired"
+
+    def test_closed_body_still_expired(self):
+        from pipeline.screen import classify_liveness
+        assert classify_liveness(200, "https://x",
+                                 "This job is no longer accepting applications.")[0] == "expired"
+
+    def test_live_page_still_active(self):
+        from pipeline.screen import classify_liveness
+        body = "Senior Software Engineer. " * 30 + "Apply now to join."
+        assert classify_liveness(200, "https://x", body)[0] == "active"
+
+    def test_expired_jd_redirect_url_is_expired(self):
+        # A closed job's human /jobs/view/ page 302s to a search page tagged
+        # expired_jd_redirect — treat that as expired (the non-guest fallback path).
+        from pipeline.screen import classify_liveness
+        body = "Software engineer jobs " * 50
+        res, _ = classify_liveness(
+            200, "https://www.linkedin.com/jobs/acme-jobs?trk=expired_jd_redirect", body)
+        assert res == "expired"
+
+
+class TestClassifyEachRetry:
+    """A `throttled` fetch is retried with backoff before giving up — a transient
+    rate-limit shouldn't leave a role unverified if a retry gets the real page."""
+
+    def test_retries_throttled_then_succeeds(self, monkeypatch):
+        seq = iter([("throttled", "HTTP 403", ""), ("expired", "HTTP 404", "")])
+        monkeypatch.setattr(screen_mod, "fetch_and_classify", lambda url, timeout=8: next(seq))
+        monkeypatch.setattr(screen_mod.time, "sleep", lambda *_: None)
+        rows = list(screen_mod.classify_each(["https://x"], lambda u: u, timeout=8, max_workers=1))
+        assert rows[0][1] == "expired"      # retried past the throttle wall
+
+    def test_gives_up_after_max_retries(self, monkeypatch):
+        monkeypatch.setattr(screen_mod, "fetch_and_classify",
+                            lambda url, timeout=8: ("throttled", "HTTP 403", ""))
+        monkeypatch.setattr(screen_mod.time, "sleep", lambda *_: None)
+        rows = list(screen_mod.classify_each(["https://x"], lambda u: u, timeout=8, max_workers=1))
+        assert rows[0][1] == "throttled"
+
+
+class TestIsLivenessVerifiable:
+    """A URL is liveness-verifiable only if we have a working unauthenticated way
+    to read it. Today that's LinkedIn /jobs/view (the guest JD endpoint); Indeed
+    and Glassdoor serve JS/anti-bot pages a plain fetch can't classify, so the
+    re-check skips them (see issue: Indeed support via CAPTCHA solving)."""
+
+    def test_linkedin_view_is_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert is_liveness_verifiable("https://www.linkedin.com/jobs/view/4342114687/")
+        assert is_liveness_verifiable("https://linkedin.com/jobs/view/eng-at-acme-555")
+
+    def test_indeed_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("https://www.indeed.com/viewjob?jk=abc123")
+
+    def test_glassdoor_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("https://www.glassdoor.com/job-listing/123")
+
+    def test_empty_or_none_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("")
+        assert not is_liveness_verifiable(None)

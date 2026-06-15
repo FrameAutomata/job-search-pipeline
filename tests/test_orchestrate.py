@@ -61,3 +61,24 @@ class TestRecheckWiring:
         monkeypatch.setattr(sys, "argv", _argv(cfg))   # no --recheck-liveness
         assert orchestrate.main() == 0
         assert called == []
+
+    def test_recheck_drain_routes_to_drain(self, quiet_pipeline, monkeypatch):
+        """--recheck-drain loops the budgeted sweep until the backlog is covered;
+        without it the re-check is a single sweep."""
+        cfg, co = quiet_pipeline
+        ran, drained = [], []
+        monkeypatch.setattr(recheck, "run", lambda career_ops, **kw: ran.append(kw))
+        monkeypatch.setattr(recheck, "drain", lambda career_ops, **kw: drained.append(kw))
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--recheck-liveness", "--recheck-drain"))
+        assert orchestrate.main() == 0
+        assert len(drained) == 1 and not ran          # drained, not single-swept
+        assert drained[0].get("timeout") == 8
+
+    def test_plain_recheck_does_not_drain(self, quiet_pipeline, monkeypatch):
+        cfg, _ = quiet_pipeline
+        ran, drained = [], []
+        monkeypatch.setattr(recheck, "run", lambda career_ops, **kw: ran.append(kw))
+        monkeypatch.setattr(recheck, "drain", lambda career_ops, **kw: drained.append(kw))
+        monkeypatch.setattr(sys, "argv", _argv(cfg, "--recheck-liveness"))   # no --recheck-drain
+        orchestrate.main()
+        assert len(ran) == 1 and not drained

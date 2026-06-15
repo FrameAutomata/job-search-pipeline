@@ -346,6 +346,16 @@ def push_status() -> JSONResponse:
         target_apps.parent.mkdir(parents=True, exist_ok=True)
         target_apps.write_text(base_text, encoding="utf-8")
 
+    # An unresolved DISCARD override targets a closed role that isn't in the cloud
+    # tracker: it's already applied locally, a closed role won't reappear to match
+    # on a later push, and the cloud's own daily recheck catches its own closed
+    # roles — so drop it instead of keeping it to nag on every future push.
+    # Non-Discard unresolved overrides (e.g. an auto-submitted Applied) are KEPT:
+    # their company may appear in a later cloud run, and then the next push lands.
+    stale_discards = [k for k in unresolved
+                      if data.canonical_status(data.override_status(overrides[k])) == "Discarded"]
+    kept_unresolved = [k for k in unresolved if k not in stale_discards]
+
     # Dispatch edit-tracker with only the resolved overrides — avoids GitHub's
     # workflow_dispatch input size limit that the full base64 tracker can exceed.
     # Nothing resolved → nothing to push (don't fire an empty workflow run).
@@ -354,18 +364,21 @@ def push_status() -> JSONResponse:
             gh.trigger_workflow(EDIT_WORKFLOW, {"status_overrides_json": json.dumps(cloud_payload)})
         except gh.GhError as e:
             raise HTTPException(status_code=502, detail=str(e))
-        # Clear ONLY the keys we pushed (re-reading under the lock) so an apply
-        # auto-submit recorded during the gh round-trip — and any identity
-        # override that DIDN'T resolve — isn't silently dropped.
+        # Clear the keys we pushed PLUS the dead Discard overrides (re-reading
+        # under the lock), leaving only the genuinely-pending unresolved ones so
+        # an apply auto-submit recorded during the gh round-trip isn't dropped.
         pushed_keys = [k for k in overrides if k not in unresolved]
-        data.clear_status_overrides(pushed_keys)
+        data.clear_status_overrides(pushed_keys + stale_discards)
         # Persist dispatched overrides so they survive Refresh and restarts until
         # the pipeline produces a new artifact that already has the correct statuses.
         pushed = _load_pushed_overrides()
         pushed.update(cloud_payload)
         _save_pushed_overrides(pushed)
+    elif stale_discards:
+        # Nothing resolved to dispatch, but still drop the dead Discard overrides.
+        data.clear_status_overrides(stale_discards)
     return JSONResponse({"ok": True, "pushed": len(cloud_payload),
-                         "unresolved": len(unresolved), "base": base_source})
+                         "unresolved": len(kept_unresolved), "base": base_source})
 
 
 @app.get("/api/reports/{report_num}", response_class=HTMLResponse)
@@ -495,8 +508,8 @@ _recheck_state: dict = {}
 
 def _recheck_idle() -> dict:
     return {"running": False, "started_at": None, "checked": 0, "total": None,
-            "discarded": 0, "unconfirmed": 0, "dead": [], "done": False,
-            "ok": None, "error": None}
+            "discarded": 0, "unconfirmed": 0, "throttled": 0, "deferred": 0,
+            "unverifiable": 0, "dead": [], "done": False, "ok": None, "error": None}
 
 
 def _run_recheck() -> None:
@@ -506,12 +519,23 @@ def _run_recheck() -> None:
         with _recheck_lock:
             _recheck_state.update(checked=checked, total=total, discarded=discarded)
     try:
-        summary = recheck.run(_career_ops(), progress=_progress)
+        # drain() loops budgeted sweeps until the backlog is covered (it
+        # self-limits to a single sweep when there are <= budget roles), so a
+        # backlog larger than one budget is fully gone through from the UI
+        # instead of stopping at one budget with hundreds deferred.
+        summary = recheck.drain(_career_ops(), progress=_progress)
         with _recheck_lock:
+            # A drain that hit an error mid-way still returns the completed
+            # cycles' partial counts (already written to disk) — surface those
+            # AND ok=False, rather than a zeroed failure.
             _recheck_state.update(
-                running=False, done=True, ok=True,
+                running=False, done=True, ok=not summary.get("error"),
+                error=summary.get("error"),
                 checked=summary["checked"], discarded=summary["discarded"],
-                unconfirmed=summary.get("unconfirmed", 0), dead=summary["dead"])
+                unconfirmed=summary.get("unconfirmed", 0),
+                throttled=summary.get("throttled", 0),
+                deferred=summary.get("deferred", 0),
+                unverifiable=summary.get("unverifiable", 0), dead=summary["dead"])
     except Exception as e:  # surface failure to the UI rather than hang on running
         with _recheck_lock:
             _recheck_state.update(running=False, done=True, ok=False, error=str(e))

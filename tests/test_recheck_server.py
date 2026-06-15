@@ -121,3 +121,73 @@ class TestRecheckTrigger:
     def test_status_idle_before_any_run(self, client):
         body = client.get("/api/recheck-liveness/status").json()
         assert body.get("running") is False
+
+    def test_idle_status_includes_throttled_and_deferred(self, client):
+        """The idle shape must carry the throttled/deferred/unverifiable keys so
+        the UI can render them before the first sweep returns a summary."""
+        body = client.get("/api/recheck-liveness/status").json()
+        assert body["throttled"] == 0
+        assert body["deferred"] == 0
+        assert body["unverifiable"] == 0
+
+    def test_status_surfaces_throttled_deferred_unverifiable(self, client, monkeypatch):
+        """A sweep must not look like a clean 'all open' run: throttled (no real
+        read), deferred (budget-skipped) and unverifiable (site can't be checked,
+        e.g. Indeed) all reach the UI status."""
+        def fake_run(career_ops, *, progress=None, **kw):
+            if progress:
+                progress(2, 2, 0)
+            return {"checked": 2, "discarded": 0, "skipped": 0, "unconfirmed": 0,
+                    "dead": [], "throttled": 2, "deferred": 5, "unverifiable": 7}
+        monkeypatch.setattr(recheck_mod, "run", fake_run)
+        client.post("/api/recheck-liveness")
+        done = _wait_done(client)
+        assert done["throttled"] == 2
+        assert done["deferred"] == 5
+        assert done["unverifiable"] == 7
+
+    def test_drain_error_surfaces_partial_counts(self, client, monkeypatch):
+        """A mid-drain failure reports ok=False with the error, but still
+        surfaces the partial checked/discarded the completed cycles achieved
+        (and already wrote to disk) — not a zeroed 'failed' result."""
+        def fake_drain(career_ops, *, progress=None, **kw):
+            if progress:
+                progress(50, None, 3)
+            return {"checked": 50, "discarded": 3, "skipped": 0, "unconfirmed": 0,
+                    "throttled": 0, "deferred": 0, "unverifiable": 0,
+                    "dead": [{"num": "7", "company": "Acme", "role": "Eng",
+                              "url": "u", "reason": "HTTP 404"}],
+                    "error": "disk full"}
+        monkeypatch.setattr(recheck_mod, "drain", fake_drain)
+        client.post("/api/recheck-liveness")
+        done = _wait_done(client)
+        assert done["ok"] is False
+        assert done["error"] == "disk full"
+        assert done["checked"] == 50 and done["discarded"] == 3   # partial work surfaced
+        assert [d["num"] for d in done["dead"]] == ["7"]
+
+    def test_ui_drains_multi_cycle_when_over_budget(self, client, monkeypatch):
+        """The UI sweep drains: when the backlog exceeds the budget it runs
+        budgeted cycles until covered and surfaces the CUMULATIVE result — so a
+        >budget backlog is fully gone through, not left at 100-checked /
+        hundreds-deferred. Driven by run() returning a full-budget first sweep
+        then an under-budget second sweep (drain's stop signal)."""
+        seq = iter([
+            {"checked": 100, "discarded": 2, "unconfirmed": 3, "throttled": 0,
+             "deferred": 400, "skipped": 0,
+             "dead": [{"num": "1", "company": "A", "role": "R", "url": "u1", "reason": "x"},
+                      {"num": "2", "company": "B", "role": "R", "url": "u2", "reason": "x"}]},
+            {"checked": 20, "discarded": 1, "unconfirmed": 1, "throttled": 0,
+             "deferred": 0, "skipped": 0,
+             "dead": [{"num": "3", "company": "C", "role": "R", "url": "u3", "reason": "x"}]},
+        ])
+        monkeypatch.setattr(recheck_mod, "run", lambda co, **kw: next(seq))
+        monkeypatch.setattr(recheck_mod.time, "sleep", lambda *_: None)
+        client.post("/api/recheck-liveness")
+        done = _wait_done(client)
+        assert done["done"] and done["ok"]
+        assert done["checked"] == 120                      # 100 + 20 across two cycles
+        assert done["discarded"] == 3
+        assert [d["num"] for d in done["dead"]] == ["1", "2", "3"]
+        assert done["unconfirmed"] == 4                    # cumulative 3 + 1 (not last-cycle 1)
+        assert done["deferred"] == 0                       # final sweep underfilled → none still due
