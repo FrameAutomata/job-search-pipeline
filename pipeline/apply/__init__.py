@@ -139,6 +139,10 @@ def build_engine(career_ops: Path, *, provider: str | None, model: str | None) -
         profile=ApplyProfile.load(career_ops),
         cache_path=career_ops / "batch" / "apply-answers.json",
         caller=_build_caller(provider, model),
+        # The candidate's CV grounds experience questions ("years with X") — the
+        # same cv.md the cover-letter generator uses. read_text returns "" if it's
+        # missing, so the engine degrades to the profile-only context.
+        cv_text=read_text(career_ops / "cv.md"),
     )
 
 
