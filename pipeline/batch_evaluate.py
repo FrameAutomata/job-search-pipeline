@@ -93,6 +93,16 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     "ollama": "qwen2.5:32b",
 }
 
+# OpenAI-compatible chat base URLs for the providers that use a fixed host.
+# (openai uses OPENAI_BASE_URL or the SDK default; ollama uses OLLAMA_BASE_URL.)
+# Shared so pipeline/verify_models derives each catalog endpoint from the same
+# source instead of re-hardcoding it (one place to update on a host migration).
+PROVIDER_BASE_URLS: dict[str, str] = {
+    "groq": "https://api.groq.com/openai/v1",
+    "deepinfra": "https://api.deepinfra.com/v1/openai",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
+
 
 # ── Provider client factories ────────────────────────────────────────────────
 # Each factory builds the SDK client once and returns a `(system, user) -> str`
@@ -464,17 +474,17 @@ def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = 
     if provider == "groq":
         return _build_openai_compat_caller(
             model, api_key=os.environ["GROQ_API_KEY"],
-            base_url="https://api.groq.com/openai/v1",
+            base_url=PROVIDER_BASE_URLS["groq"],
         )
     if provider == "deepinfra":
         return _build_openai_compat_caller(
             model, api_key=os.environ["DEEPINFRA_API_KEY"],
-            base_url="https://api.deepinfra.com/v1/openai", disable_thinking=toggle,
+            base_url=PROVIDER_BASE_URLS["deepinfra"], disable_thinking=toggle,
         )
     if provider == "openrouter":
         return _build_openai_compat_caller(
             model, api_key=os.environ["OPENROUTER_API_KEY"],
-            base_url="https://openrouter.ai/api/v1", disable_thinking=toggle,
+            base_url=PROVIDER_BASE_URLS["openrouter"], disable_thinking=toggle,
         )
     if provider == "ollama":
         # `or DEFAULT` not `get(VAR, DEFAULT)` — see BATCH_MODEL fix below for

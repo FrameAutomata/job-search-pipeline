@@ -72,3 +72,98 @@ class TestRun:
             return {PROVIDER_DEFAULTS["deepinfra"], "org/A"} if provider == "deepinfra" else None
 
         assert vm.run(env=env, fetcher=fetcher, out=lambda *_: None) == 0
+
+    def test_unknown_batch_provider_fails_loudly(self):
+        # A typo'd BATCH_PROVIDER would make the real pipeline error at call time;
+        # the verifier must flag it, not silently pass with the chain unchecked.
+        env = {"BATCH_PROVIDER": "deepinftypo", "BATCH_MODEL": "x/y"}
+        out = []
+        assert vm.run(env=env, fetcher=lambda p, e: None, out=out.append) == 1
+        assert any("deepinftypo" in line for line in out)
+
+    def test_transient_error_is_surfaced_but_not_failed(self):
+        # A reachable provider that errors (timeout/5xx) is "error", distinct from
+        # "skipped (no key)" — reported so it isn't a silent pass, but it doesn't
+        # fail the run (a network blip isn't a stale model → no flaky CI).
+        env = {"BATCH_PROVIDER": "deepinfra", "BATCH_MODEL": "org/A"}
+
+        def fetcher(provider, _env):
+            return vm.FETCH_ERROR if provider == "deepinfra" else None
+
+        out = []
+        assert vm.run(env=env, fetcher=fetcher, out=out.append) == 0
+        assert any("error" in line.lower() for line in out)
+
+
+class TestClassifyError:
+    def test_fetch_error_is_error_status(self):
+        rows = vm.classify({"deepinfra": {"m"}}, {"deepinfra": vm.FETCH_ERROR})
+        assert [r["status"] for r in rows] == ["error"]
+
+
+class TestLiveFetch:
+    """The per-provider catalog fetch, with the HTTP getter injected so the
+    response-shaping (pagination, key handling, base-URL resolution) is hermetic."""
+
+    def test_no_key_returns_none_not_error(self):
+        assert vm._live_fetch("gemini", {}, get=lambda *a, **k: pytest.fail("should not fetch")) is None
+
+    def test_request_failure_returns_fetch_error_sentinel(self):
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+        assert vm._live_fetch("deepinfra", {"DEEPINFRA_API_KEY": "k"}, get=boom) is vm.FETCH_ERROR
+
+    def test_gemini_key_in_header_not_url_and_parses_names(self):
+        seen = {}
+
+        def fake(url, *, headers=None, params=None):
+            seen.update(url=url, headers=headers or {}, params=params or {})
+            return {"models": [{"name": "models/gemini-2.5-flash"}, {"name": "models/gemma-9"}]}
+
+        out = vm._live_fetch("gemini", {"GEMINI_API_KEY": "SECRET"}, get=fake)
+        assert out == {"gemini-2.5-flash", "gemma-9"}
+        assert seen["headers"].get("x-goog-api-key") == "SECRET"        # key in header (#6)
+        assert "SECRET" not in seen["url"] and "SECRET" not in str(seen["params"])
+
+    def test_openai_honors_base_url_escape_hatch(self):
+        seen = {}
+
+        def fake(url, *, headers=None, params=None):
+            seen["url"] = url
+            return {"data": [{"id": "local-model"}]}
+
+        out = vm._live_fetch("openai", {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://proxy:8000/v1"}, get=fake)
+        assert out == {"local-model"}
+        assert seen["url"].startswith("http://proxy:8000/v1/models")
+
+    def test_anthropic_paginates_via_has_more(self):
+        pages = [{"data": [{"id": "a"}], "has_more": True, "last_id": "a"},
+                 {"data": [{"id": "b"}], "has_more": False}]
+        calls = []
+
+        def fake(url, *, headers=None, params=None):
+            calls.append(params or {})
+            return pages[len(calls) - 1]
+
+        out = vm._live_fetch("anthropic", {"ANTHROPIC_API_KEY": "k"}, get=fake)
+        assert out == {"a", "b"} and len(calls) == 2
+
+    def test_gemini_paginates_via_next_page_token(self):
+        pages = [{"models": [{"name": "models/x"}], "nextPageToken": "TOK"},
+                 {"models": [{"name": "models/y"}]}]
+        calls = []
+
+        def fake(url, *, headers=None, params=None):
+            calls.append(params or {})
+            return pages[len(calls) - 1]
+
+        out = vm._live_fetch("gemini", {"GEMINI_API_KEY": "k"}, get=fake)
+        assert out == {"x", "y"} and len(calls) == 2
+
+    def test_openrouter_is_public_no_key_needed(self):
+        def fake(url, *, headers=None, params=None):
+            assert "Authorization" not in (headers or {})   # public, no bearer
+            return {"data": [{"id": "meta-llama/llama-3.3-70b-instruct"}]}
+
+        out = vm._live_fetch("openrouter", {}, get=fake)
+        assert out == {"meta-llama/llama-3.3-70b-instruct"}
