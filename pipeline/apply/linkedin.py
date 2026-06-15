@@ -25,7 +25,7 @@ import os
 import re
 from pathlib import Path
 
-from pipeline.apply.answers import AnswerEngine
+from pipeline.apply.answers import AnswerEngine, _coerce_number
 from pipeline.apply.queue import ApplyJob
 from pipeline.apply.result import ApplyResult, APPLIED, CANCELLED, EXPIRED, failed
 
@@ -112,9 +112,15 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
             return failed("next_click_failed")
         page.wait_for_timeout(1500)
         if _has_validation_error(page):
-            # One more fill pass can clear a freshly-revealed required field.
+            # One more fill pass can clear a freshly-revealed required field, then
+            # repair any field LinkedIn flagged as needing a number — a text input
+            # reveals it's numeric only after a non-number is entered. When a
+            # repair was made, don't bail: loop so Next is re-attempted with the
+            # corrected value (the repair no-ops once the field holds a number, so
+            # this can't spin).
             _fill_visible_fields(page, answers, drafted, resume_path)
-            if _has_validation_error(page):
+            repaired = _repair_numeric_errors(page, answers, drafted)
+            if _has_validation_error(page) and not repaired:
                 # In review/dry-run, a field we couldn't satisfy isn't a failure —
                 # hand the partly-filled form to the human to complete and submit.
                 # Auto mode can't proceed past an invalid required field.
@@ -315,16 +321,121 @@ def _btn_label(button) -> str:
         return ""
 
 
+# LinkedIn's inline error for a field that wants a number ("Enter a whole number
+# larger than 0", "Enter a decimal number…", "Please enter a valid number"). This
+# is how a text-typed field reveals it's actually numeric — only after a non-
+# number is entered.
+_NUMERIC_ERROR_RE = re.compile(
+    r"\b(whole|decimal)\s+number\b|\benter a number\b|\bvalid number\b|"
+    r"\bmust be a number\b|\bnumeric\b",
+    re.IGNORECASE,
+)
+
+
+# The inline-error nodes LinkedIn renders. artdeco-* component classes are NOT
+# hashed, so the class is a reliable hook; role=alert is the layout-independent
+# backstop. Defined once and shared by _has_validation_error and the numeric
+# repair so the two can't disagree on what counts as an error node.
+_ERROR_SEL = ".artdeco-inline-feedback--error, [role='alert']"
+
+
+def _numeric_required(message: str) -> bool:
+    """Whether a validation message says the field needs a number."""
+    return bool(_NUMERIC_ERROR_RE.search(message or ""))
+
+
 def _has_validation_error(page) -> bool:
-    # artdeco-* component classes are NOT hashed, so the inline-error class is a
-    # reliable hook; role=alert is the layout-independent backstop.
     dialog = _modal(page)
     if dialog is None:
         return False
     try:
-        return dialog.locator(".artdeco-inline-feedback--error, [role='alert']").count() > 0
+        return dialog.locator(_ERROR_SEL).count() > 0
     except Exception:
         return False
+
+
+# In ONE round-trip: find each inline error node, map it to the input it belongs
+# to (the input whose aria-describedby references it, else the nearest input in a
+# shared ancestor), tag that input, and return its message + current value.
+# Driving off the error nodes — not every field — means we touch only fields that
+# actually erred, with no per-field DOM probing and no risk of a sibling's error
+# (or a help-text describedby) being misread as this field's.
+_NUMERIC_ERROR_FIELDS_JS = (
+    r"""
+d => {
+  d.querySelectorAll('[data-apply-err-gid]').forEach(e => e.removeAttribute('data-apply-err-gid'));
+  const errs = Array.from(d.querySelectorAll(%SEL%));
+  const skip = "[type=checkbox],[type=radio],[type=file],[type=hidden],[type=submit],[type=button]";
+  const out = [];
+  let gid = 0;
+  for (const err of errs) {
+    const msg = (err.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!msg) continue;
+    let input = null;
+    if (err.id)
+      input = d.querySelector(`input[aria-describedby~="${err.id}"]:not(${skip}), textarea[aria-describedby~="${err.id}"]`);
+    if (!input) {
+      let el = err.parentElement;
+      for (let i = 0; el && i < 5; i++, el = el.parentElement) {
+        input = el.querySelector(`input:not(${skip}), textarea`);
+        if (input) break;
+      }
+    }
+    if (!input) continue;
+    input.setAttribute('data-apply-err-gid', String(gid));
+    out.push({ gid: gid, message: msg, current: input.value || '' });
+    gid++;
+  }
+  return out;
+}
+""".replace("%SEL%", repr(_ERROR_SEL))
+)
+
+
+def _repair_numeric_errors(page, answers: AnswerEngine,
+                           drafted: list[tuple[str, str]]) -> bool:
+    """Re-fill fields LinkedIn flagged as needing a number after a wrong entry —
+    the case a text input only reveals as numeric once non-numeric text is typed.
+
+    For each numeric-error field: re-answer the question numerically via the
+    engine (the LLM is told to return digits, so this beats scraping a year or
+    version out of the prose currently in the field), falling back to coercing the
+    current value. The repaired field is tagged data-apply-numeric-fixed so the
+    next fill pass leaves it alone — otherwise the cached answer would overwrite
+    the fix and the step would loop to max_steps. When the value can't be improved
+    (no number derivable, or it already holds that number and the error is a range
+    we can't satisfy) it's left for human review. Returns True if anything changed."""
+    dialog = _modal(page)
+    if dialog is None:
+        return False
+    try:
+        errs = dialog.evaluate(_NUMERIC_ERROR_FIELDS_JS)
+    except Exception:
+        return False
+    fixed = False
+    for e in errs:
+        msg = e.get("message", "")
+        if not _numeric_required(msg):
+            continue
+        try:
+            el = dialog.locator(f"[data-apply-err-gid='{e.get('gid')}']").first
+            if not el.count():
+                continue
+            whole = "whole" in msg.lower()
+            current = (e.get("current") or "").strip()
+            label = _field_label(dialog, el)
+            num = _coerce_number(answers.answer(label, "numeric"), whole=whole) if label else ""
+            if not num:
+                num = _coerce_number(current, whole=whole)
+            if not num or num == current:
+                continue
+            el.fill(num)
+            el.evaluate("e => e.setAttribute('data-apply-numeric-fixed', '1')")
+            drafted.append((label or "numeric field", f"{num} (numeric)"))
+            fixed = True
+        except Exception:
+            continue
+    return fixed
 
 
 # ── field filling ─────────────────────────────────────────────────────────────
@@ -712,6 +823,11 @@ def _field_label(dialog, el) -> str:
 
 def _fill_field(dialog, el, answers: AnswerEngine, drafted: list[tuple[str, str]]) -> None:
     try:
+        # A field _repair_numeric_errors already corrected after a validation
+        # error: don't re-fill it (the cached answer would overwrite the numeric
+        # fix and the step would loop).
+        if el.get_attribute("data-apply-numeric-fixed"):
+            return
         tag = (el.evaluate("e => e.tagName") or "").lower()
     except Exception:
         return

@@ -26,6 +26,10 @@ Caller = Callable[[str, str], str]
 
 _CACHE_NAME = "apply-answers.json"
 
+# Cap on the CV/résumé text inlined into the answer prompt, so the context stays
+# bounded (a résumé is 1-2 pages; this is generous headroom).
+_CV_CONTEXT_MAX = 6000
+
 # EEO / demographic questions are always declined.
 # \w* on prefix tokens so the trailing \b lands at the real word end — without it
 # "disab" / "ethnic" never match "disability" / "ethnicity" (the \b fails between
@@ -60,6 +64,61 @@ def _sanitize(text: str) -> str:
 
 def _cache_key(question: str, field_type: str) -> str:
     return f"{field_type}::{_sanitize(question)}"
+
+
+# The first number in a string: digits with optional thousands separators and an
+# optional decimal part, OR a leading-dot decimal (".5"). The leading-dot branch
+# matters — without it ".5" would match the bare "5" and read as 5, not 0.5.
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?|\.\d+")
+
+
+def _coerce_number(text: str, whole: bool = False) -> str:
+    """The first number in `text` as a bare numeric string, or "" if none.
+
+    Strips thousands separators ("1,200" -> "1200") and normalizes a leading-dot
+    decimal (".5" -> "0.5"). With whole=True it floors to an integer ("3.5" ->
+    "3") for fields LinkedIn validates as whole numbers — but a positive value
+    below 1 becomes "1", never a bogus "0" (which would fail "larger than 0").
+    Returns "" rather than fabricating a value when no number is present."""
+    m = _NUMBER_RE.search(text or "")
+    if not m:
+        return ""
+    num = m.group(0).replace(",", "")
+    if num.startswith("."):
+        num = "0" + num
+    if whole and "." in num:
+        f = float(num)
+        num = str(int(f)) if f >= 1 else ("1" if f > 0 else "0")
+    return num
+
+
+# Questions whose answer is a count/duration, so the field wants a NUMBER even
+# when LinkedIn renders it as a plain text input (validated numeric only after
+# entry). "experience" alone is NOT enough — "Describe your experience" is prose.
+_WANTS_NUMBER_RE = re.compile(
+    r"\bhow many\b|\bnumber of\b|\byears?\s+of\b|"
+    r"\byears?\b.{0,30}\bexperience\b|\bexperience\b.{0,15}\byears?\b|"
+    r"\bhow long\b.{0,30}\b(year|month)|"
+    r"\brate\b.{0,20}\b\d+\s*(?:to|-|–|—|out of)\s*\d+",
+    re.IGNORECASE,
+)
+# Free-text cues: a question carrying one of these wants prose, even if it also
+# contains a numeric phrase ("Describe your years of experience…", "How many …
+# and why?") — so we don't reduce a real answer to a bare number.
+_FREETEXT_RE = re.compile(
+    r"\b(describe|explain|why|elaborate|summari[sz]e|tell us|in your own words)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_number(question: str) -> bool:
+    """Whether a question is asking for a number (years of experience, head
+    counts, durations) — so a text-typed field still gets a numeric answer. A
+    free-text cue (describe/why/explain/…) vetoes it."""
+    q = question or ""
+    if _FREETEXT_RE.search(q):
+        return False
+    return bool(_WANTS_NUMBER_RE.search(q))
 
 
 # A $-anchored salary figure ("$150K", "$150,000", "$150000"). The leading $ is
@@ -244,10 +303,16 @@ class AnswerEngine:
         cache_path: Path,
         caller: Caller | None = None,
         job_context: str = "",
+        cv_text: str = "",
     ):
         self.profile = profile
         self.cache_path = Path(cache_path)
         self.job_context = job_context
+        # The candidate's CV / résumé text (career-ops/cv.md). Included in the LLM
+        # Q&A context so experience questions ("years with X", "have you used Y")
+        # are answered from real work history — without it the model has no
+        # evidence of any skill and answers 0.
+        self.cv_text = cv_text or ""
         self._caller = caller          # injected (tests) or lazily built
         self._caller_built = caller is not None
         self.cache: dict[str, str] = self._load_cache()
@@ -308,10 +373,26 @@ class AnswerEngine:
         if det is not None:
             return det
 
-        key = _cache_key(question, field_type)
+        # A field is numeric when typed as such OR when a TEXT field's question
+        # asks for a count/duration — LinkedIn often renders those as plain text
+        # and only validates numeric after entry. A textarea is always free-text
+        # (never coerced), and choice fields (options) pick an option. Numeric
+        # answers are coerced to a bare number; the cache is keyed "numeric" so a
+        # text-typed-but-numeric field and a later numeric re-ask share one entry.
+        numeric = not options and (
+            field_type == "numeric"
+            or (field_type == "text" and _wants_number(question))
+        )
+        eff_type = "numeric" if numeric else field_type
+
+        key = _cache_key(question, eff_type)
         if key in self.cache:
             self.cache_hits += 1
             cached = self.cache[key]
+            # Coerce on the hit path too: an entry cached under numeric:: before
+            # this fix (or by another field type) may still hold prose.
+            if numeric:
+                return _coerce_number(cached)
             return _match_option(cached, options) if options else cached
 
         # A missing provider is a setup error — surface it (raises). A provider
@@ -320,11 +401,19 @@ class AnswerEngine:
         # so the form proceeds rather than the whole job getting skipped.
         self._ensure_caller()
         try:
-            raw = self._llm(question, field_type, options)
+            raw = self._llm(question, eff_type, options)
         except Exception:
             if question not in self.unanswered:   # a step re-filled after a validation error re-asks
                 self.unanswered.append(question)
-            return self._fallback(field_type, options)
+            return self._fallback(eff_type, options)
+        if numeric:
+            value = _coerce_number(raw)
+            # Don't cache a coercion miss ("") — a later retry should get another
+            # shot at the LLM rather than replaying a blank.
+            if value:
+                self.cache[key] = value
+                self._save_cache()
+            return value
         value = _match_option(raw, options) if options else raw
         self.cache[key] = value
         self._save_cache()
@@ -352,7 +441,7 @@ class AnswerEngine:
             "its own line, copied verbatim. If it is a single-choice question "
             "(e.g. notice period, years of experience, a duration), reply with "
             "EXACTLY ONE. If none apply, reply 'none'. Never invent.\n\n"
-            "CANDIDATE:\n" + "\n".join(self.profile.summary_lines())
+            + self._candidate_context()
         )
         user = f"Question: {question}\n\nOptions:\n- " + "\n- ".join(options)
         if self.job_context:
@@ -499,6 +588,16 @@ class AnswerEngine:
 
     # ── LLM fallback ───────────────────────────────────────────────────────────
 
+    def _candidate_context(self) -> str:
+        """The candidate block for the LLM Q&A: the structured profile PLUS the
+        CV/résumé text. Without the CV, experience questions ("years with X",
+        "have you used Y") have no work history to answer from and come back 0."""
+        block = "CANDIDATE PROFILE:\n" + "\n".join(self.profile.summary_lines())
+        cv = self.cv_text.strip()
+        if cv:
+            block += "\n\nCANDIDATE RESUME / EXPERIENCE:\n" + cv[:_CV_CONTEXT_MAX]
+        return block
+
     def _llm(self, question: str, field_type: str, options: list[str] | None) -> str:
         system = (
             "You fill job-application forms as the candidate described below. "
@@ -507,9 +606,13 @@ class AnswerEngine:
             "authorization. For multiple-choice questions, reply with EXACTLY one "
             "of the provided options and nothing else. For open-ended questions, "
             "reply with 1-3 sentences, no preamble.\n\n"
-            "CANDIDATE PROFILE:\n" + "\n".join(self.profile.summary_lines())
+            + self._candidate_context()
         )
         parts = [f"Question: {question}", f"Field type: {field_type}"]
+        if field_type == "numeric":
+            parts.append("This field accepts ONLY a number. Reply with a single "
+                         "number — digits only, no words, units, ranges, or symbols — "
+                         "your best truthful estimate from the candidate's background.")
         if options:
             parts.append("Options (choose exactly one):\n- " + "\n- ".join(options))
         if self.job_context:

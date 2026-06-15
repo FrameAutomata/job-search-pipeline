@@ -4,6 +4,7 @@ Covers result classification, profile loading, the deterministic+cache+LLM
 answer engine, and tracker candidate selection. The Playwright-driven modules
 (browser.py, linkedin.py) are verified manually via `--apply-mode dry-run`."""
 
+import json
 import textwrap
 from pathlib import Path
 
@@ -265,6 +266,171 @@ class TestAnswerEngineDeterministic:
         e = self._engine(profile, tmp_path)
         e.role_salary_target = 185000
         assert e.answer("Desired salary", "numeric") == "185000"
+
+
+class TestAnswerEngineNumeric:
+    """Numeric screening fields. LinkedIn renders most 'how many years' questions
+    as plain text inputs validated as numbers only AFTER entry, and the LLM tends
+    to answer in prose — so the engine must return a BARE number for numeric
+    fields AND numeric-intent questions, cache the number (so a re-fill after a
+    validation error doesn't re-type prose), and never fabricate one."""
+
+    def _engine(self, profile, tmp_path, reply):
+        return AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: reply)
+
+    def test_numeric_field_extracts_number_from_prose(self, profile, tmp_path):
+        e = self._engine(profile, tmp_path, "I have about 5 years of experience with Python.")
+        assert e.answer("Years of experience with Python", "numeric") == "5"
+
+    def test_numeric_intent_inferred_for_text_field(self, profile, tmp_path):
+        # LinkedIn marks the input type=text; the QUESTION is what makes it numeric.
+        e = self._engine(profile, tmp_path, "Around 7 years.")
+        assert e.answer("How many years of experience do you have with Java?", "text") == "7"
+
+    def test_numeric_blank_when_no_number_never_fabricates(self, profile, tmp_path):
+        # A prose answer with no extractable number → blank for review, not "0".
+        e = self._engine(profile, tmp_path, "It really depends on the project.")
+        assert e.answer("How many years of experience with Kubernetes?", "numeric") == ""
+
+    def test_numeric_answer_cached_as_number(self, profile, tmp_path):
+        cache = tmp_path / "c.json"
+        e = AnswerEngine(profile, cache, caller=lambda s, u: "I'd say 5 years")
+        assert e.answer("Years of professional experience", "numeric") == "5"
+        stored = json.loads(cache.read_text(encoding="utf-8"))
+        assert "5" in stored.values()        # the coerced number, not the prose
+
+    def test_decimal_preserved_for_numeric(self, profile, tmp_path):
+        e = self._engine(profile, tmp_path, "3.5 years")
+        assert e.answer("Years of experience with Go", "numeric") == "3.5"
+
+    def test_non_numeric_freetext_not_coerced(self, profile, tmp_path):
+        # A genuine free-text question keeps its prose — coercion is numeric-only.
+        e = self._engine(profile, tmp_path, "Because I admire the team's work.")
+        assert e.answer("Why do you want to work here?", "textarea") == \
+            "Because I admire the team's work."
+
+    def test_cached_numeric_prose_is_coerced_on_hit(self, profile, tmp_path):
+        # A cache entry holding prose under a numeric:: key (e.g. from before this
+        # fix) must be coerced on the cache-HIT path too, not typed verbatim.
+        cache = tmp_path / "c.json"
+        cache.write_text(
+            json.dumps({"numeric::years of professional experience": "I have about 5 years"}),
+            encoding="utf-8")
+
+        def boom(s, u):
+            raise AssertionError("a cache hit must not call the LLM")
+        e = AnswerEngine(profile, cache, caller=boom)
+        assert e.answer("Years of professional experience", "numeric") == "5"
+
+    def test_textarea_not_coerced_even_with_numeric_intent(self, profile, tmp_path):
+        # A textarea is free-text — never coerce it to a number, even when the
+        # label reads numeric ("Years of experience"). Only text/number inputs do.
+        e = self._engine(profile, tmp_path, "I have five years across three teams.")
+        assert e.answer("Years of experience", "textarea") == \
+            "I have five years across three teams."
+
+
+class TestNumericHelpers:
+    @pytest.mark.parametrize("text,expected", [
+        ("I have 5 years", "5"),
+        ("about 7 years of experience", "7"),
+        ("3.5", "3.5"),
+        (".5", "0.5"),           # leading-dot decimal normalized, NOT inflated to 5
+        ("12", "12"),
+        ("1,200", "1200"),       # thousands separators stripped
+        ("no idea", ""),
+        ("", ""),
+    ])
+    def test_coerce_number(self, text, expected):
+        from pipeline.apply.answers import _coerce_number
+        assert _coerce_number(text) == expected
+
+    def test_coerce_number_whole_floors_without_bogus_zero(self):
+        from pipeline.apply.answers import _coerce_number
+        assert _coerce_number("3.5 years", whole=True) == "3"
+        assert _coerce_number("5", whole=True) == "5"
+        # A positive value below 1 must not floor to a bogus "0" (LinkedIn's
+        # "whole number larger than 0" would reject it).
+        assert _coerce_number("0.9", whole=True) == "1"
+        assert _coerce_number(".5", whole=True) == "1"
+
+    @pytest.mark.parametrize("q,expected", [
+        ("How many years of experience do you have with Python?", True),
+        ("Years of experience", True),
+        ("How many people have you managed?", True),
+        ("Number of years in the industry", True),
+        ("What is your name?", False),
+        ("Why do you want this job?", False),
+        ("Describe your experience", False),   # 'experience' alone isn't numeric
+        # Free-text cues win even when a numeric phrase is present, so a prose
+        # answer isn't reduced to a bare number.
+        ("Describe your years of experience with distributed systems", False),
+        ("How many of our products have you used and why?", False),
+    ])
+    def test_wants_number(self, q, expected):
+        from pipeline.apply.answers import _wants_number
+        assert _wants_number(q) is expected
+
+
+class TestNumericValidationMessage:
+    """linkedin._numeric_required detects LinkedIn's post-entry 'enter a number'
+    inline error so the fill loop can re-answer that field numerically — the case
+    a text input only reveals as numeric once a non-number is typed."""
+
+    @pytest.mark.parametrize("msg,expected", [
+        ("Enter a whole number larger than 0.", True),
+        ("Enter a decimal number larger than 0.0.", True),
+        ("Please enter a valid number.", True),
+        ("Enter a number between 0 and 99.", True),
+        ("This field is required.", False),
+        ("Enter a valid email address.", False),
+        ("", False),
+    ])
+    def test_numeric_required(self, msg, expected):
+        from pipeline.apply.linkedin import _numeric_required
+        assert _numeric_required(msg) is expected
+
+
+class TestCandidateContext:
+    """The LLM answerer must be given the candidate's CV, not just contact +
+    work-auth — otherwise an experience question ("how many years with Spring
+    Boot") is answered with no evidence the candidate ever used it (-> 0). The
+    same cv.md the cover-letter generator uses, fed to single + multi answers."""
+
+    def _capture_engine(self, profile, tmp_path, captured, reply, cv_text):
+        def caller(system, user):
+            captured["system"] = system
+            return reply
+        return AnswerEngine(profile, tmp_path / "c.json", caller=caller, cv_text=cv_text)
+
+    def test_cv_text_in_single_answer_context(self, profile, tmp_path):
+        captured = {}
+        e = self._capture_engine(
+            profile, tmp_path, captured, "3",
+            "EXPERIENCE\nCapital One - Software Engineer\nJava, Spring Boot REST APIs (2021-2024)")
+        e.answer("How many years of experience with Spring Boot?", "numeric")
+        assert "Spring Boot" in captured["system"]
+        assert "Capital One" in captured["system"]
+
+    def test_cv_text_in_multi_select_context(self, profile, tmp_path):
+        captured = {}
+        e = self._capture_engine(profile, tmp_path, captured, "Java",
+                                 "Skills: Java, Spring Boot, AWS, Terraform")
+        e.answer_multi("Which of these have you used?", ["Java", "Rust", "Go"])
+        assert "Java" in captured["system"] and "Spring Boot" in captured["system"]
+
+    def test_cv_text_capped(self, profile, tmp_path):
+        from pipeline.apply.answers import _CV_CONTEXT_MAX
+        captured = {}
+        e = self._capture_engine(profile, tmp_path, captured, "1", "Y" * (_CV_CONTEXT_MAX + 5000))
+        e.answer("How many years with Y?", "numeric")
+        # The résumé block is bounded so the prompt stays a sane size.
+        assert len(captured["system"]) < _CV_CONTEXT_MAX + 2000
+
+    def test_no_cv_text_back_compat(self, profile, tmp_path):
+        # cv_text defaults to "" → context is the profile block only; still answers.
+        e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "5")
+        assert e.answer("Years of experience with Python", "numeric") == "5"
 
 
 class TestEEOHelpers:
