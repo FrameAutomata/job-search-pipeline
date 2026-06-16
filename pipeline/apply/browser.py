@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -35,12 +36,29 @@ _LAUNCH_ARGS = [
 ]
 
 
-@contextmanager
-def launch(headless: bool = False, user_data_dir: Path | None = None):
-    """Yield a Playwright page backed by a persistent context.
+@dataclass
+class Session:
+    """A live apply browser session. `page` drives the deterministic engines;
+    `cdp_endpoint` (http://localhost:{port} or None) is where the agentic engine's
+    `@playwright/mcp` attaches to the SAME Chrome, so both share one warm, logged-in,
+    Cloudflare-cleared session."""
+    page: object
+    cdp_endpoint: str | None
 
-    Raises a clear ImportError if Playwright isn't installed (it's an optional,
-    local-only dependency — see requirements.txt)."""
+
+@contextmanager
+def launch_session(*, headless: bool = False, user_data_dir: Path | None = None,
+                   cdp_port: int | None = None, channel: str | None = "chrome"):
+    """Yield a `Session` backed by a persistent context.
+
+    Defaults to REAL Chrome (`channel="chrome"`): Indeed's Cloudflare wall flags
+    Playwright's bundled Chromium, but a real Chrome on a warm, logged-in profile
+    clears it — so the apply/agentic path needs the real binary. Pass
+    `cdp_port` to open a CDP endpoint an external MCP/agent can attach to.
+    `channel=None` falls back to bundled Chromium (the LinkedIn-only deterministic
+    path, which never meets Cloudflare).
+
+    Raises a clear ImportError if Playwright isn't installed (optional local dep)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as e:  # pragma: no cover - exercised only without the dep
@@ -53,25 +71,41 @@ def launch(headless: bool = False, user_data_dir: Path | None = None):
     udd.mkdir(parents=True, exist_ok=True)
 
     args = list(_LAUNCH_ARGS)
-    # Skip image loading by default — LinkedIn job pages are image-heavy and we
-    # don't need them to fill a form, so this noticeably speeds up the initial
-    # page load and the modal render. Re-enable with APPLY_LOAD_IMAGES=true.
+    # Skip image loading by default — job pages are image-heavy and we don't need
+    # them to fill a form. Re-enable with APPLY_LOAD_IMAGES=true.
     if os.environ.get("APPLY_LOAD_IMAGES", "").strip().lower() not in ("1", "true", "yes"):
         args.append("--blink-settings=imagesEnabled=false")
+    endpoint = None
+    if cdp_port:
+        args.append(f"--remote-debugging-port={cdp_port}")
+        endpoint = f"http://localhost:{cdp_port}"
+
+    launch_kwargs: dict = dict(user_data_dir=str(udd), headless=headless, args=args,
+                               viewport={"width": 1280, "height": 900})
+    if channel:
+        launch_kwargs["channel"] = channel  # real Chrome (vs bundled Chromium)
 
     pw = sync_playwright().start()
-    context = pw.chromium.launch_persistent_context(
-        user_data_dir=str(udd),
-        headless=headless,
-        args=args,
-        viewport={"width": 1280, "height": 900},
-    )
+    context = None
     try:
+        # Inside the try so a launch failure (e.g. channel="chrome" with no Chrome
+        # installed) still runs pw.stop() and doesn't leak the driver process.
+        context = pw.chromium.launch_persistent_context(**launch_kwargs)
         page = context.pages[0] if context.pages else context.new_page()
-        yield page
+        yield Session(page=page, cdp_endpoint=endpoint)
     finally:
-        context.close()
+        if context is not None:
+            context.close()
         pw.stop()
+
+
+@contextmanager
+def launch(headless: bool = False, user_data_dir: Path | None = None):
+    """Back-compat: yield just the page, on bundled Chromium with no CDP port — the
+    existing LinkedIn deterministic path (never meets Cloudflare), unchanged."""
+    with launch_session(headless=headless, user_data_dir=user_data_dir,
+                        cdp_port=None, channel=None) as session:
+        yield session.page
 
 
 def is_logged_in(page) -> bool:
@@ -138,3 +172,70 @@ def ensure_logged_in(page, *, headless: bool, timeout_s: int = 240) -> bool:
         except Exception:
             pass
     return is_logged_in(page)
+
+
+# ── Indeed ───────────────────────────────────────────────────────────────────
+# Indeed sits behind a Cloudflare anti-bot wall that flags automation; the ONLY
+# proxyless way past it is a warm, real-Chrome profile that has signed in by hand
+# once (which also clears Cloudflare). These mirror the LinkedIn probes; the exact
+# URLs/selectors are tuned by manual --apply-mode dry-run, per this module's
+# verify-manually convention.
+
+_INDEED_AUTH_MARKERS = ("/account/login", "secure.indeed.com/auth", "/auth?", "/auth/")
+
+
+def is_logged_in_indeed(page) -> bool:
+    """Load a member-only page (My Jobs) and see whether it bounces to the auth
+    flow — redirect-based, like the LinkedIn probe, so it doesn't depend on
+    Indeed's A/B-tested DOM. NOTE: on a COLD profile the navigation itself hits
+    Cloudflare, so this only reads true once the profile is warm (signed in once
+    via ensure_logged_in_indeed)."""
+    try:
+        page.goto("https://myjobs.indeed.com/", wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+    except Exception:
+        return False
+    url = page.url.lower()
+    if any(m in url for m in _INDEED_AUTH_MARKERS):
+        return False
+    if "myjobs.indeed.com" in url:
+        return True
+    try:
+        return page.locator("[data-gnav-element-name='AccountMenu'], "
+                            "[aria-label*='Account' i], a[href*='/account']").count() > 0
+    except Exception:
+        return False
+
+
+def ensure_logged_in_indeed(page, *, headless: bool, timeout_s: int = 300) -> bool:
+    """Ensure a logged-in Indeed session in the warm real-Chrome profile.
+
+    The one-time bootstrap that matters for Indeed: signing in by hand in a
+    visible window ALSO clears Cloudflare's challenge (which automation can't),
+    and the session + cf_clearance cookies persist in the profile for later runs.
+    Headless can't complete it → returns False so the caller aborts clearly."""
+    if is_logged_in_indeed(page):
+        return True
+    if headless:
+        return False
+
+    import time
+    try:
+        page.goto("https://secure.indeed.com/auth", wait_until="domcontentloaded")
+    except Exception:
+        pass
+    print(
+        "[apply] Not signed in to Indeed. A browser window is open — sign in there "
+        f"(this also clears Cloudflare). Waiting up to {timeout_s}s...",
+        flush=True,
+    )
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(3)
+        cur = page.url.lower()
+        if any(m in cur for m in _INDEED_AUTH_MARKERS):
+            continue  # still on the auth / challenge flow
+        # Left the auth flow and landed on indeed.com → signed in.
+        if "indeed.com" in cur:
+            return True
+    return is_logged_in_indeed(page)
