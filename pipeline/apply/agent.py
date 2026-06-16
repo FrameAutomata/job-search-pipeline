@@ -69,22 +69,26 @@ def _collect_agent_text(lines: Iterable[str]) -> str:
 
 
 def parse_result(output: str, *, submitted: bool) -> ApplyResult:
-    """Map the agent's text output to an ApplyResult via its single RESULT:* line.
+    """Map the agent's text output to an ApplyResult via its RESULT:* line.
     `submitted` (only meaningful for APPLIED) records whether this was a live run
-    that actually clicked Submit vs. a dry-run rehearsal."""
+    that actually clicked Submit vs. a dry-run rehearsal.
+
+    Reads the LAST RESULT line, not the first: the agent may name a code while
+    reasoning ("I'll output RESULT:APPLIED if it submits") and then conclude
+    differently, so only its final verdict counts."""
+    verdict = next((ln for ln in reversed(output.splitlines()) if "RESULT:" in ln), None)
+    if verdict is None:
+        return failed("no_result_line")
     for token, code in (("APPLIED", APPLIED), ("EXPIRED", EXPIRED),
                         ("CAPTCHA", CAPTCHA), ("LOGIN_ISSUE", LOGIN_ISSUE)):
-        if f"RESULT:{token}" in output:
+        if f"RESULT:{token}" in verdict:
             return ApplyResult(code=code, submitted=submitted and code == APPLIED)
-    if "RESULT:FAILED" in output:
-        for line in output.splitlines():
-            if "RESULT:FAILED" in line:
-                reason = line.split("RESULT:FAILED", 1)[1].lstrip(":").strip()
-                reason = _REASON_JUNK.sub("", reason) or "unknown"
-                if reason in _PROMOTE:
-                    return ApplyResult(code=_PROMOTE[reason])
-                return failed(reason)
-        return failed("unknown")
+    if "RESULT:FAILED" in verdict:
+        reason = verdict.split("RESULT:FAILED", 1)[1].lstrip(":").strip()
+        reason = _REASON_JUNK.sub("", reason) or "unknown"
+        if reason in _PROMOTE:
+            return ApplyResult(code=_PROMOTE[reason])
+        return failed(reason)
     return failed("no_result_line")
 
 
@@ -127,6 +131,13 @@ def run_agent(prompt: str, *, cdp_endpoint: str, model: str | None = None,
         if proc:
             proc.kill()
         return failed("timeout")
+    except Exception as e:
+        # Any other subprocess failure (e.g. claude dies mid-stdin-write ->
+        # BrokenPipeError) must become an ApplyResult, not escape into the apply
+        # loop — the engine always returns a verdict.
+        if proc:
+            proc.kill()
+        return failed(f"agent_error:{type(e).__name__}")
     finally:
         try:
             os.unlink(mcp_path)

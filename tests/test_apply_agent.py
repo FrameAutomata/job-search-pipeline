@@ -53,6 +53,13 @@ class TestParseResult:
         r = agent.parse_result("the agent rambled but never concluded", submitted=False)
         assert r.code == "failed" and "no_result" in r.reason
 
+    def test_uses_last_result_line_when_multiple(self):
+        # The agent may name a code mid-reasoning then conclude differently; the
+        # FINAL RESULT line is the verdict, not the first one mentioned.
+        out = "I'll output RESULT:APPLIED if the form submits.\n...\nRESULT:FAILED:stuck"
+        r = agent.parse_result(out, submitted=True)
+        assert r.code == "failed" and r.reason == "stuck"
+
 
 class TestCollectText:
     def test_collapses_stream_json_to_text(self):
@@ -103,6 +110,27 @@ class TestRunAgent:
         assert "--output-format" in cmd and "stream-json" in cmd
         assert "--permission-mode" in cmd and "bypassPermissions" in cmd
         assert "--mcp-config" in cmd
+
+    def test_unexpected_subprocess_error_becomes_failed(self, monkeypatch):
+        # If claude dies mid-stdin-write (BrokenPipe) or anything else goes wrong,
+        # the engine must return an ApplyResult, not let the exception escape.
+        class BoomPopen:
+            def __init__(self, cmd, **kw):
+                self.returncode = 0
+                self.stdout = iter([])
+
+                class _Stdin:
+                    def write(self_, s): raise BrokenPipeError("claude died")
+                    def close(self_): pass
+                self.stdin = _Stdin()
+
+            def wait(self, timeout=None): return 0
+
+            def kill(self): pass
+
+        monkeypatch.setattr(agent.subprocess, "Popen", BoomPopen)
+        r = agent.run_agent("P", cdp_endpoint="http://localhost:9222")
+        assert r.code == "failed" and "agent_error" in r.reason
 
     def test_dry_run_applied_is_not_submitted(self, monkeypatch):
         class FakePopen:
