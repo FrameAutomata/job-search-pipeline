@@ -27,8 +27,9 @@ Caller = Callable[[str, str], str]
 
 _CACHE_NAME = "apply-answers.json"
 
-# Cap on the CV/résumé text inlined into the answer prompt, so the context stays
-# bounded (a résumé is 1-2 pages; this is generous headroom).
+# Budget on the CV/résumé text inlined into the answer prompt, so the context
+# stays bounded (a résumé is 1-2 pages; this is generous headroom). Over budget,
+# _fit_cv keeps whole sections from both ends — see there.
 _CV_CONTEXT_MAX = 6000
 
 # Reserved cache key holding a fingerprint of the CV the cached answers were
@@ -42,6 +43,56 @@ def _cv_fingerprint(cv_text: str) -> str:
     """A short content hash of the CV, stored alongside the cached answers so a
     cv.md edit invalidates everything derived from the old résumé."""
     return hashlib.sha1((cv_text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _fit_cv(cv: str, budget: int) -> str:
+    """Trim CV text to ~`budget` chars while preserving the most-recent role.
+
+    A raw head-slice silently drops the tail — losing the most recent role when
+    the CV is oldest-first, so an experience question ("years with <recent tech>")
+    is answered from older history and comes back understated. Instead, split into
+    blank-line-separated sections and keep whole sections from BOTH ends up to the
+    budget — the recent role sits at one end whichever way the CV is ordered —
+    dropping the middle with a marker. An unstructured (single-block) CV falls
+    back to a head-slice."""
+    cv = cv.strip()
+    if len(cv) <= budget:
+        return cv
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", cv) if b.strip()]
+    if len(blocks) <= 1:
+        return cv[:budget]
+
+    marker = "[... older roles omitted to fit context ...]"
+    front: list[str] = []
+    back: list[str] = []
+    used = len(marker) + 4  # the marker plus the blank lines around it
+    lo, hi = 0, len(blocks) - 1
+    take_front = True  # alternate ends; front (recent, by convention) goes first
+    while lo <= hi:
+        idx = lo if take_front else hi
+        cost = len(blocks[idx]) + 2  # the section plus its "\n\n" join
+        if used + cost > budget:
+            break
+        if take_front:
+            front.append(blocks[idx])
+            lo += 1
+        else:
+            back.insert(0, blocks[idx])
+            hi -= 1
+        used += cost
+        take_front = not take_front
+
+    if not front and not back:
+        return cv[:budget]  # not even one whole section fit
+    parts = []
+    if front:
+        parts.append("\n\n".join(front))
+    if lo <= hi:  # middle sections were dropped
+        parts.append(marker)
+    if back:
+        parts.append("\n\n".join(back))
+    return "\n\n".join(parts)
+
 
 # EEO / demographic questions are always declined.
 # \w* on prefix tokens so the trailing \b lands at the real word end — without it
@@ -608,7 +659,7 @@ class AnswerEngine:
         block = "CANDIDATE PROFILE:\n" + "\n".join(self.profile.summary_lines())
         cv = self.cv_text.strip()
         if cv:
-            block += "\n\nCANDIDATE RESUME / EXPERIENCE:\n" + cv[:_CV_CONTEXT_MAX]
+            block += "\n\nCANDIDATE RESUME / EXPERIENCE:\n" + _fit_cv(cv, _CV_CONTEXT_MAX)
         return block
 
     def _llm(self, question: str, field_type: str, options: list[str] | None) -> str:
