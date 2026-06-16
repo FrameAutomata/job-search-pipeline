@@ -435,6 +435,34 @@ class TestCandidateContext:
         e = AnswerEngine(profile, tmp_path / "c.json", caller=lambda s, u: "5")
         assert e.answer("Years of experience with Python", "numeric") == "5"
 
+    def _oversized_cv(self, recent_marker: str, *, recent_first: bool) -> str:
+        """A multi-section CV well over the cap, with a uniquely-tagged most-recent
+        role at the top (reverse-chronological) or bottom (oldest-first)."""
+        from pipeline.apply.answers import _CV_CONTEXT_MAX
+        filler = "Built and shipped backend services and pipelines. " * 30
+        old = [f"## Engineer at OldCo{i} (20{i:02d})\n{filler}" for i in range(40)]
+        recent = f"## Senior Engineer at NewCo (2024-present)\n{recent_marker} {filler}"
+        blocks = [recent, *old] if recent_first else [*old, recent]
+        cv = "\n\n".join(blocks)
+        assert len(cv) > _CV_CONTEXT_MAX  # the cut must actually engage
+        return cv
+
+    def test_over_cap_keeps_recent_role_reverse_chronological(self, profile, tmp_path):
+        captured = {}
+        e = self._capture_engine(profile, tmp_path, captured, "5",
+                                 self._oversized_cv("KUBERNETES_RECENT", recent_first=True))
+        e.answer("How many years with Kubernetes?", "numeric")
+        assert "KUBERNETES_RECENT" in captured["system"]  # recent role (top) survived
+
+    def test_over_cap_keeps_recent_role_oldest_first(self, profile, tmp_path):
+        captured = {}
+        e = self._capture_engine(profile, tmp_path, captured, "5",
+                                 self._oversized_cv("KUBERNETES_RECENT", recent_first=False))
+        e.answer("How many years with Kubernetes?", "numeric")
+        # The silent landmine: a raw head-slice drops the bottom, losing the most
+        # recent role for an oldest-first CV. Truncation must keep it.
+        assert "KUBERNETES_RECENT" in captured["system"]
+
     def test_salary_field_stays_deterministic_with_cv(self, profile, tmp_path):
         # Even with a comp figure in the CV, a salary field is answered
         # deterministically — it never reaches the LLM, so the CV can't leak it.
