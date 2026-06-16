@@ -11,6 +11,8 @@ result) — and their tests — don't require it to be installed."""
 from __future__ import annotations
 
 import os
+import platform
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,50 @@ _LAUNCH_ARGS = [
     # restore bubble that can sit over the page; suppress it.
     "--hide-crash-restore-bubble",
 ]
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and its children (Chrome spawns many). Best-effort."""
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        else:
+            import signal as _signal
+            try:
+                os.killpg(os.getpgid(pid), _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(pid, _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
+
+
+def _kill_on_port(port: int) -> None:
+    """Evict any process listening on `port` before we open it. A stale Chrome
+    from a crashed run holds the CDP port; a fresh launch can't rebind it, so the
+    agent's MCP (and connect_over_cdp) would silently attach to the OLD browser
+    instead of the warm, logged-in one. Best-effort — a missing netstat/lsof is
+    fine (we just skip the sweep)."""
+    try:
+        if platform.system() == "Windows":
+            out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    pid = line.split()[-1]
+                    if pid.isdigit():
+                        _kill_process_tree(int(pid))
+        else:
+            out = subprocess.run(["lsof", "-ti", f":{port}"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for pid in out.split():
+                if pid.isdigit():
+                    _kill_process_tree(int(pid))
+    except Exception:
+        pass
 
 
 @dataclass
@@ -77,6 +123,7 @@ def launch_session(*, headless: bool = False, user_data_dir: Path | None = None,
         args.append("--blink-settings=imagesEnabled=false")
     endpoint = None
     if cdp_port:
+        _kill_on_port(cdp_port)  # evict a stale Chrome holding the port (see _kill_on_port)
         args.append(f"--remote-debugging-port={cdp_port}")
         endpoint = f"http://localhost:{cdp_port}"
 
