@@ -59,6 +59,10 @@ def main() -> int:
                          "set high (e.g. 99) to always use the default resume.")
     ap.add_argument("--headless", action="store_true",
                     help="Run the apply browser headless (only works once you've logged in once)")
+    ap.add_argument("--capture-indeed-login", action="store_true",
+                    help="One-time: open a normal Chrome to sign in to Indeed, then capture "
+                         "the session into the apply profile (required before --apply can do "
+                         "Indeed jobs). Standalone — skips the pipeline stages.")
     ap.add_argument("--recheck-liveness", action="store_true",
                     help="Re-check liveness of evaluated tracker roles and mark "
                          "closed/gone ones Discarded. Off by default; the daily "
@@ -94,6 +98,13 @@ def main() -> int:
     # silently uses the CWD as the career-ops path. The `or` form treats
     # unset and empty-string both as "use the default".
     career_ops = resolve(os.environ.get("CAREER_OPS_PATH") or "career-ops")
+
+    if args.capture_indeed_login:
+        # One-time setup: sign in to Indeed in a normal browser and capture the
+        # live session into the patchright apply profile. Standalone — it doesn't
+        # need a search config and skips the pipeline stages.
+        from pipeline.apply import browser
+        return 0 if browser.capture_indeed_login() else 1
 
     config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG") or "config/search.yml")
     if not config_path.exists():

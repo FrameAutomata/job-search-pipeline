@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -231,22 +232,44 @@ def ensure_logged_in(page, *, headless: bool, timeout_s: int = 240) -> bool:
 _INDEED_AUTH_MARKERS = ("/account/login", "secure.indeed.com/auth", "/auth?", "/auth/")
 
 
-def is_logged_in_indeed(page) -> bool:
-    """Load a member-only page (My Jobs) and see whether it bounces to the auth
-    flow — redirect-based, like the LinkedIn probe, so it doesn't depend on
-    Indeed's A/B-tested DOM. NOTE: on a COLD profile the navigation itself hits
-    Cloudflare, so this only reads true once the profile is warm (signed in once
-    via ensure_logged_in_indeed)."""
+def _is_cf_challenge(page) -> bool:
+    """True while Cloudflare's interstitial is showing. It's served at the TARGET
+    url (myjobs.indeed.com shows 'Just a moment…'), so the url alone can't tell
+    'cleared' from 'still challenging' — we read the title/body."""
     try:
-        page.goto("https://myjobs.indeed.com/", wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
+        if any(s in (page.title() or "").lower() for s in ("just a moment", "attention required")):
+            return True
+        body = (page.locator("body").inner_text(timeout=800) or "").lower()
+        return any(s in body for s in ("verify you are human", "additional verification",
+                                       "checking your browser"))
     except Exception:
         return False
-    url = page.url.lower()
-    if any(m in url for m in _INDEED_AUTH_MARKERS):
+
+
+def is_logged_in_indeed(page, *, timeout_s: int = 20) -> bool:
+    """Load a member page (My Jobs) and decide whether we're signed in — redirect-
+    based, so it doesn't depend on Indeed's A/B-tested DOM.
+
+    Polls through patchright's Cloudflare clearance rather than a single fixed wait:
+    the interstitial is served at the same url, so a too-short wait (the old 2s)
+    could read the challenge as 'not signed in' and wrongly abort a valid run. A
+    bounce to the auth flow = logged out; the member page (cleared, not the CF
+    challenge) = logged in."""
+    try:
+        page.goto("https://myjobs.indeed.com/", wait_until="domcontentloaded")
+    except Exception:
         return False
-    if "myjobs.indeed.com" in url:
-        return True
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        page.wait_for_timeout(1000)
+        url = page.url.lower()
+        if any(m in url for m in _INDEED_AUTH_MARKERS):
+            return False          # bounced to the auth flow → logged out
+        if _is_cf_challenge(page):
+            continue              # patchright still clearing Cloudflare → wait
+        if "myjobs.indeed.com" in url:
+            return True           # cleared and on the member page → logged in
+    # Timed out without a clear verdict — fall back to authenticated-only chrome.
     try:
         return page.locator("[data-gnav-element-name='AccountMenu'], "
                             "[aria-label*='Account' i], a[href*='/account']").count() > 0
@@ -286,3 +309,109 @@ def ensure_logged_in_indeed(page, *, headless: bool, timeout_s: int = 300) -> bo
         if "indeed.com" in cur:
             return True
     return is_logged_in_indeed(page)
+
+
+# ── Indeed apply session (patchright) ──────────────────────────────────────────
+# The apply browser for Indeed is patchright (stealth real Chrome), NOT the
+# bundled-Chromium LinkedIn path: it's the only thing that clears Indeed's
+# Cloudflare challenge (proven). The login can't be done in the automated browser
+# (Google/Indeed block it), so it's captured once from a normal Chrome by
+# capture_indeed_login and injected here as cookies.
+
+def default_indeed_profile_dir() -> Path:
+    env = os.environ.get("APPLY_INDEED_BROWSER_DIR")
+    return Path(env) if env else ROOT / "output" / ".chrome-apply-indeed"
+
+
+@contextmanager
+def launch_indeed(*, headless: bool = False, user_data_dir: Path | None = None):
+    """Yield a patchright (stealth) Chrome page on the persistent Indeed apply
+    profile. patchright clears Cloudflare; the injected captured session keeps us
+    logged in. Raises a clear ImportError if patchright isn't installed."""
+    try:
+        from patchright.sync_api import sync_playwright
+    except ImportError as e:  # pragma: no cover - exercised only without the dep
+        raise ImportError(
+            "patchright is required for Indeed auto-apply. Install it locally:\n"
+            "  pip install patchright"
+        ) from e
+
+    udd = Path(user_data_dir) if user_data_dir else default_indeed_profile_dir()
+    udd.mkdir(parents=True, exist_ok=True)
+    pw = sync_playwright().start()
+    context = None
+    try:
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(udd), channel="chrome", headless=headless, no_viewport=True)
+        page = context.pages[0] if context.pages else context.new_page()
+        yield page
+    finally:
+        if context is not None:
+            context.close()
+        pw.stop()
+
+
+def _system_chrome_path() -> str | None:
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+    ]
+    return next((c for c in candidates if Path(c).exists()), None)
+
+
+def _read_indeed_cookies_over_cdp(cdp_url: str) -> list[dict]:
+    """Read all indeed.com cookies (incl. session-scoped) from a Chrome with an
+    open debug port. Does NOT close the remote browser."""
+    try:
+        from patchright.sync_api import sync_playwright
+    except ImportError:
+        from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        browser = pw.chromium.connect_over_cdp(cdp_url)
+        cks: list[dict] = []
+        for ctx in browser.contexts:
+            cks.extend(ctx.cookies())
+        return [c for c in cks if "indeed" in (c.get("domain", "") or "")]
+
+
+def capture_indeed_login(*, debug_port: int = 9222, prompt_fn=input) -> int:
+    """One-time bootstrap: open a NORMAL Chrome (where Indeed/Google accept the
+    login), wait for the user to sign in, capture the live session cookies over
+    the debug port, and inject them into the patchright apply profile so the apply
+    browser is logged in. Returns the number of cookies injected.
+
+    Login can't happen in the automated apply browser (Google/Indeed block it),
+    and Indeed's auth cookie is session-scoped — so the session must be captured
+    live from a normal browser, not cloned from a closed profile."""
+    chrome = _system_chrome_path()
+    if not chrome:
+        raise RuntimeError("Google Chrome not found — install it or set the path.")
+    login_dir = ROOT / "output" / ".chrome-indeed-login"
+    login_dir.mkdir(parents=True, exist_ok=True)
+    _kill_on_port(debug_port)
+    proc = subprocess.Popen(
+        [chrome, f"--remote-debugging-port={debug_port}", f"--user-data-dir={login_dir}",
+         "--no-first-run", "--no-default-browser-check", "--hide-crash-restore-bubble"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(3)
+        print("[apply] A Chrome window opened. Go to https://www.indeed.com and SIGN IN "
+              "(Google or email both work in this normal browser).", flush=True)
+        prompt_fn("[apply] Press Enter here once you are signed in to Indeed... ")
+        raw = _read_indeed_cookies_over_cdp(f"http://localhost:{debug_port}")
+        if not raw:
+            print("[apply] no Indeed cookies captured — were you signed in?", flush=True)
+            return 0
+        from pipeline.apply.indeed import prepare_indeed_cookies
+        cookies = prepare_indeed_cookies(raw)
+        with launch_indeed(headless=True) as page:
+            page.context.add_cookies(cookies)
+        print(f"[apply] captured + injected {len(cookies)} Indeed cookies into the apply profile.",
+              flush=True)
+        return len(cookies)
+    finally:
+        if proc.poll() is None:
+            _kill_process_tree(proc.pid)
