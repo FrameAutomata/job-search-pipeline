@@ -202,6 +202,12 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "eeoRace": form.get("eeo_race") or "",
             "eeoVeteran": form.get("eeo_veteran") or "",
             "eeoDisability": form.get("eeo_disability") or "",
+            # Voluntary self-ID (EEO) consent prefs — platform-agnostic. The
+            # data-processing consent some forms require to submit defaults agree;
+            # saving/sharing answers default off.
+            "eeoConsent": str(form.get("data_processing_consent", "yes")).strip().lower() != "no",
+            "eeoSaveAnswers": str(form.get("save_answers", "")).strip().lower() == "yes",
+            "eeoShareAnswers": str(form.get("share_answers", "")).strip().lower() == "yes",
         },
         "criteria": {
             "targetRoles": _split_csv(form.get("target_roles")),

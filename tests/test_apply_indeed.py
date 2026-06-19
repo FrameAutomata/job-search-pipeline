@@ -9,6 +9,7 @@ import pytest
 
 from pipeline.apply import indeed
 from pipeline.apply import queue as _queue
+from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.indeed import prepare_indeed_cookies, _classify_step, _primary_action
 
 _MIXED_TRACKER = """# Applications Tracker
@@ -101,7 +102,7 @@ class TestClassifyStep:
 
 
 class TestDemographicPref:
-    _KEYS = ("APPLY_INDEED_EEO_CONSENT", "APPLY_INDEED_SAVE_ANSWERS", "APPLY_INDEED_SHARE_ANSWERS")
+    _KEYS = ("APPLY_EEO_DATA_CONSENT", "APPLY_EEO_SAVE_ANSWERS", "APPLY_EEO_SHARE_ANSWERS")
 
     def test_defaults_consent_on_save_share_off(self, monkeypatch):
         for k in self._KEYS:
@@ -111,10 +112,23 @@ class TestDemographicPref:
         assert indeed._demographic_pref("share") is False
 
     def test_env_overrides(self, monkeypatch):
-        monkeypatch.setenv("APPLY_INDEED_EEO_CONSENT", "off")
-        monkeypatch.setenv("APPLY_INDEED_SHARE_ANSWERS", "true")
+        monkeypatch.setenv("APPLY_EEO_DATA_CONSENT", "off")
+        monkeypatch.setenv("APPLY_EEO_SHARE_ANSWERS", "true")
         assert indeed._demographic_pref("consent") is False
         assert indeed._demographic_pref("share") is True
+
+    def test_reads_profile_when_no_env(self, monkeypatch):
+        for k in self._KEYS:
+            monkeypatch.delenv(k, raising=False)
+        prof = ApplyProfile(eeo_data_consent=False, eeo_save_answers=True, eeo_share_answers=False)
+        assert indeed._demographic_pref("consent", prof) is False
+        assert indeed._demographic_pref("save", prof) is True
+        assert indeed._demographic_pref("share", prof) is False
+
+    def test_env_overrides_profile(self, monkeypatch):
+        monkeypatch.setenv("APPLY_EEO_DATA_CONSENT", "off")
+        prof = ApplyProfile(eeo_data_consent=True)  # profile says yes, env wins
+        assert indeed._demographic_pref("consent", prof) is False
 
 
 class TestPrimaryAction:

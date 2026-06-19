@@ -93,26 +93,29 @@ def _primary_action(labels) -> str:
     return "none"
 
 
-# Demographic / voluntary-self-ID consent defaults. The candidate sets these in
-# setup/UI; the apply engine reads them as env. Default: AGREE to the required
-# data-processing consent (we provide no demographic data anyway, and it's
-# required to submit), but do NOT save or share answers with Indeed.
+# Voluntary self-ID (EEO) consent prefs — platform-agnostic (LinkedIn and other
+# ATS ask the same), set once in setup/UI (persisted to profile.yml ->
+# ApplyProfile); an env var overrides for a one-off. (env_var, profile_attr,
+# default). Default: AGREE to the data-processing consent some apply forms require
+# to submit (we provide no demographic data anyway), but do NOT save/share answers.
 _DEMOGRAPHIC_PREFS = {
-    "consent": ("APPLY_INDEED_EEO_CONSENT", True),
-    "save": ("APPLY_INDEED_SAVE_ANSWERS", False),
-    "share": ("APPLY_INDEED_SHARE_ANSWERS", False),
+    "consent": ("APPLY_EEO_DATA_CONSENT", "eeo_data_consent", True),
+    "save": ("APPLY_EEO_SAVE_ANSWERS", "eeo_save_answers", False),
+    "share": ("APPLY_EEO_SHARE_ANSWERS", "eeo_share_answers", False),
 }
 
 
-def _demographic_pref(kind: str) -> bool:
-    """Whether to check a demographic-consent box (consent/save/share), from env
-    with the candidate's configured default."""
-    env_name, default = _DEMOGRAPHIC_PREFS[kind]
+def _demographic_pref(kind: str, profile=None) -> bool:
+    """Whether to check a demographic-consent box (consent/save/share): env
+    override → the candidate's profile pref → hardcoded default."""
+    env_name, prof_attr, default = _DEMOGRAPHIC_PREFS[kind]
     v = os.environ.get(env_name, "").strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
     if v in ("0", "false", "no", "off"):
         return False
+    if profile is not None:
+        return bool(getattr(profile, prof_attr, default))
     return default
 
 
@@ -216,7 +219,7 @@ def _fill_step(sa, step: str, answers: AnswerEngine, drafted: list[tuple[str, st
         # The actual EEO questions are declined by the answer engine below; the
         # blocker is the required data-processing CONSENT — handle it per the
         # candidate's configured prefs, then fall through to decline any EEO field.
-        _handle_demographic(sa, drafted)
+        _handle_demographic(sa, drafted, getattr(answers, "profile", None))
         # Toggling the consent re-renders the advance button (Continue -> Review)
         # a beat later; wait so the loop's click lands on the enabled button.
         sa.wait_for_timeout(2500)
@@ -270,12 +273,12 @@ def _upload_resume(sa, answers: AnswerEngine, drafted: list[tuple[str, str]],
         drafted.append(("Resume", "using pre-selected Indeed resume"))
 
 
-def _handle_demographic(sa, drafted: list[tuple[str, str]]) -> None:
+def _handle_demographic(sa, drafted: list[tuple[str, str]], profile=None) -> None:
     """Set the demographic-consent checkboxes per the candidate's prefs: AGREE to
     the required data-processing consent (so the application can proceed), Save and
     Share answers off by default. Matched by label text — save/share are checked
     before the bare 'Agree' because their labels also contain consent verbs."""
-    want = {k: _demographic_pref(k) for k in ("save", "share", "consent")}
+    want = {k: _demographic_pref(k, profile) for k in ("save", "share", "consent")}
     try:
         cbs = sa.locator("input[type=checkbox]")
         n = cbs.count()

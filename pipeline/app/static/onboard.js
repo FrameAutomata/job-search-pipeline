@@ -61,6 +61,11 @@ function showAction(text, kind) {
   actionMsg.hidden = false;
 }
 
+// Voluntary self-ID (EEO) consent toggles — serialized as explicit "yes"/"no"
+// (a bare checkbox is absent when unchecked, which collides with consent's
+// default-on), and restored by .checked rather than .value.
+const CONSENT_TOGGLES = ["data_processing_consent", "save_answers", "share_answers"];
+
 // Collect the form into a plain object (sites -> array of checked values).
 function collectForm() {
   const fd = new FormData(form);
@@ -71,6 +76,9 @@ function collectForm() {
   }
   obj.sites = [...form.querySelectorAll('input[name="sites"]:checked')].map((c) => c.value);
   obj.include_easy_apply = form.querySelector('input[name="include_easy_apply"]').checked;
+  for (const name of CONSENT_TOGGLES) {
+    obj[name] = form.querySelector(`input[name="${name}"]`).checked ? "yes" : "no";
+  }
   return obj;
 }
 
@@ -113,7 +121,7 @@ function validateStep(i) {
 // untick the rest. include_easy_apply: set .checked.
 function prefillForm(saved) {
   for (const [k, v] of Object.entries(saved)) {
-    if (k === "sites" || k === "include_easy_apply") continue;
+    if (k === "sites" || k === "include_easy_apply" || CONSENT_TOGGLES.includes(k)) continue;
     if (v === undefined || v === null || v === "") continue;
     const el = form.querySelector(`[name="${k}"]`);
     if (el && el.tagName !== "FIELDSET") el.value = v;
@@ -124,6 +132,11 @@ function prefillForm(saved) {
   });
   const easyCb = form.querySelector('input[name="include_easy_apply"]');
   if (easyCb) easyCb.checked = !!saved.include_easy_apply;
+  // Consent toggles: saved as "yes"/"no"; default consent on, save/share off.
+  CONSENT_TOGGLES.forEach((name) => {
+    const cb = form.querySelector(`input[name="${name}"]`);
+    if (cb) cb.checked = name in saved ? saved[name] === "yes" : name === "data_processing_consent";
+  });
 }
 
 function enterEditMode(hasResume) {

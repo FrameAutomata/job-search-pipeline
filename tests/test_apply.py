@@ -128,6 +128,23 @@ class TestApplyProfile:
         assert p.eeo_disability == "No, I do not have a disability"
         assert p.eeo_veteran == ""        # unset → blank → declines at apply time
 
+    def test_loads_indeed_consent_prefs(self, tmp_path):
+        co = self._write(tmp_path, """
+            voluntary_disclosures:
+              data_processing_consent: false
+              save_answers: true
+              share_answers: true
+        """)
+        p = ApplyProfile.load(co)
+        assert p.eeo_data_consent is False
+        assert p.eeo_save_answers is True and p.eeo_share_answers is True
+
+    def test_indeed_consent_prefs_default(self, tmp_path):
+        # Missing → auto-agree the required consent, but don't save/share answers.
+        p = ApplyProfile.load(tmp_path)
+        assert p.eeo_data_consent is True
+        assert p.eeo_save_answers is False and p.eeo_share_answers is False
+
 
 # ── answers.py ───────────────────────────────────────────────────────────────
 

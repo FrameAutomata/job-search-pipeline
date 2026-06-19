@@ -1093,6 +1093,12 @@ function generateProfile(info, criteria) {
       race_ethnicity: info.eeoRace || '',
       veteran_status: info.eeoVeteran || '',
       disability_status: info.eeoDisability || '',
+      // Voluntary self-ID (EEO) consent prefs — platform-agnostic. The data-
+      // processing consent some apply forms require to submit defaults agree;
+      // saving/sharing answers default off.
+      data_processing_consent: info.eeoConsent !== false,
+      save_answers: info.eeoSaveAnswers === true,
+      share_answers: info.eeoShareAnswers === true,
     },
     cv: {
       output_format: 'html',

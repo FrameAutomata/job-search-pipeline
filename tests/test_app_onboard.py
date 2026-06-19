@@ -101,6 +101,18 @@ class TestBuildOnboardingJson:
         assert payload["searchSettings"]["sites"] == ["indeed", "linkedin", "glassdoor"]
         assert payload["searchSettings"]["resultsWanted"] == 100
 
+    def test_maps_indeed_consent_toggles(self):
+        info = onboard.build_onboarding_json(
+            {"data_processing_consent": "no", "save_answers": "yes"}, "")["info"]
+        assert info["eeoConsent"] is False        # explicit decline honored
+        assert info["eeoSaveAnswers"] is True
+        assert info["eeoShareAnswers"] is False
+
+    def test_indeed_consent_defaults(self):
+        info = onboard.build_onboarding_json({}, "")["info"]
+        assert info["eeoConsent"] is True         # auto-agree the required consent
+        assert info["eeoSaveAnswers"] is False and info["eeoShareAnswers"] is False
+
 
 class TestParseResumeInfo:
     SAMPLE = (
