@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline.app import data, gh, local_run, onboard, self_update, skills
+from pipeline.app import data, gh, local_run, onboard, reset, self_update, skills
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
@@ -434,6 +434,33 @@ def template_update() -> JSONResponse:
         return JSONResponse(result)
     raise HTTPException(status_code=409 if result.get("conflict") else 500,
                         detail=result.get("error", "update failed"))
+
+
+class ResetRequest(BaseModel):
+    confirm: str = ""
+    clear_cloud: bool = True
+
+
+@app.post("/api/reset")
+def reset_search(req: ResetRequest) -> JSONResponse:
+    """Start over: snapshot then wipe the job-search state (tracker, history,
+    reports, queue, batch, outputs, UI overlays), keeping setup + system code.
+    Requires confirm == "RESET" so it can't fire by accident. With clear_cloud,
+    also delete the cloud Actions state cache (best-effort) so a Refresh / next
+    run can't restore the old history."""
+    if req.confirm != "RESET":
+        raise HTTPException(status_code=400, detail='Type "RESET" to confirm — nothing was reset.')
+    _refuse_during_local_run()   # a wipe mid-run would race the pipeline's writes
+
+    ui_root = UI_CACHE.parent     # .ui-cache/ (UI_CACHE is .ui-cache/latest)
+    backup = ui_root / "backups" / f"reset-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    summary = reset.reset_job_search(_career_ops_local(), ROOT, ui_root, backup)
+    if req.clear_cloud:
+        try:
+            summary["cloud"] = reset.clear_cloud_caches()
+        except gh.GhError as e:
+            summary["cloud_error"] = str(e)   # local reset still succeeded
+    return JSONResponse({"ok": True, **summary})
 
 
 # ── local pipeline run ──────────────────────────────────────────────────────

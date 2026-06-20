@@ -189,6 +189,44 @@ def test_template_update_conflict_returns_409(client, mocker):
     assert "conflict" in r.json()["detail"].lower()
 
 
+def test_reset_requires_confirm(client, mocker):
+    from pipeline.app import server
+    rj = mocker.patch.object(server.reset, "reset_job_search")
+    r = client.post("/api/reset", json={"confirm": "nope"})
+    assert r.status_code == 400
+    rj.assert_not_called()   # nothing wiped without the exact confirmation
+
+
+def test_reset_runs_and_clears_cloud(client, mocker):
+    from pipeline.app import server
+    rj = mocker.patch.object(server.reset, "reset_job_search", return_value={"removed": ["a"], "count": 1})
+    cc = mocker.patch.object(server.reset, "clear_cloud_caches", return_value={"deleted": ["pipeline-state-v1-1"]})
+    r = client.post("/api/reset", json={"confirm": "RESET", "clear_cloud": True})
+    assert r.status_code == 200
+    rj.assert_called_once()
+    cc.assert_called_once()
+    assert r.json()["cloud"]["deleted"] == ["pipeline-state-v1-1"]
+
+
+def test_reset_local_only(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.reset, "reset_job_search", return_value={"removed": []})
+    cc = mocker.patch.object(server.reset, "clear_cloud_caches")
+    r = client.post("/api/reset", json={"confirm": "RESET", "clear_cloud": False})
+    assert r.status_code == 200
+    cc.assert_not_called()
+
+
+def test_reset_succeeds_even_if_cloud_clear_fails(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.reset, "reset_job_search", return_value={"removed": []})
+    mocker.patch.object(server.reset, "clear_cloud_caches",
+                        side_effect=server.gh.GhError("not authenticated"))
+    r = client.post("/api/reset", json={"confirm": "RESET", "clear_cloud": True})
+    assert r.status_code == 200
+    assert "cloud_error" in r.json()
+
+
 def test_push_status_400_when_nothing_pending(client):
     r = client.post("/api/push-status")
     assert r.status_code == 400
