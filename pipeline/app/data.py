@@ -7,6 +7,7 @@ import — so they're unit-testable without standing up a server.
 
 import json
 import re
+import shutil
 import threading
 from pathlib import Path
 
@@ -382,11 +383,20 @@ def parse_applications(applications_md: Path) -> list[dict]:
     Returns [] if the file is missing or has no data rows."""
     if not applications_md.exists():
         return []
+    return parse_applications_text(
+        applications_md.read_text(encoding="utf-8"),
+        easy_apply_urls=load_easy_apply_urls(applications_md.parent),
+    )
 
-    easy_apply_urls = load_easy_apply_urls(applications_md.parent)
 
+def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = None) -> list[dict]:
+    """Parse applications.md *text* into row dicts (see parse_applications for the
+    shape). Split out so the offline-tracker merge can parse in-memory cloud and
+    local trackers without a file. `easy_apply_urls` tags the easy_apply flag;
+    omitted for callers (like the merge) that don't need it."""
+    easy_apply_urls = easy_apply_urls or set()
     rows: list[dict] = []
-    for line in applications_md.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if not line.lstrip().startswith("|"):
             continue
         if _SEPARATOR_RE.match(line.strip()):
@@ -415,6 +425,177 @@ def parse_applications(applications_md: Path) -> list[dict]:
         rows.append(row)
 
     return rows
+
+
+def _row_identity(row: dict) -> str:
+    """Cross-tracker identity key — normalized company::role, the same key the
+    bridge and merge-tracker.mjs dedup on. Cloud and local trackers number rows
+    independently, so the number can't be the identity."""
+    return f"{normalize_company(row.get('company', ''))}::{normalize_company(row.get('role', ''))}"
+
+
+def reconcile_trackers(
+    cloud_md: str, local_md: str, cloud_report_nums: set[str],
+    local_report_nums: set[str] = frozenset(),
+) -> tuple[str, list[tuple[str, str]]]:
+    """Merge the pulled cloud tracker with the durable local tracker.
+
+    Cloud wins for any role present in both (it's the canonical pipeline output),
+    so cloud rows — and their numbers and report links — are kept verbatim. Rows
+    only in local (offline `Run local` results) are preserved, renumbered to sit
+    after the cloud max so row numbers stay unique. A local-only row whose report
+    number collides with a cloud report is given a fresh number (max(used)+1) and
+    its Report link rewritten; the (old, new) pair is returned so the caller can
+    rename the report file. Triage edits live in the overrides overlay, not here.
+
+    `local_report_nums` is the set of report numbers that exist as files in the
+    local reports dir — passed so a renumber can't target an existing local file
+    (including one orphaned by a cloud-shared row). Returns (merged_md, renames)."""
+    cloud_rows = parse_applications_text(cloud_md)
+    local_rows = parse_applications_text(local_md)
+
+    cloud_ids = {_row_identity(r) for r in cloud_rows}
+    local_only = [r for r in local_rows if _row_identity(r) not in cloud_ids]
+    if not local_only:
+        return cloud_md, []
+
+    def _ints(vals):
+        out = []
+        for v in vals:
+            try:
+                out.append(int(str(v).strip()))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    next_num = max(_ints(r.get("num") for r in cloud_rows), default=0)
+    # A renumbered report must avoid every number already in use: cloud reports
+    # (about to be copied in), every report referenced by a local row, and every
+    # report file on local disk (orphans included). Seed the running max from all
+    # three so an assigned number can't collide with any of them.
+    reserved = (set(cloud_report_nums) | set(local_report_nums)
+                | {r.get("report_num") for r in local_rows if r.get("report_num")})
+    next_rep = max(_ints(reserved), default=0)
+
+    renames: list[tuple[str, str]] = []
+    new_lines: list[str] = []
+    for row in local_only:
+        next_num += 1
+        cells = [row.get(c, "") for c in _COLUMNS]
+        cells[_COLUMNS.index("num")] = str(next_num)
+
+        old_rep = row.get("report_num", "")
+        if old_rep and old_rep in cloud_report_nums:
+            next_rep += 1
+            new_rep = str(next_rep)
+            renames.append((old_rep, new_rep))
+            cells[_REPORT_COL_IDX] = _renumber_report_cell(cells[_REPORT_COL_IDX], old_rep, new_rep)
+        new_lines.append("| " + " | ".join(cells) + " |")
+
+    return _append_rows(cloud_md, new_lines), renames
+
+
+def _renumber_report_cell(cell: str, old: str, new: str) -> str:
+    """Rewrite a `[old](reports/old-slug.md)` Report cell to use `new`, in both
+    the link text and the filename prefix."""
+    def repl(m: re.Match) -> str:
+        text, path = m.group(1).strip(), m.group(2).strip()
+        if text == old:
+            text = new
+        path = re.sub(rf"(^|/){re.escape(old)}-", rf"\g<1>{new}-", path)
+        return f"[{text}]({path})"
+    return _REPORT_LINK_RE.sub(repl, cell)
+
+
+def _append_rows(md: str, new_lines: list[str]) -> str:
+    """Insert table-row lines right after the last existing table row, so they
+    land inside the markdown table rather than after any trailing prose."""
+    lines = md.splitlines()
+    last = -1
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("|") and not _SEPARATOR_RE.match(s):
+            last = i
+    if last == -1:  # no table found — just append
+        return md.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
+    lines[last + 1:last + 1] = new_lines
+    return "\n".join(lines) + ("\n" if md.endswith("\n") else "")
+
+
+_REPORT_FILE_RE = re.compile(r"^(\d+)(?:-.*)?\.md$")
+
+
+def _report_numbers(reports_dir: Path) -> set[str]:
+    """Leading report numbers of `NNN-slug.md` / `NNN.md` files in a reports dir."""
+    if not reports_dir.is_dir():
+        return set()
+    nums = set()
+    for f in reports_dir.glob("*.md"):
+        m = _REPORT_FILE_RE.match(f.name)
+        if m:
+            nums.add(m.group(1))
+    return nums
+
+
+def sync_pulled_tracker(artifact_dir: Path, local_dir: Path) -> dict:
+    """Merge a downloaded pipeline artifact into the durable local career-ops.
+
+    The offline-first core: makes local always hold the latest cloud tracker
+    while preserving local-only rows (offline `Run local` results). Steps, in
+    order — the order matters so a report-number collision can't clobber a
+    local-only report:
+      1. reconcile applications.md (cloud wins shared; keep + renumber local-only)
+      2. rename the colliding local-only report files BEFORE copying cloud in
+      3. copy cloud reports/ into local (cloud canonical for shared numbers)
+      4. copy cloud pipeline.md into local
+      5. write the merged applications.md
+
+    Only writes to local on success; the caller skips this entirely on a failed
+    download, so local is never wiped when offline."""
+    cloud_apps = artifact_dir / "data" / "applications.md"
+    local_apps = local_dir / "data" / "applications.md"
+    cloud_md = cloud_apps.read_text(encoding="utf-8") if cloud_apps.exists() else ""
+    local_md = local_apps.read_text(encoding="utf-8") if local_apps.exists() else ""
+
+    # A reports-only / malformed artifact (no usable cloud tracker) must NOT be
+    # treated as "cloud has zero rows" — merging would renumber every local row
+    # and write a header-less file over the durable tracker. Leave local intact.
+    if not cloud_md.strip():
+        return {"renames": [], "rows": len(parse_applications_text(local_md)),
+                "skipped": "no-cloud-tracker"}
+
+    cloud_reports = artifact_dir / "reports"
+    local_reports = local_dir / "reports"
+    merged, renames = reconcile_trackers(
+        cloud_md, local_md,
+        _report_numbers(cloud_reports), _report_numbers(local_reports))
+
+    for old, new in renames:
+        _rename_report_file(local_reports, old, new)
+    if cloud_reports.is_dir():
+        local_reports.mkdir(parents=True, exist_ok=True)
+        for f in cloud_reports.glob("*.md"):
+            shutil.copy2(f, local_reports / f.name)
+
+    cloud_pipeline = artifact_dir / "data" / "pipeline.md"
+    local_apps.parent.mkdir(parents=True, exist_ok=True)
+    if cloud_pipeline.exists():
+        shutil.copy2(cloud_pipeline, local_dir / "data" / "pipeline.md")
+
+    atomic_write_text(local_apps, merged)
+    return {"renames": renames, "rows": len(parse_applications_text(merged))}
+
+
+def _rename_report_file(reports_dir: Path, old: str, new: str) -> None:
+    """Rename `old-slug.md` (or `old.md`) to use the `new` number prefix,
+    preserving the slug. No-op if the source file isn't present."""
+    if not reports_dir.is_dir():
+        return
+    for f in reports_dir.glob(f"{old}-*.md"):
+        f.rename(reports_dir / f"{new}-{f.name[len(old) + 1:]}")
+    plain = reports_dir / f"{old}.md"
+    if plain.exists():
+        plain.rename(reports_dir / f"{new}.md")
 
 
 def parse_tracker_additions(tracker_dir: Path) -> list[dict]:

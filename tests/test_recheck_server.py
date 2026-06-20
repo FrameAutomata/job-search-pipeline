@@ -41,7 +41,6 @@ def server_mod(tmp_path, monkeypatch):
     monkeypatch.setenv("CAREER_OPS_PATH", str(co))
     from pipeline.app import server
     importlib.reload(server)
-    server._active_data_dir = None
     # Default: no local run in progress (each test can override).
     monkeypatch.setattr(server.local_run, "is_running", lambda: False)
     return server

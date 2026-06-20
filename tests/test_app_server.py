@@ -40,7 +40,6 @@ def client(tmp_path, monkeypatch):
     # autouse conftest fixture via data.STATUS_OVERRIDES_FILE.)
     server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
     server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
-    server._active_data_dir = None
     return TestClient(server.app)
 
 
@@ -123,15 +122,12 @@ def test_refresh_downloads_and_repoints(client, tmp_path, mocker):
     mocker.patch.object(server.gh, "latest_successful_run",
                         return_value={"databaseId": 7, "createdAt": "t", "displayTitle": "Daily"})
     mocker.patch.object(server.gh, "download_artifact", return_value=art)
-    try:
-        r = client.post("/api/refresh")
-        assert r.status_code == 200
-        assert r.json()["run_id"] == 7
-        # After refresh, /api/jobs reads the downloaded dir, not the env one.
-        jobs = client.get("/api/jobs").json()
-        assert jobs["rows"][0]["company"] == "Refreshed Co"
-    finally:
-        server._active_data_dir = None  # reset module state for other tests
+    r = client.post("/api/refresh")
+    assert r.status_code == 200
+    assert r.json()["run_id"] == 7
+    # Refresh merges the artifact INTO local; /api/jobs (always local) shows it.
+    jobs = client.get("/api/jobs").json()
+    assert any(row["company"] == "Refreshed Co" for row in jobs["rows"])
 
 
 def test_set_status_records_override(client):
@@ -150,6 +146,20 @@ def test_set_status_rejects_unknown(client):
     r = client.post("/api/status", json={"num": "1", "status": "Bogus"})
     assert r.status_code == 400
     assert "Unknown status" in r.json()["detail"]
+
+
+def test_refresh_offline_keeps_local_intact(client, mocker):
+    # No credits / gh error: Refresh must not wipe or alter the local tracker —
+    # the user keeps working against the last-synced data.
+    from pipeline.app import server
+    local_apps = server._career_ops_local() / "data" / "applications.md"
+    before = local_apps.read_text(encoding="utf-8")
+    mocker.patch.object(server.gh, "latest_successful_run",
+                        side_effect=server.gh.GhError("billing limit reached"))
+    r = client.post("/api/refresh")
+    assert r.status_code == 502
+    assert "last-synced" in r.json()["detail"]
+    assert local_apps.read_text(encoding="utf-8") == before
 
 
 def test_push_status_400_when_nothing_pending(client):
@@ -262,6 +272,8 @@ def test_push_status_surfaces_gh_error(client, mocker):
     r = client.post("/api/push-status")
     assert r.status_code == 502
     assert "edit-tracker" in r.json()["detail"]
+    # The edit stays pending so it can be re-pushed once credits return.
+    assert client.get("/api/jobs").json()["pending"] == 1
 
 
 def _fresh_base_with_acme(tmp_path):

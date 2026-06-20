@@ -1,7 +1,6 @@
 """Tests for the local pipeline run endpoints (pipeline/app/local_run.py +
 server routes). The orchestrate subprocess is faked — these cover option→flag
-mapping, single-flight, stage parsing from the log, cancel, and the
-use-local data-source switch."""
+mapping, single-flight, stage parsing from the log, and cancel."""
 
 import importlib
 
@@ -51,7 +50,6 @@ def client(tmp_path, monkeypatch):
     )
     from pipeline.app import server
     importlib.reload(server)
-    server._active_data_dir = None
     return TestClient(server.app)
 
 
@@ -187,16 +185,6 @@ class TestRunLocalEndpoints:
     def test_status_without_any_run(self, client, fake_popen):
         s = client.get("/api/run-local/status").json()
         assert s["running"] is False and s["exit_code"] is None and s["ok"] is None
-
-
-class TestUseLocal:
-    def test_resets_active_data_dir(self, client, tmp_path):
-        from pipeline.app import server
-        server._active_data_dir = tmp_path / "artifact"
-        r = client.post("/api/use-local")
-        assert r.status_code == 200
-        assert server._active_data_dir is None
-        assert r.json()["ok"] is True
 
 
 class TestOrphanGuard:

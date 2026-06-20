@@ -432,7 +432,7 @@ async function pollLocalRun() {
   if (s.exit_code === null) return;        // never started this session
   if (s.ok) {
     try {
-      await postAction("/api/use-local");  // show the fresh local results
+      // The UI always reads the local career-ops, so the fresh run shows on reload.
       await loadJobs();
       showAction("Local pipeline run finished — showing local results.", "ok");
     } catch (e) {

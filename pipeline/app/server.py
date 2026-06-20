@@ -54,19 +54,10 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env", override=False)
 
-# Where `gh run download` drops artifacts. Gitignored. When a Refresh has
-# populated this, the data layer reads from here; otherwise it falls back to
-# CAREER_OPS_PATH (a local run, or a manually-passed --data dir).
+# Scratch dir where `gh run download` drops artifacts before Refresh merges them
+# into the local career-ops. Gitignored. The data layer ALWAYS reads from the
+# local install (offline-first); Refresh/Push just keep it synced with the cloud.
 UI_CACHE = ROOT / ".ui-cache" / "latest"
-
-# Set by /api/refresh to the artifact subdir gh extracted, so subsequent reads
-# use freshly-downloaded data without restarting the server. Guarded by a lock
-# because push_status mutates it across a multi-second gh download while
-# /api/use-local (auto-fired when a local run finishes) can null it — an
-# unsynchronized interleave could make push write cloud data over the LOCAL
-# tracker.
-_active_data_dir: Path | None = None
-_data_dir_lock = threading.Lock()
 
 # Background add-job tasks: job_id → {status, result?, error?}
 _add_job_tasks: dict[str, dict] = {}
@@ -145,9 +136,10 @@ def _career_ops_local() -> Path:
 
 
 def _career_ops() -> Path:
-    """Resolve the data directory for reads (jobs, reports). A successful
-    Refresh wins; otherwise the local install."""
-    return _active_data_dir if _active_data_dir is not None else _career_ops_local()
+    """The data directory for reads (jobs, reports) — always the local install.
+    Refresh merges the cloud artifact INTO local (offline-first), so there's a
+    single durable source of truth that survives restarts and offline periods."""
+    return _career_ops_local()
 
 
 def _refuse_during_local_run() -> None:
@@ -279,71 +271,51 @@ def push_status() -> JSONResponse:
     """Push pending status changes to the cloud tracker via the edit-tracker
     workflow.
 
-    Guard against clobbering cloud-added rows: we first pull a FRESH base
-    (download the latest pipeline artifact's applications.md), apply the
-    pending status overrides onto *that*, and push the merged result. So rows
-    the pipeline added since the last refresh are preserved, and the user's
-    status edits win on the rows they touched. Falls back to the local
-    applications.md only if the refresh can't be done (no runs / gh error)."""
+    Clobber guard: we first pull the latest pipeline artifact and MERGE it into
+    the local tracker (so rows the pipeline added since the last Refresh are
+    present), then apply the pending status overrides onto the local base and
+    dispatch the resolved {num: status} to edit-tracker. Offline (no runs / gh
+    error) → push against the last-synced local tracker."""
     overrides = _load_overrides()
     if not overrides:
         raise HTTPException(status_code=400, detail="No pending status changes to push.")
 
-    global _active_data_dir
-    base_text = None
-    base_source = "local"
-    target_apps: Path | None = None   # the exact file base_text came from
+    local_apps = _career_ops_local() / "data" / "applications.md"
 
-    # Try to refresh a fresh base first (the clobber guard).
+    # Clobber guard: pull the latest cloud artifact and MERGE it into local
+    # first, so rows the pipeline added since the last Refresh are present and
+    # overrides resolve against current cloud numbers. Offline (no runs / gh
+    # error) → push against the last-synced local tracker, untouched.
+    base_source = "local"
     try:
         run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
         if run is not None:
             if UI_CACHE.exists():
                 shutil.rmtree(UI_CACHE)
-            data_dir = gh.download_artifact(run["databaseId"], UI_CACHE)
-            with _data_dir_lock:
-                _active_data_dir = data_dir
-            apps = data_dir / "data" / "applications.md"
-            if apps.exists():
-                base_text = apps.read_text(encoding="utf-8")
-                base_source = "refreshed"
-                target_apps = apps
+            artifact = gh.download_artifact(run["databaseId"], UI_CACHE)
+            data.sync_pulled_tracker(artifact, _career_ops_local())
+            base_source = "refreshed"
     except gh.GhError:
-        pass  # fall through to local base
+        pass  # offline — push against the last-synced local tracker
 
-    if base_text is None:
-        # Write back to the LOCAL install — never via _career_ops(), whose
-        # _active_data_dir can flip to a cloud artifact mid-request (the
-        # use-local auto-fire) and turn this persist into cloud-over-local
-        # data loss. Capturing target_apps == the file we read pins the write.
-        apps = _career_ops_local() / "data" / "applications.md"
-        if not apps.exists():
-            raise HTTPException(
-                status_code=409,
-                detail="No applications.md to update (run the pipeline so the tracker exists).",
-            )
-        base_text = apps.read_text(encoding="utf-8")
-        target_apps = apps
+    if not local_apps.exists():
+        raise HTTPException(
+            status_code=409,
+            detail="No applications.md to update (run the pipeline so the tracker exists).",
+        )
+    base_text = local_apps.read_text(encoding="utf-8")
 
-    # Apply the overrides onto the base, resolving each identity-anchored
-    # override to the correct num IN THIS base. An identity override that
-    # doesn't resolve here (its company isn't in this tracker yet) is returned
-    # in `unresolved` — NOT applied and NOT dispatched, so we never mark a
-    # different company that merely shares the num. The cloud payload is always
-    # {num: status} (what edit-tracker.yml consumes).
-    # Persist the merged tracker ONLY to the durable local tracker. A downloaded
-    # artifact copy is transient (re-downloaded on every Refresh), and editing it
-    # makes the pushed-override bridge self-clean against a copy push itself
-    # changed — so the status would appear to vanish on the next Refresh. For the
-    # refreshed case the pushed-override overlay shows the change in the UI and
-    # persists it until a genuinely fresh pipeline run incorporates it (which is
-    # when the self-clean SHOULD fire). The cloud write goes via edit-tracker below.
-    persist_local = base_source == "local"
-    base_text, cloud_payload, unresolved = data.resolve_overrides_for_push(
-        base_text, overrides, build_text=persist_local)
-    if persist_local:
-        target_apps.parent.mkdir(parents=True, exist_ok=True)
-        target_apps.write_text(base_text, encoding="utf-8")
+    # Resolve each identity-anchored override to the correct num IN THIS base. An
+    # override whose company isn't in the tracker is returned in `unresolved` —
+    # NOT applied and NOT dispatched, so we never mark a different company that
+    # merely shares the num. cloud_payload is {num: status} (edit-tracker.yml's
+    # input). We do NOT write the status into applications.md: that file is the
+    # last-synced CLOUD mirror, and the pending edit lives in the pushed-override
+    # overlay (below) until a real cloud run incorporates it — only then does the
+    # self-clean in list_jobs fire. Writing it here would self-clean immediately
+    # and then vanish when Refresh's cloud-wins reverts the row.
+    _, cloud_payload, unresolved = data.resolve_overrides_for_push(
+        base_text, overrides, build_text=False)
 
     # An unresolved DISCARD override targets a closed role that isn't in the cloud
     # tracker: it's already applied locally, a closed role won't reappear to match
@@ -392,44 +364,43 @@ def get_report(report_num: str) -> HTMLResponse:
 
 @app.get("/api/health")
 def health() -> dict:
-    """Basic readiness probe — confirms where the UI is reading data from and
-    whether the tracker exists yet."""
+    """Basic readiness probe — confirms where the UI reads data from (always the
+    local install now) and whether the tracker exists yet."""
     apps_md = _career_ops() / "data" / "applications.md"
     return {
         "status": "ok",
         "career_ops": str(_career_ops()),
         "applications_md_exists": apps_md.exists(),
-        "refreshed": _active_data_dir is not None,
     }
 
 
 @app.post("/api/refresh")
 def refresh() -> JSONResponse:
-    """Download the most recent successful pipeline artifact (daily or
-    easy-apply, whichever ran later) via gh and point the data layer at it, so
-    the user can pull fresh cloud results without leaving the UI. Returns the
-    run that was downloaded."""
-    global _active_data_dir
+    """Pull the most recent successful pipeline artifact and MERGE it into the
+    local career-ops (offline-first): cloud wins for shared roles, local-only
+    rows (offline `Run local` results) are preserved. The merged tracker lives
+    durably in local, so it survives restarts and offline periods. Only writes
+    to local on a successful download — a gh/credits error leaves local intact."""
     try:
         run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
         if run is None:
             raise HTTPException(status_code=404, detail="No successful pipeline runs found yet.")
-        # Clear any prior download so stale files can't linger.
+        # Fresh scratch dir for the download, then merge it into local.
         if UI_CACHE.exists():
-            import shutil
             shutil.rmtree(UI_CACHE)
-        data_dir = gh.download_artifact(run["databaseId"], UI_CACHE)
-        with _data_dir_lock:
-            _active_data_dir = data_dir
+        artifact = gh.download_artifact(run["databaseId"], UI_CACHE)
+        summary = data.sync_pulled_tracker(artifact, _career_ops_local())
         return JSONResponse({
             "ok": True,
             "run_id": run["databaseId"],
             "created_at": run.get("createdAt"),
             "title": run.get("displayTitle"),
-            "data_dir": str(data_dir),
+            "rows": summary["rows"],
+            "renamed_reports": len(summary["renames"]),
         })
     except gh.GhError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        # Offline / no credits: keep the last-synced local tracker untouched.
+        raise HTTPException(status_code=502, detail=f"{e} — showing last-synced local data.")
 
 
 @app.post("/api/run")
@@ -454,7 +425,7 @@ class LocalRunRequest(BaseModel):
 def run_local(req: LocalRunRequest) -> JSONResponse:
     """Start a local pipeline run (orchestrate.py subprocess). Single-flight:
     409 when one is already running. Poll /api/run-local/status for progress;
-    on success the UI switches to the local tracker via /api/use-local."""
+    on success the fresh local results show on the next loadJobs()."""
     if req.passes not in local_run.VALID_PASSES:
         raise HTTPException(status_code=400, detail=f"unknown passes value: {req.passes}")
     # A pipeline run rewrites the tracker wholesale; a recheck sweep edits it
@@ -483,17 +454,6 @@ def run_local_status() -> JSONResponse:
 @app.post("/api/run-local/cancel")
 def run_local_cancel() -> JSONResponse:
     return JSONResponse(local_run.cancel())
-
-
-@app.post("/api/use-local")
-def use_local() -> JSONResponse:
-    """Point the data layer back at the LOCAL career-ops (the default source).
-    Used after a local pipeline run so its fresh results are what the UI
-    shows, instead of a previously downloaded cloud artifact."""
-    global _active_data_dir
-    with _data_dir_lock:
-        _active_data_dir = None
-    return JSONResponse({"ok": True, "career_ops": str(_career_ops_local())})
 
 
 # ── tracker liveness re-check ───────────────────────────────────────────────
@@ -1152,23 +1112,8 @@ def _run_add_job(job_id: str, url: str, company: str, role: str) -> None:
         tracker_dir.mkdir(parents=True, exist_ok=True)
         result = write_job_result(response_text, job_meta, reports_dir, tracker_dir, today)
         run_merge_tracker(co)
-
-        # If the UI is currently showing a cloud-artifact directory (_active_data_dir),
-        # list_jobs reads from there instead of the local career-ops path. Copy the
-        # updated applications.md and the new report into that directory so the
-        # next loadJobs() call sees the newly added entry.
-        if _active_data_dir is not None:
-            local_apps = co / "data" / "applications.md"
-            cache_apps = _active_data_dir / "data" / "applications.md"
-            if local_apps.exists():
-                cache_apps.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(local_apps, cache_apps)
-            if result.get("report_file"):
-                cache_reports = _active_data_dir / "reports"
-                cache_reports.mkdir(parents=True, exist_ok=True)
-                local_report = reports_dir / result["report_file"]
-                if local_report.exists():
-                    shutil.copy2(local_report, cache_reports / result["report_file"])
+        # list_jobs reads the local career-ops directly (offline-first), so the
+        # newly written tracker row + report are visible on the next loadJobs().
 
         with _add_job_lock:
             _add_job_tasks[job_id] = {
@@ -1310,7 +1255,7 @@ def _run_apply_review(job_id: str) -> None:
     drafted answers, then block until the user submits/cancels (or the hold times
     out). Submit clicks Submit and marks the row Applied; a closed posting marks
     it Discarded. The tracker path + local career-ops are captured at session
-    start, so a mid-hold use-local/refresh flip can't misdirect the write."""
+    start, so a mid-hold Refresh rewriting the tracker can't misdirect the write."""
     task = _apply_tasks[job_id]
     job = task["job"]
     applications_md = task["applications_md"]
@@ -1410,7 +1355,7 @@ def apply_async(req: ApplyAsyncRequest) -> JSONResponse:
             "role": job.role, "answers": [], "needs_review": [], "code": None,
             "reason": None, "job": job, "event": threading.Event(), "decision": None,
             # Pin the tracker + local career-ops at session start so a mid-hold
-            # use-local/refresh flip can't redirect the Applied/Discarded write.
+            # Refresh rewriting the tracker can't redirect the Applied/Discarded write.
             "applications_md": _career_ops() / "data" / "applications.md",
             "co_local": _career_ops_local(),
         }
