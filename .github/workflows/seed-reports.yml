@@ -88,17 +88,12 @@ jobs:
           before=$(find career-ops/reports -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
           echo "starting report count: $before"
 
-          # Collect successful run IDs from both pipeline workflows. gh's
-          # --workflow flag isn't repeatable, so loop. We pull up to 100 per
-          # workflow which comfortably covers the artifact retention window
-          # (90 days × 6+ runs/day = ~540 — most older runs will have expired
-          # artifacts anyway; gh run download silently skips those).
-          : > runs.txt
-          for wf in daily-pipeline.yml easy-apply-pipeline.yml; do
-            gh run list --workflow "$wf" --status success --limit 100 \
-              --json databaseId --jq '.[].databaseId' >> runs.txt || true
-          done
-          sort -u runs.txt -o runs.txt
+          # Collect successful run IDs from the daily pipeline (the only
+          # workflow that produces artifacts). 100 runs comfortably covers the
+          # 90-day artifact retention window; gh run download silently skips
+          # runs whose artifacts have expired.
+          gh run list --workflow daily-pipeline.yml --status success --limit 100 \
+            --json databaseId --jq '.[].databaseId' > runs.txt || true
           echo "candidate runs: $(wc -l < runs.txt)"
 
           mkdir -p artifacts

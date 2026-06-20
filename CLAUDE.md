@@ -184,12 +184,11 @@ Set in `.env` or as repository secrets for GitHub Actions. `BATCH_PROVIDER` over
 
 > **Privacy first**: every cloud workflow refuses to run unless your fork is private. The Actions tab of a public repo exposes workflow run history, schedule cadence, and durations — all of which reveal active job searching. See the privacy notice at the top of [README.md](README.md).
 
-Three workflows make up the cloud automation:
+Two workflows make up the cloud automation:
 
 | Workflow | Schedule | What it does |
 |----------|----------|--------------|
-| `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs every pass without `easy_apply: true` via `--no-easy-apply`. Scrape → filter → screen → bridge → evaluate. |
-| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC **and** right after a successful `daily-pipeline` run (`workflow_run` chain) | Runs every pass with `easy_apply: true` via `--easy-apply-only`. These listings churn fast — re-scrape often and rely on screen-stage dedup so only new+live postings get evaluated. No-ops cleanly if no easy-apply passes are configured. |
+| `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs **every** search pass (including any `easy_apply: true` pass) once a day — no pass-selection flag. Scrape → filter → screen → bridge → evaluate. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a user-supplied base64 blob. Use after editing the tracker locally. |
 
 **Storage model — no user data is ever committed:**
@@ -198,7 +197,7 @@ Three workflows make up the cloud automation:
 - **Runtime state** (scan-history, applications.md, pipeline.md, recheck-state, batch state, cached JDs) → **`actions/cache@v4`** keyed `pipeline-state-v1`. Per-fork, restored at workflow start, saved at workflow end. Invisible to anyone but the fork owner.
 - **Outputs** (reports, tracker snapshot) → **`actions/upload-artifact@v4`**. Downloadable from the Actions tab for 90 days.
 
-**Pass selection flags** (mutually exclusive): `--only-pass "name1,name2"` (case-insensitive name match, errors on no match), `--easy-apply-only` (passes with `easy_apply: true`, no-ops if none), `--no-easy-apply` (passes without `easy_apply: true`). The cloud workflows route by `easy_apply` field rather than name so user-renamed passes still work.
+**Pass selection flags** (mutually exclusive, for manual/local runs): `--only-pass "name1,name2"` (case-insensitive name match, errors on no match), `--easy-apply-only` (passes with `easy_apply: true`, no-ops if none), `--no-easy-apply` (passes without `easy_apply: true`). The daily cloud workflow runs **every** pass with no selection flag; these flags exist for ad-hoc local runs and route by the `easy_apply` field rather than name so user-renamed passes still work.
 
 **Setup** (one-time):
 
