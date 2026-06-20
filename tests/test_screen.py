@@ -169,6 +169,41 @@ class TestRunScreen:
         result = run(cfg)
         assert result == 0
 
+    def test_records_easy_apply_urls_before_dedup(self, tmp_path, monkeypatch, career_ops_dir):
+        # A SmartApply role already in scan-history is dropped by the pre-screen
+        # dedup, but its easy_apply flag must still be recorded so the UI can
+        # gate its apply button — the recording must happen before the drop.
+        from pipeline.bridge import load_easy_apply_urls
+
+        cfg = tmp_path / "search.yml"
+        self._write_config(cfg, liveness=True)
+        (career_ops_dir / "data" / "scan-history.tsv").write_text(
+            "url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n"
+            "https://www.indeed.com/viewjob?jk=seen\t2026-01-01\tjobspy\teng\tacme\tadded\n",
+            encoding="utf-8",
+        )
+        filtered = tmp_path / "filtered_jobs.csv"
+        with open(filtered, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(
+                f, fieldnames=["title", "company", "job_url", "relevance_score", "easy_apply"]
+            )
+            w.writeheader()
+            w.writerow({"title": "Eng", "company": "Acme",
+                        "job_url": "https://www.indeed.com/viewjob?jk=seen",
+                        "relevance_score": 8, "easy_apply": "True"})
+            w.writerow({"title": "Dev", "company": "Globex",
+                        "job_url": "https://www.indeed.com/viewjob?jk=new",
+                        "relevance_score": 7, "easy_apply": "False"})
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        monkeypatch.setattr(screen_mod, "fetch_and_classify",
+                            lambda url, timeout=8: ("active", "apply control visible", ""))
+
+        run(cfg, career_ops_dir)
+
+        urls = load_easy_apply_urls(career_ops_dir)
+        assert "https://www.indeed.com/viewjob?jk=seen" in urls   # recorded despite dedup
+        assert "https://www.indeed.com/viewjob?jk=new" not in urls  # easy_apply False
+
     def test_drops_expired_keeps_active(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
         self._write_config(cfg, liveness=True)

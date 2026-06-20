@@ -176,6 +176,12 @@ def append_to_scan_history(
             f.write(f"{e['url']}\t{today}\tjobspy\t{e['title']}\t{e['company']}\t{status}\n")
 
 
+def is_easy_apply_row(row) -> bool:
+    """True if a filtered_jobs.csv row came from an easy_apply pass. pandas wrote
+    the bool column as the string "True"; shared by the screen and bridge stages."""
+    return (row.get("easy_apply") or "").strip().lower() == "true"
+
+
 def load_easy_apply_urls(career_ops: Path) -> set[str]:
     """The set of easy-apply URLs recorded so far (empty if none yet)."""
     return read_url_set(career_ops / EASY_APPLY_URLS)
@@ -219,8 +225,9 @@ def run(career_ops_path: Path) -> list[dict]:
             company = (row.get("company") or "").strip()
             # Record easy-apply URLs from the full file — independent of the
             # tracker-dedup below — so a listing already in scan-history still
-            # gets its SmartApply flag persisted for the UI.
-            if url and (row.get("easy_apply") or "").strip().lower() == "true":
+            # gets its SmartApply flag persisted for the UI. (Screen also
+            # records these pre-dedup; this covers a --skip-screen run.)
+            if url and is_easy_apply_row(row):
                 easy_apply_urls.append(url)
             if not url or not title or not company:
                 continue
