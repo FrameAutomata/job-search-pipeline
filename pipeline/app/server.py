@@ -89,13 +89,12 @@ _APPLY_TASK_CAP = 50
 
 # Cloud workflow filenames (must match .github/workflows/*.yml).
 DAILY_WORKFLOW = "daily-pipeline.yml"
-EASY_APPLY_WORKFLOW = "easy-apply-pipeline.yml"
 EDIT_WORKFLOW = "edit-tracker.yml"
 
-# Both pipelines upload the same `pipeline-output-*` artifact. Refresh/push pull
-# whichever ran (successfully) most recently — the easy-apply pipeline fires
-# several times a day, so it's frequently newer than the daily one.
-PIPELINE_WORKFLOWS = [DAILY_WORKFLOW, EASY_APPLY_WORKFLOW]
+# The daily pipeline uploads the `pipeline-output-*` artifact. Refresh/push pull
+# its most recent successful run. (Kept as a list — latest_successful_run takes
+# several — in case more artifact-producing workflows are added later.)
+PIPELINE_WORKFLOWS = [DAILY_WORKFLOW]
 
 # Pending status changes the user hasn't pushed yet. Written by kanban drags
 # here AND by the apply stage when it auto-submits — one channel, owned by

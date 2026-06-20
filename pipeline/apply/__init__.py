@@ -27,9 +27,9 @@ from pipeline.apply.result import ApplyResult, EXPIRED, failed
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 _VALID_MODES = ("review", "dry-run", "auto")
-# The workflows whose artifact carries the latest applications.md (mirror of
-# server.py's list — both pipelines upload the same pipeline-output-* artifact).
-_PIPELINE_WORKFLOWS = ["daily-pipeline.yml", "easy-apply-pipeline.yml"]
+# The workflow whose artifact carries the latest applications.md (mirror of
+# server.py's list — the daily pipeline uploads the pipeline-output-* artifact).
+_PIPELINE_WORKFLOWS = ["daily-pipeline.yml"]
 
 
 def run(

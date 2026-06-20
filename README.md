@@ -78,7 +78,7 @@ First generate the profile artifacts locally with `node setup-profile.mjs`. That
 #### Then, either way
 
 1. **Actions tab → "I understand my workflows, go ahead and enable them".**
-2. **Actions → Daily Job Pipeline → Run workflow** to do a test run before the scheduled cron fires. (A successful daily run also kicks off an easy-apply run immediately after, if you configured an easy-apply pass.)
+2. **Actions → Daily Job Pipeline → Run workflow** to do a test run before the scheduled cron fires. It runs every configured search pass (including any easy-apply pass) in one go.
 3. **Read results**: Actions tab → open the run → download the `pipeline-output-*` artifact, or use the local UI's **↻ Refresh** button to pull it without leaving the browser.
 
 ### Pulling updates from the template later
@@ -188,10 +188,10 @@ When `liveness: false` the screen stage is a no-op (no dedup, no fetches, no bac
 Three flags (mutually exclusive) select a subset of the `searches:` in your config:
 
 - `--only-pass "name1,name2"` — explicit case-insensitive match on the `name:` field. Errors loudly on no match (typo protection).
-- `--easy-apply-only` — only passes with `easy_apply: true`. No-ops cleanly if none configured (used by `easy-apply-pipeline.yml`).
-- `--no-easy-apply` — only passes without `easy_apply: true` (used by `daily-pipeline.yml`).
+- `--easy-apply-only` — only passes with `easy_apply: true`. No-ops cleanly if none configured.
+- `--no-easy-apply` — only passes without `easy_apply: true`.
 
-The cloud workflows use the `--easy-apply-only` / `--no-easy-apply` pair, not name matching, so your pass `name:` values can be anything you like — the workflows route by the `easy_apply` JobSpy field instead.
+These flags are for ad-hoc local runs; the daily cloud workflow runs **every** pass once a day with no selection flag. Pass `name:` values can be anything you like — when you do use selection, it routes by the `easy_apply` JobSpy field, not the name.
 
 ## Skipping steps
 
@@ -230,7 +230,7 @@ Then open http://localhost:8000.
 Point it at either your local `career-ops/` directory (if you run the pipeline locally) or a GitHub Actions artifact you've downloaded and extracted (the artifact has the same `reports/` + `data/applications.md` layout).
 
 **Cloud buttons** (require the [`gh` CLI](https://cli.github.com) installed + `gh auth login`):
-- **↻ Refresh** — downloads the most recent *successful* pipeline artifact (daily **or** easy-apply, whichever ran later) via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
+- **↻ Refresh** — downloads the most recent *successful* `daily-pipeline` artifact via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
 - **▶ Run now** — triggers a `daily-pipeline` run in the cloud (`gh workflow run`). It executes on GitHub; click Refresh once it finishes.
 - **⇧ Push N changes** — appears once you've made status edits on the board. Pushes them to the cloud tracker via the `edit-tracker` workflow. It first refreshes the latest tracker and applies your changes on top, so roles the pipeline added since your last refresh aren't clobbered.
 - **⚙ Setup** — opens the guided onboarding wizard (see below).

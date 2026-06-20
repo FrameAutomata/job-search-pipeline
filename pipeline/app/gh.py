@@ -201,13 +201,13 @@ def latest_run(workflow: str) -> dict | None:
 
 
 def latest_successful_run(workflows: list[str], per_workflow: int = 10) -> dict | None:
-    """Most recently-created *successful* run across several workflow files.
+    """Most recently-created *successful* run across the given workflow files.
 
-    The UI should load whichever pipeline produced fresh output last — the
-    easy-apply pipeline runs several times a day, so it's often newer than the
-    daily one. We require conclusion=success (and look back a few runs per
-    workflow) so a failed or in-progress tick never gets chosen — that run has
-    no downloadable artifact. Returns the run dict, or None if none succeeded."""
+    The UI should load whichever pipeline produced fresh output last. We require
+    conclusion=success (and look back a few runs per workflow) so a failed or
+    in-progress tick never gets chosen — that run has no downloadable artifact.
+    Returns the run dict, or None if none succeeded. (Takes a list so callers can
+    span multiple artifact-producing workflows; today that's just the daily one.)"""
     best = None
     for wf in workflows:
         out = _run([

@@ -251,21 +251,21 @@ class TestLatestSuccessfulRun:
             "daily-pipeline.yml": [
                 {"databaseId": 1, "status": "completed", "conclusion": "success",
                  "createdAt": "2026-05-27T00:00:00Z", "displayTitle": "Daily"}],
-            "easy-apply-pipeline.yml": [
+            "other-pipeline.yml": [
                 {"databaseId": 2, "status": "completed", "conclusion": "success",
-                 "createdAt": "2026-05-27T06:00:00Z", "displayTitle": "Easy Apply"}],
+                 "createdAt": "2026-05-27T06:00:00Z", "displayTitle": "Other"}],
         }
         mocker.patch("pipeline.app.gh.subprocess.run",
                      side_effect=self._per_workflow(mapping))
-        r = gh.latest_successful_run(["daily-pipeline.yml", "easy-apply-pipeline.yml"])
-        assert r["databaseId"] == 2  # easy-apply ran later
+        r = gh.latest_successful_run(["daily-pipeline.yml", "other-pipeline.yml"])
+        assert r["databaseId"] == 2  # other ran later
 
     def test_skips_failed_or_in_progress(self, mocker):
         mapping = {
             "daily-pipeline.yml": [
                 {"databaseId": 1, "status": "completed", "conclusion": "success",
                  "createdAt": "2026-05-27T00:00:00Z"}],
-            "easy-apply-pipeline.yml": [
+            "other-pipeline.yml": [
                 # newest is in-progress (no artifact); next is failed; then success.
                 {"databaseId": 4, "status": "in_progress", "conclusion": None,
                  "createdAt": "2026-05-27T08:00:00Z"},
@@ -276,8 +276,8 @@ class TestLatestSuccessfulRun:
         }
         mocker.patch("pipeline.app.gh.subprocess.run",
                      side_effect=self._per_workflow(mapping))
-        r = gh.latest_successful_run(["daily-pipeline.yml", "easy-apply-pipeline.yml"])
-        # easy-apply's only success (2) predates daily's success (1) -> daily wins.
+        r = gh.latest_successful_run(["daily-pipeline.yml", "other-pipeline.yml"])
+        # other's only success (2) predates daily's success (1) -> daily wins.
         assert r["databaseId"] == 1
 
     def test_returns_none_when_none_successful(self, mocker):

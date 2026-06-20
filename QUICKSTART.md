@@ -238,7 +238,7 @@ Three mutually-exclusive flags subset the `searches:` in your config:
 ./run.sh --evaluate-batch --no-easy-apply
 ```
 
-The cloud workflows use the `easy_apply` routing pair — `daily-pipeline.yml` runs everything except easy-apply, `easy-apply-pipeline.yml` runs just the easy-apply pass. This means your pass `name:` values can be anything; the workflows route by the JobSpy `easy_apply` field, not by name.
+These flags are for ad-hoc local runs. The daily cloud workflow runs **every** pass once a day with no selection flag, so your pass `name:` values can be anything.
 
 ---
 
@@ -259,12 +259,11 @@ The cloud workflows use the `easy_apply` routing pair — `daily-pipeline.yml` r
 
 ## Cloud automation (GitHub Actions)
 
-The repo ships three scheduled workflows + one manual workflow. **They refuse to run unless your fork is private.** See the README's [Using this template](README.md#using-this-template) section for setup.
+The repo ships one scheduled workflow + one manual workflow. **They refuse to run unless your fork is private.** See the README's [Using this template](README.md#using-this-template) section for setup.
 
 | Workflow | Schedule | What it does |
 |---|---|---|
-| `daily-pipeline.yml` | Noon UTC | Runs every pass without `easy_apply: true` via `--no-easy-apply`. |
-| `easy-apply-pipeline.yml` | Every 4 h at 02/06/10/14/18/22 UTC, **and** right after a successful `daily-pipeline` run | Runs every pass with `easy_apply: true` via `--easy-apply-only`. No-ops if none configured. |
+| `daily-pipeline.yml` | Noon UTC | Runs **every** search pass (including any `easy_apply: true` pass) once a day. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a base64 blob — for status edits without committing the file. |
 
 All runtime state (scan-history, applications.md, batch state) lives in `actions/cache@v4`. Reports and tracker snapshots are uploaded as `actions/upload-artifact@v4` (90-day retention). No user data is ever committed.
