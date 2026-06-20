@@ -162,6 +162,33 @@ def test_refresh_offline_keeps_local_intact(client, mocker):
     assert local_apps.read_text(encoding="utf-8") == before
 
 
+def test_template_status_reports_available(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.self_update, "update_available",
+                        return_value={"available": True, "template_sha": "abc123"})
+    r = client.get("/api/template/status")
+    assert r.status_code == 200
+    assert r.json() == {"available": True, "template_sha": "abc123"}
+
+
+def test_template_update_success(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.self_update, "apply_update",
+                        return_value={"ok": True, "updated": True})
+    r = client.post("/api/template/update")
+    assert r.status_code == 200
+    assert r.json()["updated"] is True
+
+
+def test_template_update_conflict_returns_409(client, mocker):
+    from pipeline.app import server
+    mocker.patch.object(server.self_update, "apply_update",
+                        return_value={"ok": False, "conflict": True, "error": "merge conflict"})
+    r = client.post("/api/template/update")
+    assert r.status_code == 409
+    assert "conflict" in r.json()["detail"].lower()
+
+
 def test_push_status_400_when_nothing_pending(client):
     r = client.post("/api/push-status")
     assert r.status_code == 400

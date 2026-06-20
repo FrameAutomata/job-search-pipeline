@@ -234,6 +234,7 @@ Point it at either your local `career-ops/` directory (if you run the pipeline l
 - **▶ Run now** — triggers a `daily-pipeline` run in the cloud (`gh workflow run`). It executes on GitHub; click Refresh once it finishes.
 - **⇧ Push N changes** — appears once you've made status edits on the board. Pushes them to the cloud tracker via the `edit-tracker` workflow. It first refreshes the latest tracker and applies your changes on top, so roles the pipeline added since your last refresh aren't clobbered.
 - **⚙ Setup** — opens the guided onboarding wizard (see below).
+- **⬆ Update available** — appears only when the maintainer's template has changes your copy doesn't have yet. Clicking merges the template's latest `main` into your local clone and pushes to your copy — updating both the local UI and the cloud copy in one step (restart `run-ui` afterward to load the new code). On a merge conflict it leaves your tree clean and tells you to resolve it manually. Cloud-only users can instead run the **Update from Template** workflow from the Actions tab.
 
 `gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override.
 

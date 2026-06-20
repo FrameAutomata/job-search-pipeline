@@ -373,6 +373,34 @@ runBtn.addEventListener("click", async () => {
   }
 });
 
+// Template self-update: reveal the button only when this copy is behind the
+// maintainer's template. The check is best-effort (silent on error / offline).
+const updateBtn = document.getElementById("update-btn");
+async function checkTemplateUpdate() {
+  try {
+    const r = await fetch("/api/template/status").then((x) => x.json());
+    updateBtn.hidden = !r.available;
+  } catch { /* offline or no gh — leave the button hidden */ }
+}
+
+updateBtn.addEventListener("click", async () => {
+  if (!confirm("Update this app to the latest template version? This merges the template into your local clone and pushes to your cloud copy.")) return;
+  updateBtn.disabled = true;
+  showAction("Updating from the template…", "");
+  try {
+    const r = await postAction("/api/template/update");
+    updateBtn.hidden = true;
+    showAction(r.updated
+      ? "Updated. Restart the UI (run-ui) to load the new code."
+      : "Already up to date.", "ok");
+  } catch (e) {
+    // 409 = merge conflict; the detail explains how to resolve it.
+    showAction(String(e.message || e), "error");
+  } finally {
+    updateBtn.disabled = false;
+  }
+});
+
 // ── local pipeline run ─────────────────────────────────────────────────────
 
 const localRun = {
@@ -941,6 +969,7 @@ async function decideApply(decision) {
 
 loadCaps();
 loadJobs();
+checkTemplateUpdate();
 
 // ── Add Job modal ────────────────────────────────────────────────────────────
 

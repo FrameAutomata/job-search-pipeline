@@ -184,12 +184,13 @@ Set in `.env` or as repository secrets for GitHub Actions. `BATCH_PROVIDER` over
 
 > **Privacy first**: every cloud workflow refuses to run unless your fork is private. The Actions tab of a public repo exposes workflow run history, schedule cadence, and durations — all of which reveal active job searching. See the privacy notice at the top of [README.md](README.md).
 
-Two workflows make up the cloud automation:
+Cloud automation workflows:
 
 | Workflow | Schedule | What it does |
 |----------|----------|--------------|
 | `daily-pipeline.yml` | Noon UTC (7 AM CDT) | Runs **every** search pass (including any `easy_apply: true` pass) once a day — no pass-selection flag. Scrape → filter → screen → bridge → evaluate. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a user-supplied base64 blob. Use after editing the tracker locally. |
+| `update-from-template.yml` | Manual (`workflow_dispatch`) | Merges the upstream template's latest `main` into this copy and pushes (copies have no fork link). Skips in the template repo itself; aborts on conflict. The UI's **⬆ Update** button does the same merge+push locally (also refreshing the clone running the UI); `pipeline/app/self_update.py` holds the logic. |
 
 **Storage model — no user data is ever committed:**
 
