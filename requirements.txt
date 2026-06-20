@@ -14,6 +14,11 @@ openai                             # OpenAI, Groq, DeepInfra, and Ollama (all Op
 # so it's never used in the cloud workflows. After installing, fetch the browser:
 #   pip install playwright && playwright install chromium
 # playwright
+# Indeed auto-apply additionally needs patchright — a stealth Playwright fork that
+# clears Indeed's Cloudflare challenge (plain Playwright/Chromium gets walled).
+# Drives the system Chrome (channel="chrome"), so no extra browser download.
+#   pip install patchright
+# patchright
 
 # Per-job tailored resumes during auto-apply (slot-edits a copy of
 # resumes/resume.docx so the formatting stays exactly yours). Pure-Python and

@@ -339,7 +339,16 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     skipped_seen = 0
     if career_ops_path is not None and career_ops_path.exists():
         # Local import to avoid a top-level cycle if bridge ever pulls from screen.
-        from pipeline.bridge import load_seen_urls
+        from pipeline.bridge import append_easy_apply_urls, is_easy_apply_row, load_seen_urls
+        # Record easy-apply URLs from the FULL set, before the dedup drop below.
+        # An already-tracked SmartApply role is removed here as a repeat and never
+        # reaches bridge, so this is the only stage that can persist its flag for
+        # the UI's apply-button gating.
+        # append_easy_apply_urls strips/dedups/skips blanks itself.
+        append_easy_apply_urls(
+            career_ops_path,
+            [j.get("job_url") for j in jobs if is_easy_apply_row(j)],
+        )
         seen_urls = load_seen_urls(career_ops_path)
         if seen_urls:
             before = len(jobs)

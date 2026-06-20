@@ -580,3 +580,18 @@ def test_onboard_skips_provider_key_write_when_api_key_blank(client, tmp_path, m
         assert call.args[0] != "GEMINI_API_KEY"
     for call in set_var.call_args_list:
         assert call.args[0] != "BATCH_PROVIDER"
+
+
+class TestStaticNoCache:
+    """SPA assets must revalidate every load (no-cache), so a UI change isn't
+    masked by a stale cached app.js/onboard.js until a manual hard refresh."""
+
+    def test_spa_asset_no_cache(self, client):
+        r = client.get("/app.js")
+        assert r.status_code == 200
+        assert "no-cache" in r.headers.get("cache-control", "").lower()
+
+    def test_onboard_html_no_cache(self, client):
+        r = client.get("/onboard")
+        assert r.status_code == 200
+        assert "no-cache" in r.headers.get("cache-control", "").lower()

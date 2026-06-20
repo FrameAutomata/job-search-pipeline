@@ -139,6 +139,24 @@ class TestParseTrackerAdditions:
     def test_missing_dir_returns_empty(self, tmp_path):
         assert data.parse_tracker_additions(tmp_path / "nope") == []
 
+    def test_tags_easy_apply_from_sibling_data_dir(self, tmp_path):
+        # Fallback rows must carry easy_apply too, so the apply button gating
+        # works when the UI shows unmerged tracker-additions.
+        tsv = (
+            "1\t2026-05-27\tAcme\tEng\tEvaluated\t4.0/5\tnull\t[1](reports/1.md)\t"
+            "APPLY https://www.indeed.com/viewjob?jk=aaa\n"
+            "2\t2026-05-27\tGlobex\tEng\tEvaluated\t3.0/5\tnull\t[2](reports/2.md)\t"
+            "APPLY https://www.indeed.com/viewjob?jk=bbb\n"
+        )
+        d = self._make(tmp_path, {"x.tsv": tsv})
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "easy-apply-urls.txt").write_text(
+            "https://www.indeed.com/viewjob?jk=aaa\n", encoding="utf-8"
+        )
+        by_co = {r["company"]: r for r in data.parse_tracker_additions(d)}
+        assert by_co["Acme"]["easy_apply"] is True
+        assert by_co["Globex"]["easy_apply"] is False
+
     def test_parses_tsv_row(self, tmp_path):
         d = self._make(tmp_path, {"562.tsv": SAMPLE_TSV})
         rows = data.parse_tracker_additions(d)
@@ -447,3 +465,35 @@ class TestRenderReportHtml:
         f.write_text("# Heading One\n\nbody", encoding="utf-8")
         html = data.render_report_html(f)
         assert "<h1>" in html.lower()
+
+
+class TestEasyApplyTag:
+    """parse_applications tags each row easy_apply=True iff its Notes URL is in
+    the sibling easy-apply-urls.txt — gates the Indeed SmartApply apply button."""
+
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 1 | 2026-05-27 | Acme | Eng | 4.2/5 | Evaluated | ❌ | [001](reports/001.md) | APPLY https://www.indeed.com/viewjob?jk=aaa |\n"
+        "| 2 | 2026-05-27 | Globex | Eng | 3.0/5 | Evaluated | ❌ | [002](reports/002.md) | APPLY https://www.indeed.com/viewjob?jk=bbb |\n"
+    )
+
+    def _write(self, tmp_path, urls=None):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        apps = data_dir / "applications.md"
+        apps.write_text(self.APPS, encoding="utf-8")
+        if urls is not None:
+            (data_dir / "easy-apply-urls.txt").write_text("\n".join(urls) + "\n", encoding="utf-8")
+        return apps
+
+    def test_url_in_set_tagged_true_others_false(self, tmp_path):
+        apps = self._write(tmp_path, ["https://www.indeed.com/viewjob?jk=aaa"])
+        by_co = {r["company"]: r for r in data.parse_applications(apps)}
+        assert by_co["Acme"]["easy_apply"] is True
+        assert by_co["Globex"]["easy_apply"] is False
+
+    def test_missing_file_all_false(self, tmp_path):
+        apps = self._write(tmp_path, urls=None)
+        assert all(r["easy_apply"] is False for r in data.parse_applications(apps))

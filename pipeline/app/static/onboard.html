@@ -88,6 +88,12 @@
               <input name="eeo_disability" placeholder="e.g. No, I do not have a disability (blank = decline)" />
             </label>
           </div>
+          <p class="hint" style="margin-top:.6rem">Some job sites ask you to consent to processing your
+            self-identification data, and to save or share those answers, before an application can be
+            submitted. You provide none either way, but the consent is required on the sites that ask for it.</p>
+          <label class="chk"><input type="checkbox" name="data_processing_consent" checked /> Agree to a site's required self-ID data-processing consent (needed to submit where required)</label>
+          <label class="chk"><input type="checkbox" name="save_answers" /> Let job sites save these answers to pre-fill future applications</label>
+          <label class="chk"><input type="checkbox" name="share_answers" /> Share these answers with the job site</label>
         </fieldset>
       </section>
 
@@ -221,8 +227,26 @@
         <div id="local-save-msg" class="action-msg" hidden></div>
       </section>
 
-      <!-- 8. Review -->
+      <!-- 8. Auto-apply -->
       <section class="step" data-step="7" hidden>
+        <h2>Auto-apply <span class="muted">(optional — local only)</span></h2>
+        <p class="hint">Auto-apply fills and submits applications from your own machine (never in the
+          cloud). Choose the platforms to auto-apply on — each needs a one-time sign-in so the local
+          browser carries your session. A window opens for you to log in; the session is saved for later.</p>
+        <label class="chk"><input type="checkbox" name="auto_apply_linkedin" /> Auto-apply to LinkedIn Easy Apply roles</label>
+        <div class="login-row" data-platform="linkedin" hidden>
+          <button type="button" class="login-btn" data-platform="linkedin">Log in to LinkedIn</button>
+          <span class="login-status muted"></span>
+        </div>
+        <label class="chk"><input type="checkbox" name="auto_apply_indeed" /> Auto-apply to Indeed SmartApply roles</label>
+        <div class="login-row" data-platform="indeed" hidden>
+          <button type="button" class="login-btn" data-platform="indeed">Log in to Indeed</button>
+          <span class="login-status muted"></span>
+        </div>
+      </section>
+
+      <!-- 9. Review -->
+      <section class="step" data-step="8" hidden>
         <h2>Review &amp; submit</h2>
         <p class="hint">This generates your profile, CV, and search config, then
           writes them — plus your API key — as encrypted GitHub secrets on

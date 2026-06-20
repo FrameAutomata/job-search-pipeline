@@ -62,6 +62,15 @@ def _as_list(value) -> list[str]:
     return []
 
 
+def _as_bool(value, default: bool) -> bool:
+    """Parse a yaml/string boolean; an unset (None) value takes the default."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class ApplyProfile:
     full_name: str = ""
@@ -90,6 +99,12 @@ class ApplyProfile:
     eeo_race: str = ""
     eeo_veteran: str = ""
     eeo_disability: str = ""
+    # Voluntary self-ID (EEO) consent prefs — platform-agnostic. The data-
+    # processing consent some apply forms require to submit defaults on (we
+    # provide no demographic data either way); saving/sharing answers default off.
+    eeo_data_consent: bool = True
+    eeo_save_answers: bool = False
+    eeo_share_answers: bool = False
 
     @property
     def first_name(self) -> str:
@@ -144,6 +159,9 @@ class ApplyProfile:
             eeo_race=str(eeo.get("race_ethnicity", "")).strip(),
             eeo_veteran=str(eeo.get("veteran_status", "")).strip(),
             eeo_disability=str(eeo.get("disability_status", "")).strip(),
+            eeo_data_consent=_as_bool(eeo.get("data_processing_consent"), True),
+            eeo_save_answers=_as_bool(eeo.get("save_answers"), False),
+            eeo_share_answers=_as_bool(eeo.get("share_answers"), False),
         )
 
     def summary_lines(self) -> list[str]:

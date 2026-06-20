@@ -18,6 +18,12 @@ config/search.yml
 # Pipeline outputs
 output/
 
+# Throwaway local test/spike drivers (never committed)
+scratch_*.py
+
+# Playwright MCP session artifacts (page snapshots from agentic runs)
+.playwright-mcp/
+
 # Local UI artifact cache (populated by the Refresh button via `gh run download`)
 .ui-cache/
 

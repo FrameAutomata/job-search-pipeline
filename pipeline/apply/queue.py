@@ -38,19 +38,42 @@ def is_linkedin_job(url: str) -> bool:
     return host.endswith("linkedin.com") and "/jobs/view/" in url
 
 
+def is_indeed_job(url: str) -> bool:
+    """True for an Indeed job-posting URL (the SmartApply target)."""
+    try:
+        host = urlparse(url).netloc.lower()
+    except ValueError:
+        return False
+    return host.endswith("indeed.com") and ("/viewjob" in url or "jk=" in url)
+
+
+def job_site(url: str) -> str | None:
+    """The apply engine for a URL: 'linkedin' / 'indeed', or None for an
+    unsupported host (off-site employer ATS we don't yet drive)."""
+    if is_linkedin_job(url):
+        return "linkedin"
+    if is_indeed_job(url):
+        return "indeed"
+    return None
+
+
 def select(
     career_ops: Path,
     *,
     min_score: float = 4.0,
     limit: int = 0,
     linkedin_only: bool = True,
+    sites: tuple[str, ...] | None = None,
     applications_md: Path | None = None,
 ) -> list[ApplyJob]:
     """Return apply candidates, highest score first.
 
     min_score: skip rows scoring below this (rows with no score are skipped).
     limit: cap the number returned (0 = no cap).
-    linkedin_only: keep only linkedin.com/jobs/view URLs (the Phase 2 engine).
+    sites: when given, keep only jobs whose engine (job_site) is in this set —
+        e.g. ("linkedin", "indeed"). Takes precedence over linkedin_only.
+    linkedin_only: legacy gate kept for back-compat (used when sites is None):
+        keep only linkedin.com/jobs/view URLs.
     applications_md: tracker to read; defaults to career_ops/data/applications.md.
         The apply stage points this at a freshly-downloaded GitHub artifact so it
         applies against current cloud evaluations, not a stale local copy."""
@@ -67,7 +90,10 @@ def select(
         url = _data.extract_url(row.get("notes", ""))
         if not url:
             continue
-        if linkedin_only and not is_linkedin_job(url):
+        if sites is not None:
+            if job_site(url) not in sites:
+                continue
+        elif linkedin_only and not is_linkedin_job(url):
             continue
         jobs.append(ApplyJob(
             num=row.get("num", ""),

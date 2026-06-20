@@ -148,6 +148,7 @@ jobs:
             career-ops/data/scan-history.tsv
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
@@ -185,6 +186,7 @@ jobs:
             career-ops/data/scan-history.tsv
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
@@ -200,6 +202,7 @@ jobs:
             career-ops/reports/
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/tracker-additions/
           if-no-files-found: ignore
           retention-days: 90

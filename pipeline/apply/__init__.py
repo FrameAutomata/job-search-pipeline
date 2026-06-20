@@ -20,7 +20,7 @@ from pathlib import Path
 
 from pipeline.app import data as _data
 from pipeline._batch_common import normalize_company, read_text
-from pipeline.apply import browser, linkedin, queue
+from pipeline.apply import browser, indeed, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.result import ApplyResult, EXPIRED, failed
@@ -72,9 +72,9 @@ def run(
         if refresh:
             applications_md = _refresh_tracker(career_ops)
         jobs = queue.select(career_ops, min_score=min_score, limit=limit,
-                            linkedin_only=True, applications_md=applications_md)
+                            sites=("linkedin", "indeed"), applications_md=applications_md)
         if not jobs:
-            print(f"[apply] no LinkedIn Easy Apply candidates "
+            print(f"[apply] no LinkedIn/Indeed apply candidates "
                   f"(score >= {min_score}, status Evaluated) in {applications_md.name}")
             return 0
     if mode == "auto" and refresh:
@@ -85,20 +85,60 @@ def run(
           f"{'headless' if headless else 'windowed'}")
 
     engine = build_engine(career_ops, provider=provider, model=model)
+    # Reports live next to the tracker (career-ops/reports OR the refreshed
+    # artifact's reports/), not necessarily under the local career-ops — so a
+    # cloud-only-evaluated job's report is found rather than read as empty.
+    report_root = applications_md.parent.parent
+
+    # LinkedIn (bundled-Chromium Easy Apply) and Indeed (patchright SmartApply) use
+    # different browsers, so each site's jobs run in their own session. Unknown
+    # hosts route to LinkedIn (which fails gracefully with not_easy_apply).
+    groups: dict[str, list] = {}
+    for job in jobs:
+        groups.setdefault(queue.job_site(job.url) or "linkedin", []).append(job)
 
     applied = held = failures = 0
+    for site in ("linkedin", "indeed"):
+        if not groups.get(site):
+            continue
+        a, h, f = _apply_jobs(
+            site, groups[site], engine, career_ops=career_ops, report_root=report_root,
+            applications_md=applications_md, mode=mode, headless=headless,
+            provider=provider, model=model, tailor_min_score=tailor_min_score,
+        )
+        applied += a
+        held += h
+        failures += f
 
+    print(f"[apply] done — {applied} submitted, {held} filled (held for review), "
+          f"{failures} failed | {engine.llm_calls} LLM calls, {engine.cache_hits} cache hits")
+    return applied if mode == "auto" else held
+
+
+def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path,
+                report_root: Path, applications_md: Path, mode: str, headless: bool,
+                provider: str | None, model: str | None,
+                tailor_min_score: float) -> tuple[int, int, int]:
+    """Apply to one site's jobs in its own browser session. LinkedIn uses the
+    bundled-Chromium Easy Apply engine; Indeed the patchright SmartApply engine on
+    the pre-captured login. Returns (applied, held, failures)."""
+    applied = held = failures = 0
     try:
-        with browser.launch(headless=headless) as page:
-            if not browser.ensure_logged_in(page, headless=headless):
-                print("[apply] not signed in to LinkedIn — aborting. "
-                      "Run windowed (not --headless) and sign in when prompted.")
-                return 0
-
-            # Reports live next to the tracker (career-ops/reports OR the refreshed
-            # artifact's reports/), not necessarily under the local career-ops — so a
-            # cloud-only-evaluated job's report is found rather than read as empty.
-            report_root = applications_md.parent.parent
+        if site == "indeed":
+            session, apply_fn = browser.launch_indeed(headless=headless), indeed.apply_to
+        else:
+            session, apply_fn = browser.launch(headless=headless), linkedin.apply_to
+        with session as page:
+            if site == "indeed":
+                if not browser.is_logged_in_indeed(page):
+                    print("[apply] Indeed apply profile isn't signed in. Run the one-time "
+                          "capture-login first: `./run.ps1 --capture-indeed-login` (sign in "
+                          "once in the normal browser that opens).")
+                    return 0, 0, 0
+            elif not browser.ensure_logged_in(page, headless=headless):
+                print("[apply] not signed in to LinkedIn — aborting. Run windowed "
+                      "(not --headless) and sign in when prompted.")
+                return 0, 0, 0
 
             for job in jobs:
                 configure_engine_for_job(
@@ -107,28 +147,22 @@ def run(
                 )
                 resume = _resolve_resume(career_ops, job)
                 try:
-                    result = linkedin.apply_to(page, job, engine, mode=mode, resume_path=resume)
+                    result = apply_fn(page, job, engine, mode=mode, resume_path=resume)
                 except Exception as e:  # never let one job kill the batch
                     result = failed(f"exception:{type(e).__name__}")
-
                 applied, held, failures = _report(
                     job, result, mode, applications_md, applied, held, failures,
                     unanswered=list(engine.unanswered),
                 )
     except ImportError as e:
         print(f"[apply] {e}")
-        return 0
     except Exception as e:
-        # Most commonly the browser window was closed mid-run (Playwright raises
-        # a target-closed / navigation-aborted error). Report cleanly rather than
-        # dumping a traceback; whatever finished before the close still counts.
+        # Most commonly the browser window was closed mid-run (Playwright raises a
+        # target-closed error). Report cleanly; whatever finished still counts.
         msg = str(e).splitlines()[0] if str(e) else type(e).__name__
-        print(f"[apply] session ended early ({type(e).__name__}: {msg[:80]}) — "
+        print(f"[apply] {site} session ended early ({type(e).__name__}: {msg[:80]}) — "
               "did the browser window close?")
-
-    print(f"[apply] done — {applied} submitted, {held} filled (held for review), "
-          f"{failures} failed | {engine.llm_calls} LLM calls, {engine.cache_hits} cache hits")
-    return applied if mode == "auto" else held
+    return applied, held, failures
 
 
 def build_engine(career_ops: Path, *, provider: str | None, model: str | None) -> AnswerEngine:
