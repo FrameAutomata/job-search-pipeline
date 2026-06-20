@@ -447,6 +447,39 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   btn.disabled = false;
 });
 
+// Danger zone: start over. Double-gated (a typed "RESET") since it's destructive
+// and the cloud-cache deletion is irreversible.
+const resetBtn = document.getElementById("reset-btn");
+resetBtn.addEventListener("click", async () => {
+  const typed = prompt(
+    "This wipes your job-search results (tracker, history, reports, queue, PDFs) and " +
+    "cannot be fully undone — the cloud cache deletion is irreversible. Your setup is kept. " +
+    "Type RESET to confirm:");
+  if (typed !== "RESET") return;
+  const clearCloud = document.getElementById("reset-clear-cloud").checked;
+  const msg = document.getElementById("reset-msg");
+  const show = (text, kind) => { msg.hidden = false; msg.textContent = text; msg.className = "action-msg" + (kind ? " " + kind : ""); };
+  resetBtn.disabled = true;
+  show("Resetting…", "");
+  try {
+    const resp = await fetch("/api/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: "RESET", clear_cloud: clearCloud }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `reset failed (${resp.status})`);
+    let txt = `Reset complete — wiped ${body.count} item(s); snapshot saved under .ui-cache/backups/.`;
+    if (body.cloud) txt += ` Cleared ${body.cloud.deleted.length} cloud cache(s).`;
+    if (body.cloud_error) txt += ` (Cloud not cleared: ${body.cloud_error})`;
+    show(txt, "ok");
+  } catch (e) {
+    show(String(e.message || e), "error");
+  } finally {
+    resetBtn.disabled = false;
+  }
+});
+
 showStep(0);
 loadStatus();
 loadSavedConfig();
