@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pipeline.app import data, gh, local_run, onboard, skills
+from pipeline.app import data, gh, local_run, onboard, self_update, skills
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
@@ -412,6 +412,28 @@ def run_pipeline() -> JSONResponse:
         return JSONResponse({"ok": True, "workflow": DAILY_WORKFLOW})
     except gh.GhError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/template/status")
+def template_status() -> JSONResponse:
+    """Whether the maintainer's template has updates this copy doesn't have yet.
+    Drives the UI's 'update available' badge. Read-only."""
+    try:
+        return JSONResponse(self_update.update_available())
+    except gh.GhError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/template/update")
+def template_update() -> JSONResponse:
+    """Pull the template's latest main into the local clone and push to origin —
+    updating both the local UI and the cloud copy. 409 on a merge conflict so the
+    user resolves it manually (the working tree is left clean)."""
+    result = self_update.apply_update(ROOT)
+    if result.get("ok"):
+        return JSONResponse(result)
+    raise HTTPException(status_code=409 if result.get("conflict") else 500,
+                        detail=result.get("error", "update failed"))
 
 
 # ── local pipeline run ──────────────────────────────────────────────────────

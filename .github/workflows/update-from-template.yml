@@ -1,0 +1,43 @@
+name: Update from Template
+
+# Pull the maintainer's latest changes (the upstream template) into this copy.
+# Copies made via "Use this template" have no git link to the source, so this
+# adds it as a remote, merges template/main, and pushes. Dispatch-only — run it
+# from the Actions tab, or use the local UI's "Update" button (which does the
+# same merge+push locally and also refreshes the clone running the UI).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-from-template
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # Never self-update the upstream template repository.
+    if: github.repository != 'FrameAutomata/job-search-pipeline'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history so the merge has a common ancestor
+
+      - name: Merge latest template main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add template https://github.com/FrameAutomata/job-search-pipeline.git
+          git fetch template main
+          if git merge --no-edit FETCH_HEAD; then
+            git push origin HEAD
+          else
+            # Leave a clean tree and fail loudly — the user resolves it locally
+            # (fetch the template, merge, push) rather than the bot guessing.
+            git merge --abort
+            echo "::error::Merge conflict with the template. Resolve it locally: add the template remote, merge template/main, push."
+            exit 1
+          fi
