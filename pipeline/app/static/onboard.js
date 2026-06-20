@@ -4,7 +4,7 @@
 // multipart to /api/onboard, which generates the profile artifacts and writes
 // them as GitHub secrets.
 
-const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local eval", "Review"];
+const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local eval", "Auto-apply", "Review"];
 
 const form = document.getElementById("wizard");
 const steps = [...document.querySelectorAll(".step")];
@@ -65,6 +65,8 @@ function showAction(text, kind) {
 // (a bare checkbox is absent when unchecked, which collides with consent's
 // default-on), and restored by .checked rather than .value.
 const CONSENT_TOGGLES = ["data_processing_consent", "save_answers", "share_answers"];
+// Auto-apply platform opt-ins (local-only pref; checkbox -> boolean).
+const APPLY_TOGGLES = ["auto_apply_linkedin", "auto_apply_indeed"];
 
 // Collect the form into a plain object (sites -> array of checked values).
 function collectForm() {
@@ -78,6 +80,9 @@ function collectForm() {
   obj.include_easy_apply = form.querySelector('input[name="include_easy_apply"]').checked;
   for (const name of CONSENT_TOGGLES) {
     obj[name] = form.querySelector(`input[name="${name}"]`).checked ? "yes" : "no";
+  }
+  for (const name of APPLY_TOGGLES) {
+    obj[name] = form.querySelector(`input[name="${name}"]`).checked;
   }
   return obj;
 }
@@ -121,7 +126,8 @@ function validateStep(i) {
 // untick the rest. include_easy_apply: set .checked.
 function prefillForm(saved) {
   for (const [k, v] of Object.entries(saved)) {
-    if (k === "sites" || k === "include_easy_apply" || CONSENT_TOGGLES.includes(k)) continue;
+    if (k === "sites" || k === "include_easy_apply") continue;
+    if (CONSENT_TOGGLES.includes(k) || APPLY_TOGGLES.includes(k)) continue;
     if (v === undefined || v === null || v === "") continue;
     const el = form.querySelector(`[name="${k}"]`);
     if (el && el.tagName !== "FIELDSET") el.value = v;
@@ -136,6 +142,11 @@ function prefillForm(saved) {
   CONSENT_TOGGLES.forEach((name) => {
     const cb = form.querySelector(`input[name="${name}"]`);
     if (cb) cb.checked = name in saved ? saved[name] === "yes" : name === "data_processing_consent";
+  });
+  // Auto-apply opt-ins (boolean); dispatch change so the login row re-syncs.
+  APPLY_TOGGLES.forEach((name) => {
+    const cb = form.querySelector(`input[name="${name}"]`);
+    if (cb) { cb.checked = !!saved[name]; cb.dispatchEvent(new Event("change")); }
   });
 }
 
@@ -184,6 +195,43 @@ nextBtn.addEventListener("click", async () => {
   showStep(current + 1);
 });
 backBtn.addEventListener("click", () => showStep(current - 1));
+
+// Auto-apply step: reveal a platform's "Log in" button when its opt-in is checked,
+// and launch the one-time local sign-in (opens a terminal + browser) on click.
+function wireAutoApply() {
+  document.querySelectorAll('input[name^="auto_apply_"]').forEach((cb) => {
+    const platform = cb.name.replace("auto_apply_", "");
+    const row = document.querySelector(`.login-row[data-platform="${platform}"]`);
+    const sync = () => { if (row) row.hidden = !cb.checked; };
+    cb.addEventListener("change", sync);
+    sync();
+  });
+  document.querySelectorAll(".login-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const status = btn.parentElement.querySelector(".login-status");
+      btn.disabled = true;
+      if (status) status.textContent = "Opening sign-in…";
+      try {
+        const r = await fetch("/api/apply/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ platform: btn.dataset.platform }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (status) {
+          status.textContent = r.ok
+            ? "A window opened — sign in there, then come back."
+            : data.detail || "Couldn't open the login window.";
+        }
+      } catch {
+        if (status) status.textContent = "Couldn't reach the server.";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+}
+wireAutoApply();
 
 // When a resume is chosen, parse it and autofill the About fields. Only fills
 // fields the user hasn't already typed into, so it never clobbers manual edits.

@@ -12,6 +12,14 @@ from pathlib import Path
 MAX_TOKENS = 8192
 
 
+def read_url_set(path: Path) -> set[str]:
+    """Read a newline-delimited URL file into a set of stripped, non-blank
+    lines. Missing file → empty set."""
+    if not path.exists():
+        return set()
+    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
 def parse_date_posted(val: str) -> datetime | None:
     """Parse a date_posted string. Tolerates both date and datetime forms."""
     if not val or val.strip().lower() in ("", "none", "nan", "nat"):

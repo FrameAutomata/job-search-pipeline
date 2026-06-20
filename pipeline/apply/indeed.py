@@ -189,6 +189,20 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
     return failed("max_steps_exceeded")
 
 
+def submit_application(page) -> ApplyResult:
+    """Click the held 'Submit your application' after a review-mode fill. The UI
+    holds the SmartApply browser on the review step and calls this once the user
+    confirms. Re-verifies we're actually on a submit step (primary action ==
+    submit) so a relabeled button can never be clicked as a submit."""
+    sa = next((p for p in page.context.pages if _SMARTAPPLY_HOST in (p.url or "")), page)
+    if _primary_action(_button_labels(sa)) != "submit":
+        return failed("not_on_submit_step")
+    if not _click_submit(sa):
+        return failed("submit_click_failed")
+    sa.wait_for_timeout(2500)
+    return ApplyResult(code=APPLIED, submitted=True)
+
+
 def _await_smartapply(page, timeout_ms: int = 12000):
     """After clicking Apply, return the page now on smartapply.indeed.com — the
     same tab (it usually navigates) or a newly-opened one. None if it never gets

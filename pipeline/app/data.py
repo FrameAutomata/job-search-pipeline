@@ -10,7 +10,7 @@ import re
 import threading
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text, normalize_company
+from pipeline._batch_common import atomic_write_text, normalize_company, read_url_set
 
 # The UI's pending-status-changes channel: {row key: status-or-record}. Kanban
 # drags and the apply stage's auto-submits both write here; /api/jobs overlays
@@ -362,15 +362,28 @@ def extract_url(notes: str) -> str:
     return m.group(0).rstrip(".,);]") if m else ""
 
 
+# Sibling of applications.md, written by pipeline/bridge.py — the URLs that came
+# from an easy_apply search pass (Indeed SmartApply / LinkedIn Easy Apply).
+_EASY_APPLY_URLS_FILE = "easy-apply-urls.txt"
+
+
+def load_easy_apply_urls(data_dir: Path) -> set[str]:
+    """The set of easy-apply URLs recorded by the bridge stage (empty if none)."""
+    return read_url_set(data_dir / _EASY_APPLY_URLS_FILE)
+
+
 def parse_applications(applications_md: Path) -> list[dict]:
     """Parse applications.md into a list of row dicts.
 
     Each dict has the _COLUMNS keys plus a derived `report_num` and
-    `report_path` extracted from the Report cell's markdown link, and a
-    `score_value` float (parsed from the "X.X/5" Score cell, or None).
+    `report_path` extracted from the Report cell's markdown link, a
+    `score_value` float (parsed from the "X.X/5" Score cell, or None), and an
+    `easy_apply` bool (its Notes URL is in the sibling easy-apply-urls.txt).
     Returns [] if the file is missing or has no data rows."""
     if not applications_md.exists():
         return []
+
+    easy_apply_urls = load_easy_apply_urls(applications_md.parent)
 
     rows: list[dict] = []
     for line in applications_md.read_text(encoding="utf-8").splitlines():
@@ -397,6 +410,7 @@ def parse_applications(applications_md: Path) -> list[dict]:
         # Parse the leading float out of "4.2/5" → 4.2 for sorting.
         row["score_value"] = _parse_score(row.get("score", ""))
         row["status_canonical"] = canonical_status(row.get("status", ""))
+        row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
 
         rows.append(row)
 
@@ -415,6 +429,9 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
     report_path, score_value), sorted by tracker number."""
     if not tracker_dir.exists():
         return []
+    # Same easy_apply tagging as parse_applications, so the apply button gating
+    # works in this fallback path too (career-ops/data is a sibling of batch/).
+    easy_apply_urls = load_easy_apply_urls(tracker_dir.parent.parent / "data")
     rows: list[dict] = []
     for f in tracker_dir.glob("*.tsv"):
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -431,6 +448,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
             row["report_path"] = m.group(2).strip() if m else ""
             row["score_value"] = _parse_score(row.get("score", ""))
             row["status_canonical"] = canonical_status(row.get("status", ""))
+            row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
             rows.append(row)
     rows.sort(key=lambda r: _safe_int(r.get("num")))
     return rows

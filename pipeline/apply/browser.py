@@ -222,6 +222,23 @@ def ensure_logged_in(page, *, headless: bool, timeout_s: int = 240) -> bool:
     return is_logged_in(page)
 
 
+def login_linkedin(*, timeout_s: int = 300) -> bool:
+    """One-time bootstrap: open the LinkedIn apply browser and park for sign-in so
+    the session persists in the apply profile for auto-apply. Standalone version
+    of the login ensure_logged_in does lazily at --apply time. Returns whether we
+    ended up signed in."""
+    try:
+        with launch(headless=False) as page:
+            if ensure_logged_in(page, headless=False, timeout_s=timeout_s):
+                print("[apply] Signed in to LinkedIn — session saved for auto-apply.", flush=True)
+                return True
+            print("[apply] LinkedIn sign-in not completed (timed out).", flush=True)
+            return False
+    except ImportError as e:  # pragma: no cover - only without Playwright installed
+        print(f"[apply] {e}", flush=True)
+        return False
+
+
 # ── Indeed ───────────────────────────────────────────────────────────────────
 # Indeed sits behind a Cloudflare anti-bot wall that flags automation; the ONLY
 # proxyless way past it is a warm, real-Chrome profile that has signed in by hand

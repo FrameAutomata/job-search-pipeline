@@ -63,6 +63,9 @@ def main() -> int:
                     help="One-time: open a normal Chrome to sign in to Indeed, then capture "
                          "the session into the apply profile (required before --apply can do "
                          "Indeed jobs). Standalone — skips the pipeline stages.")
+    ap.add_argument("--login-linkedin", action="store_true",
+                    help="One-time: open the LinkedIn apply browser and park for sign-in so "
+                         "the session persists for --apply. Standalone — skips the pipeline stages.")
     ap.add_argument("--recheck-liveness", action="store_true",
                     help="Re-check liveness of evaluated tracker roles and mark "
                          "closed/gone ones Discarded. Off by default; the daily "
@@ -105,6 +108,11 @@ def main() -> int:
         # need a search config and skips the pipeline stages.
         from pipeline.apply import browser
         return 0 if browser.capture_indeed_login() else 1
+
+    if args.login_linkedin:
+        # One-time setup: park the LinkedIn apply browser for sign-in. Standalone.
+        from pipeline.apply import browser
+        return 0 if browser.login_linkedin() else 1
 
     config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG") or "config/search.yml")
     if not config_path.exists():

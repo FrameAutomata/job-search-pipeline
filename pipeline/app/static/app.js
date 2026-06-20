@@ -234,7 +234,7 @@ async function openReport(job) {
   selectedJob = job;
   resetSkillPanel();
   resetApplyPanel();
-  applyEls.btn.hidden = !isLinkedInJob(job);
+  applyEls.btn.hidden = !isApplyableJob(job);
   applyEls.btn.disabled = false;
   render();
   els.reportLink.href = extractUrl(job) || "#";
@@ -782,6 +782,21 @@ applyEls.btn.addEventListener("click", startApply);
 
 function isLinkedInJob(job) {
   return /linkedin\.com\/jobs\/view\//i.test(extractUrl(job) || "");
+}
+
+function isIndeedJob(job) {
+  // Anchor the jk= param to indeed.com so a foreign URL carrying ?jk= can't
+  // match — mirrors pipeline/apply/queue.py is_indeed_job.
+  return /indeed\.com\/viewjob|indeed\.com[^\s]*[?&]jk=/i.test(extractUrl(job) || "");
+}
+
+// The apply button shows for postings the deterministic engines can drive.
+// LinkedIn /jobs/view URLs are all Easy-Apply-driveable. Indeed, though, only
+// exposes SmartApply on a subset of listings and JobSpy gives no per-job flag —
+// so we gate the Indeed button on job.easy_apply (set from the easy_apply search
+// pass via the bridge's URL side channel; see pipeline/app/data.py).
+function isApplyableJob(job) {
+  return isLinkedInJob(job) || (isIndeedJob(job) && !!job.easy_apply);
 }
 
 function resetApplyPanel() {

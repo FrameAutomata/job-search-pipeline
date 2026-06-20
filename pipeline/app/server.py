@@ -701,6 +701,37 @@ def launch_skill(req: SkillLaunchRequest) -> JSONResponse:
     })
 
 
+class ApplyLoginRequest(BaseModel):
+    platform: str
+
+
+@app.post("/api/apply/login")
+def apply_login(req: ApplyLoginRequest) -> JSONResponse:
+    """Open a terminal that signs in to a platform's apply session (LinkedIn /
+    Indeed) — the one-click login the onboarding 'Auto-apply' step offers.
+    Auto-apply is local-only, so the session is captured here on the user's
+    machine. The command is built server-side (no client-supplied command)."""
+    if not skills.terminal_available():
+        raise HTTPException(
+            status_code=501,
+            detail="Run-in-terminal isn't wired up on this OS yet. Run the login "
+                   "command in your own terminal instead.",
+        )
+    try:
+        command = skills.apply_login_command(req.platform)
+    except skills.SkillError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        info = skills.launch_in_terminal(command, str(ROOT))
+    except skills.SkillError as e:
+        raise HTTPException(status_code=501, detail=str(e))
+    except OSError as e:  # rare: temp-file or Popen problem
+        raise HTTPException(status_code=502, detail=f"Couldn't open a terminal: {e}")
+    return JSONResponse({
+        "ok": True, "launched": True, "platform": req.platform, "command": command, **info,
+    })
+
+
 @app.get("/api/skills/output/{filename}")
 def skill_output(filename: str) -> FileResponse:
     """Download a generated skill artifact from the local career-ops output/."""
@@ -719,7 +750,7 @@ def onboard_page() -> FileResponse:
     page = STATIC_DIR / "onboard.html"
     if not page.exists():
         raise HTTPException(status_code=404, detail="onboard.html not found")
-    return FileResponse(str(page))
+    return FileResponse(str(page), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/onboard/status")
@@ -1251,6 +1282,29 @@ def _apply_public(task: dict) -> dict:
     return {k: task.get(k) for k in _APPLY_PUBLIC}
 
 
+def _apply_dispatch(job):
+    """Per-site apply wiring for the review worker: (launch-context factory,
+    login-check, engine module, login-fail message). Indeed uses the patchright
+    session + the captured login; LinkedIn the bundled-Chromium Easy Apply engine."""
+    from pipeline.apply import browser, linkedin, indeed
+    from pipeline.apply.queue import job_site
+    if job_site(job.url) == "indeed":
+        return (
+            lambda: browser.launch_indeed(headless=False),
+            lambda page: browser.is_logged_in_indeed(page),
+            indeed,
+            "not signed in to Indeed — open the onboarding 'Auto-apply' step and "
+            "'Log in to Indeed' first (the automated browser can't sign in itself).",
+        )
+    return (
+        lambda: browser.launch(headless=False),
+        lambda page: browser.ensure_logged_in(page, headless=False),
+        linkedin,
+        "not signed in to LinkedIn (run the UI's apply review and sign in to the "
+        "window when prompted).",
+    )
+
+
 def _run_apply_review(job_id: str) -> None:
     """Worker: launch a visible browser, fill the Easy Apply form (bailing early
     if the user cancels mid-fill), stop at the Submit step and surface the
@@ -1263,15 +1317,13 @@ def _run_apply_review(job_id: str) -> None:
     applications_md = task["applications_md"]
     co_local = task["co_local"]
     try:
-        from pipeline.apply import browser, linkedin
         from pipeline.apply.result import CANCELLED, EXPIRED
         from pipeline import apply as apply_pkg
+        open_session, login_ok, engine_mod, login_fail = _apply_dispatch(job)
         report_root = applications_md.parent.parent
-        with browser.launch(headless=False) as page:
-            if not browser.ensure_logged_in(page, headless=False):
-                _set_apply(job_id, status="failed", code="login_issue",
-                           reason="not signed in to LinkedIn (run the UI's apply review "
-                                  "and sign in to the window when prompted)")
+        with open_session() as page:
+            if not login_ok(page):
+                _set_apply(job_id, status="failed", code="login_issue", reason=login_fail)
                 return
             engine = apply_pkg.build_engine(co_local, provider=None, model=None)
             apply_pkg.configure_engine_for_job(
@@ -1280,7 +1332,7 @@ def _run_apply_review(job_id: str) -> None:
                 tailor_min_score=env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
             )
             resume = apply_pkg._resolve_resume(co_local, job)
-            result = linkedin.apply_to(
+            result = engine_mod.apply_to(
                 page, job, engine, mode="review", resume_path=resume,
                 should_cancel=lambda: _apply_decision(job_id) == "cancel",
             )
@@ -1312,7 +1364,7 @@ def _run_apply_review(job_id: str) -> None:
                 final = task["status"]
 
             if final == "submitting":
-                sub = linkedin.submit_application(page)
+                sub = engine_mod.submit_application(page)
                 if sub.submitted:
                     apply_pkg._mark_status(applications_md, job, "Applied")
                     _set_apply(job_id, status="submitted")
@@ -1335,17 +1387,17 @@ class ApplyAsyncRequest(BaseModel):
 @app.post("/api/jobs/apply-async")
 def apply_async(req: ApplyAsyncRequest) -> JSONResponse:
     """Start a visible apply-review session for tracker row `num`. 404 if the
-    row is unknown, 400 if it isn't a LinkedIn Easy Apply posting, 409 if a
-    session is already in progress (one visible browser at a time)."""
+    row is unknown, 400 if it isn't a LinkedIn Easy Apply or Indeed SmartApply
+    posting, 409 if a session is already in progress (one browser at a time)."""
     job = _apply_job_for_num(req.num)
     if job is None:
         raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
-    from pipeline.apply.queue import is_linkedin_job
-    if not is_linkedin_job(job.url):
+    from pipeline.apply.queue import job_site
+    if job_site(job.url) not in ("linkedin", "indeed"):
         raise HTTPException(
             status_code=400,
-            detail="This role has no LinkedIn job URL — the review-and-submit flow "
-                   "opens LinkedIn postings (Easy Apply is confirmed once the page loads).",
+            detail="This role has no LinkedIn or Indeed job URL — the review-and-submit "
+                   "flow applies to LinkedIn Easy Apply and Indeed SmartApply postings.",
         )
     with _apply_lock:
         if any(t["status"] in _APPLY_ACTIVE for t in _apply_tasks.values()):
@@ -1409,7 +1461,17 @@ def apply_cancel(job_id: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+class _NoCacheStaticFiles(StaticFiles):
+    """Serve SPA assets with Cache-Control: no-cache so the browser revalidates
+    every load (conditional GET -> 304 when unchanged). Without this a cached
+    app.js / onboard.js lingers after a UI change until a manual hard refresh."""
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 # Mount the SPA last so /api/* routes take precedence. html=True serves
 # index.html at "/" and for unknown paths (client-side routing friendly).
 if STATIC_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    app.mount("/", _NoCacheStaticFiles(directory=str(STATIC_DIR), html=True), name="static")

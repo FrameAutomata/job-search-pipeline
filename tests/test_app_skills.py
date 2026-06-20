@@ -366,3 +366,39 @@ def test_same_origin_post_allowed(client):
 def test_get_unaffected_by_origin(client):
     r = client.get("/api/jobs", headers={"Origin": "http://evil.example"})
     assert r.status_code == 200
+
+
+# ── apply-login (auto-apply platform sign-in) ────────────────────────────────
+
+class TestApplyLogin:
+    def test_command_indeed(self):
+        from pipeline.app import skills
+        cmd = skills.apply_login_command("indeed")
+        assert "orchestrate.py" in cmd and "--capture-indeed-login" in cmd
+
+    def test_command_linkedin(self):
+        from pipeline.app import skills
+        assert "--login-linkedin" in skills.apply_login_command("linkedin")
+
+    def test_command_unknown_raises(self):
+        from pipeline.app import skills
+        with pytest.raises(skills.SkillError):
+            skills.apply_login_command("monster")
+
+    def test_endpoint_launches(self, client, mocker):
+        mocker.patch("pipeline.app.skills.terminal_available", return_value=True)
+        launch = mocker.patch("pipeline.app.skills.launch_in_terminal",
+                              return_value={"launcher": "cmd", "script": "x"})
+        r = client.post("/api/apply/login", json={"platform": "indeed"})
+        assert r.status_code == 200
+        assert launch.called and "--capture-indeed-login" in launch.call_args[0][0]
+
+    def test_endpoint_invalid_platform_400(self, client, mocker):
+        mocker.patch("pipeline.app.skills.terminal_available", return_value=True)
+        r = client.post("/api/apply/login", json={"platform": "monster"})
+        assert r.status_code == 400
+
+    def test_endpoint_no_terminal_501(self, client, mocker):
+        mocker.patch("pipeline.app.skills.terminal_available", return_value=False)
+        r = client.post("/api/apply/login", json={"platform": "linkedin"})
+        assert r.status_code == 501

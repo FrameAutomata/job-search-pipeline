@@ -538,3 +538,62 @@ class TestRun:
 
         # Newest (job2) should come first, oldest (job1) last
         assert job2_idx < job3_idx < job1_idx
+
+
+class TestEasyApplyUrls:
+    """bridge persists the URLs that came from an easy_apply pass to a deduped,
+    append-only side channel (career-ops/data/easy-apply-urls.txt) so the UI can
+    gate the Indeed SmartApply apply button — JobSpy returns no per-job flag."""
+
+    def test_append_and_load_roundtrip(self, career_ops_dir):
+        bridge_mod.append_easy_apply_urls(career_ops_dir, ["https://a", "https://b"])
+        assert bridge_mod.load_easy_apply_urls(career_ops_dir) == {"https://a", "https://b"}
+
+    def test_append_dedupes_within_and_across_calls(self, career_ops_dir):
+        bridge_mod.append_easy_apply_urls(career_ops_dir, ["https://a", "https://a"])
+        bridge_mod.append_easy_apply_urls(career_ops_dir, ["https://a", "https://c"])
+        assert bridge_mod.load_easy_apply_urls(career_ops_dir) == {"https://a", "https://c"}
+        text = (career_ops_dir / "data" / "easy-apply-urls.txt").read_text(encoding="utf-8")
+        assert text.count("https://a\n") == 1
+
+    def test_append_ignores_blank(self, career_ops_dir):
+        bridge_mod.append_easy_apply_urls(career_ops_dir, ["", "   ", "https://a"])
+        assert bridge_mod.load_easy_apply_urls(career_ops_dir) == {"https://a"}
+
+    def test_load_missing_file_returns_empty(self, career_ops_dir):
+        assert bridge_mod.load_easy_apply_urls(career_ops_dir) == set()
+
+    def test_run_records_only_easy_apply_urls(self, career_ops_dir, monkeypatch, tmp_path):
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text(
+            "title,company,job_url,easy_apply\n"
+            "engineer,acme,https://job1.com,True\n"
+            "developer,globex,https://job2.com,False\n"
+            "dev,initech,https://job3.com,True\n"
+        )
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+        bridge_mod.run(career_ops_dir)
+        assert bridge_mod.load_easy_apply_urls(career_ops_dir) == {
+            "https://job1.com",
+            "https://job3.com",
+        }
+
+    def test_run_records_easy_apply_url_even_when_already_seen(self, career_ops_dir, monkeypatch, tmp_path):
+        # A URL already in scan-history is skipped for the tracker (a dup) but
+        # must still be recorded in the easy-apply set, so the write happens
+        # before the "no new offers" early return.
+        hist = career_ops_dir / "data" / "scan-history.tsv"
+        hist.write_text(
+            "url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n"
+            "https://job1.com\t2026-01-01\tjobspy\teng\tacme\tadded\n",
+            encoding="utf-8",
+        )
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text(
+            "title,company,job_url,easy_apply\n"
+            "engineer,acme,https://job1.com,True\n"
+        )
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+        result = bridge_mod.run(career_ops_dir)
+        assert result == []
+        assert "https://job1.com" in bridge_mod.load_easy_apply_urls(career_ops_dir)

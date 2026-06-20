@@ -89,6 +89,26 @@ def filter_passes(
     return result
 
 
+def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the per-pass easy_apply flag to a per-URL OR.
+
+    Each row arrives carrying the easy_apply flag of the pass that produced it.
+    A job returned by both a broad pass (False) and an easy_apply pass (True)
+    must end up True regardless of which duplicate row `drop_duplicates` later
+    keeps — so OR the flag across every row sharing a job_url before dedup.
+    JobSpy gives no per-job "easy apply" signal, so this pass-level flag is the
+    only thing that distinguishes (e.g.) Indeed SmartApply roles downstream."""
+    if "easy_apply" not in combined.columns:
+        combined["easy_apply"] = False
+    flag = combined["easy_apply"].fillna(False).astype(bool)
+    # transform drops NaN-keyed groups, so a row with a NaN job_url comes back
+    # NaN and would promote the column to object dtype — fillna keeps it bool.
+    combined["easy_apply"] = (
+        flag.groupby(combined["job_url"]).transform("max").fillna(False).astype(bool)
+    )
+    return combined
+
+
 def validate_limitations(cfg: dict) -> None:
     """Raise ValueError if mutually exclusive JobSpy options are combined.
 
@@ -162,6 +182,7 @@ def run(
         validate_limitations(cfg)
         optional = {k: cfg[k] for k in OPTIONAL_PARAMS if cfg.get(k) is not None}
 
+        pass_easy_apply = cfg.get("easy_apply") is True
         for term in cfg["search_terms"]:
             print(f"[scrape] [{name}] searching: {term!r}", flush=True)
             df = scrape_jobs(
@@ -170,6 +191,9 @@ def run(
                 results_wanted=cfg.get("results_wanted", 50),
                 **optional,
             )
+            # Tag every row with the pass's easy_apply flag so it survives the
+            # cross-pass merge; mark_easy_apply ORs it per URL below.
+            df["easy_apply"] = pass_easy_apply
             all_rows.append(df)
 
     combined = pd.concat(all_rows, ignore_index=True) if all_rows else None
@@ -177,6 +201,7 @@ def run(
         print("[scrape] no jobs returned")
         return OUTPUT_PATH
 
+    combined = mark_easy_apply(combined)
     before = len(combined)
     combined = combined.drop_duplicates(subset=["job_url"])
     print(f"[scrape] {before} rows -> {len(combined)} after dedup")

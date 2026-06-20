@@ -419,3 +419,35 @@ filter:
 
         csv_df = pd.read_csv(output_path)
         assert len(csv_df) == 4  # All rows merged
+
+
+class TestMarkEasyApply:
+    """scrape.mark_easy_apply collapses the per-pass easy_apply flag to a
+    per-URL OR — a job returned by both a broad pass (False) and an easy_apply
+    pass (True) must end up True, regardless of which row dedup later keeps."""
+
+    def test_url_in_both_passes_becomes_true(self):
+        df = pd.DataFrame({
+            "job_url": ["https://a", "https://a", "https://b"],
+            "easy_apply": [False, True, False],
+        })
+        out = scrape_mod.mark_easy_apply(df)
+        a_rows = out[out["job_url"] == "https://a"]["easy_apply"]
+        assert [bool(v) for v in a_rows] == [True, True]
+        assert bool(out[out["job_url"] == "https://b"]["easy_apply"].iloc[0]) is False
+
+    def test_url_only_in_easy_pass_is_true(self):
+        df = pd.DataFrame({"job_url": ["https://x"], "easy_apply": [True]})
+        out = scrape_mod.mark_easy_apply(df)
+        assert bool(out["easy_apply"].iloc[0]) is True
+
+    def test_url_only_in_broad_pass_is_false(self):
+        df = pd.DataFrame({"job_url": ["https://y"], "easy_apply": [False]})
+        out = scrape_mod.mark_easy_apply(df)
+        assert bool(out["easy_apply"].iloc[0]) is False
+
+    def test_missing_column_defaults_false(self):
+        df = pd.DataFrame({"job_url": ["https://z"]})
+        out = scrape_mod.mark_easy_apply(df)
+        assert "easy_apply" in out.columns
+        assert bool(out["easy_apply"].iloc[0]) is False

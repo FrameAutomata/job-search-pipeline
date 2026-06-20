@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from pipeline.apply import browser as browser_mod  # noqa: E402
 from pipeline.apply import linkedin as linkedin_mod  # noqa: E402
+from pipeline.apply import indeed as indeed_mod  # noqa: E402
 from pipeline.apply.result import ApplyResult, APPLIED, EXPIRED, LOGIN_ISSUE  # noqa: E402
 
 
@@ -45,6 +46,8 @@ _TRACKER = (
     "https://www.linkedin.com/jobs/view/123 — strong fit |\n"
     "| 2 | 2026-06-01 | Globex | Dev | 4.2/5 | Evaluated | ❌ | [002](reports/002.md) | "
     "https://boards.greenhouse.io/x/jobs/9 — offsite ATS |\n"
+    "| 3 | 2026-06-01 | Initech | SRE | 4.8/5 | Evaluated | ❌ | [003](reports/003.md) | "
+    "https://www.indeed.com/viewjob?jk=abc123 — indeed smartapply |\n"
 )
 
 
@@ -86,11 +89,26 @@ def engine(monkeypatch):
         fn = state.get("submit_fn")
         return fn(page) if fn else state["submit_result"]
 
+    @contextlib.contextmanager
+    def fake_launch_indeed(headless=False, user_data_dir=None):
+        state["calls"].append(("launch_indeed", headless))
+        try:
+            yield object()
+        finally:
+            state["calls"].append(("close", None))
+
     monkeypatch.setattr(browser_mod, "launch", fake_launch)
     monkeypatch.setattr(browser_mod, "ensure_logged_in",
                         lambda page, *, headless, **kw: state["logged_in"])
     monkeypatch.setattr(linkedin_mod, "apply_to", fake_apply_to)
     monkeypatch.setattr(linkedin_mod, "submit_application", fake_submit, raising=False)
+    # Indeed path: launch_indeed + is_logged_in_indeed + the indeed engine, all
+    # mocked onto the same fakes so the worker can drive either platform.
+    monkeypatch.setattr(browser_mod, "launch_indeed", fake_launch_indeed, raising=False)
+    monkeypatch.setattr(browser_mod, "is_logged_in_indeed",
+                        lambda page, **kw: state["logged_in"], raising=False)
+    monkeypatch.setattr(indeed_mod, "apply_to", fake_apply_to)
+    monkeypatch.setattr(indeed_mod, "submit_application", fake_submit, raising=False)
     # Short hold so a worker left blocking on the decision Event (a test that
     # asserts "ready" but never submits/cancels) dies fast instead of lingering.
     monkeypatch.setenv("APPLY_HOLD_TIMEOUT", "2")
@@ -137,6 +155,18 @@ def _wait_status(client, job_id, targets, timeout=5.0):
 class TestApplyAsyncStart:
     def test_unknown_num_404(self, client, engine):
         assert client.post("/api/jobs/apply-async", json={"num": "999"}).status_code == 404
+
+    def test_indeed_url_admitted(self, client, engine):
+        # An Indeed SmartApply URL is now accepted (not 400) — starts a session.
+        r = client.post("/api/jobs/apply-async", json={"num": "3"})
+        assert r.status_code == 200 and "job_id" in r.json()
+
+    def test_indeed_worker_drives_indeed_engine_to_submitted(self, client, engine):
+        job_id = client.post("/api/jobs/apply-async", json={"num": "3"}).json()["job_id"]
+        assert _wait_status(client, job_id, {"ready", "failed"}).get("status") == "ready"
+        client.post(f"/api/jobs/apply-submit/{job_id}")
+        assert _wait_status(client, job_id, {"submitted", "failed"}).get("status") == "submitted"
+        assert ("launch_indeed", False) in engine["calls"]   # drove the Indeed browser
 
     def test_non_linkedin_url_400(self, client, engine):
         # Row 2 is an off-site greenhouse ATS, not a LinkedIn Easy Apply URL.

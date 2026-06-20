@@ -15,7 +15,7 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from pipeline._batch_common import parse_date_posted
+from pipeline._batch_common import parse_date_posted, read_url_set
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -23,6 +23,11 @@ FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
 PIPELINE_MD = "data/pipeline.md"
 SCAN_HISTORY = "data/scan-history.tsv"
 APPLICATIONS_MD = "data/applications.md"
+# Deduped, append-only list of URLs that came from an easy_apply search pass.
+# JobSpy returns no per-job "easy apply" flag, so this URL-keyed side channel is
+# how the pass-level flag reaches the UI (which gates the Indeed SmartApply
+# apply button on it). The UI reads it via pipeline/app/data.py.
+EASY_APPLY_URLS = "data/easy-apply-urls.txt"
 
 # Full job descriptions can be tens of KB. We keep the structured copy in
 # career-ops/batch/jds/{id}.txt and only embed a preview in pipeline.md.
@@ -171,6 +176,27 @@ def append_to_scan_history(
             f.write(f"{e['url']}\t{today}\tjobspy\t{e['title']}\t{e['company']}\t{status}\n")
 
 
+def load_easy_apply_urls(career_ops: Path) -> set[str]:
+    """The set of easy-apply URLs recorded so far (empty if none yet)."""
+    return read_url_set(career_ops / EASY_APPLY_URLS)
+
+
+def append_easy_apply_urls(career_ops: Path, urls) -> None:
+    """Append new (non-blank, not-already-recorded) URLs to the easy-apply set.
+    Append-only and deduped, so re-runs that re-encounter the same easy_apply
+    listing are cheap no-ops."""
+    existing = load_easy_apply_urls(career_ops)
+    fresh = [u.strip() for u in urls if u and u.strip() and u.strip() not in existing]
+    if not fresh:
+        return
+    # dict.fromkeys dedupes within this batch while preserving order.
+    path = career_ops / EASY_APPLY_URLS
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for u in dict.fromkeys(fresh):
+            f.write(u + "\n")
+
+
 def run(career_ops_path: Path) -> list[dict]:
     if not FILTERED_PATH.exists() or FILTERED_PATH.stat().st_size == 0:
         print("[bridge] no filtered_jobs.csv — run filter first (or nothing passed the threshold)")
@@ -185,11 +211,17 @@ def run(career_ops_path: Path) -> list[dict]:
     seen_urls, seen_roles = load_seen(career_ops_path)
 
     new_offers = []
+    easy_apply_urls = []
     with open(FILTERED_PATH, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             url = (row.get("job_url") or "").strip()
             title = (row.get("title") or "").strip()
             company = (row.get("company") or "").strip()
+            # Record easy-apply URLs from the full file — independent of the
+            # tracker-dedup below — so a listing already in scan-history still
+            # gets its SmartApply flag persisted for the UI.
+            if url and (row.get("easy_apply") or "").strip().lower() == "true":
+                easy_apply_urls.append(url)
             if not url or not title or not company:
                 continue
             if url in seen_urls:
@@ -210,6 +242,8 @@ def run(career_ops_path: Path) -> list[dict]:
                 "description": description,
                 "date_posted": date_posted_str,
             })
+
+    append_easy_apply_urls(career_ops_path, easy_apply_urls)
 
     if not new_offers:
         print("[bridge] no new offers to add (all duplicates)")
