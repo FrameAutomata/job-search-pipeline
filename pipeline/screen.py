@@ -344,9 +344,10 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
         # An already-tracked SmartApply role is removed here as a repeat and never
         # reaches bridge, so this is the only stage that can persist its flag for
         # the UI's apply-button gating.
+        # append_easy_apply_urls strips/dedups/skips blanks itself.
         append_easy_apply_urls(
             career_ops_path,
-            [url for j in jobs if is_easy_apply_row(j) and (url := (j.get("job_url") or "").strip())],
+            [j.get("job_url") for j in jobs if is_easy_apply_row(j)],
         )
         seen_urls = load_seen_urls(career_ops_path)
         if seen_urls:
