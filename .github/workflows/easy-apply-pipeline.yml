@@ -202,6 +202,7 @@ jobs:
             career-ops/reports/
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/tracker-additions/
           if-no-files-found: ignore
           retention-days: 90
