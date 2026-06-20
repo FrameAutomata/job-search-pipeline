@@ -68,6 +68,17 @@ def apply_update(repo_root: Path, template_url: str = TEMPLATE_URL) -> dict:
     if git("remote", "get-url", "origin").returncode != 0:
         return {"ok": False, "error": "no 'origin' remote to push to"}
 
+    # Only update the main branch: merging template/main into a feature branch
+    # would pollute it and leave the cloud copy's main un-updated.
+    branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if branch != "main":
+        return {"ok": False, "error": f"switch to the 'main' branch to update (currently on '{branch}')"}
+
+    # A dirty tree makes `git merge` refuse pre-merge — that's not a conflict, so
+    # report it distinctly rather than telling the user to resolve a merge.
+    if git("status", "--porcelain").stdout.strip():
+        return {"ok": False, "error": "commit or stash your local changes before updating"}
+
     fetched = git("fetch", template_url, "main")
     if fetched.returncode != 0:
         return {"ok": False, "error": f"fetch from template failed: {fetched.stderr.strip()}"}

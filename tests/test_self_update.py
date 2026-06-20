@@ -66,9 +66,15 @@ class TestApplyUpdate:
 
         def run_git(repo_root, *args):
             calls.append(args)
-            for sig, cp in overrides.items():
-                if " ".join(args).startswith(sig):
+            sig = " ".join(args)
+            for s, cp in overrides.items():
+                if sig.startswith(s):
                     return cp
+            # Happy-path defaults for the guards: on main, clean tree.
+            if sig.startswith("rev-parse --abbrev-ref"):
+                return _cp(0, "main\n")
+            if sig.startswith("status --porcelain"):
+                return _cp(0, "")
             return _cp(0, "", "")
         mocker.patch.object(self_update, "_run_git", side_effect=run_git)
         return calls
@@ -118,3 +124,23 @@ class TestApplyUpdate:
         r = self_update.apply_update(tmp_path)
         assert r["ok"] is False
         assert "origin" in r["error"].lower()
+
+    def test_refuses_when_not_on_main(self, tmp_path, mocker):
+        # On a feature branch, merging+pushing would pollute it and miss main.
+        calls = self._fake_git(mocker, {"rev-parse --abbrev-ref": _cp(0, "feature-x\n")})
+        r = self_update.apply_update(tmp_path)
+        assert r["ok"] is False
+        assert "main" in r["error"].lower()
+        sigs = [" ".join(a) for a in calls]
+        assert not any(s.startswith(("fetch", "merge", "push")) for s in sigs)
+
+    def test_refuses_dirty_working_tree(self, tmp_path, mocker):
+        # Uncommitted changes make `git merge` refuse pre-merge — that's NOT a
+        # conflict; report it distinctly so the user commits/stashes.
+        calls = self._fake_git(mocker, {"status --porcelain": _cp(0, " M orchestrate.py\n")})
+        r = self_update.apply_update(tmp_path)
+        assert r["ok"] is False
+        assert r.get("conflict") is not True
+        assert ("commit" in r["error"].lower()) or ("stash" in r["error"].lower())
+        sigs = [" ".join(a) for a in calls]
+        assert not any(s.startswith(("merge", "push")) for s in sigs)
