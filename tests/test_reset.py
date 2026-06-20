@@ -124,6 +124,23 @@ class TestResetJobSearch:
         reset.reset_job_search(tmp_path / "co", tmp_path / "repo",
                                tmp_path / "uic", tmp_path / "backup")
 
+    def test_continues_and_reports_on_item_failure(self, tmp_path, mocker):
+        # A locked/unreadable file (snapshot fails) must NOT abort the whole wipe
+        # or delete that item — it's preserved and reported in `failed`.
+        co, repo, uic = _build(tmp_path)
+        real_copy2 = reset.shutil.copy2
+
+        def flaky_copy2(src, dst, *a, **k):
+            if "scan-history.tsv" in str(src):
+                raise PermissionError("file in use")
+            return real_copy2(src, dst, *a, **k)
+        mocker.patch.object(reset.shutil, "copy2", side_effect=flaky_copy2)
+
+        summary = reset.reset_job_search(co, repo, uic, tmp_path / "backup")
+        assert (co / "data" / "scan-history.tsv").exists()           # preserved (not deleted)
+        assert any("scan-history.tsv" in f["path"] for f in summary["failed"])
+        assert not (co / "data" / "applications.md").exists()        # the rest still wiped
+
 
 class TestClearCloudCaches:
     def test_deletes_only_matching_prefix(self, mocker):
@@ -155,3 +172,35 @@ class TestClearCloudCaches:
         mocker.patch.object(gh, "_run", side_effect=gh.GhError("not authenticated"))
         with pytest.raises(gh.GhError):
             reset.clear_cloud_caches()
+
+    def test_skips_malformed_cache_entry(self, mocker):
+        listing = json.dumps([{"key": "pipeline-state-v1-1"},          # no id
+                              {"id": 2, "key": "pipeline-state-v1-2"}])
+        deleted = []
+
+        def fake_run(args, **kw):
+            if args[:2] == ["cache", "list"]:
+                return listing
+            if args[:2] == ["cache", "delete"]:
+                deleted.append(args[2])
+                return ""
+            return ""
+        mocker.patch.object(gh, "_run", side_effect=fake_run)
+        r = reset.clear_cloud_caches()
+        assert r["deleted"] == ["pipeline-state-v1-2"]   # malformed entry skipped, no crash
+        assert deleted == ["2"]
+
+    def test_partial_delete_failure_reported(self, mocker):
+        listing = json.dumps([{"id": 1, "key": "pipeline-state-v1-1"},
+                              {"id": 2, "key": "pipeline-state-v1-2"}])
+
+        def fake_run(args, **kw):
+            if args[:2] == ["cache", "list"]:
+                return listing
+            if args[:2] == ["cache", "delete"] and args[2] == "2":
+                raise gh.GhError("delete failed")
+            return ""
+        mocker.patch.object(gh, "_run", side_effect=fake_run)
+        r = reset.clear_cloud_caches()
+        assert r["deleted"] == ["pipeline-state-v1-1"]
+        assert any(f["key"] == "pipeline-state-v1-2" for f in r["failed"])

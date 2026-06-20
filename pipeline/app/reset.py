@@ -44,6 +44,7 @@ def reset_job_search(career_ops: Path, repo_root: Path, ui_cache: Path,
     """Snapshot then wipe the job-search state. Returns a summary of what was
     removed. Missing paths are skipped (safe to run on an already-clean tree)."""
     removed: list[str] = []
+    failed: list[dict] = []
 
     def snapshot(src: Path, rel: str) -> None:
         dest = backup_dir / rel
@@ -54,18 +55,27 @@ def reset_job_search(career_ops: Path, repo_root: Path, ui_cache: Path,
             shutil.copy2(src, dest)
 
     def remove_file(src: Path, rel: str) -> None:
-        if src.is_file():
+        if not src.is_file():
+            return
+        # Snapshot before delete; a failure (locked file, long path) is recorded
+        # and the item left intact — one bad file can't abort or half-do the wipe.
+        try:
             snapshot(src, rel)
             src.unlink()
             removed.append(rel)
+        except OSError as e:
+            failed.append({"path": rel, "error": str(e)})
 
     def remove_path(src: Path, rel: str) -> None:
-        if src.is_dir():
+        if not src.is_dir():
+            remove_file(src, rel)
+            return
+        try:
             snapshot(src, rel)
             shutil.rmtree(src)
             removed.append(rel)
-        else:
-            remove_file(src, rel)
+        except OSError as e:
+            failed.append({"path": rel, "error": str(e)})
 
     def clear_dir(d: Path, rel: str) -> None:
         if not d.is_dir():
@@ -89,7 +99,8 @@ def reset_job_search(career_ops: Path, repo_root: Path, ui_cache: Path,
     for d in _UI_DIRS:
         remove_path(ui_cache / d, f".ui-cache/{d}")
 
-    return {"removed": removed, "count": len(removed), "backup_dir": str(backup_dir)}
+    return {"removed": removed, "failed": failed, "count": len(removed),
+            "backup_dir": str(backup_dir)}
 
 
 def clear_cloud_caches(prefix: str = CLOUD_CACHE_PREFIX) -> dict:
@@ -99,8 +110,15 @@ def clear_cloud_caches(prefix: str = CLOUD_CACHE_PREFIX) -> dict:
     out = gh._run(["cache", "list", *gh._repo_args(), "--limit", "100", "--json", "id,key"])
     caches = json.loads(out or "[]")
     deleted: list[str] = []
+    failed: list[dict] = []
     for c in caches:
-        if str(c.get("key", "")).startswith(prefix):
-            gh._run(["cache", "delete", str(c["id"]), *gh._repo_args()])
-            deleted.append(c["key"])
-    return {"deleted": deleted}
+        cid, key = c.get("id"), str(c.get("key", ""))
+        if cid is None or not key.startswith(prefix):
+            continue
+        # Per-cache: one failed delete shouldn't drop the others already deleted.
+        try:
+            gh._run(["cache", "delete", str(cid), *gh._repo_args()])
+            deleted.append(key)
+        except gh.GhError as e:
+            failed.append({"key": key, "error": str(e)})
+    return {"deleted": deleted, "failed": failed}
