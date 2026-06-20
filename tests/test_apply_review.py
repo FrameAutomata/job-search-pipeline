@@ -135,7 +135,6 @@ def client(tmp_path, monkeypatch, engine):
     monkeypatch.setenv("CAREER_OPS_PATH", str(co))
     from pipeline.app import server
     importlib.reload(server)
-    server._active_data_dir = None
     return TestClient(server.app)
 
 

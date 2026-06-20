@@ -53,7 +53,6 @@ def client(tmp_path, monkeypatch):
     # push-touching test can write the developer's real (gitignored) .ui-cache.
     server.PUSHED_OVERRIDES_FILE = tmp_path / ".ui-cache" / "pushed-overrides.json"
     server.UI_CACHE = tmp_path / ".ui-cache" / "latest"
-    server._active_data_dir = None
     return TestClient(server.app)
 
 

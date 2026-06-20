@@ -230,7 +230,7 @@ Then open http://localhost:8000.
 Point it at either your local `career-ops/` directory (if you run the pipeline locally) or a GitHub Actions artifact you've downloaded and extracted (the artifact has the same `reports/` + `data/applications.md` layout).
 
 **Cloud buttons** (require the [`gh` CLI](https://cli.github.com) installed + `gh auth login`):
-- **↻ Refresh** — downloads the most recent *successful* `daily-pipeline` artifact via `gh run download` and loads it, so you don't extract by hand. Cached under `.ui-cache/` (gitignored).
+- **↻ Refresh** — downloads the most recent *successful* `daily-pipeline` artifact via `gh run download` and **merges it into your local tracker** (offline-first): cloud wins for shared roles, and rows from a local `Run local` are preserved. The merged tracker lives durably in `career-ops/`, so it survives restarts and is still there when you're offline or out of CI/CD credits. If GitHub is unreachable, your last-synced local data is left untouched.
 - **▶ Run now** — triggers a `daily-pipeline` run in the cloud (`gh workflow run`). It executes on GitHub; click Refresh once it finishes.
 - **⇧ Push N changes** — appears once you've made status edits on the board. Pushes them to the cloud tracker via the `edit-tracker` workflow. It first refreshes the latest tracker and applies your changes on top, so roles the pipeline added since your last refresh aren't clobbered.
 - **⚙ Setup** — opens the guided onboarding wizard (see below).
