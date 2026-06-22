@@ -5,6 +5,7 @@ extraction are guarded so the suite still passes without node / pdfplumber.
 """
 
 import base64
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -296,6 +297,51 @@ class TestArticleDigestSecretWiring:
         self._seed_required(tmp_path)
         blobs = onboard.collect_secret_blobs(tmp_path)
         assert "ARTICLE_DIGEST_B64" not in blobs
+
+
+class TestEeoDatalists:
+    """The four voluntary self-ID fields offer standard answers as dropdown
+    suggestions, but must stay free-text so a user can type the employer's exact
+    wording (the answers are fuzzy-matched per form) or a non-US category. That
+    means an <input list="..."> wired to a <datalist> — never a hard <select>,
+    which would lock in one (US-centric) option set and drop free typing."""
+
+    EEO_FIELDS = ["eeo_gender", "eeo_race", "eeo_veteran", "eeo_disability"]
+
+    @pytest.fixture
+    def html(self):
+        root = Path(__file__).resolve().parent.parent
+        return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
+
+    def _input_tag(self, html, name):
+        m = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
+        assert m, f"no <input name={name!r}> found"
+        return m.group(0)
+
+    def test_each_eeo_field_is_input_not_select(self, html):
+        # A <select name="eeo_*"> would mean we lost free-text entry.
+        for name in self.EEO_FIELDS:
+            assert not re.search(rf'<select\b[^>]*\bname="{re.escape(name)}"', html), \
+                f"{name} must stay an <input> (free-text), not a <select>"
+            self._input_tag(html, name)  # the <input> still exists
+
+    def test_each_eeo_input_references_an_existing_datalist(self, html):
+        datalist_ids = set(re.findall(r'<datalist\b[^>]*\bid="([^"]+)"', html))
+        for name in self.EEO_FIELDS:
+            tag = self._input_tag(html, name)
+            m = re.search(r'\blist="([^"]+)"', tag)
+            assert m, f"{name} input is missing a list= attribute"
+            assert m.group(1) in datalist_ids, \
+                f"{name} list={m.group(1)!r} has no matching <datalist id>"
+
+    def test_datalists_offer_standard_and_decline_options(self, html):
+        # Spot-check that the suggestion sets carry the usual wording, including
+        # an explicit "prefer not to say" so declining is one click, not just blank.
+        assert "Non-binary" in html
+        assert "Black or African American" in html
+        assert "protected veteran" in html
+        assert "do not have a disability" in html
+        assert re.search(r"[Pp]refer not to (say|answer)|don't wish to answer|do not want to answer", html)
 
 
 class TestPortfolioUrls:
