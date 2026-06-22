@@ -916,13 +916,20 @@ def _maybe_generate_article_digest(payload: dict, resume_text: str,
     if not (provider and api_key):
         return
     try:
-        article_digest.generate_and_write(
+        written = article_digest.generate_and_write(
             ROOT / "career-ops", resume_text, onboard.portfolio_urls(payload),
             provider=provider, api_key=api_key,
             model=(payload.get("batch_model") or "").strip() or None,
         )
-    except Exception:
-        pass  # best-effort — onboarding succeeds regardless
+        # One-line signal for troubleshooting "why no digest?": None means we
+        # wrote nothing (existing digest kept, no grounding, or the LLM was
+        # unavailable). Not an error — onboarding proceeds regardless.
+        if written is None:
+            print("[onboard] article-digest not generated "
+                  "(existing digest kept, no grounding, or LLM unavailable)")
+    except Exception as e:
+        # best-effort — onboarding succeeds regardless; log so it's not invisible.
+        print(f"[onboard] article-digest generation errored (ignored): {e}")
 
 
 @app.post("/api/onboard")

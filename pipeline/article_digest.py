@@ -33,6 +33,9 @@ _GH_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.I)
 # blow the context. (cover_letters._JD_MAX is the sibling cap for JDs.)
 _RESUME_MAX = 8000
 _README_MAX = 6000
+# Hard cap on bytes pulled per README fetch. We keep only _README_MAX chars
+# downstream, so this just stops a pathological response from ballooning memory.
+_FETCH_MAX_BYTES = 1_000_000
 
 Caller = Callable[[str, str], str]
 
@@ -45,7 +48,7 @@ def _default_fetch(url: str, timeout: int = 10) -> str:
 
     req = urllib.request.Request(url, headers={"User-Agent": "career-ops-onboard"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - https only
-        return resp.read().decode("utf-8", errors="replace")
+        return resp.read(_FETCH_MAX_BYTES).decode("utf-8", errors="replace")
 
 
 def _readme_urls(owner: str, repo: str) -> list[str]:
