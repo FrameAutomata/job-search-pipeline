@@ -725,3 +725,55 @@ class TestOpenAICompatibleProviders:
         mock_build = mocker.patch.object(eval_mod, "_build_openai_compat_caller", return_value=lambda s, u: "fake")
         eval_mod._build_caller("openai", "gpt-4o-mini")
         assert mock_build.call_args.kwargs["base_url"] is None
+
+
+class TestFreeTierPacing:
+    """_build_caller wraps the caller with gemini_limits.paced_caller, so eval +
+    tailoring + cover-letters all conform to the free-tier RPM through one place."""
+
+    def test_build_caller_applies_pacing_when_conforming(self, monkeypatch):
+        sentinel = lambda *a, **k: "RESULT"
+        monkeypatch.setattr(eval_mod, "_build_single_caller", lambda *a, **k: sentinel)
+
+        # conforming OFF → returned unwrapped
+        monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)
+        assert eval_mod._build_caller("gemini", "gemini-2.5-flash") is sentinel
+
+        # conforming ON + free-tier model → wrapped, but still calls through
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        wrapped = eval_mod._build_caller("gemini", "gemini-2.5-flash")
+        assert wrapped is not sentinel
+        assert wrapped() == "RESULT"
+
+    def test_build_caller_no_pacing_for_paid_model(self, monkeypatch):
+        sentinel = lambda *a, **k: "RESULT"
+        monkeypatch.setattr(eval_mod, "_build_single_caller", lambda *a, **k: sentinel)
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        assert eval_mod._build_caller("openai", "gpt-4o-mini") is sentinel
+
+    def test_run_eval_caps_pending_to_rpd_when_conforming(self, tmp_path, monkeypatch, capsys):
+        # dry_run returns after the cap (before the caller/executor), so it's a
+        # clean seam to verify _run_eval honors the free-tier daily cap.
+        co = tmp_path / "career-ops"
+        (co / "batch").mkdir(parents=True)
+        (co / "batch" / "batch-input.tsv").write_text("x", encoding="utf-8")  # must exist
+        monkeypatch.setattr(eval_mod, "load_state", lambda p: {})
+        rows = [{"id": str(i), "source": "s", "notes": "n"} for i in range(50)]
+        monkeypatch.setattr(eval_mod, "load_pending", lambda bi, st: list(rows))
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+
+        n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True)
+        assert n == 20                                   # capped from 50 (RPD)
+        assert "30 deferred" in capsys.readouterr().err
+
+    def test_run_eval_no_cap_when_not_conforming(self, tmp_path, monkeypatch):
+        co = tmp_path / "career-ops"
+        (co / "batch").mkdir(parents=True)
+        (co / "batch" / "batch-input.tsv").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(eval_mod, "load_state", lambda p: {})
+        rows = [{"id": str(i), "source": "s", "notes": "n"} for i in range(50)]
+        monkeypatch.setattr(eval_mod, "load_pending", lambda bi, st: list(rows))
+        monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)
+
+        n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True)
+        assert n == 50                                   # no cap

@@ -389,6 +389,10 @@ async function loadLocalProviders() {
     // Current model.
     modelInput.value = d.current.batch_model || "";
 
+    // Current Gemini free-tier opt-in.
+    const freeTierCb = document.getElementById("gemini-free-tier");
+    if (freeTierCb) freeTierCb.checked = !!d.current.gemini_free_tier;
+
     // Update model hint when provider changes.
     function updateModelHint() {
       const pName = select.value;
@@ -427,13 +431,15 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   const provider = document.getElementById("local-provider-select").value;
   const model    = document.getElementById("local-model-input").value.trim();
   const cli      = document.getElementById("local-cli-select").value;
+  const geminiFreeTier = document.getElementById("gemini-free-tier").checked;
   btn.disabled = true;
   msgEl.hidden = true;
   try {
     const resp = await fetch("/api/onboard/local-config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli }),
+      body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
+                             gemini_free_tier: geminiFreeTier }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || "save failed");

@@ -448,9 +448,13 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
     single-model builder."""
     models = _split_models(model)
     if len(models) > 1:
-        return _build_failover_caller(provider, models, disable_thinking=disable_thinking)
-    return _build_single_caller(provider, models[0] if models else model,
-                                disable_thinking=disable_thinking)
+        caller = _build_failover_caller(provider, models, disable_thinking=disable_thinking)
+    else:
+        caller = _build_single_caller(provider, models[0] if models else model,
+                                      disable_thinking=disable_thinking)
+    # Gemini free-tier conforming: pace each call to the (lead) model's RPM. No-op
+    # unless GEMINI_FREE_TIER is set and the lead model is a known free-tier model.
+    return gemini_limits.paced_caller(caller, models[0] if models else model)
 
 
 def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:
@@ -697,13 +701,20 @@ def _run_eval(
     # scrape/filter/screen/bridge already did the expensive work.
     concurrency = max(1, int(concurrency))
 
-    print(f"[batch-eval] {len(pending)} job(s) | provider={provider} | model={model} | workers={concurrency}")
+    # Gemini free tier: when conforming (GEMINI_FREE_TIER), cap the run to the
+    # model's daily RPD and defer the rest to the next run; otherwise just warn.
+    # (Per-minute RPM pacing happens inside the caller — see _build_caller.)
+    total = len(pending)
+    pending, deferred = gemini_limits.cap_to_rpd(pending, model)
+    if deferred:
+        print(f"[batch-eval] free-tier cap: evaluating {len(pending)} of {total} today; "
+              f"{deferred} deferred to the next run.", file=sys.stderr)
+    else:
+        warning = gemini_limits.format_free_tier_warning(model, total)
+        if warning:
+            print(warning, file=sys.stderr)
 
-    # Free-tier viability: warn before a run that would exceed the model's daily
-    # cap (no-op for paid/non-Gemini models). RPD is the binding constraint.
-    warning = gemini_limits.format_free_tier_warning(model, len(pending))
-    if warning:
-        print(warning, file=sys.stderr)
+    print(f"[batch-eval] {len(pending)} job(s) | provider={provider} | model={model} | workers={concurrency}")
 
     if dry_run:
         for row in pending[:5]:

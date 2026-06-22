@@ -60,3 +60,85 @@ class TestWarning:
 
     def test_no_warning_for_unknown_model(self):
         assert gl.format_free_tier_warning("gpt-4o-mini", 9999) is None
+
+
+class TestConforming:
+    def test_conforming_enabled_reads_env(self, monkeypatch):
+        for v in ("true", "1", "yes", "on", "TRUE"):
+            monkeypatch.setenv("GEMINI_FREE_TIER", v)
+            assert gl.conforming_enabled() is True
+        for v in ("", "false", "0", "no"):
+            monkeypatch.setenv("GEMINI_FREE_TIER", v)
+            assert gl.conforming_enabled() is False
+        monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)
+        assert gl.conforming_enabled() is False
+
+    def test_rpd_cap_only_when_conforming_and_free_tier(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        assert gl.rpd_cap("gemini-2.5-flash") == 20
+        assert gl.rpd_cap("gemma-4-26b-a4b-it") == 1500
+        assert gl.rpd_cap("gpt-4o-mini") is None          # not a free-tier model
+        monkeypatch.setenv("GEMINI_FREE_TIER", "false")
+        assert gl.rpd_cap("gemini-2.5-flash") is None     # conforming off
+
+    def test_cap_to_rpd_slices_and_counts(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        items = list(range(50))
+        kept, deferred = gl.cap_to_rpd(items, "gemini-2.5-flash")
+        assert kept == list(range(20)) and deferred == 30
+        # under the cap → unchanged
+        assert gl.cap_to_rpd(list(range(5)), "gemini-2.5-flash") == (list(range(5)), 0)
+        # conforming off → never caps
+        monkeypatch.setenv("GEMINI_FREE_TIER", "false")
+        assert gl.cap_to_rpd(items, "gemini-2.5-flash") == (items, 0)
+
+
+class TestRateLimiter:
+    def test_paces_to_rpm(self):
+        clock = [0.0]
+        sleeps = []
+
+        def fsleep(s):
+            sleeps.append(s)
+            clock[0] += s
+        rl = gl.RateLimiter(60, monotonic=lambda: clock[0], sleep=fsleep)  # 1 req/sec
+        for _ in range(4):
+            rl.acquire()
+        assert sleeps == [1.0, 1.0, 1.0]   # first immediate, then ~1s apart
+
+    def test_first_acquire_does_not_sleep(self):
+        sleeps = []
+        rl = gl.RateLimiter(5, monotonic=lambda: 0.0, sleep=sleeps.append)
+        rl.acquire()
+        assert sleeps == []
+
+
+class TestPacedCaller:
+    def test_acquires_then_calls_when_conforming(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        events = []
+
+        class FakeRL:
+            def __init__(self, rpm):
+                events.append(("init", rpm))
+
+            def acquire(self):
+                events.append(("acquire",))
+        monkeypatch.setattr(gl, "RateLimiter", FakeRL)
+
+        def base(*a, **k):
+            events.append(("call",))
+            return "R"
+        wrapped = gl.paced_caller(base, "gemini-2.5-flash")
+        assert wrapped() == "R"
+        assert events == [("init", 5), ("acquire",), ("call",)]
+
+    def test_noop_when_conforming_off(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)
+        base = lambda: "R"
+        assert gl.paced_caller(base, "gemini-2.5-flash") is base
+
+    def test_noop_for_non_free_tier_model(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        base = lambda: "R"
+        assert gl.paced_caller(base, "gpt-4o-mini") is base

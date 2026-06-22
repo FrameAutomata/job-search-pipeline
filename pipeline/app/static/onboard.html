@@ -223,6 +223,14 @@
         </label>
         <p id="local-cli-hint" class="hint"></p>
 
+        <label class="check" style="margin-top:10px">
+          <input type="checkbox" id="gemini-free-tier" />
+          I'm on Gemini's free tier — pace requests and cap each run to the daily limit
+        </label>
+        <p class="hint">When on, evaluation and résumé tailoring stay within the free-tier RPM/RPD
+          (e.g. ~20 jobs/day on <code>gemini-2.5-flash</code>; the rest defer to the next run).
+          Use <code>gemma-4-26b-a4b-it</code> for ~1,500/day.</p>
+
         <button type="button" id="save-local-btn" style="margin-top:8px">Save to .env</button>
         <div id="local-save-msg" class="action-msg" hidden></div>
       </section>
