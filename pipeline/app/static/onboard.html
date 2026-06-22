@@ -76,18 +76,47 @@
             against the form's options, so use the employer's wording.</p>
           <div class="grid2">
             <label>Gender
-              <input name="eeo_gender" placeholder="e.g. Male, Female, Non-binary (blank = decline)" />
+              <input name="eeo_gender" list="eeo-gender-options" placeholder="e.g. Male, Female, Non-binary (blank = decline)" />
             </label>
             <label>Race / ethnicity
-              <input name="eeo_race" placeholder="e.g. Asian, Hispanic or Latino (blank = decline)" />
+              <input name="eeo_race" list="eeo-race-options" placeholder="e.g. Asian, Hispanic or Latino (blank = decline)" />
             </label>
             <label>Veteran status
-              <input name="eeo_veteran" placeholder="e.g. I am not a protected veteran (blank = decline)" />
+              <input name="eeo_veteran" list="eeo-veteran-options" placeholder="e.g. I am not a protected veteran (blank = decline)" />
             </label>
             <label>Disability status
-              <input name="eeo_disability" placeholder="e.g. No, I do not have a disability (blank = decline)" />
+              <input name="eeo_disability" list="eeo-disability-options" placeholder="e.g. No, I do not have a disability (blank = decline)" />
             </label>
           </div>
+          <!-- Suggestions only: each field stays free-text so a user can type the
+               employer's exact wording (answers are fuzzy-matched per form) or a
+               non-US category. Standard EEO phrasings cover the common case. -->
+          <datalist id="eeo-gender-options">
+            <option value="Male"></option>
+            <option value="Female"></option>
+            <option value="Non-binary"></option>
+            <option value="Prefer not to say"></option>
+          </datalist>
+          <datalist id="eeo-race-options">
+            <option value="Hispanic or Latino"></option>
+            <option value="White"></option>
+            <option value="Black or African American"></option>
+            <option value="Asian"></option>
+            <option value="Native American or Alaska Native"></option>
+            <option value="Native Hawaiian or Pacific Islander"></option>
+            <option value="Two or More Races"></option>
+            <option value="Prefer not to say"></option>
+          </datalist>
+          <datalist id="eeo-veteran-options">
+            <option value="I am not a protected veteran"></option>
+            <option value="I identify as one or more classifications of protected veteran"></option>
+            <option value="I don't wish to answer"></option>
+          </datalist>
+          <datalist id="eeo-disability-options">
+            <option value="Yes, I have a disability (or previously had one)"></option>
+            <option value="No, I do not have a disability"></option>
+            <option value="I do not want to answer"></option>
+          </datalist>
           <p class="hint" style="margin-top:.6rem">Some job sites ask you to consent to processing your
             self-identification data, and to save or share those answers, before an application can be
             submitted. You provide none either way, but the consent is required on the sites that ask for it.</p>
