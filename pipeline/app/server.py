@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.app import data, gh, local_run, onboard, reset, self_update, skills
+from pipeline import article_digest
 from pipeline import gemini_limits
 from pipeline._batch_common import (
     build_system_prompt,
@@ -905,6 +906,25 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     return JSONResponse({"ok": True, "updated": updated})
 
 
+def _maybe_generate_article_digest(payload: dict, resume_text: str,
+                                   provider: str, api_key: str) -> None:
+    """Best-effort: draft career-ops/article-digest.md (the proof-points corpus
+    career-ops inlines into every evaluation) from the résumé + the candidate's
+    GitHub repo READMEs, using the provider + key just entered. Skips silently
+    when there's no key or a non-empty digest already exists; never raises — a
+    failed digest must not fail onboarding."""
+    if not (provider and api_key):
+        return
+    try:
+        article_digest.generate_and_write(
+            ROOT / "career-ops", resume_text, onboard.portfolio_urls(payload),
+            provider=provider, api_key=api_key,
+            model=(payload.get("batch_model") or "").strip() or None,
+        )
+    except Exception:
+        pass  # best-effort — onboarding succeeds regardless
+
+
 @app.post("/api/onboard")
 async def onboard_submit(
     form: str = Form(...),
@@ -975,6 +995,9 @@ async def onboard_submit(
     # Generate artifacts via the shared node generator, then collect base64.
     try:
         onboard.run_generation(ROOT, onboard.build_onboarding_json(payload, resume_text))
+        # Best-effort proof-points corpus, written before we snapshot files into
+        # secrets so it rides along to the cloud. Never blocks onboarding.
+        _maybe_generate_article_digest(payload, resume_text, provider, api_key)
         blobs = onboard.collect_secret_blobs(ROOT)
     except onboard.OnboardError as e:
         raise HTTPException(status_code=500, detail=str(e))
