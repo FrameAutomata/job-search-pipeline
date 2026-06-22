@@ -777,3 +777,17 @@ class TestFreeTierPacing:
 
         n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True)
         assert n == 50                                   # no cap
+
+    def test_run_eval_cap_sums_failover_chain(self, tmp_path, monkeypatch, capsys):
+        co = tmp_path / "career-ops"
+        (co / "batch").mkdir(parents=True)
+        (co / "batch" / "batch-input.tsv").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(eval_mod, "load_state", lambda p: {})
+        rows = [{"id": str(i), "source": "s", "notes": "n"} for i in range(50)]
+        monkeypatch.setattr(eval_mod, "load_pending", lambda bi, st: list(rows))
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        # chain of two 20-RPD models → summed cap 40
+        n = eval_mod._run_eval(co, provider="gemini",
+                               model="gemini-2.5-flash,gemini-3.5-flash", dry_run=True)
+        assert n == 40
+        assert "10 deferred" in capsys.readouterr().err

@@ -34,19 +34,35 @@ GEMINI_FREE_TIER_LIMITS: dict[str, dict] = {
 BATCH_RECOMMENDATION = "gemma-4-26b-a4b-it"
 
 
-def free_tier_viability(model: str, pending_jobs: int) -> dict | None:
-    """Whether `pending_jobs` fits the model's free-tier daily cap.
+def _spec_models(model: str) -> list[str]:
+    """Split a model spec into members. A comma-separated `BATCH_MODEL` is a
+    failover chain (tried in order); a single value is a one-member chain."""
+    return [m.strip() for m in (model or "").split(",") if m.strip()]
 
-    Returns None for a model not in the free-tier table (paid model, non-Gemini,
-    or an unknown id). Otherwise {"rpd", "exceeds": pending > rpd[, "suggestion"]}
-    — `suggestion` is the recommended higher-cap model, present only when the run
-    exceeds the cap AND a better free option than the current model exists."""
-    limits = GEMINI_FREE_TIER_LIMITS.get(model)
-    if limits is None:
+
+def _spec_rpd(model: str) -> int | None:
+    """Summed free-tier RPD across the spec's known members. A failover chain's
+    daily capacity is the SUM — when one member is exhausted (429) the call falls
+    over to the next — so a `flash,gemma` chain does ~20 then ~1,500 = 1,520/day.
+    None if no member is a known free-tier model (paid / non-Gemini / unknown)."""
+    caps = [GEMINI_FREE_TIER_LIMITS[m]["rpd"] for m in _spec_models(model)
+            if m in GEMINI_FREE_TIER_LIMITS]
+    return sum(caps) if caps else None
+
+
+def free_tier_viability(model: str, pending_jobs: int) -> dict | None:
+    """Whether `pending_jobs` fits the model spec's free-tier daily capacity.
+
+    Returns None for a spec with no known free-tier member (paid / non-Gemini /
+    unknown). Otherwise {"rpd", "exceeds": pending > rpd[, "suggestion"]} —
+    `suggestion` is the recommended higher-cap model, present only when the run
+    exceeds the cap AND that model isn't already in the spec. Chain-aware: rpd is
+    the sum across members (see _spec_rpd)."""
+    rpd = _spec_rpd(model)
+    if rpd is None:
         return None
-    rpd = limits["rpd"]
     result = {"rpd": rpd, "exceeds": pending_jobs > rpd}
-    if result["exceeds"] and model != BATCH_RECOMMENDATION:
+    if result["exceeds"] and BATCH_RECOMMENDATION not in _spec_models(model):
         result["suggestion"] = BATCH_RECOMMENDATION
     return result
 
@@ -77,11 +93,11 @@ def conforming_enabled() -> bool:
 
 
 def rpd_cap(model: str) -> int | None:
-    """The model's free-tier daily request cap when conforming is on, else None."""
+    """The spec's free-tier daily request cap (summed across a failover chain)
+    when conforming is on, else None."""
     if not conforming_enabled():
         return None
-    limits = GEMINI_FREE_TIER_LIMITS.get(model)
-    return limits["rpd"] if limits else None
+    return _spec_rpd(model)
 
 
 def cap_to_rpd(items: list, model: str) -> tuple[list, int]:

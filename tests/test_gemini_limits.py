@@ -46,6 +46,19 @@ class TestViability:
         assert gl.free_tier_viability("claude-sonnet-4-6", 50) is None
         assert gl.free_tier_viability("gemma-4-26b-it", 50) is None   # the wrong ID isn't in the table
 
+    def test_sums_failover_chain_rpd(self):
+        # A chain fails over member-to-member, so its daily capacity is the SUM.
+        v = gl.free_tier_viability("gemini-2.5-flash,gemma-4-26b-a4b-it", 2000)
+        assert v["rpd"] == 1520                       # 20 + 1500
+        assert v["exceeds"] is True
+        assert "suggestion" not in v                  # the recommended model is already in the chain
+
+    def test_chain_suggests_when_recommendation_absent(self):
+        v = gl.free_tier_viability("gemini-2.5-flash,gemini-3.5-flash", 50)
+        assert v["rpd"] == 40                          # 20 + 20
+        assert v["exceeds"] is True
+        assert v["suggestion"] == "gemma-4-26b-a4b-it"
+
 
 class TestWarning:
     def test_warning_when_exceeded_names_model_rpd_and_suggestion(self):
@@ -91,6 +104,17 @@ class TestConforming:
         # conforming off → never caps
         monkeypatch.setenv("GEMINI_FREE_TIER", "false")
         assert gl.cap_to_rpd(items, "gemini-2.5-flash") == (items, 0)
+
+    def test_chain_aware_cap(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        # summed cap; whitespace tolerated; unknown members ignored
+        assert gl.rpd_cap("gemini-2.5-flash,gemma-4-26b-a4b-it") == 1520
+        assert gl.rpd_cap("gemini-2.5-flash , gemini-3.5-flash") == 40
+        assert gl.rpd_cap("gemini-2.5-flash,unknown-x") == 20
+        assert gl.rpd_cap("unknown-a,unknown-b") is None
+        items = list(range(50))
+        assert gl.cap_to_rpd(items, "gemini-2.5-flash,gemini-3.5-flash") == (list(range(40)), 10)
+        assert gl.cap_to_rpd(items, "gemini-2.5-flash,gemma-4-26b-a4b-it") == (items, 0)
 
 
 class TestRateLimiter:
