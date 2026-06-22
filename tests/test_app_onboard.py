@@ -334,6 +334,18 @@ class TestEeoDatalists:
             assert m.group(1) in datalist_ids, \
                 f"{name} list={m.group(1)!r} has no matching <datalist id>"
 
+    def test_each_eeo_input_reenables_autocomplete(self, html):
+        # The form sets autocomplete="off" (so the browser doesn't autofill
+        # name/email across the wizard). Chromium suppresses <datalist>
+        # suggestions whenever the input's effective autocomplete is "off", so
+        # each EEO input must override it back to "on" or the dropdown is dead.
+        for name in self.EEO_FIELDS:
+            tag = self._input_tag(html, name)
+            m = re.search(r'\bautocomplete="([^"]+)"', tag)
+            assert m, f"{name} input must set autocomplete to override the form default"
+            assert m.group(1).lower() != "off", \
+                f"{name} input has autocomplete=off — its datalist won't show in Chromium"
+
     def test_datalists_offer_standard_and_decline_options(self, html):
         # Spot-check that the suggestion sets carry the usual wording, including
         # an explicit "prefer not to say" so declining is one click, not just blank.

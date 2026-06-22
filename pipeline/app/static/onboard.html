@@ -75,17 +75,19 @@
             application — the default. Fill one in only to self-identify; it's matched
             against the form's options, so use the employer's wording.</p>
           <div class="grid2">
+            <!-- autocomplete="on" overrides the form's autocomplete="off": Chromium
+                 hides a <datalist> when the input's effective autocomplete is off. -->
             <label>Gender
-              <input name="eeo_gender" list="eeo-gender-options" placeholder="e.g. Male, Female, Non-binary (blank = decline)" />
+              <input name="eeo_gender" list="eeo-gender-options" autocomplete="on" placeholder="e.g. Male, Female, Non-binary (blank = decline)" />
             </label>
             <label>Race / ethnicity
-              <input name="eeo_race" list="eeo-race-options" placeholder="e.g. Asian, Hispanic or Latino (blank = decline)" />
+              <input name="eeo_race" list="eeo-race-options" autocomplete="on" placeholder="e.g. Asian, Hispanic or Latino (blank = decline)" />
             </label>
             <label>Veteran status
-              <input name="eeo_veteran" list="eeo-veteran-options" placeholder="e.g. I am not a protected veteran (blank = decline)" />
+              <input name="eeo_veteran" list="eeo-veteran-options" autocomplete="on" placeholder="e.g. I am not a protected veteran (blank = decline)" />
             </label>
             <label>Disability status
-              <input name="eeo_disability" list="eeo-disability-options" placeholder="e.g. No, I do not have a disability (blank = decline)" />
+              <input name="eeo_disability" list="eeo-disability-options" autocomplete="on" placeholder="e.g. No, I do not have a disability (blank = decline)" />
             </label>
           </div>
           <!-- Suggestions only: each field stays free-text so a user can type the
