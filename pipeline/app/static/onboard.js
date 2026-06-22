@@ -389,12 +389,20 @@ async function loadLocalProviders() {
     // Current model.
     modelInput.value = d.current.batch_model || "";
 
-    // Update model hint when provider changes.
+    // Current Gemini free-tier opt-in.
+    const freeTierCb = document.getElementById("gemini-free-tier");
+    const freeTierRow = document.getElementById("gemini-free-tier-row");
+    if (freeTierCb) freeTierCb.checked = !!d.current.gemini_free_tier;
+
+    // Update model hint + the Gemini-only free-tier checkbox when provider changes.
     function updateModelHint() {
       const pName = select.value;
       const def = d.provider_defaults[pName] || "";
       modelHint.hidden = !def;
       modelHint.textContent = def ? `Default for ${pName}: ${def}` : "";
+      // Gemini-only — show for Gemini and auto-detect (which may resolve to Gemini),
+      // hide only when an explicit non-Gemini provider is chosen.
+      if (freeTierRow) freeTierRow.hidden = pName !== "" && pName !== "gemini";
     }
     select.addEventListener("change", updateModelHint);
     updateModelHint();
@@ -427,13 +435,18 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   const provider = document.getElementById("local-provider-select").value;
   const model    = document.getElementById("local-model-input").value.trim();
   const cli      = document.getElementById("local-cli-select").value;
+  // Gemini-only: don't persist the flag for an explicit non-Gemini provider
+  // (it'd be a no-op anyway). Allowed for Gemini + auto-detect.
+  const geminiFreeTier = (provider === "" || provider === "gemini")
+    && document.getElementById("gemini-free-tier").checked;
   btn.disabled = true;
   msgEl.hidden = true;
   try {
     const resp = await fetch("/api/onboard/local-config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli }),
+      body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
+                             gemini_free_tier: geminiFreeTier }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || "save failed");

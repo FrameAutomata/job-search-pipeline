@@ -66,6 +66,7 @@ from pipeline._batch_common import (
     run_merge_tracker,
     write_job_result,
 )
+from pipeline import gemini_limits
 
 # Hoisted to _batch_common (shared with the UI's local-run orphan guard); kept
 # under the old private name for callers/tests that import it from here.
@@ -77,11 +78,11 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     # gemini-2.5-flash, NOT gemini-2.0-flash: the 2.0 model was deprecated by
     # Google (shutdown 2026-06-01) and its free-tier quota collapsed months
-    # ahead of that. 2.5-flash is supported and won't fail with a deprecation
-    # error — but its free-tier RPD is only ~20/day, so users running >20
-    # evaluations per day should override BATCH_MODEL to one of the
-    # higher-RPD options (gemma-4-26b-it has 1.5K RPD + unlimited TPM,
-    # gemini-3.1-flash-lite has 500 RPD). See .env.example.
+    # ahead of that. 2.5-flash is supported — but its free-tier RPD is only
+    # ~20/day, so users running >20 evaluations per day should override
+    # BATCH_MODEL to gemma-4-26b-a4b-it (1.5K RPD + unlimited TPM). See
+    # gemini_limits.py for the per-model free-tier caps + the run-time warning,
+    # and .env.example.
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
@@ -447,9 +448,13 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
     single-model builder."""
     models = _split_models(model)
     if len(models) > 1:
-        return _build_failover_caller(provider, models, disable_thinking=disable_thinking)
-    return _build_single_caller(provider, models[0] if models else model,
-                                disable_thinking=disable_thinking)
+        caller = _build_failover_caller(provider, models, disable_thinking=disable_thinking)
+    else:
+        caller = _build_single_caller(provider, models[0] if models else model,
+                                      disable_thinking=disable_thinking)
+    # Gemini free-tier conforming: pace each call to the (lead) model's RPM. No-op
+    # unless GEMINI_FREE_TIER is set and the lead model is a known free-tier model.
+    return gemini_limits.paced_caller(caller, models[0] if models else model)
 
 
 def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:
@@ -695,6 +700,19 @@ def _run_eval(
     # BATCH_CONCURRENCY ("0", "0.9"→0) shouldn't traceback the eval stage after
     # scrape/filter/screen/bridge already did the expensive work.
     concurrency = max(1, int(concurrency))
+
+    # Gemini free tier: when conforming (GEMINI_FREE_TIER), cap the run to the
+    # model's daily RPD and defer the rest to the next run; otherwise just warn.
+    # (Per-minute RPM pacing happens inside the caller — see _build_caller.)
+    total = len(pending)
+    pending, deferred = gemini_limits.cap_to_rpd(pending, model)
+    if deferred:
+        print(f"[batch-eval] free-tier cap: evaluating {len(pending)} of {total} today; "
+              f"{deferred} deferred to the next run.", file=sys.stderr)
+    else:
+        warning = gemini_limits.format_free_tier_warning(model, total)
+        if warning:
+            print(warning, file=sys.stderr)
 
     print(f"[batch-eval] {len(pending)} job(s) | provider={provider} | model={model} | workers={concurrency}")
 

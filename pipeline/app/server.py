@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.app import data, gh, local_run, onboard, reset, self_update, skills
+from pipeline import gemini_limits
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
@@ -842,6 +843,7 @@ def get_providers() -> JSONResponse:
             "batch_provider": os.environ.get("BATCH_PROVIDER", ""),
             "batch_model": os.environ.get("BATCH_MODEL", ""),
             "batch_cli": os.environ.get("BATCH_CLI", "claude"),
+            "gemini_free_tier": gemini_limits.conforming_enabled(),
         },
         "provider_defaults": dict(PROVIDER_DEFAULTS),
     })
@@ -852,6 +854,7 @@ class LocalConfigRequest(BaseModel):
     batch_model: str = ""
     batch_cli: str = ""
     api_key: str = ""   # optional — write the provider's API key to .env too
+    gemini_free_tier: bool = False   # conform eval/tailoring to Gemini free-tier limits
 
 
 @app.post("/api/onboard/local-config")
@@ -896,6 +899,8 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     api_key = req.api_key.strip()
     if api_key and provider and provider in onboard.PROVIDER_SECRETS:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
+    # Opt into Gemini free-tier conforming (RPM pacing + RPD capping).
+    _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
 
     return JSONResponse({"ok": True, "updated": updated})
 
