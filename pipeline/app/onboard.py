@@ -41,12 +41,16 @@ PROVIDER_SECRETS = {
 
 # Generated file -> secret name. The first four are required by the workflow;
 # PROFILE_MD_B64 is optional but always generated, so we include it.
+# ARTICLE_DIGEST_B64 is optional AND only produced when the (best-effort,
+# LLM-grounded) article-digest generation succeeded — collect_secret_blobs
+# includes it only when the file exists.
 SECRET_FILES = {
     "SEARCH_CONFIG_B64": "config/search.yml",
     "RESUME_TXT_B64": "resumes/resume.txt",
     "CV_MD_B64": "career-ops/cv.md",
     "PROFILE_YML_B64": "career-ops/config/profile.yml",
     "PROFILE_MD_B64": "career-ops/modes/_profile.md",
+    "ARTICLE_DIGEST_B64": "career-ops/article-digest.md",
 }
 REQUIRED_SECRETS = ["SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64"]
 
@@ -149,6 +153,18 @@ def _split_csv(value) -> list[str]:
     if not value:
         return []
     return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def portfolio_urls(form: dict) -> list[str]:
+    """Portfolio/proof-point URLs from the onboarding form: the `portfolio`
+    field (CSV string or list) plus the GitHub URL. Used to fetch README context
+    for article-digest generation — kept here so form-field mapping stays in one
+    place rather than re-parsed in the HTTP layer."""
+    urls = _split_csv(form.get("portfolio"))
+    gh_url = (form.get("github") or "").strip()
+    if gh_url:
+        urls.append(gh_url)
+    return urls
 
 
 # ── form -> --from-json payload ────────────────────────────────────────────

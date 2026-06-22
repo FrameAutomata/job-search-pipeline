@@ -263,3 +263,49 @@ class TestSidecar:
                      side_effect=OSError("read-only"))
         # No exception:
         onboard.save_sidecar(tmp_path, {"name": "Jane"})
+
+
+class TestArticleDigestSecretWiring:
+    """article-digest.md is generated during onboarding (LLM-grounded) and must
+    ride along to the cloud as an OPTIONAL secret — present when generation
+    succeeded, silently omitted when it didn't (so onboarding never hard-depends
+    on the digest)."""
+
+    def _seed_required(self, root):
+        (root / "config").mkdir()
+        (root / "resumes").mkdir()
+        (root / "career-ops" / "config").mkdir(parents=True)
+        (root / "career-ops" / "modes").mkdir(parents=True)
+        (root / "config" / "search.yml").write_text("searches: []", encoding="utf-8")
+        (root / "resumes" / "resume.txt").write_text("resume", encoding="utf-8")
+        (root / "career-ops" / "cv.md").write_text("# CV", encoding="utf-8")
+        (root / "career-ops" / "config" / "profile.yml").write_text("candidate: {}", encoding="utf-8")
+
+    def test_article_digest_is_an_optional_secret(self):
+        assert onboard.SECRET_FILES.get("ARTICLE_DIGEST_B64") == "career-ops/article-digest.md"
+        assert "ARTICLE_DIGEST_B64" not in onboard.REQUIRED_SECRETS
+
+    def test_collect_includes_article_digest_when_present(self, tmp_path):
+        self._seed_required(tmp_path)
+        (tmp_path / "career-ops" / "article-digest.md").write_text("## Proj", encoding="utf-8")
+        blobs = onboard.collect_secret_blobs(tmp_path)
+        assert "ARTICLE_DIGEST_B64" in blobs
+        assert base64.b64decode(blobs["ARTICLE_DIGEST_B64"]).decode() == "## Proj"
+
+    def test_collect_omits_article_digest_when_absent(self, tmp_path):
+        self._seed_required(tmp_path)
+        blobs = onboard.collect_secret_blobs(tmp_path)
+        assert "ARTICLE_DIGEST_B64" not in blobs
+
+
+class TestPortfolioUrls:
+    def test_combines_portfolio_csv_and_github(self):
+        urls = onboard.portfolio_urls(
+            {"portfolio": "https://a.com, https://b.com", "github": "https://github.com/me"})
+        assert urls == ["https://a.com", "https://b.com", "https://github.com/me"]
+
+    def test_accepts_list_and_skips_blank_github(self):
+        assert onboard.portfolio_urls({"portfolio": ["https://a.com"], "github": ""}) == ["https://a.com"]
+
+    def test_empty_when_nothing_supplied(self):
+        assert onboard.portfolio_urls({}) == []
