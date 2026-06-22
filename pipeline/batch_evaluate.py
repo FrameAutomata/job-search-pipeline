@@ -66,6 +66,7 @@ from pipeline._batch_common import (
     run_merge_tracker,
     write_job_result,
 )
+from pipeline import gemini_limits
 
 # Hoisted to _batch_common (shared with the UI's local-run orphan guard); kept
 # under the old private name for callers/tests that import it from here.
@@ -77,11 +78,11 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     # gemini-2.5-flash, NOT gemini-2.0-flash: the 2.0 model was deprecated by
     # Google (shutdown 2026-06-01) and its free-tier quota collapsed months
-    # ahead of that. 2.5-flash is supported and won't fail with a deprecation
-    # error — but its free-tier RPD is only ~20/day, so users running >20
-    # evaluations per day should override BATCH_MODEL to one of the
-    # higher-RPD options (gemma-4-26b-it has 1.5K RPD + unlimited TPM,
-    # gemini-3.1-flash-lite has 500 RPD). See .env.example.
+    # ahead of that. 2.5-flash is supported — but its free-tier RPD is only
+    # ~20/day, so users running >20 evaluations per day should override
+    # BATCH_MODEL to gemma-4-26b-a4b-it (1.5K RPD + unlimited TPM). See
+    # gemini_limits.py for the per-model free-tier caps + the run-time warning,
+    # and .env.example.
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
@@ -697,6 +698,12 @@ def _run_eval(
     concurrency = max(1, int(concurrency))
 
     print(f"[batch-eval] {len(pending)} job(s) | provider={provider} | model={model} | workers={concurrency}")
+
+    # Free-tier viability: warn before a run that would exceed the model's daily
+    # cap (no-op for paid/non-Gemini models). RPD is the binding constraint.
+    warning = gemini_limits.format_free_tier_warning(model, len(pending))
+    if warning:
+        print(warning, file=sys.stderr)
 
     if dry_run:
         for row in pending[:5]:

@@ -202,7 +202,7 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 |---|---|---|---|---|
 | Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | Frontier paid | Closed-weights, established reputation for structured-output tasks. |
 | OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` | Frontier paid (mini is cheaper) | Closed-weights. `gpt-4o-mini` is competitively priced; `gpt-4o` is frontier-tier. |
-| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with per-model RPD ceilings | Check your per-model limits at aistudio.google.com/usage. Default model has a low RPD; `gemma-4-26b-it` has more headroom. |
+| Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with per-model RPD ceilings | Check your per-model limits at aistudio.google.com/rate-limit. Default model has a low RPD (~20/day); `gemma-4-26b-a4b-it` has 1,500/day. The batch run warns if a run would exceed the cap. |
 | Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier with tight TPM ceiling | Fast inference, but the per-minute token limit binds tightly on our large prompts — best for small runs. |
 | DeepInfra | `DEEPINFRA_API_KEY` | `deepseek-ai/DeepSeek-V4-Flash` | Pay-as-you-go (cheaper than frontier) | Hosted open-weight models. Pricing typically a fraction of frontier API rates per token. |
 | OpenRouter | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct` | Pay-as-you-go (varies by model) | Meta-aggregator — one key, switch models via `BATCH_MODEL`. Pricing varies by which backend model you select. |
@@ -215,7 +215,7 @@ For current per-token pricing, check each provider's pricing page — rates chan
 There are three real factors to weigh: **cost**, **output quality**, and **operational reliability** (rate limits, uptime, deprecation cadence). No single provider wins on all three; pick based on what matters most for your situation.
 
 - **Just trying things out / learning the pipeline.** Pick something with established output consistency so you can tell pipeline problems from LLM problems. Anthropic (`claude-sonnet-4-6`) or OpenAI (`gpt-4o-mini`) are good defaults — they cost money but you only need a few dollars to validate end-to-end.
-- **Free, small daily volume.** Gemini's free tier handles small runs (~20 evaluations/day on the default model, ~500/day with `BATCH_MODEL=gemini-3.1-flash-lite`, ~1500/day with `gemma-4-26b-it`). Check your specific per-model limits before relying on a number.
+- **Free, small daily volume.** Gemini's free tier handles small runs (~20 evaluations/day on the default model, ~500/day with `BATCH_MODEL=gemini-3.1-flash-lite`, ~1,500/day with `gemma-4-26b-a4b-it`). Check your specific per-model limits before relying on a number — and the batch run warns if a run would exceed the cap.
 - **Free, willing to navigate quotas.** Groq's free tier is fast but the TPM ceiling is tight against our large prompts. Workable for small runs, not for daily 100+ job evaluations.
 - **Active job search, cost matters at scale.** Hosted open-weight providers (DeepInfra, OpenRouter) typically run a fraction of frontier API per-token rates. Worth using after you've validated the pipeline against a frontier baseline so you know what "good output" looks like — open-weight models like Llama 3.3 70B are capable but occasionally weaker on the more nuanced report sections.
 - **A/B testing several models.** OpenRouter — single API key, dozens of backends accessible via `BATCH_MODEL`.
