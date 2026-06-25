@@ -1,16 +1,19 @@
-"""Auto-apply stage — deterministic LinkedIn Easy Apply fast-path.
+"""Auto-apply stage — routes each evaluated job to the engine that can drive it.
 
-`run()` selects evaluated jobs from the tracker, opens a logged-in browser, and
-walks each LinkedIn Easy Apply form with the deterministic engine, calling the
+`run()` selects evaluated jobs from the tracker and dispatches each by URL: the
+deterministic LinkedIn Easy Apply and Indeed SmartApply engines for those sites,
+and the agentic catch-all (a claude + Playwright-MCP runner) for everything else
+(off-site employer ATS, arbitrary forms). Each engine fills the form, calling the
 answer engine only for fields it can't fill from the profile. Three modes:
 
   review  (default) — fill every form, stop before Submit, print the drafted
                       answers for you to eyeball. Nothing is submitted.
   dry-run           — same as review; an explicit rehearsal.
   auto              — click Submit unattended and mark the tracker Applied.
-                      Higher throughput, higher risk (LinkedIn ToS) — opt-in.
+                      Higher throughput, higher risk (site ToS) — opt-in.
 
-Local-only: it needs a real LinkedIn session, so it never runs in the cloud."""
+Local-only: it needs real logged-in browser sessions, so it never runs in the
+cloud."""
 
 from __future__ import annotations
 
@@ -20,13 +23,19 @@ from pathlib import Path
 
 from pipeline.app import data as _data
 from pipeline._batch_common import normalize_company, read_text
-from pipeline.apply import browser, indeed, linkedin, queue
+from pipeline.apply import agent_engine, browser, indeed, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.result import ApplyResult, EXPIRED, failed
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 _VALID_MODES = ("review", "dry-run", "auto")
+# The engines we can drive, in dispatch order. "agent" is the universal catch-all
+# (any off-site ATS / arbitrary form) the deterministic LinkedIn/Indeed engines
+# can't handle; it runs last so the cheap deterministic paths go first. The
+# agent's CDP port + persistent profile live in browser.py beside the other
+# sessions' config.
+_APPLY_SITES = ("linkedin", "indeed", "agent")
 # The workflow whose artifact carries the latest applications.md (mirror of
 # server.py's list — the daily pipeline uploads the pipeline-output-* artifact).
 _PIPELINE_WORKFLOWS = ["daily-pipeline.yml"]
@@ -45,8 +54,8 @@ def run(
     model: str | None = None,
     tailor_min_score: float = 4.0,
 ) -> int:
-    """Apply to qualifying LinkedIn Easy Apply jobs. Returns the count applied
-    (auto mode) or filled-and-held (review/dry-run).
+    """Apply to qualifying jobs (LinkedIn / Indeed / off-site ATS via the agent).
+    Returns the count applied (auto mode) or filled-and-held (review/dry-run).
 
     target_url: apply to this one posting, bypassing the tracker queue (for a
         one-off apply or to reproduce a specific job). Skips refresh/selection.
@@ -72,9 +81,9 @@ def run(
         if refresh:
             applications_md = _refresh_tracker(career_ops)
         jobs = queue.select(career_ops, min_score=min_score, limit=limit,
-                            sites=("linkedin", "indeed"), applications_md=applications_md)
+                            sites=_APPLY_SITES, applications_md=applications_md)
         if not jobs:
-            print(f"[apply] no LinkedIn/Indeed apply candidates "
+            print(f"[apply] no apply candidates "
                   f"(score >= {min_score}, status Evaluated) in {applications_md.name}")
             return 0
     if mode == "auto" and refresh:
@@ -90,15 +99,16 @@ def run(
     # cloud-only-evaluated job's report is found rather than read as empty.
     report_root = applications_md.parent.parent
 
-    # LinkedIn (bundled-Chromium Easy Apply) and Indeed (patchright SmartApply) use
-    # different browsers, so each site's jobs run in their own session. Unknown
-    # hosts route to LinkedIn (which fails gracefully with not_easy_apply).
+    # Each engine uses a different browser, so a site's jobs run in their own
+    # session. job_site routes LinkedIn/Indeed to their deterministic engines and
+    # everything else navigable to the agentic catch-all ("agent"); only a
+    # non-navigable URL falls through to the LinkedIn default.
     groups: dict[str, list] = {}
     for job in jobs:
         groups.setdefault(queue.job_site(job.url) or "linkedin", []).append(job)
 
     applied = held = failures = 0
-    for site in ("linkedin", "indeed"):
+    for site in _APPLY_SITES:
         if not groups.get(site):
             continue
         a, h, f = _apply_jobs(
@@ -121,11 +131,20 @@ def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path
                 tailor_min_score: float) -> tuple[int, int, int]:
     """Apply to one site's jobs in its own browser session. LinkedIn uses the
     bundled-Chromium Easy Apply engine; Indeed the patchright SmartApply engine on
-    the pre-captured login. Returns (applied, held, failures)."""
+    the pre-captured login; "agent" the CDP-attached agentic engine. Returns
+    (applied, held, failures)."""
     applied = held = failures = 0
     try:
         if site == "indeed":
             session, apply_fn = browser.launch_indeed(headless=headless), indeed.apply_to
+        elif site == "agent":
+            # Real Chrome with a CDP endpoint the agent's Playwright-MCP attaches
+            # to; `page` below is the Session (carrying that endpoint), which
+            # agent_engine.apply_to needs — not a bare page like the others.
+            session = browser.launch_session(
+                headless=headless, cdp_port=browser.AGENT_CDP_PORT,
+                user_data_dir=browser.default_agent_profile_dir())
+            apply_fn = agent_engine.apply_to
         else:
             session, apply_fn = browser.launch(headless=headless), linkedin.apply_to
         with session as page:
@@ -135,6 +154,8 @@ def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path
                           "capture-login first: `./run.ps1 --capture-indeed-login` (sign in "
                           "once in the normal browser that opens).")
                     return 0, 0, 0
+            elif site == "agent":
+                pass  # the agent signs into each ATS itself; no pre-flight login gate
             elif not browser.ensure_logged_in(page, headless=headless):
                 print("[apply] not signed in to LinkedIn — aborting. Run windowed "
                       "(not --headless) and sign in when prompted.")

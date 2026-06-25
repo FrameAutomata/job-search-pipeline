@@ -27,6 +27,19 @@ def default_user_data_dir() -> Path:
     return Path(env) if env else ROOT / "output" / ".chrome-apply"
 
 
+# The agentic catch-all gets its own persistent profile (separate from the
+# LinkedIn/Indeed ones) so the per-ATS logins/accounts it creates survive across
+# runs without clobbering the deterministic sessions. Override with
+# APPLY_AGENT_BROWSER_DIR. AGENT_CDP_PORT is the endpoint the agent's
+# Playwright-MCP attaches to (launch_session evicts a stale Chrome on it first).
+AGENT_CDP_PORT = 9333
+
+
+def default_agent_profile_dir() -> Path:
+    env = os.environ.get("APPLY_AGENT_BROWSER_DIR")
+    return Path(env) if env else ROOT / "output" / ".chrome-agent"
+
+
 _LAUNCH_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
