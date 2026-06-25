@@ -31,7 +31,9 @@ class TestQueueSites:
     def test_job_site(self):
         assert _queue.job_site("https://www.indeed.com/viewjob?jk=abc") == "indeed"
         assert _queue.job_site("https://www.linkedin.com/jobs/view/1") == "linkedin"
-        assert _queue.job_site("https://greenhouse.io/x") is None
+        # Off-site ATS now routes to the agentic catch-all, not None (see
+        # TestJobSite in test_apply.py for the full contract).
+        assert _queue.job_site("https://greenhouse.io/x") == "agent"
 
     def test_select_sites_admits_indeed_excludes_other_ats(self, tmp_path):
         (tmp_path / "data").mkdir(parents=True)

@@ -20,6 +20,10 @@ LOGIN_ISSUE = "login_issue"    # not signed in / session expired
 NOT_ELIGIBLE = "not_eligible"  # a screening answer disqualified the candidate
 SKIPPED = "skipped"            # user/queue skipped it (not an attempt)
 CANCELLED = "cancelled"        # the user aborted the fill before it finished (UI review)
+READY = "ready"                # agent filled the form and PARKED at review without
+                               # submitting — the held state the adapter maps to an
+                               # APPLIED/submitted=False result (distinct from APPLIED
+                               # so "filled" can never be mistaken for "submitted")
 
 # Failures that will never succeed on retry — recording them as permanent keeps
 # the worker from re-attempting the same dead job every run.

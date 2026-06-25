@@ -48,13 +48,19 @@ def is_indeed_job(url: str) -> bool:
 
 
 def job_site(url: str) -> str | None:
-    """The apply engine for a URL: 'linkedin' / 'indeed', or None for an
-    unsupported host (off-site employer ATS we don't yet drive)."""
+    """The apply engine for a URL: 'linkedin' / 'indeed' for the deterministic
+    fast-paths, else 'agent' for the agentic catch-all that drives any other
+    navigable posting (off-site employer ATS, arbitrary forms). None only for a
+    non-navigable string (garbage / non-http scheme), which no engine can open."""
     if is_linkedin_job(url):
         return "linkedin"
     if is_indeed_job(url):
         return "indeed"
-    return None
+    try:
+        scheme = urlparse(url).scheme.lower()
+    except ValueError:
+        return None
+    return "agent" if scheme in ("http", "https") else None
 
 
 def select(

@@ -22,7 +22,7 @@ import tempfile
 from typing import Iterable
 
 from pipeline.apply.result import (APPLIED, CAPTCHA, EXPIRED, LOGIN_ISSUE,
-                                   ApplyResult, failed)
+                                   READY, ApplyResult, failed)
 
 _VIEWPORT = "1280,900"
 _DEFAULT_TIMEOUT = 300  # seconds; an agentic application is many LLM turns
@@ -79,7 +79,9 @@ def parse_result(output: str, *, submitted: bool) -> ApplyResult:
     verdict = next((ln for ln in reversed(output.splitlines()) if "RESULT:" in ln), None)
     if verdict is None:
         return failed("no_result_line")
-    for token, code in (("APPLIED", APPLIED), ("EXPIRED", EXPIRED),
+    # READY is the review-mode hold point: filled but parked before submit, so
+    # it's never a submission (the `code == APPLIED` guard keeps submitted False).
+    for token, code in (("APPLIED", APPLIED), ("READY", READY), ("EXPIRED", EXPIRED),
                         ("CAPTCHA", CAPTCHA), ("LOGIN_ISSUE", LOGIN_ISSUE)):
         if f"RESULT:{token}" in verdict:
             return ApplyResult(code=code, submitted=submitted and code == APPLIED)

@@ -36,6 +36,14 @@ class TestParseResult:
     def test_terminal_codes(self, token, code):
         assert agent.parse_result(f"x\n{token}\ny", submitted=False).code == code
 
+    def test_ready_is_a_held_not_submitted_outcome(self):
+        # The review-mode "filled but parked at submit" signal. Must NOT be a
+        # submission even when the run was live — it's the hold point.
+        from pipeline.apply.result import READY
+        r = agent.parse_result("filled all pages; at review step\nRESULT:READY",
+                               submitted=True)
+        assert r.code == READY and r.submitted is False
+
     def test_failed_with_reason(self):
         r = agent.parse_result("RESULT:FAILED:cloudflare_blocked", submitted=False)
         assert r.code == "failed" and r.reason == "cloudflare_blocked"

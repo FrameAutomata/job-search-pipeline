@@ -801,6 +801,21 @@ class TestQueueSelect:
         # Without the override, the empty local career-ops yields nothing.
         assert queue.select(co, min_score=4.0) == []
 
+    def test_sites_includes_agent_for_offsite_ats(self, tmp_path):
+        """Always-on catch-all: with "agent" in `sites`, select() surfaces the
+        off-site ATS row (Globex/greenhouse) that the linkedin/indeed-only gates
+        drop — the agentic engine will drive it."""
+        co = self._career_ops(tmp_path)
+        jobs = queue.select(co, min_score=4.0, sites=("linkedin", "indeed", "agent"))
+        assert "2" in [j.num for j in jobs]  # Globex greenhouse (off-site ATS)
+
+    def test_sites_without_agent_still_excludes_offsite(self, tmp_path):
+        """Regression guard: omitting "agent" keeps the deterministic-only
+        behavior — the greenhouse row stays out."""
+        co = self._career_ops(tmp_path)
+        jobs = queue.select(co, min_score=4.0, sites=("linkedin", "indeed"))
+        assert "2" not in [j.num for j in jobs]
+
 
 class TestQueueHelpers:
     def test_is_linkedin_job(self):
@@ -812,6 +827,34 @@ class TestQueueHelpers:
     def test_extract_url_strips_trailing_punctuation(self):
         # extract_url now lives in data.py (shared by the apply queue + recheck).
         assert app_data.extract_url("see https://x.com/a/b, fits") == "https://x.com/a/b"
+
+
+class TestJobSite:
+    """job_site routes a URL to its apply engine. LinkedIn/Indeed keep their
+    deterministic engines; every other http(s) posting routes to the agentic
+    catch-all ("agent"). Only non-navigable strings get None (no engine)."""
+
+    def test_known_deterministic_platforms(self):
+        assert queue.job_site("https://www.linkedin.com/jobs/view/123") == "linkedin"
+        assert queue.job_site("https://www.indeed.com/viewjob?jk=abc") == "indeed"
+
+    def test_offsite_ats_routes_to_agent(self):
+        # The agentic engine is the universal fallback — an off-site employer ATS
+        # is "agent", not None (None would drop it from selection/dispatch).
+        for url in (
+            "https://boards.greenhouse.io/acme/jobs/9",
+            "https://jobs.lever.co/acme/abc-123",
+            "https://acme.wd1.myworkdayjobs.com/External/job/X",
+            "https://jobs.ashbyhq.com/acme/abc",
+            "https://careers.acme.com/apply/42",
+        ):
+            assert queue.job_site(url) == "agent", url
+
+    def test_non_navigable_strings_have_no_engine(self):
+        # Garbage / non-http schemes can't be driven by any engine → None.
+        assert queue.job_site("not a url") is None
+        assert queue.job_site("") is None
+        assert queue.job_site("mailto:jobs@acme.com") is None
 
 
 # ── linkedin.py pure helpers (no browser) ────────────────────────────────────
