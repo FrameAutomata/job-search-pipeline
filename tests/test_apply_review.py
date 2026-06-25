@@ -9,8 +9,9 @@ submit-marks-Applied write-back through the identity-anchored override channel.
 
 Design under test (per the Phase-2 plan):
 - POST /api/jobs/apply-async {num}: start a visible review session for tracker
-  row `num`. 404 unknown num, 400 if it isn't a LinkedIn Easy Apply URL, 409 if
-  a session is already active. Returns {job_id}.
+  row `num`. 404 unknown num, 400 if the URL isn't navigable, 409 if a session is
+  already active. LinkedIn/Indeed use deterministic engines; off-site ATS the
+  agentic catch-all. Returns {job_id}.
 - GET  /api/jobs/apply-status/{job_id}: {status, company, role, num, answers,
   needs_review, code, reason}.
 - POST /api/jobs/apply-submit/{job_id}: only valid from "ready"; signals the
@@ -35,6 +36,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from pipeline.apply import browser as browser_mod  # noqa: E402
 from pipeline.apply import linkedin as linkedin_mod  # noqa: E402
 from pipeline.apply import indeed as indeed_mod  # noqa: E402
+from pipeline.apply import agent_engine as agent_engine_mod  # noqa: E402
 from pipeline.apply.result import ApplyResult, APPLIED, EXPIRED, LOGIN_ISSUE  # noqa: E402
 
 
@@ -97,6 +99,15 @@ def engine(monkeypatch):
         finally:
             state["calls"].append(("close", None))
 
+    @contextlib.contextmanager
+    def fake_launch_session(*, headless=False, cdp_port=None, user_data_dir=None,
+                            channel="chrome"):
+        state["calls"].append(("launch_session", headless))
+        try:
+            yield object()           # a stand-in Session; agent_engine is mocked
+        finally:
+            state["calls"].append(("close", None))
+
     monkeypatch.setattr(browser_mod, "launch", fake_launch)
     monkeypatch.setattr(browser_mod, "ensure_logged_in",
                         lambda page, *, headless, **kw: state["logged_in"])
@@ -109,6 +120,11 @@ def engine(monkeypatch):
                         lambda page, **kw: state["logged_in"], raising=False)
     monkeypatch.setattr(indeed_mod, "apply_to", fake_apply_to)
     monkeypatch.setattr(indeed_mod, "submit_application", fake_submit, raising=False)
+    # Agent path: launch_session (real Chrome + CDP) + the agentic engine, on the
+    # same fakes so the worker drives any of the three platforms.
+    monkeypatch.setattr(browser_mod, "launch_session", fake_launch_session, raising=False)
+    monkeypatch.setattr(agent_engine_mod, "apply_to", fake_apply_to)
+    monkeypatch.setattr(agent_engine_mod, "submit_application", fake_submit, raising=False)
     # Short hold so a worker left blocking on the decision Event (a test that
     # asserts "ready" but never submits/cancels) dies fast instead of lingering.
     monkeypatch.setenv("APPLY_HOLD_TIMEOUT", "2")
@@ -167,9 +183,23 @@ class TestApplyAsyncStart:
         assert _wait_status(client, job_id, {"submitted", "failed"}).get("status") == "submitted"
         assert ("launch_indeed", False) in engine["calls"]   # drove the Indeed browser
 
-    def test_non_linkedin_url_400(self, client, engine):
-        # Row 2 is an off-site greenhouse ATS, not a LinkedIn Easy Apply URL.
-        assert client.post("/api/jobs/apply-async", json={"num": "2"}).status_code == 400
+    def test_offsite_url_admitted(self, client, engine):
+        # Row 2 is an off-site greenhouse ATS — now driven by the agentic catch-all,
+        # so it's admitted (was 400 before the agent engine was wired into the UI).
+        r = client.post("/api/jobs/apply-async", json={"num": "2"})
+        assert r.status_code == 200 and "job_id" in r.json()
+
+    def test_agent_worker_drives_agent_engine_to_submitted(self, client, engine):
+        # The off-site row runs through the agentic engine on its CDP browser, holds
+        # at review, then submits — same review-hold lifecycle as the deterministic
+        # engines, just a different launch + engine module.
+        start = client.post("/api/jobs/apply-async", json={"num": "2"})
+        assert start.status_code == 200
+        job_id = start.json()["job_id"]
+        assert _wait_status(client, job_id, {"ready", "failed"}).get("status") == "ready"
+        client.post(f"/api/jobs/apply-submit/{job_id}")
+        assert _wait_status(client, job_id, {"submitted", "failed"}).get("status") == "submitted"
+        assert ("launch_session", False) in engine["calls"]   # drove the agent's CDP browser
 
     def test_valid_num_returns_job_id(self, client, engine):
         r = client.post("/api/jobs/apply-async", json={"num": "1"})

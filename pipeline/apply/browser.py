@@ -169,6 +169,15 @@ def launch(headless: bool = False, user_data_dir: Path | None = None):
         yield session.page
 
 
+def launch_agent_session(*, headless: bool = False):
+    """The agentic catch-all's session: real Chrome with the agent's CDP endpoint
+    + persistent profile, ready for agent_engine to attach its Playwright-MCP.
+    One definition shared by the CLI and UI apply dispatchers. Returns the
+    launch_session context manager (use it as `with launch_agent_session() as s`)."""
+    return launch_session(headless=headless, cdp_port=AGENT_CDP_PORT,
+                          user_data_dir=default_agent_profile_dir())
+
+
 def is_logged_in(page) -> bool:
     """LinkedIn login check: load the feed and look for AUTHENTICATED-only chrome.
 

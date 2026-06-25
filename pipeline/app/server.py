@@ -1313,16 +1313,27 @@ def _apply_public(task: dict) -> dict:
 def _apply_dispatch(job):
     """Per-site apply wiring for the review worker: (launch-context factory,
     login-check, engine module, login-fail message). Indeed uses the patchright
-    session + the captured login; LinkedIn the bundled-Chromium Easy Apply engine."""
-    from pipeline.apply import browser, linkedin, indeed
+    session + the captured login; LinkedIn the bundled-Chromium Easy Apply engine;
+    "agent" the agentic catch-all on a real-Chrome CDP session."""
+    from pipeline.apply import agent_engine, browser, linkedin, indeed
     from pipeline.apply.queue import job_site
-    if job_site(job.url) == "indeed":
+    site = job_site(job.url)
+    if site == "indeed":
         return (
             lambda: browser.launch_indeed(headless=False),
             lambda page: browser.is_logged_in_indeed(page),
             indeed,
             "not signed in to Indeed — open the onboarding 'Auto-apply' step and "
             "'Log in to Indeed' first (the automated browser can't sign in itself).",
+        )
+    if site == "agent":
+        # `page` here is the Session (carrying the CDP endpoint agent_engine needs).
+        # No pre-flight login gate — the agent signs into each ATS itself.
+        return (
+            lambda: browser.launch_agent_session(headless=False),
+            lambda page: True,
+            agent_engine,
+            "",
         )
     return (
         lambda: browser.launch(headless=False),
@@ -1415,17 +1426,19 @@ class ApplyAsyncRequest(BaseModel):
 @app.post("/api/jobs/apply-async")
 def apply_async(req: ApplyAsyncRequest) -> JSONResponse:
     """Start a visible apply-review session for tracker row `num`. 404 if the
-    row is unknown, 400 if it isn't a LinkedIn Easy Apply or Indeed SmartApply
-    posting, 409 if a session is already in progress (one browser at a time)."""
+    row is unknown, 400 if it has no navigable job URL, 409 if a session is
+    already in progress (one browser at a time)."""
     job = _apply_job_for_num(req.num)
     if job is None:
         raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
     from pipeline.apply.queue import job_site
-    if job_site(job.url) not in ("linkedin", "indeed"):
+    # Admit any navigable posting: LinkedIn/Indeed run their deterministic engines,
+    # everything else the agentic catch-all. Only a non-navigable URL (job_site
+    # None) has no engine to drive it.
+    if job_site(job.url) is None:
         raise HTTPException(
             status_code=400,
-            detail="This role has no LinkedIn or Indeed job URL — the review-and-submit "
-                   "flow applies to LinkedIn Easy Apply and Indeed SmartApply postings.",
+            detail="This role has no navigable job URL to apply through.",
         )
     with _apply_lock:
         if any(t["status"] in _APPLY_ACTIVE for t in _apply_tasks.values()):

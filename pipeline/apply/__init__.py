@@ -141,9 +141,7 @@ def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path
             # Real Chrome with a CDP endpoint the agent's Playwright-MCP attaches
             # to; `page` below is the Session (carrying that endpoint), which
             # agent_engine.apply_to needs — not a bare page like the others.
-            session = browser.launch_session(
-                headless=headless, cdp_port=browser.AGENT_CDP_PORT,
-                user_data_dir=browser.default_agent_profile_dir())
+            session = browser.launch_agent_session(headless=headless)
             apply_fn = agent_engine.apply_to
         else:
             session, apply_fn = browser.launch(headless=headless), linkedin.apply_to
