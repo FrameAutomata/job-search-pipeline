@@ -75,7 +75,15 @@ _apply_lock = threading.Lock()
 # / "cancelling" are transient states the worker sets, under the lock, between
 # the hold and the Playwright action — so a Cancel that races an in-flight submit
 # sees a non-"ready" status and is rejected.
-_APPLY_ACTIVE = frozenset({"pending", "ready", "submitting", "cancelling"})
+_APPLY_ACTIVE = frozenset({"pending", "ready", "needs_human", "resuming",
+                           "submitting", "cancelling"})
+# Cap on human-in-the-loop rounds so a wall that never clears can't hang the held
+# browser indefinitely (each round waits APPLY_HOLD_TIMEOUT).
+_MAX_HUMAN_ROUNDS = 3
+# Walls only a person can clear: a CAPTCHA (needs_human) or an ATS sign-in/account
+# wall (login_issue). The worker holds + resumes on these — but only on a resumable
+# (agent) session; a deterministic engine's login_issue fails fast (no resume turn).
+_HUMAN_WALL = frozenset({"needs_human", "login_issue"})
 # Cap on retained TERMINAL tasks so _apply_tasks doesn't grow unbounded over a
 # long-lived server; apply_async prunes the oldest on each new session.
 _APPLY_TASK_CAP = 50
@@ -1376,6 +1384,39 @@ def _run_apply_review(job_id: str) -> None:
                 should_cancel=lambda: _apply_decision(job_id) == "cancel",
             )
 
+            # Human-in-the-loop: the agent parked on a wall only a person can clear
+            # — a CAPTCHA or an ATS sign-in/account wall (_HUMAN_WALL). Only an agent
+            # session can be resumed mid-fill, so guard on resume support: a
+            # deterministic engine's login_issue falls through to fail fast below.
+            # Surface the wall (the SPA notifies + shows code-specific copy), hold for
+            # the user to act in the open browser and hit Continue, then resume on the
+            # still-parked page. Bounded so a wall that never clears can't hang it.
+            resumable = hasattr(engine_mod, "resume_after_human")
+            rounds = 0
+            while resumable and result.code in _HUMAN_WALL and rounds < _MAX_HUMAN_ROUNDS:
+                rounds += 1
+                _set_apply(job_id, status="needs_human", code=result.code, reason=result.reason)
+                with _apply_lock:
+                    task["decision"] = None
+                    task["event"].clear()
+                if not task["event"].wait(timeout=_apply_hold_timeout()):
+                    _set_apply(job_id, status="failed", code=result.code,
+                               reason="no one cleared the block in time")
+                    return
+                if _apply_decision(job_id) == "cancel":
+                    _set_apply(job_id, status="cancelled")
+                    return
+                _set_apply(job_id, status="resuming")   # the agent works again (minutes)
+                result = engine_mod.resume_after_human(page)
+            if resumable and result.code in _HUMAN_WALL:   # still blocked after the cap
+                _set_apply(job_id, status="failed", code=result.code,
+                           reason="still blocked after retries")
+                return
+            if rounds:   # the loop consumed the hold event — reset for ready->submit
+                with _apply_lock:
+                    task["decision"] = None
+                    task["event"].clear()
+
             if result.code == CANCELLED:
                 _set_apply(job_id, status="cancelled")
                 return
@@ -1494,10 +1535,26 @@ def apply_cancel(job_id: str) -> JSONResponse:
         task = _apply_tasks.get(job_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Unknown apply session.")
-        if task["status"] not in ("pending", "ready"):
+        if task["status"] not in ("pending", "ready", "needs_human"):
             raise HTTPException(status_code=409,
                                 detail=f"Session can't be cancelled now (status={task['status']}).")
         task["decision"] = "cancel"
+        task["event"].set()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/jobs/apply-continue/{job_id}")
+def apply_continue(job_id: str) -> JSONResponse:
+    """Resume a held session after the user cleared a CAPTCHA/wall in the browser.
+    Valid only from 'needs_human' — the worker is blocked there waiting for this."""
+    with _apply_lock:
+        task = _apply_tasks.get(job_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Unknown apply session.")
+        if task["status"] != "needs_human":
+            raise HTTPException(status_code=409,
+                                detail=f"Session isn't awaiting a human (status={task['status']}).")
+        task["decision"] = "continue"
         task["event"].set()
     return JSONResponse({"ok": True})
 

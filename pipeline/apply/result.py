@@ -16,7 +16,10 @@ from dataclasses import dataclass
 APPLIED = "applied"            # submitted (or, in review mode, filled and ready)
 EXPIRED = "expired"            # posting closed / no longer accepting
 CAPTCHA = "captcha"            # blocked by an unsolved challenge
-LOGIN_ISSUE = "login_issue"    # not signed in / session expired
+LOGIN_ISSUE = "login_issue"    # not signed in / session expired, or an ATS sign-in
+                               # /account wall the agent hit mid-fill. Permanent for
+                               # the CLI (no human); the UI worker holds on it like
+                               # NEEDS_HUMAN — a person at the browser can sign in.
 NOT_ELIGIBLE = "not_eligible"  # a screening answer disqualified the candidate
 SKIPPED = "skipped"            # user/queue skipped it (not an attempt)
 CANCELLED = "cancelled"        # the user aborted the fill before it finished (UI review)
@@ -27,6 +30,10 @@ READY = "ready"                # agent filled the form and PARKED at review with
 DEFER = "defer"                # this engine is the wrong one for the role — hand off
                                # to the engine named in `deferred_to` (agent <-> the
                                # deterministic LinkedIn/Indeed fast-paths)
+NEEDS_HUMAN = "needs_human"    # parked on a CAPTCHA/wall the agent couldn't clear —
+                               # a person can solve it. NOT permanent: the UI holds,
+                               # notifies, waits for the human, then resumes; the CLI
+                               # (no human present) reports it as a failure to retry.
 
 # A deterministic engine reports one of these — as the result code (LinkedIn) or
 # the reason (Indeed) — when the role has no fast-apply form (apply-on-company-

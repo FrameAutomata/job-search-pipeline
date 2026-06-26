@@ -48,6 +48,11 @@ class TestParseResult:
     def test_terminal_codes(self, token, code):
         assert agent.parse_result(f"x\n{token}\ny", submitted=False).code == code
 
+    def test_needs_human_parsed(self):
+        from pipeline.apply.result import NEEDS_HUMAN
+        r = agent.parse_result("can't clear the captcha\nRESULT:NEEDS_HUMAN", submitted=False)
+        assert r.code == NEEDS_HUMAN
+
     def test_defer_carries_target_engine(self):
         from pipeline.apply.result import DEFER
         r = agent.parse_result("this is Indeed SmartApply\nRESULT:DEFER:indeed", submitted=False)

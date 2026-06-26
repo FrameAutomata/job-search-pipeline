@@ -10,7 +10,7 @@ import pytest
 
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.queue import ApplyJob
-from pipeline.apply.prompt import build_prompt, build_submit_prompt
+from pipeline.apply.prompt import build_prompt, build_submit_prompt, build_resume_prompt
 
 
 def _job():
@@ -89,6 +89,22 @@ class TestReviewVsLiveSubmit:
         assert "do not click" not in live.lower()  # and doesn't hold
 
 
+class TestNeedsHumanFallback:
+    def test_captcha_fallback_asks_for_a_human(self):
+        # An unsolvable CAPTCHA parks for a person, not a hard give-up.
+        p = build_prompt(_job(), _profile())
+        assert "RESULT:NEEDS_HUMAN" in p
+
+
+class TestResumePrompt:
+    def test_continues_from_here_without_renavigating(self):
+        rp = build_resume_prompt()
+        low = rp.lower()
+        assert "continue" in low
+        assert "do not" in low and ("navigate" in low or "reload" in low or "start over" in low)
+        assert "RESULT:READY" in rp        # stops at review like the first turn
+
+
 class TestDeferDetection:
     """The agent should bail to the deterministic engines when it lands on a
     fast-apply flow rather than driving it the slow way."""
@@ -128,6 +144,15 @@ class TestLoginAndSignup:
         assert "hunter2" not in p
         # No account-creation instruction; an unscalable login wall bails out.
         assert "LOGIN_ISSUE" in p
+
+    def test_login_wall_routes_to_login_issue_not_needs_human(self):
+        """A sign-in / account-creation wall the agent can't pass must report
+        LOGIN_ISSUE, NOT NEEDS_HUMAN — NEEDS_HUMAN is scoped to CAPTCHA / anti-bot
+        challenges. Without this disambiguation the agent picks NEEDS_HUMAN for a
+        login wall (it saw "a person can clear it"), so the UI mislabels it as a
+        CAPTCHA and the CLI tally is wrong (see the Suffolk/iCIMS dry-run)."""
+        p = build_prompt(_job(), _profile())
+        assert "not needs_human" in p.lower()
 
     def test_verification_tool_mentioned_only_when_available(self):
         with_v = build_prompt(_job(), _profile(), verification_available=True)

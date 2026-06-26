@@ -71,6 +71,18 @@ def apply_to(session, job: ApplyJob, answers, *, mode: str = "review",
     return result
 
 
+def resume_after_human(session) -> ApplyResult:
+    """Continue an application after a human cleared a CAPTCHA/wall in the open
+    browser: a second agent turn over the SAME parked session that continues from
+    the current page (no re-navigate) and stops at review. Returns a held result
+    (READY->APPLIED/submitted=False), or NEEDS_HUMAN/failure passed through."""
+    result = agent.run_agent(prompt.build_resume_prompt(),
+                             cdp_endpoint=session.cdp_endpoint, dry_run=True)
+    if result.code in (READY, APPLIED):
+        return _held(result)
+    return result   # another wall (NEEDS_HUMAN) or a failure — surface it
+
+
 def submit_application(session) -> ApplyResult:
     """Second agent turn: click the final Submit on the browser parked at the
     review step. Returns an APPLIED/submitted result on success."""

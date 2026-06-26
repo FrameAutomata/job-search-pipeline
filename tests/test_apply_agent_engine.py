@@ -19,7 +19,7 @@ import pytest
 
 from pipeline.apply import agent_engine
 from pipeline.apply.queue import ApplyJob
-from pipeline.apply.result import (APPLIED, EXPIRED, READY, ApplyResult,
+from pipeline.apply.result import (APPLIED, EXPIRED, NEEDS_HUMAN, READY, ApplyResult,
                                    CANCELLED, failed)
 
 
@@ -144,6 +144,29 @@ class TestApplyToAuto:
         r = agent_engine.apply_to(_session(), _job(), _answers(), mode="auto")
         assert r.applied is True and r.submitted is True
         assert calls[0].dry_run is False  # auto = live submit
+
+
+class TestNeedsHumanAndResume:
+    def test_review_passes_needs_human_through(self, fake_run_agent):
+        # The agent parked on a wall it couldn't clear — surface it (not held/applied)
+        # so the worker can hold for a human.
+        fake_run_agent(ApplyResult(code=NEEDS_HUMAN, reason="captcha"))
+        r = agent_engine.apply_to(_session(), _job(), _answers(), mode="review")
+        assert r.code == NEEDS_HUMAN and r.applied is False
+
+    def test_resume_after_human_holds_at_review(self, fake_run_agent):
+        # After the human clears the wall, the continue turn fills + parks (READY)
+        # -> mapped to a held result the worker surfaces as "ready".
+        calls = fake_run_agent(ApplyResult(code=READY))
+        r = agent_engine.resume_after_human(_session("http://localhost:8123"))
+        assert r.applied is True and r.submitted is False
+        assert calls[0].dry_run is True
+        assert calls[0].cdp_endpoint == "http://localhost:8123"
+
+    def test_resume_passes_through_another_wall(self, fake_run_agent):
+        fake_run_agent(ApplyResult(code=NEEDS_HUMAN, reason="another captcha"))
+        r = agent_engine.resume_after_human(_session())
+        assert r.code == NEEDS_HUMAN
 
 
 class TestSubmitApplication:

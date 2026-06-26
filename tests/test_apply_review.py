@@ -37,7 +37,7 @@ from pipeline.apply import browser as browser_mod  # noqa: E402
 from pipeline.apply import linkedin as linkedin_mod  # noqa: E402
 from pipeline.apply import indeed as indeed_mod  # noqa: E402
 from pipeline.apply import agent_engine as agent_engine_mod  # noqa: E402
-from pipeline.apply.result import ApplyResult, APPLIED, EXPIRED, LOGIN_ISSUE  # noqa: E402
+from pipeline.apply.result import ApplyResult, APPLIED, EXPIRED, LOGIN_ISSUE, NEEDS_HUMAN  # noqa: E402
 
 
 _TRACKER = (
@@ -91,6 +91,13 @@ def engine(monkeypatch):
         fn = state.get("submit_fn")
         return fn(page) if fn else state["submit_result"]
 
+    def fake_resume(page):
+        # Continue-after-human turn; returns a held "ready" by default.
+        state["calls"].append(("resume", None))
+        return state.get("resume_result") or ApplyResult(
+            code=APPLIED, reason="resumed after human", submitted=False,
+            answers=(("First name", "Tom"),))
+
     @contextlib.contextmanager
     def fake_launch_indeed(headless=False, user_data_dir=None):
         state["calls"].append(("launch_indeed", headless))
@@ -125,6 +132,7 @@ def engine(monkeypatch):
     monkeypatch.setattr(browser_mod, "launch_session", fake_launch_session, raising=False)
     monkeypatch.setattr(agent_engine_mod, "apply_to", fake_apply_to)
     monkeypatch.setattr(agent_engine_mod, "submit_application", fake_submit, raising=False)
+    monkeypatch.setattr(agent_engine_mod, "resume_after_human", fake_resume, raising=False)
     # Short hold so a worker left blocking on the decision Event (a test that
     # asserts "ready" but never submits/cancels) dies fast instead of lingering.
     monkeypatch.setenv("APPLY_HOLD_TIMEOUT", "2")
@@ -254,6 +262,80 @@ class TestReviewLifecycle:
         job_id = self._start(client)
         _wait_status(client, job_id, {"failed"})
         assert client.post(f"/api/jobs/apply-submit/{job_id}").status_code == 409
+
+
+class TestNeedsHumanFlow:
+    """The agent parks on a CAPTCHA it can't clear (RESULT:NEEDS_HUMAN); the worker
+    holds, the user solves it in the open browser and hits Continue, then a resume
+    turn finishes — surfaced for review like any other ready session."""
+
+    def _start_agent(self, client):
+        # Row 2 is an off-site greenhouse role -> the agentic engine.
+        return client.post("/api/jobs/apply-async", json={"num": "2"}).json()["job_id"]
+
+    def test_holds_for_human_then_resumes_to_ready(self, client, engine):
+        engine["result"] = ApplyResult(code=NEEDS_HUMAN, reason="captcha at the door")
+        job_id = self._start_agent(client)
+        assert _wait_status(client, job_id, {"needs_human", "ready", "failed"})["status"] == "needs_human"
+        assert client.post(f"/api/jobs/apply-continue/{job_id}").status_code == 200
+        s = _wait_status(client, job_id, {"ready", "failed"})
+        assert s["status"] == "ready"
+        assert ("resume", None) in engine["calls"]          # the resume turn ran
+
+    def test_cancel_during_needs_human(self, client, engine):
+        engine["result"] = ApplyResult(code=NEEDS_HUMAN, reason="captcha")
+        job_id = self._start_agent(client)
+        _wait_status(client, job_id, {"needs_human"})
+        assert client.post(f"/api/jobs/apply-cancel/{job_id}").status_code == 200
+        assert _wait_status(client, job_id, {"cancelled", "failed"})["status"] == "cancelled"
+
+    def test_continue_rejected_when_not_awaiting_human(self, client, engine):
+        # A ready (LinkedIn Easy Apply) session isn't awaiting a human -> 409.
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        _wait_status(client, job_id, {"ready"})
+        assert client.post(f"/api/jobs/apply-continue/{job_id}").status_code == 409
+        client.post(f"/api/jobs/apply-cancel/{job_id}")
+
+
+class TestLoginWallFlow:
+    """The agent hits an ATS sign-in / account-creation wall it can't pass on its
+    own (RESULT:LOGIN_ISSUE). In the UI a human IS present, so the worker holds the
+    same way it does for a CAPTCHA — the user signs in / creates the account in the
+    open browser and hits Continue, then a resume turn finishes. The held status
+    carries code=login_issue so the SPA shows sign-in copy, not "a CAPTCHA needs
+    you". A deterministic engine (no resume turn) still fails fast on LOGIN_ISSUE."""
+
+    def _start_agent(self, client):
+        # Row 2 is an off-site greenhouse role -> the agentic (resumable) engine.
+        return client.post("/api/jobs/apply-async", json={"num": "2"}).json()["job_id"]
+
+    def test_login_wall_holds_then_resumes_to_ready(self, client, engine):
+        engine["result"] = ApplyResult(code=LOGIN_ISSUE, reason="create an account to apply")
+        job_id = self._start_agent(client)
+        s = _wait_status(client, job_id, {"needs_human", "ready", "failed"})
+        assert s["status"] == "needs_human"
+        assert s["code"] == LOGIN_ISSUE      # surfaced so the SPA shows sign-in (not CAPTCHA) copy
+        assert client.post(f"/api/jobs/apply-continue/{job_id}").status_code == 200
+        s = _wait_status(client, job_id, {"ready", "failed"})
+        assert s["status"] == "ready"
+        assert ("resume", None) in engine["calls"]          # the resume turn ran
+
+    def test_cancel_during_login_wall(self, client, engine):
+        engine["result"] = ApplyResult(code=LOGIN_ISSUE, reason="signup wall")
+        job_id = self._start_agent(client)
+        _wait_status(client, job_id, {"needs_human"})
+        assert client.post(f"/api/jobs/apply-cancel/{job_id}").status_code == 200
+        assert _wait_status(client, job_id, {"cancelled", "failed"})["status"] == "cancelled"
+
+    def test_deterministic_login_issue_fails_fast(self, client, engine):
+        # Regression guard: a deterministic engine (LinkedIn, row 1) has no resume
+        # turn, so a LOGIN_ISSUE from its fill must FAIL — never enter the human
+        # hold (which would call a resume_after_human the engine doesn't have).
+        engine["logged_in"] = True
+        engine["result"] = ApplyResult(code=LOGIN_ISSUE, reason="session expired mid-fill")
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        s = _wait_status(client, job_id, {"failed", "needs_human", "ready"})
+        assert s["status"] == "failed" and s["code"] == LOGIN_ISSUE
 
 
 class TestSingleFlightAndBails:

@@ -826,6 +826,7 @@ function resetApplyPanel() {
   }
   applyEls.jobId = null;
   applyEls.deciding = false;
+  applyEls.lastStatus = null;
   applyEls.panel.hidden = true;
   applyEls.panel.innerHTML = "";
 }
@@ -864,14 +865,82 @@ async function pollApply() {
     return;
   }
   renderApply(s);
-  if (["pending", "ready", "submitting", "cancelling"].includes(s.status)) {
+  if (["pending", "ready", "needs_human", "resuming", "submitting", "cancelling"].includes(s.status)) {
     applyEls.timer = setTimeout(pollApply, s.status === "ready" ? 2500 : 1000);
   }
+}
+
+// The agent can park on two kinds of wall a person must clear: a CAPTCHA, or an
+// ATS sign-in/account wall (code "login_issue"). The copy differs so the user
+// knows what to actually do in the open browser.
+function humanWallCopy(s) {
+  if (s.code === "login_issue") {
+    return {
+      title: "Sign-in needed",
+      notify: "sign in or create the account in the open browser, then click Continue",
+      banner: "Sign in or create the account",
+      button: "I'm signed in — Continue",
+    };
+  }
+  return {
+    title: "A CAPTCHA needs you",
+    notify: "solve it in the open browser, then click Continue",
+    banner: "Solve it",
+    button: "I solved it — Continue",
+  };
+}
+
+// One short beep + a desktop notification when the agent needs the user. Fired
+// once per entry into needs_human (the prev-status check in renderApply gates it).
+function notifyNeedsHuman(s) {
+  const copy = humanWallCopy(s);
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    osc.connect(ctx.destination); osc.frequency.value = 880;
+    osc.start(); osc.stop(ctx.currentTime + 0.25);
+  } catch (_) {}
+  try {
+    if (window.Notification) {
+      if (Notification.permission === "granted") {
+        new Notification(copy.title, {
+          body: `${s.company || "A role"} — ${copy.notify}.`,
+        });
+      } else if (Notification.permission !== "denied") {
+        Notification.requestPermission();
+      }
+    }
+  } catch (_) {}
 }
 
 function renderApply(s) {
   const p = applyEls.panel;
   p.hidden = false;
+  const prev = applyEls.lastStatus;
+  applyEls.lastStatus = s.status;
+  if (s.status === "resuming") {
+    p.className = "apply-panel";
+    p.innerHTML = "<p>Thanks — resuming the application…</p>";
+    return;
+  }
+  if (s.status === "needs_human") {
+    if (prev !== "needs_human") {
+      applyEls.deciding = false;   // a fresh wall — re-enable the buttons
+      notifyNeedsHuman(s);
+    }
+    if (applyEls.deciding) return;
+    const copy = humanWallCopy(s);
+    p.className = "apply-panel warn";
+    p.innerHTML =
+      `<p><b>⚠ ${copy.title}.</b> ${copy.banner} in the open browser window${s.reason ? ` (${escapeHtml(s.reason)})` : ""}, then click Continue — the agent will finish from there. Nothing is submitted.</p>
+       <div class="apply-actions">
+         <button id="apply-do-continue" class="primary">${copy.button}</button>
+         <button id="apply-do-cancel">Cancel</button>
+       </div>`;
+    document.getElementById("apply-do-continue").addEventListener("click", () => decideApply("continue"));
+    document.getElementById("apply-do-cancel").addEventListener("click", () => decideApply("cancel"));
+    return;
+  }
   if (s.status === "pending") {
     p.className = "apply-panel";
     p.innerHTML = "<p>Opening a browser and filling the form — watch the window…</p>";
@@ -936,8 +1005,9 @@ function renderApply(s) {
 
 async function decideApply(decision) {
   if (!applyEls.jobId) return;
-  applyEls.deciding = true;   // suppress the ready-panel rebuild until the worker flips
-  applyEls.panel.innerHTML = `<p>${decision === "submit" ? "Submitting" : "Cancelling"}…</p>`;
+  applyEls.deciding = true;   // suppress the held-panel rebuild until the worker flips
+  const verb = { submit: "Submitting", cancel: "Cancelling", continue: "Resuming" }[decision] || "Working";
+  applyEls.panel.innerHTML = `<p>${verb}…</p>`;
   try {
     const resp = await fetch(`/api/jobs/apply-${decision}/${applyEls.jobId}`, { method: "POST" });
     if (!resp.ok) {

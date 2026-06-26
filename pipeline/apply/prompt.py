@@ -123,12 +123,13 @@ SOLVE — createTask then poll then inject (separate browser_evaluate calls):
 If createTask returns errorId > 0, or after 30s, go to MANUAL FALLBACK.
 
 MANUAL FALLBACK: try the audio challenge or solve a simple text/logic puzzle
-yourself. If still blocked -> RESULT:CAPTCHA."""
+yourself. If still blocked, a person can solve it for you -> RESULT:NEEDS_HUMAN
+(stop here; do not fail the application)."""
 
 _CAPTCHA_UNCONFIGURED = """== CAPTCHA ==
 CapSolver is NOT CONFIGURED (no CAPSOLVER_API_KEY). If a CAPTCHA blocks you, try
 the MANUAL FALLBACK: the audio challenge, or solve a simple text/logic puzzle
-yourself. If it's unsolvable, output RESULT:CAPTCHA."""
+yourself. If you can't, a person can solve it -> RESULT:NEEDS_HUMAN (stop here)."""
 
 
 def _captcha_section(capsolver_key: str) -> str:
@@ -148,7 +149,10 @@ def _result_codes() -> str:
         "== RESULT (output EXACTLY one line) ==\n"
         "RESULT:APPLIED -- submitted successfully\n"
         "RESULT:EXPIRED -- job closed / no longer accepting applications\n"
-        "RESULT:CAPTCHA -- blocked by an unsolvable CAPTCHA\n"
+        "RESULT:CAPTCHA -- blocked by a truly unsolvable CAPTCHA\n"
+        "RESULT:NEEDS_HUMAN -- parked on a CAPTCHA / anti-bot challenge a person can "
+        "clear; stop and wait to be resumed (preferred over CAPTCHA when a human could "
+        "solve it). NOT for sign-in/account walls — those are LOGIN_ISSUE\n"
         "RESULT:LOGIN_ISSUE -- could not sign in or create an account\n"
         "RESULT:FAILED:reason -- any other failure (brief reason, e.g. "
         "cloudflare_blocked, not_a_job_application, stuck)"
@@ -176,8 +180,30 @@ def _login_rules(profile: ApplyProfile, *, ats_password: str,
     if verification_available:
         lines.append("- If the site emails a confirmation link or verification code, "
                      "call the read_verification_code tool to fetch it, then enter it.")
-    lines.append("- Cannot sign in or create an account -> RESULT:LOGIN_ISSUE.")
+    lines.append("- Cannot sign in or create an account -> RESULT:LOGIN_ISSUE. A "
+                 "sign-in / account wall is LOGIN_ISSUE, NOT NEEDS_HUMAN — even though "
+                 "a person could sign in, that's a login issue, not a CAPTCHA.")
     return "\n".join(lines)
+
+
+def build_resume_prompt(*, capsolver_key: str | None = None) -> str:
+    """Continue-after-human prompt: a person just cleared a CAPTCHA/wall in the
+    open browser; continue filling from the CURRENT page (do NOT re-navigate) and
+    stop at the review step."""
+    capsolver_key = _resolve_capsolver_key(capsolver_key)
+    return f"""A person has just cleared a CAPTCHA or sign-in wall in the open browser for you.
+CONTINUE the same job application from the CURRENT page — do NOT re-navigate, reload,
+or start over (that would lose the cleared wall and the answers so far).
+
+== STEP-BY-STEP ==
+1. browser_snapshot to see where you are now.
+2. Continue filling the application from here; answer the remaining fields/questions.
+3. Stop at the final review step — do NOT submit. Output RESULT:READY.
+4. If you hit ANOTHER wall you can't clear, output RESULT:NEEDS_HUMAN again.
+
+{_captcha_section(capsolver_key)}
+
+{_result_codes()}"""
 
 
 def build_submit_prompt(*, capsolver_key: str | None = None) -> str:
