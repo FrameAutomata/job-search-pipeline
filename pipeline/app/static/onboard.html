@@ -264,6 +264,37 @@
             Use <code>gemma-4-26b-a4b-it</code> for ~1,500/day.</p>
         </div>
 
+        <div id="ats-creds" style="margin-top:16px;border-top:1px solid var(--border,#ddd);padding-top:12px">
+          <p style="margin:0 0 4px"><strong>Auto-apply: off-site ATS account</strong>
+            <span class="muted">(optional)</span></p>
+          <p class="hint" style="margin-top:0">For the agentic apply engine to sign into / create
+            accounts on employer ATS (Greenhouse, Lever, Workday, …) and auto-read email
+            verification codes. <strong>Local only</strong> — written to <code>.env</code>, never
+            uploaded to GitHub. Leave a password blank to keep the one already saved.</p>
+          <div class="grid2">
+            <label>Account email
+              <input id="ats-email-input" type="email" autocomplete="off"
+                     placeholder="defaults to your candidate email" />
+            </label>
+            <label>Account password
+              <input id="ats-password-input" type="password" autocomplete="new-password"
+                     placeholder="(none set)" />
+            </label>
+          </div>
+          <div class="grid2" style="margin-top:8px">
+            <label>IMAP host
+              <input id="imap-host-input" autocomplete="off" placeholder="e.g. imap.gmail.com" />
+            </label>
+            <label>IMAP port
+              <input id="imap-port-input" autocomplete="off" placeholder="993" />
+            </label>
+          </div>
+          <label style="margin-top:8px">IMAP app-password
+            <input id="imap-password-input" type="password" autocomplete="new-password"
+                   placeholder="(none set) — Gmail: a 16-char App Password, not your login" />
+          </label>
+        </div>
+
         <button type="button" id="save-local-btn" style="margin-top:8px">Save to .env</button>
         <div id="local-save-msg" class="action-msg" hidden></div>
       </section>

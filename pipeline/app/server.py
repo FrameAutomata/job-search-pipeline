@@ -853,6 +853,13 @@ def get_providers() -> JSONResponse:
             "batch_model": os.environ.get("BATCH_MODEL", ""),
             "batch_cli": os.environ.get("BATCH_CLI", "claude"),
             "gemini_free_tier": gemini_limits.conforming_enabled(),
+            # Off-site ATS creds: non-secret fields for form pre-fill + booleans
+            # for the passwords (never echo the secret values back to the browser).
+            "ats_email": os.environ.get("APPLY_ATS_EMAIL", ""),
+            "imap_host": os.environ.get("APPLY_IMAP_HOST", ""),
+            "imap_port": os.environ.get("APPLY_IMAP_PORT", ""),
+            "ats_password_set": bool(os.environ.get("APPLY_ATS_PASSWORD", "").strip()),
+            "imap_password_set": bool(os.environ.get("APPLY_IMAP_PASSWORD", "").strip()),
         },
         "provider_defaults": dict(PROVIDER_DEFAULTS),
     })
@@ -864,6 +871,15 @@ class LocalConfigRequest(BaseModel):
     batch_cli: str = ""
     api_key: str = ""   # optional — write the provider's API key to .env too
     gemini_free_tier: bool = False   # conform eval/tailoring to Gemini free-tier limits
+    # Off-site ATS account credentials for the agentic apply engine. LOCAL-ONLY
+    # secrets (auto-apply never runs in the cloud) — written to .env, never to
+    # profile.yml / GitHub Secrets. Blank = leave the existing value untouched (the
+    # form never receives the stored passwords to echo back).
+    ats_email: str = ""
+    ats_password: str = ""
+    imap_host: str = ""
+    imap_port: str = ""
+    imap_password: str = ""
 
 
 @app.post("/api/onboard/local-config")
@@ -910,6 +926,19 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
     # Opt into Gemini free-tier conforming (RPM pacing + RPD capping).
     _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
+
+    # Off-site ATS account credentials -> local .env. Write ONLY non-blank values
+    # so re-saving settings preserves a password the form didn't re-send (it never
+    # receives the stored secret to echo back); a blank IMAP port falls back to the
+    # profile loader's default (993) rather than persisting an empty one.
+    for key, value in (("APPLY_ATS_EMAIL", req.ats_email),
+                       ("APPLY_ATS_PASSWORD", req.ats_password),
+                       ("APPLY_IMAP_HOST", req.imap_host),
+                       ("APPLY_IMAP_PORT", req.imap_port),
+                       ("APPLY_IMAP_PASSWORD", req.imap_password)):
+        value = value.strip()
+        if value:
+            _set(key, value)
 
     return JSONResponse({"ok": True, "updated": updated})
 

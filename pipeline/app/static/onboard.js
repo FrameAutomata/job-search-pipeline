@@ -424,6 +424,20 @@ async function loadLocalProviders() {
     }
     cliSelect.addEventListener("change", updateCliHint);
     updateCliHint();
+
+    // Pre-fill the off-site ATS account fields from the (non-secret) current
+    // config. Passwords are never sent back, so they stay blank — a blank save
+    // preserves the stored value — and the placeholder just signals "already set".
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ""; };
+    setVal("ats-email-input", d.current.ats_email);
+    setVal("imap-host-input", d.current.imap_host);
+    setVal("imap-port-input", d.current.imap_port);
+    const setPwPlaceholder = (id, isSet) => {
+      const el = document.getElementById(id);
+      if (el) el.placeholder = isSet ? "•••••••• (saved — leave blank to keep)" : "(none set)";
+    };
+    setPwPlaceholder("ats-password-input", d.current.ats_password_set);
+    setPwPlaceholder("imap-password-input", d.current.imap_password_set);
   } catch (e) {
     detection.textContent = "Could not detect providers: " + (e.message || e);
   }
@@ -445,11 +459,23 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
     const resp = await fetch("/api/onboard/local-config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // Passwords are sent raw (the server strips surrounding whitespace) so a
+      // pasted Gmail app-password keeps its internal spaces; blank = keep existing.
       body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
-                             gemini_free_tier: geminiFreeTier }),
+                             gemini_free_tier: geminiFreeTier,
+                             ats_email: document.getElementById("ats-email-input")?.value.trim() || "",
+                             ats_password: document.getElementById("ats-password-input")?.value || "",
+                             imap_host: document.getElementById("imap-host-input")?.value.trim() || "",
+                             imap_port: document.getElementById("imap-port-input")?.value.trim() || "",
+                             imap_password: document.getElementById("imap-password-input")?.value || "" }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || "save failed");
+    // Clear the password inputs after a successful save so the secret doesn't
+    // linger in the DOM; the placeholder will refresh to "saved" on next load.
+    for (const id of ["ats-password-input", "imap-password-input"]) {
+      const el = document.getElementById(id); if (el) el.value = "";
+    }
     msgEl.textContent = `Saved to .env (${body.updated.join(", ")}). Changes take effect immediately.`;
     msgEl.className = "action-msg ok";
   } catch (e) {
