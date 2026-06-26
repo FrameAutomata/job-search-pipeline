@@ -17,6 +17,7 @@ cloud."""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from pathlib import Path
@@ -133,7 +134,13 @@ def run(
     dispatch(groups, deferrals)
     if deferrals:
         regroups: dict[str, list] = {}
-        for job, target, _result in deferrals:
+        for job, target, result in deferrals:
+            # If the deferring engine captured an off-site redirect (e.g. Indeed's
+            # Apply bounced to the company's own ATS), point the next engine at THAT
+            # URL — otherwise the agent lands back on the original (Indeed) and
+            # ping-pongs / hits the bot wall.
+            if result.redirect_url:
+                job = dataclasses.replace(job, url=result.redirect_url)
             regroups.setdefault(target, []).append(job)
         dispatch(regroups, None)
 
@@ -195,7 +202,8 @@ def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path
                 if deferrals is not None and target and target != site:
                     # Wrong engine for this role — hand it off for re-dispatch.
                     deferrals.append((job, target, result))
-                    print(f"[apply] [->]   DEFER {job.company} / {job.role} -> {target}")
+                    via = f" (via {result.redirect_url[:60]})" if result.redirect_url else ""
+                    print(f"[apply] [->]   DEFER {job.company} / {job.role} -> {target}{via}")
                     continue
                 applied, held, failures = _report(
                     job, result, mode, applications_md, applied, held, failures,
@@ -269,6 +277,8 @@ def _defer_target(site: str, result: ApplyResult) -> str | None:
     signal — re-route those to the agentic catch-all."""
     if result.code == DEFER:
         return result.deferred_to or None
+    # Indeed signals no-SmartApply in the reason (code stays "failed"); LinkedIn in
+    # the code — accept either.
     if site != "agent" and (result.code in NO_FAST_APPLY_FORM
                             or result.reason in NO_FAST_APPLY_FORM):
         return "agent"

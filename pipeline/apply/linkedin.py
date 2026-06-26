@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import urllib.parse
 from pathlib import Path
 
 from pipeline.apply.answers import AnswerEngine, _coerce_number
@@ -60,9 +61,12 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
             # Carry the CTA debug so a false EXPIRED (selector miss on a live
             # job) is distinguishable from a genuinely closed posting.
             return ApplyResult(code=EXPIRED, reason=_apply_cta_debug(page))
-        # No CTA at all usually means a logged-out guest view; the reason carries
-        # the page URL/title and whether a sign-in wall is present.
-        return ApplyResult(code="not_easy_apply", reason=_apply_cta_debug(page))
+        # No Easy Apply CTA → "Apply on company website" (or a logged-out guest
+        # view). Capture the employer URL so the DEFER hands the agent the company
+        # ATS directly, bypassing LinkedIn's login wall (its profile isn't signed
+        # in to LinkedIn). reason carries the CTA/sign-in-wall debug either way.
+        return ApplyResult(code="not_easy_apply", reason=_apply_cta_debug(page),
+                           redirect_url=_company_apply_url(page))
 
     try:
         btn.click()
@@ -221,6 +225,34 @@ def _already_applied(page) -> bool:
     return (txt.startswith("applied")
             or "application submitted" in txt
             or "you've applied" in txt)
+
+
+def _unwrap_safety_redirect(href: str) -> str:
+    """The employer URL behind a LinkedIn 'Apply on company website' link. LinkedIn
+    wraps external links as /safety/go/?url=<encoded>; unwrap that. A plain off-
+    LinkedIn href passes through; a same-site LinkedIn href yields '' (not an apply
+    target)."""
+    if not href:
+        return ""
+    if "/safety/go" in href:
+        inner = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("url", [""])[0]
+        return inner if inner and "linkedin.com" not in inner else ""
+    return href if href.startswith("http") and "linkedin.com" not in href else ""
+
+
+def _company_apply_url(page) -> str:
+    """For a non-Easy-Apply role, the employer's own application URL from the
+    'Apply on company website' link — so a DEFER hands the agent the company site,
+    not the login-walled LinkedIn page. '' if there's no such link."""
+    try:
+        loc = page.locator("a[href*='/safety/go'], a[aria-label*='company website' i][href]")
+        for i in range(min(loc.count(), 5)):
+            url = _unwrap_safety_redirect(loc.nth(i).get_attribute("href") or "")
+            if url:
+                return url
+    except Exception:
+        pass
+    return ""
 
 
 def _apply_cta_debug(page) -> str:

@@ -28,10 +28,15 @@ DEFER = "defer"                # this engine is the wrong one for the role — h
                                # to the engine named in `deferred_to` (agent <-> the
                                # deterministic LinkedIn/Indeed fast-paths)
 
-# A deterministic engine reports one of these when the role has no fast-apply
-# form (apply-on-company-site): permanent for THAT engine, but also the signal to
-# hand the role to the agentic catch-all instead (see apply._defer_target).
-NO_FAST_APPLY_FORM: frozenset[str] = frozenset({"not_easy_apply", "no_easy_apply_button"})
+# A deterministic engine reports one of these — as the result code (LinkedIn) or
+# the reason (Indeed) — when the role has no fast-apply form (apply-on-company-
+# site): permanent for THAT engine, but also the signal to hand the role to the
+# agentic catch-all instead (see apply._defer_target). The off-site company URL,
+# when captured, rides along in ApplyResult.redirect_url so the agent targets it.
+# LinkedIn: not_easy_apply / no_easy_apply_button. Indeed: smartapply_did_not_open.
+NO_FAST_APPLY_FORM: frozenset[str] = frozenset({
+    "not_easy_apply", "no_easy_apply_button", "smartapply_did_not_open",
+})
 
 # Failures that will never succeed on retry — recording them as permanent keeps
 # the worker from re-attempting the same dead job every run.
@@ -55,6 +60,8 @@ class ApplyResult:
     answers: tuple[tuple[str, str], ...] = ()
     submitted: bool = False
     deferred_to: str = ""   # for code==DEFER: the engine to re-dispatch this job to
+    redirect_url: str = ""  # an off-site URL the next engine should target instead
+                            # (e.g. Indeed's apply redirected to the company's ATS)
 
     @property
     def applied(self) -> bool:

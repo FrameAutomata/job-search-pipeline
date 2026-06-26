@@ -150,7 +150,12 @@ def apply_to(page, job: ApplyJob, answers: AnswerEngine, *, mode: str = "review"
 
     sa = _await_smartapply(page)
     if sa is None:
-        return failed(f"smartapply_did_not_open | url={(page.url or '')[:80]}")
+        # Apply didn't land on SmartApply — it bounced off-Indeed to the company's
+        # own ATS (apply-on-company-site), usually in a new tab. Hand that company
+        # URL to the agentic catch-all via the dispatcher's DEFER re-route; fall
+        # back to page.url if no off-Indeed tab is found.
+        return ApplyResult(code="failed", reason="smartapply_did_not_open",
+                           redirect_url=_company_apply_url(page) or page.url or "")
 
     drafted: list[tuple[str, str]] = []
     for _ in range(_MAX_STEPS):
@@ -201,6 +206,17 @@ def submit_application(page) -> ApplyResult:
         return failed("submit_click_failed")
     sa.wait_for_timeout(2500)
     return ApplyResult(code=APPLIED, submitted=True)
+
+
+def _company_apply_url(page) -> str:
+    """When Apply went off-Indeed (apply-on-company-site), the employer ATS is
+    usually a newly-opened tab. Return the first open page that's off indeed.com,
+    or '' if none — so the DEFER hands the agent the real company URL, not Indeed's."""
+    for p in page.context.pages:
+        url = p.url or ""
+        if url and "indeed.com" not in url and not url.startswith("about:"):
+            return url
+    return ""
 
 
 def _await_smartapply(page, timeout_ms: int = 12000):

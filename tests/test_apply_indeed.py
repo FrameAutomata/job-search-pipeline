@@ -5,12 +5,34 @@ The page-driving (apply_to, step fills) is verified manually like linkedin.py;
 here we pin the pure surface: cookie preparation for session injection, SmartApply
 step classification, and primary-action (submit-beats-continue) selection."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from pipeline.apply import indeed
 from pipeline.apply import queue as _queue
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.indeed import prepare_indeed_cookies, _classify_step, _primary_action
+
+
+def _page(current, *other_urls):
+    """A stand-in page whose browser context holds `other_urls` as open tabs."""
+    pages = [SimpleNamespace(url=current)] + [SimpleNamespace(url=u) for u in other_urls]
+    return SimpleNamespace(url=current, context=SimpleNamespace(pages=pages))
+
+
+class TestCompanyApplyUrl:
+    def test_picks_the_off_indeed_tab(self):
+        # Apply-on-company-site opens the employer ATS in a new tab; capture it so
+        # the agent can drive THAT, not the Indeed URL it'd otherwise ping-pong on.
+        p = _page("https://www.indeed.com/viewjob?jk=x",
+                  "https://jpmc.wd5.myworkdayjobs.com/External/apply/123")
+        assert indeed._company_apply_url(p) == "https://jpmc.wd5.myworkdayjobs.com/External/apply/123"
+
+    def test_empty_when_only_indeed_tabs(self):
+        p = _page("https://www.indeed.com/viewjob?jk=x",
+                  "https://smartapply.indeed.com/x", "about:blank")
+        assert indeed._company_apply_url(p) == ""
 
 _MIXED_TRACKER = """# Applications Tracker
 

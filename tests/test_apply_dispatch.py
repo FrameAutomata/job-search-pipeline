@@ -23,6 +23,7 @@ from pipeline.apply.result import APPLIED, DEFER, ApplyResult, failed
 
 _LI = "https://www.linkedin.com/jobs/view/1"
 _GH = "https://boards.greenhouse.io/x/jobs/9"
+_IND = "https://www.indeed.com/viewjob?jk=abc"
 
 
 def _job(num, url, score=4.5):
@@ -125,6 +126,14 @@ class TestDeferTarget:
         assert apply_pkg._defer_target("indeed", ApplyResult(code="not_easy_apply")) == "agent"
         assert apply_pkg._defer_target("linkedin", ApplyResult(code="no_easy_apply_button")) == "agent"
 
+    def test_indeed_smartapply_did_not_open_defers_to_agent(self):
+        # Found in live E2E: a generic Indeed role (apply redirects off-Indeed to
+        # the company ATS) returns failed(reason="smartapply_did_not_open") — that
+        # reason must trigger the defer to the agentic catch-all (LinkedIn signals
+        # the same via the code; Indeed via the reason).
+        r = ApplyResult(code="failed", reason="smartapply_did_not_open")
+        assert apply_pkg._defer_target("indeed", r) == "agent"
+
     def test_agent_no_form_does_not_defer_to_itself(self):
         assert apply_pkg._defer_target("agent", ApplyResult(code="not_easy_apply")) is None
 
@@ -151,6 +160,26 @@ class TestRedispatch:
         apply_pkg.run(tmp_path, refresh=False)
         # round 1 ran the job at agent; round 2 re-dispatched it to indeed.
         assert seen == [("agent", ["1"]), ("indeed", ["1"])]
+
+    def test_redirect_url_threaded_to_agent_on_defer(self, tmp_path, monkeypatch):
+        # An Indeed generic role (apply redirects off-Indeed to the company ATS)
+        # defers to the agent — which must navigate the COMPANY-site URL the Indeed
+        # engine captured, NOT the Indeed URL (else it ping-pongs back / is walled).
+        monkeypatch.setattr(queue_mod, "select", lambda co, **kw: [_job("1", _IND)])
+        seen = []
+
+        def fake_apply_jobs(site, jobs, engine, *, deferrals=None, **kw):
+            seen.append((site, [j.url for j in jobs]))
+            if site == "indeed" and deferrals is not None:   # round 1
+                deferrals.append((jobs[0], "agent", ApplyResult(
+                    code="failed", reason="smartapply_did_not_open",
+                    redirect_url="https://acme.com/careers/apply/42")))
+            return (0, 0, 0)
+
+        monkeypatch.setattr(apply_pkg, "_apply_jobs", fake_apply_jobs)
+        apply_pkg.run(tmp_path, refresh=False)
+        agent_urls = [urls for site, urls in seen if site == "agent"]
+        assert agent_urls == [["https://acme.com/careers/apply/42"]]   # company URL, not Indeed
 
     def test_second_defer_is_not_redispatched(self, tmp_path, monkeypatch):
         # Loop guard: a ping-ponging job is dispatched at most twice (no round 3).

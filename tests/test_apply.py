@@ -912,6 +912,26 @@ class TestOptoutCheckbox:
         assert linkedin._is_optout_checkbox("I certify the information is accurate") is False
 
 
+class TestLinkedInExternalApplyUrl:
+    """The employer URL behind a non-Easy-Apply 'Apply on company website' link —
+    so a DEFER hands the agent the company ATS, not the login-walled LinkedIn page."""
+
+    def test_unwraps_safety_go_redirect(self):
+        href = ("https://www.linkedin.com/safety/go/?url=https%3A%2F%2Fcareers.quest-global.com"
+                "%2Fjob%2F119867%3Futm_source%3Dlinkedin&urlhash=ab&mt=x")
+        assert linkedin._unwrap_safety_redirect(href) == \
+            "https://careers.quest-global.com/job/119867?utm_source=linkedin"
+
+    def test_plain_offsite_href_passes_through(self):
+        assert linkedin._unwrap_safety_redirect("https://careers.acme.com/apply/1") == \
+            "https://careers.acme.com/apply/1"
+
+    def test_linkedin_internal_href_is_empty(self):
+        # A same-site LinkedIn anchor (e.g. a similar-jobs link) isn't an apply URL.
+        assert linkedin._unwrap_safety_redirect("https://www.linkedin.com/jobs/view/9") == ""
+        assert linkedin._unwrap_safety_redirect("") == ""
+
+
 class TestResumeResolution:
     def test_prefers_resume_path_env(self, tmp_path, monkeypatch):
         pdf = tmp_path / "my_resume.pdf"
