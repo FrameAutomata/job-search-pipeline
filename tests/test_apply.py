@@ -116,6 +116,35 @@ class TestApplyProfile:
         p = ApplyProfile.load(tmp_path)
         assert p.full_name == "" and p.salary_target is None
 
+    def test_loads_apply_credentials_from_env(self, tmp_path, monkeypatch):
+        # Auto-apply creds live in .env (local-only), not profile.yml.
+        co = self._write(tmp_path, "candidate:\n  email: tom@example.com\n")
+        monkeypatch.setenv("APPLY_ATS_PASSWORD", "atspw")
+        monkeypatch.setenv("APPLY_IMAP_HOST", "imap.gmail.com")
+        monkeypatch.setenv("APPLY_IMAP_PASSWORD", "imap-app-pw")
+        p = ApplyProfile.load(co)
+        assert p.ats_password == "atspw"
+        assert p.imap_host == "imap.gmail.com" and p.imap_password == "imap-app-pw"
+        assert p.imap_configured is True       # inbox + host + app-password present
+
+    def test_credentials_absent_is_not_configured(self, tmp_path, monkeypatch):
+        for k in ("APPLY_ATS_EMAIL", "APPLY_ATS_PASSWORD", "APPLY_IMAP_HOST",
+                  "APPLY_IMAP_PASSWORD"):
+            monkeypatch.delenv(k, raising=False)
+        co = self._write(tmp_path, "candidate:\n  email: tom@example.com\n")
+        p = ApplyProfile.load(co)
+        assert p.ats_password == "" and p.imap_password == ""
+        assert p.imap_configured is False
+
+    def test_ats_email_defaults_to_candidate_email(self, tmp_path, monkeypatch):
+        # The "single shared email": ATS accounts + the verification inbox use the
+        # candidate's email unless an explicit APPLY_ATS_EMAIL overrides it.
+        monkeypatch.delenv("APPLY_ATS_EMAIL", raising=False)
+        co = self._write(tmp_path, "candidate:\n  email: tom@example.com\n")
+        assert ApplyProfile.load(co).ats_email == "tom@example.com"
+        monkeypatch.setenv("APPLY_ATS_EMAIL", "apply@example.com")
+        assert ApplyProfile.load(co).ats_email == "apply@example.com"
+
     def test_loads_voluntary_disclosures(self, tmp_path):
         co = self._write(tmp_path, """
             voluntary_disclosures:

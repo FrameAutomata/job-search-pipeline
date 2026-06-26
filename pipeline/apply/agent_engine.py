@@ -48,6 +48,8 @@ def apply_to(session, job: ApplyJob, answers, *, mode: str = "review",
         resume_pdf=str(resume_path) if resume_path else "",
         cv_text=getattr(answers, "cv_text", "") or "",
         cover_letter_text=getattr(answers, "cover_letter_text", "") or "",
+        ats_password=answers.profile.ats_password,
+        verification_available=answers.profile.imap_configured,
         dry_run=not auto,
     )
     result = agent.run_agent(prompt_text, cdp_endpoint=session.cdp_endpoint,

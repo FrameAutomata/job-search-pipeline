@@ -32,10 +32,11 @@ def _job():
                     url="https://boards.greenhouse.io/x/jobs/9", score=4.5)
 
 
-def _answers():
-    # The adapter reads profile + cv_text off the shared AnswerEngine to build
-    # the prompt; a stand-in with those attributes is enough here.
-    return SimpleNamespace(profile=object(), cv_text="", cover_letter_text="")
+def _answers(*, ats_password="", imap_configured=False):
+    # The adapter reads profile (incl. apply creds) + cv_text off the shared
+    # AnswerEngine to build the prompt; a stand-in with those attributes is enough.
+    profile = SimpleNamespace(ats_password=ats_password, imap_configured=imap_configured)
+    return SimpleNamespace(profile=profile, cv_text="", cover_letter_text="")
 
 
 @pytest.fixture
@@ -91,6 +92,27 @@ class TestApplyToReview:
                                   should_cancel=lambda: True)
         assert r.code == CANCELLED
         assert calls == []  # the agent is never spawned once cancelled
+
+
+class TestForwardsCredentials:
+    def test_apply_to_passes_ats_password_and_verification_flag(self, monkeypatch):
+        # Phase 6 wiring: the adapter forwards the profile's ATS password and
+        # whether email verification is available into the prompt builder, which
+        # activates the login/signup + read_verification_code instructions.
+        captured = {}
+
+        def fake_build_prompt(job, profile, **kw):
+            captured.update(kw)
+            return "PROMPT"
+
+        monkeypatch.setattr(agent_engine.prompt, "build_prompt", fake_build_prompt)
+        monkeypatch.setattr(agent_engine.agent, "run_agent",
+                            lambda *a, **k: ApplyResult(code=READY))
+        agent_engine.apply_to(_session(), _job(),
+                              _answers(ats_password="atspw", imap_configured=True),
+                              mode="review")
+        assert captured.get("ats_password") == "atspw"
+        assert captured.get("verification_available") is True
 
 
 class TestApplyToAuto:

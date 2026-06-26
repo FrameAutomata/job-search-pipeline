@@ -7,11 +7,14 @@ nothing here is hardcoded to a specific candidate or country."""
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+from pipeline._batch_common import env_int
 
 
 def _parse_salary(value: str | int | None) -> int | None:
@@ -105,6 +108,21 @@ class ApplyProfile:
     eeo_data_consent: bool = True
     eeo_save_answers: bool = False
     eeo_share_answers: bool = False
+    # Auto-apply account credentials — local-only, loaded from .env (NOT
+    # profile.yml, which ships to GitHub Secrets). The agentic engine signs into /
+    # creates accounts on off-site ATS with ats_email + ats_password, and reads
+    # email verification codes over IMAP (imap_host/port + the app-password).
+    ats_email: str = ""
+    ats_password: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_password: str = ""
+
+    @property
+    def imap_configured(self) -> bool:
+        """Whether email verification can be auto-read — an inbox address, IMAP
+        host, and app-password are all present."""
+        return bool(self.ats_email and self.imap_host and self.imap_password)
 
     @property
     def first_name(self) -> str:
@@ -119,16 +137,32 @@ class ApplyProfile:
     def phone_digits(self) -> str:
         return "".join(c for c in self.phone if c.isdigit())
 
+    @staticmethod
+    def _apply_credentials(cand_email: str = "") -> dict:
+        """Auto-apply account creds from .env (local-only — never profile.yml).
+        ats_email defaults to the candidate's email (the single shared email for
+        ATS accounts + the verification inbox) unless APPLY_ATS_EMAIL overrides."""
+        def env(name: str) -> str:
+            return os.environ.get(name, "").strip()
+        return dict(
+            ats_email=env("APPLY_ATS_EMAIL") or cand_email,
+            ats_password=env("APPLY_ATS_PASSWORD"),
+            imap_host=env("APPLY_IMAP_HOST"),
+            imap_port=env_int("APPLY_IMAP_PORT", 993),
+            imap_password=env("APPLY_IMAP_PASSWORD"),
+        )
+
     @classmethod
     def load(cls, career_ops: Path) -> "ApplyProfile":
-        """Read profile.yml under the given career-ops directory.
+        """Read profile.yml under the given career-ops directory, plus the
+        auto-apply credentials from .env.
 
         Missing file or missing sections degrade gracefully to empty defaults —
         a half-configured profile shouldn't crash the apply stage; the answer
         engine will fall back to the LLM for anything the profile can't supply."""
         path = Path(career_ops) / "config" / "profile.yml"
         if not path.exists():
-            return cls()
+            return cls(**cls._apply_credentials())
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
         cand = data.get("candidate", {}) or {}
@@ -139,10 +173,11 @@ class ApplyProfile:
 
         authorized = _as_list(wa.get("legally_authorized_to_work_in"))
         eligible = _as_list(wa.get("eligible_countries")) or authorized
+        email = str(cand.get("email", "")).strip()
 
         return cls(
             full_name=str(cand.get("full_name", "")).strip(),
-            email=str(cand.get("email", "")).strip(),
+            email=email,
             phone=str(cand.get("phone", "")).strip(),
             city=str(cand.get("city") or loc.get("city") or "").strip(),
             country=str(loc.get("country", "")).strip(),
@@ -162,6 +197,7 @@ class ApplyProfile:
             eeo_data_consent=_as_bool(eeo.get("data_processing_consent"), True),
             eeo_save_answers=_as_bool(eeo.get("save_answers"), False),
             eeo_share_answers=_as_bool(eeo.get("share_answers"), False),
+            **cls._apply_credentials(cand_email=email),
         )
 
     def summary_lines(self) -> list[str]:
