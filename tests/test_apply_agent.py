@@ -20,6 +20,18 @@ class TestMcpConfig:
         pw = cfg["mcpServers"]["playwright"]
         assert any("--cdp-endpoint=http://localhost:9222" == a for a in pw["args"])
 
+    def test_no_imap_env_is_playwright_only(self):
+        cfg = agent.make_mcp_config("http://localhost:9222")
+        assert set(cfg["mcpServers"]) == {"playwright"}
+
+    def test_imap_env_adds_verification_server(self):
+        cfg = agent.make_mcp_config("http://localhost:9222",
+                                    imap_env={"APPLY_IMAP_HOST": "imap.gmail.com"})
+        assert "imap" in cfg["mcpServers"]
+        imap = cfg["mcpServers"]["imap"]
+        assert "pipeline.apply.imap_mcp" in " ".join(imap["args"])   # runs our module
+        assert imap["env"]["APPLY_IMAP_HOST"] == "imap.gmail.com"     # creds via env
+
 
 class TestParseResult:
     def test_applied_submitted_flag_follows_caller(self):

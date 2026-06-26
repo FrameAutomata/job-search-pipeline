@@ -124,6 +124,16 @@ class ApplyProfile:
         host, and app-password are all present."""
         return bool(self.ats_email and self.imap_host and self.imap_password)
 
+    def imap_mcp_env(self) -> dict:
+        """The env vars the read_verification_code MCP subprocess reads to reach
+        the inbox (the agent never sees these — they go to the subprocess)."""
+        return {
+            "APPLY_ATS_EMAIL": self.ats_email,
+            "APPLY_IMAP_HOST": self.imap_host,
+            "APPLY_IMAP_PORT": str(self.imap_port),
+            "APPLY_IMAP_PASSWORD": self.imap_password,
+        }
+
     @property
     def first_name(self) -> str:
         return self.full_name.split()[0] if self.full_name else ""

@@ -52,8 +52,11 @@ def apply_to(session, job: ApplyJob, answers, *, mode: str = "review",
         verification_available=answers.profile.imap_configured,
         dry_run=not auto,
     )
+    # Give the agent the read_verification_code tool only when an inbox is wired,
+    # feeding the IMAP creds to that MCP subprocess (never into the prompt).
+    imap_env = answers.profile.imap_mcp_env() if answers.profile.imap_configured else None
     result = agent.run_agent(prompt_text, cdp_endpoint=session.cdp_endpoint,
-                             dry_run=not auto)
+                             dry_run=not auto, imap_env=imap_env)
     if auto:
         return result  # run_agent already set submitted from dry_run=False
 

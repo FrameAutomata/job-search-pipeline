@@ -145,6 +145,17 @@ class TestApplyProfile:
         monkeypatch.setenv("APPLY_ATS_EMAIL", "apply@example.com")
         assert ApplyProfile.load(co).ats_email == "apply@example.com"
 
+    def test_imap_mcp_env_carries_creds_for_the_subprocess(self, tmp_path, monkeypatch):
+        co = self._write(tmp_path, "candidate:\n  email: tom@example.com\n")
+        monkeypatch.setenv("APPLY_IMAP_HOST", "imap.gmail.com")
+        monkeypatch.setenv("APPLY_IMAP_PASSWORD", "imap-app-pw")
+        monkeypatch.setenv("APPLY_IMAP_PORT", "993")
+        env = ApplyProfile.load(co).imap_mcp_env()
+        assert env["APPLY_ATS_EMAIL"] == "tom@example.com"
+        assert env["APPLY_IMAP_HOST"] == "imap.gmail.com"
+        assert env["APPLY_IMAP_PASSWORD"] == "imap-app-pw"
+        assert env["APPLY_IMAP_PORT"] == "993"   # stringified for a subprocess env
+
     def test_loads_voluntary_disclosures(self, tmp_path):
         co = self._write(tmp_path, """
             voluntary_disclosures:

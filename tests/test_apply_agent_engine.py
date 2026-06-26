@@ -32,10 +32,14 @@ def _job():
                     url="https://boards.greenhouse.io/x/jobs/9", score=4.5)
 
 
-def _answers(*, ats_password="", imap_configured=False):
+def _answers(*, ats_password="", imap_configured=False, imap_env=None):
     # The adapter reads profile (incl. apply creds) + cv_text off the shared
-    # AnswerEngine to build the prompt; a stand-in with those attributes is enough.
-    profile = SimpleNamespace(ats_password=ats_password, imap_configured=imap_configured)
+    # AnswerEngine to build the prompt and wire the verification MCP; a stand-in
+    # with those attributes is enough.
+    profile = SimpleNamespace(
+        ats_password=ats_password, imap_configured=imap_configured,
+        imap_mcp_env=lambda: (imap_env if imap_env is not None else {}),
+    )
     return SimpleNamespace(profile=profile, cv_text="", cover_letter_text="")
 
 
@@ -48,7 +52,8 @@ def fake_run_agent(monkeypatch):
     def make(result: ApplyResult):
         def _fake(prompt, *, cdp_endpoint, dry_run=False, model=None, **kw):
             calls.append(SimpleNamespace(prompt=prompt, cdp_endpoint=cdp_endpoint,
-                                         dry_run=dry_run, model=model))
+                                         dry_run=dry_run, model=model,
+                                         imap_env=kw.get("imap_env")))
             return result
         monkeypatch.setattr(agent_engine.agent, "run_agent", _fake)
         return calls
@@ -113,6 +118,24 @@ class TestForwardsCredentials:
                               mode="review")
         assert captured.get("ats_password") == "atspw"
         assert captured.get("verification_available") is True
+
+
+class TestForwardsImapEnv:
+    def test_passes_imap_env_when_configured(self, fake_run_agent):
+        # Phase 7 wiring: a configured IMAP inbox means the agent gets the
+        # read_verification_code tool, fed creds via the subprocess env.
+        calls = fake_run_agent(ApplyResult(code=READY))
+        agent_engine.apply_to(
+            _session(), _job(),
+            _answers(imap_configured=True, imap_env={"APPLY_IMAP_HOST": "h"}),
+            mode="review")
+        assert calls[0].imap_env == {"APPLY_IMAP_HOST": "h"}
+
+    def test_no_imap_env_when_unconfigured(self, fake_run_agent):
+        calls = fake_run_agent(ApplyResult(code=READY))
+        agent_engine.apply_to(_session(), _job(),
+                              _answers(imap_configured=False), mode="review")
+        assert calls[0].imap_env is None
 
 
 class TestApplyToAuto:

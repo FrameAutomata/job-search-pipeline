@@ -18,6 +18,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from typing import Iterable
 
@@ -33,15 +34,27 @@ _PROMOTE = {"captcha": CAPTCHA, "expired": EXPIRED, "login_issue": LOGIN_ISSUE}
 _REASON_JUNK = re.compile(r'[*`"\s]+$')  # trailing markdown the agent sometimes adds
 
 
-def make_mcp_config(cdp_endpoint: str, *, viewport: str = _VIEWPORT) -> dict:
+def make_mcp_config(cdp_endpoint: str, *, viewport: str = _VIEWPORT,
+                    imap_env: dict | None = None) -> dict:
     """The `--mcp-config` payload: a Playwright MCP attached to the SAME Chrome the
     deterministic engine drives, via its CDP endpoint — so the agent inherits the
-    warm, logged-in, Cloudflare-cleared session rather than a fresh one."""
-    return {"mcpServers": {"playwright": {"command": "npx", "args": [
+    warm, logged-in, Cloudflare-cleared session rather than a fresh one. When
+    `imap_env` is given (IMAP configured), also exposes the read_verification_code
+    tool so the agent can clear email confirmations during account creation."""
+    servers = {"playwright": {"command": "npx", "args": [
         "@playwright/mcp@latest",
         f"--cdp-endpoint={cdp_endpoint}",
         f"--viewport-size={viewport}",
-    ]}}}
+    ]}}
+    if imap_env:
+        # Run our IMAP reader as a second MCP server on this same Python; creds go
+        # to the subprocess via env (the agent only ever sees the returned token).
+        servers["imap"] = {
+            "command": sys.executable,
+            "args": ["-m", "pipeline.apply.imap_mcp"],
+            "env": dict(imap_env),
+        }
+    return {"mcpServers": servers}
 
 
 def _collect_agent_text(lines: Iterable[str]) -> str:
@@ -96,14 +109,18 @@ def parse_result(output: str, *, submitted: bool) -> ApplyResult:
 
 def run_agent(prompt: str, *, cdp_endpoint: str, model: str | None = None,
               dry_run: bool = False, timeout: int = _DEFAULT_TIMEOUT,
-              claude_bin: str = "claude") -> ApplyResult:
+              claude_bin: str = "claude", imap_env: dict | None = None) -> ApplyResult:
     """Spawn `claude` + Playwright MCP on `cdp_endpoint`, feed `prompt` on stdin,
     parse the stream-json stdout, and return an ApplyResult. APPLIED counts as
-    submitted only on a live (non-dry-run) run."""
+    submitted only on a live (non-dry-run) run. `imap_env` (when set) adds the
+    read_verification_code MCP server so the agent can clear email confirmations."""
+    # mkstemp creates the file 0600 (owner-only). With imap_env this config holds
+    # the plaintext IMAP password for the agent run's duration (~secs–mins) — an
+    # accepted local-only window; anyone able to read it has already broken in.
     fd, mcp_path = tempfile.mkstemp(suffix=".json", prefix="apply-mcp-")
     os.close(fd)
     with open(mcp_path, "w", encoding="utf-8") as f:
-        json.dump(make_mcp_config(cdp_endpoint), f)
+        json.dump(make_mcp_config(cdp_endpoint, imap_env=imap_env), f)
 
     cmd = [claude_bin]
     if model:
