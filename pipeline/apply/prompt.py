@@ -137,6 +137,12 @@ def _captcha_section(capsolver_key: str) -> str:
     return _CAPTCHA_FLOW.replace("__CAPSOLVER_KEY__", capsolver_key)
 
 
+def _resolve_capsolver_key(capsolver_key: str | None) -> str:
+    """The CapSolver key from the arg, else CAPSOLVER_API_KEY env (never baked in
+    when absent). Shared by both prompt builders."""
+    return capsolver_key if capsolver_key is not None else os.environ.get("CAPSOLVER_API_KEY", "")
+
+
 def _result_codes() -> str:
     return (
         "== RESULT (output EXACTLY one line) ==\n"
@@ -149,8 +155,54 @@ def _result_codes() -> str:
     )
 
 
+def _login_rules(profile: ApplyProfile, *, ats_password: str,
+                 verification_available: bool) -> str:
+    """Login-or-signup rules. With a stored ATS password the agent signs in or
+    creates an account; with email verification available it fetches the code via
+    the read_verification_code tool. SSO is forbidden in _never_do, so it's not
+    repeated here."""
+    lines = ["== LOGIN & ACCOUNT (many ATS require an account) ==",
+             f"- At a login wall, use the candidate's email: {profile.email}."]
+    if ats_password:
+        # The literal password is needed so the agent can type it into the field;
+        # this prompt is built and consumed locally (auto-apply never runs in the
+        # cloud), so the secret never leaves the machine.
+        lines.append(f"- Sign in with that email and this password: {ats_password}")
+        lines.append("- If no account exists yet, CREATE one (sign up) with the same "
+                     "email and password.")
+    else:
+        lines.append("- Try the candidate's email; if it needs a password you don't "
+                     "have, do not guess it.")
+    if verification_available:
+        lines.append("- If the site emails a confirmation link or verification code, "
+                     "call the read_verification_code tool to fetch it, then enter it.")
+    lines.append("- Cannot sign in or create an account -> RESULT:LOGIN_ISSUE.")
+    return "\n".join(lines)
+
+
+def build_submit_prompt(*, capsolver_key: str | None = None) -> str:
+    """Second-turn prompt: the form is already filled and parked at its final
+    review step in the open browser; click the final Submit and confirm. The
+    answers were drafted in the review turn — do not change them."""
+    capsolver_key = _resolve_capsolver_key(capsolver_key)
+    return f"""You are resuming a job application already filled out and parked at its final
+review step in the open browser. The answers were drafted in a prior turn — do NOT
+change them.
+
+== STEP-BY-STEP ==
+1. browser_snapshot to confirm you are at the final review / submit step.
+2. Click the final Submit/Apply button.
+3. Submit often triggers a CAPTCHA — run CAPTCHA DETECT and solve it.
+4. Confirm a "thank you / application received" state, then output your RESULT.
+
+{_captcha_section(capsolver_key)}
+
+{_result_codes()}"""
+
+
 def build_prompt(job: ApplyJob, profile: ApplyProfile, *, resume_pdf: str = "",
                  cv_text: str = "", cover_letter_text: str = "",
+                 ats_password: str = "", verification_available: bool = False,
                  dry_run: bool = False, capsolver_key: str | None = None) -> str:
     """The full instruction prompt for the agentic apply engine.
 
@@ -158,12 +210,12 @@ def build_prompt(job: ApplyJob, profile: ApplyProfile, *, resume_pdf: str = "",
     and `cv_text` grounds skill/tenure answers. `dry_run` stops the agent before
     Submit. `capsolver_key` defaults to CAPSOLVER_API_KEY; when absent the CAPTCHA
     section degrades to a manual fallback (no key is ever baked into the prompt)."""
-    if capsolver_key is None:
-        capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+    capsolver_key = _resolve_capsolver_key(capsolver_key)
 
     if dry_run:
-        submit = ("Do NOT click the final Submit/Apply button. Fill and review every "
-                  "field, then output RESULT:APPLIED noting this was a dry run.")
+        submit = ("Fill and review EVERY field, then STOP at the final review step. "
+                  "Do NOT click the final Submit/Apply button — output RESULT:READY "
+                  "(the form is filled and parked for the candidate to submit).")
     else:
         submit = ("Before clicking Submit, snapshot and verify EVERY field against the "
                   "profile and resume; fix anything wrong, then click Submit.")
@@ -198,12 +250,13 @@ Resume PDF (upload this): {resume_pdf or "N/A"}
 
 {_screening_rules()}
 
+{_login_rules(profile, ats_password=ats_password, verification_available=verification_available)}
+
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL; browser_snapshot to read it. Run CAPTCHA DETECT.
 2. If the posting is closed / "no longer accepting applications" -> RESULT:EXPIRED.
 3. Click Apply. Many sites trigger a CAPTCHA right after — DETECT and solve.
-4. Login wall? Employer's own login: try the candidate's email. SSO/OAuth (Google/
-   Microsoft) -> RESULT:FAILED:sso_required. Can't get in -> RESULT:LOGIN_ISSUE.
+4. Login wall? Follow the LOGIN & ACCOUNT rules above.
 5. Upload the resume PDF (fresh — replace any auto-parsed one).
 6. Check ALL pre-filled fields against the profile; fix parser mistakes; fill blanks.
    Phone digits only when a field has a country prefix: {phone_digits}. Dates: {datetime.now().strftime('%m/%d/%Y')}.

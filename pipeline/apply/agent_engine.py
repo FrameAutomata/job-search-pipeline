@@ -69,16 +69,8 @@ def apply_to(session, job: ApplyJob, answers, *, mode: str = "review",
 def submit_application(session) -> ApplyResult:
     """Second agent turn: click the final Submit on the browser parked at the
     review step. Returns an APPLIED/submitted result on success."""
-    # Inline for now; Phase 5 moves the wording into prompt.py beside the
-    # fill-and-stop variant so both turns share one source.
-    submit_prompt = (
-        "You are on the final review step of a job application already filled out "
-        "in the open browser. Click the final Submit/Apply button and confirm the "
-        "submission. Do not change any answers.\n"
-        "Report exactly one line: RESULT:APPLIED on success, else RESULT:FAILED:<reason>."
-    )
-    return agent.run_agent(submit_prompt, cdp_endpoint=session.cdp_endpoint,
-                           dry_run=False)
+    return agent.run_agent(prompt.build_submit_prompt(),
+                           cdp_endpoint=session.cdp_endpoint, dry_run=False)
 
 
 def _held(result: ApplyResult) -> ApplyResult:

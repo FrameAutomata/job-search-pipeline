@@ -10,7 +10,7 @@ import pytest
 
 from pipeline.apply.profile import ApplyProfile
 from pipeline.apply.queue import ApplyJob
-from pipeline.apply.prompt import build_prompt
+from pipeline.apply.prompt import build_prompt, build_submit_prompt
 
 
 def _job():
@@ -48,12 +48,6 @@ class TestBuildPrompt:
                      "RESULT:LOGIN_ISSUE", "RESULT:FAILED"):
             assert code in p, code
 
-    def test_dry_run_holds_before_submit(self):
-        dry = build_prompt(_job(), _profile(), dry_run=True)
-        live = build_prompt(_job(), _profile(), dry_run=False)
-        assert "do not click" in dry.lower()           # rehearsal: stop before submit
-        assert "do not click" not in live.lower()       # live mode submits after review
-
     def test_captcha_section_included_with_key(self):
         p = build_prompt(_job(), _profile(), capsolver_key="CAPKEY123")
         assert "api.capsolver.com" in p
@@ -77,3 +71,56 @@ class TestBuildPrompt:
     def test_never_unsafe_rules_present(self):
         p = build_prompt(_job(), _profile())
         assert "unsafe_permissions" in p or "permission" in p.lower()
+
+
+class TestReviewVsLiveSubmit:
+    """Review mode is the fill-and-STOP turn: the agent parks at the final review
+    step and signals RESULT:READY (never a submission). Live mode submits."""
+
+    def test_review_parks_and_emits_ready(self):
+        dry = build_prompt(_job(), _profile(), dry_run=True)
+        assert "RESULT:READY" in dry            # the hold signal the adapter maps
+        assert "do not click" in dry.lower()    # parks before the final submit
+
+    def test_live_submits_not_ready(self):
+        live = build_prompt(_job(), _profile(), dry_run=False)
+        assert "RESULT:READY" not in live       # live mode never parks
+        assert "submit" in live.lower()         # it clicks Submit
+        assert "do not click" not in live.lower()  # and doesn't hold
+
+
+class TestSubmitPrompt:
+    """The second turn over the parked browser: click the final Submit, don't
+    re-fill, report the terminal outcome."""
+
+    def test_clicks_submit_and_reports_applied(self):
+        p = build_submit_prompt()
+        assert "submit" in p.lower()
+        assert "RESULT:APPLIED" in p
+
+    def test_does_not_refill(self):
+        # It must not re-fill — the answers were already drafted in the review turn.
+        p = build_submit_prompt()
+        assert "change them" in p.lower()       # "...do NOT change them"
+
+
+class TestLoginAndSignup:
+    """The login-or-signup variant: with a stored ATS password the agent logs in
+    or CREATES an account; with email verification available it fetches the code."""
+
+    def test_with_password_enables_account_creation(self):
+        p = build_prompt(_job(), _profile(), ats_password="hunter2")
+        assert "hunter2" in p                    # the agent needs the value to type it
+        assert "account" in p.lower() and ("create" in p.lower() or "sign up" in p.lower())
+
+    def test_without_password_routes_to_login_issue(self):
+        p = build_prompt(_job(), _profile())     # no creds
+        assert "hunter2" not in p
+        # No account-creation instruction; an unscalable login wall bails out.
+        assert "LOGIN_ISSUE" in p
+
+    def test_verification_tool_mentioned_only_when_available(self):
+        with_v = build_prompt(_job(), _profile(), verification_available=True)
+        without_v = build_prompt(_job(), _profile(), verification_available=False)
+        assert "read_verification_code" in with_v
+        assert "read_verification_code" not in without_v
