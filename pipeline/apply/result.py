@@ -24,14 +24,21 @@ READY = "ready"                # agent filled the form and PARKED at review with
                                # submitting — the held state the adapter maps to an
                                # APPLIED/submitted=False result (distinct from APPLIED
                                # so "filled" can never be mistaken for "submitted")
+DEFER = "defer"                # this engine is the wrong one for the role — hand off
+                               # to the engine named in `deferred_to` (agent <-> the
+                               # deterministic LinkedIn/Indeed fast-paths)
+
+# A deterministic engine reports one of these when the role has no fast-apply
+# form (apply-on-company-site): permanent for THAT engine, but also the signal to
+# hand the role to the agentic catch-all instead (see apply._defer_target).
+NO_FAST_APPLY_FORM: frozenset[str] = frozenset({"not_easy_apply", "no_easy_apply_button"})
 
 # Failures that will never succeed on retry — recording them as permanent keeps
 # the worker from re-attempting the same dead job every run.
 PERMANENT_FAILURES: frozenset[str] = frozenset({
     EXPIRED, CAPTCHA, LOGIN_ISSUE, NOT_ELIGIBLE,
-    "not_eligible_location", "not_eligible_work_auth",
-    "already_applied", "not_easy_apply", "no_easy_apply_button",
-})
+    "not_eligible_location", "not_eligible_work_auth", "already_applied",
+}) | NO_FAST_APPLY_FORM
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,7 @@ class ApplyResult:
     reason: str = ""
     answers: tuple[tuple[str, str], ...] = ()
     submitted: bool = False
+    deferred_to: str = ""   # for code==DEFER: the engine to re-dispatch this job to
 
     @property
     def applied(self) -> bool:

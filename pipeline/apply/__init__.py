@@ -26,7 +26,7 @@ from pipeline._batch_common import normalize_company, read_text
 from pipeline.apply import agent_engine, browser, indeed, linkedin, queue
 from pipeline.apply.answers import AnswerEngine, salary_from_report
 from pipeline.apply.profile import ApplyProfile
-from pipeline.apply.result import ApplyResult, EXPIRED, failed
+from pipeline.apply.result import ApplyResult, DEFER, EXPIRED, NO_FAST_APPLY_FORM, failed
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 _VALID_MODES = ("review", "dry-run", "auto")
@@ -107,18 +107,35 @@ def run(
     for job in jobs:
         groups.setdefault(queue.job_site(job.url) or "linkedin", []).append(job)
 
+    job_kwargs = dict(
+        career_ops=career_ops, report_root=report_root, applications_md=applications_md,
+        mode=mode, headless=headless, provider=provider, model=model,
+        tailor_min_score=tailor_min_score,
+    )
     applied = held = failures = 0
-    for site in _APPLY_SITES:
-        if not groups.get(site):
-            continue
-        a, h, f = _apply_jobs(
-            site, groups[site], engine, career_ops=career_ops, report_root=report_root,
-            applications_md=applications_md, mode=mode, headless=headless,
-            provider=provider, model=model, tailor_min_score=tailor_min_score,
-        )
-        applied += a
-        held += h
-        failures += f
+
+    def dispatch(buckets: dict, deferrals: list | None) -> None:
+        nonlocal applied, held, failures
+        for site in _APPLY_SITES:
+            if not buckets.get(site):
+                continue
+            a, h, f = _apply_jobs(site, buckets[site], engine, deferrals=deferrals,
+                                  **job_kwargs)
+            applied += a
+            held += h
+            failures += f
+
+    # Round 1 collects deferrals (a job routed to the wrong engine). Round 2
+    # re-runs each under its target with deferrals=None, so a second defer just
+    # reports as a failure — a 2-round cap that stops a deterministic<->agent
+    # ping-pong.
+    deferrals: list = []
+    dispatch(groups, deferrals)
+    if deferrals:
+        regroups: dict[str, list] = {}
+        for job, target, _result in deferrals:
+            regroups.setdefault(target, []).append(job)
+        dispatch(regroups, None)
 
     print(f"[apply] done — {applied} submitted, {held} filled (held for review), "
           f"{failures} failed | {engine.llm_calls} LLM calls, {engine.cache_hits} cache hits")
@@ -128,11 +145,16 @@ def run(
 def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path,
                 report_root: Path, applications_md: Path, mode: str, headless: bool,
                 provider: str | None, model: str | None,
-                tailor_min_score: float) -> tuple[int, int, int]:
+                tailor_min_score: float,
+                deferrals: list | None = None) -> tuple[int, int, int]:
     """Apply to one site's jobs in its own browser session. LinkedIn uses the
     bundled-Chromium Easy Apply engine; Indeed the patchright SmartApply engine on
     the pre-captured login; "agent" the CDP-attached agentic engine. Returns
-    (applied, held, failures)."""
+    (applied, held, failures).
+
+    `deferrals`: when given, a job this engine reports as the wrong fit (DEFER, or
+    a deterministic no-fast-apply-form) is appended as (job, target, result) for
+    the caller to re-dispatch, instead of being reported here."""
     applied = held = failures = 0
     try:
         if site == "indeed":
@@ -169,6 +191,12 @@ def _apply_jobs(site: str, jobs: list, engine: AnswerEngine, *, career_ops: Path
                     result = apply_fn(page, job, engine, mode=mode, resume_path=resume)
                 except Exception as e:  # never let one job kill the batch
                     result = failed(f"exception:{type(e).__name__}")
+                target = _defer_target(site, result)
+                if deferrals is not None and target and target != site:
+                    # Wrong engine for this role — hand it off for re-dispatch.
+                    deferrals.append((job, target, result))
+                    print(f"[apply] [->]   DEFER {job.company} / {job.role} -> {target}")
+                    continue
                 applied, held, failures = _report(
                     job, result, mode, applications_md, applied, held, failures,
                     unanswered=list(engine.unanswered),
@@ -232,6 +260,19 @@ def configure_engine_for_job(engine: AnswerEngine, job, *, career_ops: Path, rep
             lambda j=job: resume_tailor.generate_for_job(
                 career_ops, j, report_base=report_root, provider=provider, model=model)
         )
+
+
+def _defer_target(site: str, result: ApplyResult) -> str | None:
+    """The engine to hand `result`'s job off to, or None to keep it here. The
+    agent emits RESULT:DEFER:<engine> when it lands on a fast-apply flow; a
+    deterministic engine that finds no Easy-Apply/SmartApply form is the inverse
+    signal — re-route those to the agentic catch-all."""
+    if result.code == DEFER:
+        return result.deferred_to or None
+    if site != "agent" and (result.code in NO_FAST_APPLY_FORM
+                            or result.reason in NO_FAST_APPLY_FORM):
+        return "agent"
+    return None
 
 
 def _report(job, result: ApplyResult, mode: str, applications_md: Path,

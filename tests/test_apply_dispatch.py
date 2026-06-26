@@ -19,7 +19,7 @@ from pipeline.apply import browser as browser_mod
 from pipeline.apply import linkedin as linkedin_mod
 from pipeline.apply import queue as queue_mod
 from pipeline.apply.queue import ApplyJob
-from pipeline.apply.result import APPLIED, ApplyResult, failed
+from pipeline.apply.result import APPLIED, DEFER, ApplyResult, failed
 
 _LI = "https://www.linkedin.com/jobs/view/1"
 _GH = "https://boards.greenhouse.io/x/jobs/9"
@@ -110,3 +110,60 @@ class TestApplyJobsAgentBranch:
         assert calls[0].mode == "review"
         assert calls[0].session.cdp_endpoint.startswith("http://localhost:")
         assert (applied, held, failures) == (0, 1, 0)  # held for review
+
+
+class TestDeferTarget:
+    """Which engine a result hands a job off to (None = keep it here)."""
+
+    def test_agent_defer_uses_deferred_to(self):
+        r = ApplyResult(code=DEFER, deferred_to="indeed")
+        assert apply_pkg._defer_target("agent", r) == "indeed"
+
+    def test_deterministic_no_form_defers_to_agent(self):
+        # The inverse handoff: a LinkedIn/Indeed engine that finds no fast-apply
+        # form (apply-on-company-site) routes to the agentic catch-all.
+        assert apply_pkg._defer_target("indeed", ApplyResult(code="not_easy_apply")) == "agent"
+        assert apply_pkg._defer_target("linkedin", ApplyResult(code="no_easy_apply_button")) == "agent"
+
+    def test_agent_no_form_does_not_defer_to_itself(self):
+        assert apply_pkg._defer_target("agent", ApplyResult(code="not_easy_apply")) is None
+
+    def test_applied_does_not_defer(self):
+        assert apply_pkg._defer_target("linkedin",
+                                       ApplyResult(code=APPLIED, submitted=True)) is None
+
+
+class TestRedispatch:
+    def test_deferred_job_runs_under_target_engine(self, tmp_path, monkeypatch):
+        # An off-site job the agent recognizes as Indeed SmartApply defers to the
+        # deterministic engine, which re-runs it in a second round.
+        monkeypatch.setattr(queue_mod, "select", lambda co, **kw: [_job("1", _GH)])
+        seen = []
+
+        def fake_apply_jobs(site, jobs, engine, *, deferrals=None, **kw):
+            seen.append((site, [j.num for j in jobs]))
+            if site == "agent" and deferrals is not None:   # round 1
+                deferrals.append((jobs[0], "indeed",
+                                  ApplyResult(code=DEFER, deferred_to="indeed")))
+            return (0, 0, 0)
+
+        monkeypatch.setattr(apply_pkg, "_apply_jobs", fake_apply_jobs)
+        apply_pkg.run(tmp_path, refresh=False)
+        # round 1 ran the job at agent; round 2 re-dispatched it to indeed.
+        assert seen == [("agent", ["1"]), ("indeed", ["1"])]
+
+    def test_second_defer_is_not_redispatched(self, tmp_path, monkeypatch):
+        # Loop guard: a ping-ponging job is dispatched at most twice (no round 3).
+        monkeypatch.setattr(queue_mod, "select", lambda co, **kw: [_job("1", _GH)])
+        calls = []
+
+        def fake_apply_jobs(site, jobs, engine, *, deferrals=None, **kw):
+            calls.append(site)
+            if deferrals is not None:   # only the first round collects deferrals
+                deferrals.append((jobs[0], "indeed",
+                                  ApplyResult(code=DEFER, deferred_to="indeed")))
+            return (0, 0, 0)
+
+        monkeypatch.setattr(apply_pkg, "_apply_jobs", fake_apply_jobs)
+        apply_pkg.run(tmp_path, refresh=False)
+        assert calls == ["agent", "indeed"]   # round 1 + round 2 only — no round 3

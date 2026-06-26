@@ -89,6 +89,16 @@ class TestReviewVsLiveSubmit:
         assert "do not click" not in live.lower()  # and doesn't hold
 
 
+class TestDeferDetection:
+    """The agent should bail to the deterministic engines when it lands on a
+    fast-apply flow rather than driving it the slow way."""
+
+    def test_prompt_instructs_defer_on_fast_apply(self):
+        p = build_prompt(_job(), _profile())
+        assert "RESULT:DEFER" in p
+        assert "smartapply" in p.lower() or "easy apply" in p.lower()
+
+
 class TestSubmitPrompt:
     """The second turn over the parked browser: click the final Submit, don't
     re-fill, report the terminal outcome."""

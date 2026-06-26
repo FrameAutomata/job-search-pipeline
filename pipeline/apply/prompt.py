@@ -252,6 +252,12 @@ Resume PDF (upload this): {resume_pdf or "N/A"}
 
 {_login_rules(profile, ats_password=ats_password, verification_available=verification_available)}
 
+== HAND OFF (check before filling) ==
+If the apply flow is one a faster deterministic engine owns, STOP and hand it back
+instead of driving it the slow way — recognize this by URL/redirect, before filling:
+- LinkedIn Easy Apply modal -> RESULT:DEFER:linkedin
+- Indeed SmartApply (smartapply.indeed.com or an "Apply with Indeed" button) -> RESULT:DEFER:indeed
+
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL; browser_snapshot to read it. Run CAPTCHA DETECT.
 2. If the posting is closed / "no longer accepting applications" -> RESULT:EXPIRED.

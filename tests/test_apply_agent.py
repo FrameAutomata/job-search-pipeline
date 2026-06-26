@@ -48,6 +48,13 @@ class TestParseResult:
     def test_terminal_codes(self, token, code):
         assert agent.parse_result(f"x\n{token}\ny", submitted=False).code == code
 
+    def test_defer_carries_target_engine(self):
+        from pipeline.apply.result import DEFER
+        r = agent.parse_result("this is Indeed SmartApply\nRESULT:DEFER:indeed", submitted=False)
+        assert r.code == DEFER and r.deferred_to == "indeed"
+        r2 = agent.parse_result("RESULT:DEFER:linkedin", submitted=True)
+        assert r2.code == DEFER and r2.deferred_to == "linkedin"
+
     def test_ready_is_a_held_not_submitted_outcome(self):
         # The review-mode "filled but parked at submit" signal. Must NOT be a
         # submission even when the run was live — it's the hold point.

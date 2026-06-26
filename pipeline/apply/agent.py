@@ -22,7 +22,7 @@ import sys
 import tempfile
 from typing import Iterable
 
-from pipeline.apply.result import (APPLIED, CAPTCHA, EXPIRED, LOGIN_ISSUE,
+from pipeline.apply.result import (APPLIED, CAPTCHA, DEFER, EXPIRED, LOGIN_ISSUE,
                                    READY, ApplyResult, failed)
 
 _VIEWPORT = "1280,900"
@@ -98,6 +98,11 @@ def parse_result(output: str, *, submitted: bool) -> ApplyResult:
                         ("CAPTCHA", CAPTCHA), ("LOGIN_ISSUE", LOGIN_ISSUE)):
         if f"RESULT:{token}" in verdict:
             return ApplyResult(code=code, submitted=submitted and code == APPLIED)
+    if "RESULT:DEFER" in verdict:
+        rest = verdict.split("RESULT:DEFER", 1)[1].lstrip(":").strip()
+        tokens = rest.split()
+        target = _REASON_JUNK.sub("", tokens[0] if tokens else "").lower()
+        return ApplyResult(code=DEFER, deferred_to=target)
     if "RESULT:FAILED" in verdict:
         reason = verdict.split("RESULT:FAILED", 1)[1].lstrip(":").strip()
         reason = _REASON_JUNK.sub("", reason) or "unknown"
