@@ -206,6 +206,8 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "street": form.get("street") or "",
             "state": form.get("state") or "",
             "postalCode": form.get("postal_code") or "",
+            # Free-text resume-tailoring guidance -> profile.yml tailoring.instructions.
+            "tailoringInstructions": form.get("tailoring_instructions") or "",
             "linkedin": form.get("linkedin") or "",
             "github": form.get("github") or "",
             "portfolio_url": form.get("website") or "",

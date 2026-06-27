@@ -1084,6 +1084,10 @@ function generateProfile(info, criteria) {
       timezone: timezone,
       visa_status: info.requiresSponsorship ? 'Requires sponsorship' : 'No sponsorship needed',
     },
+    // Free-text resume-tailoring guidance the apply stage feeds to the tailor prompt.
+    tailoring: {
+      instructions: info.tailoringInstructions || '',
+    },
     work_authorization: {
       citizenship: info.citizenship || '',
       legally_authorized_to_work_in: workAuthRegions,

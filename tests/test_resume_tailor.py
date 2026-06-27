@@ -62,6 +62,34 @@ def _job(company="Acme", score=4.5, report="", role="Backend Engineer"):
                     url="u", score=score, report_path=report)
 
 
+class TestCustomTailoringInstructions:
+    """Free-text candidate guidance from setup is appended to the tailoring SYSTEM
+    prompt as trusted preferences — applied within the existing hard rules, so it
+    can't license fabrication. Loaded from profile.yml; absent -> no block."""
+
+    def _slots(self):
+        return [rt.Slot(id="s1", kind="summary", para_index=0, text="Software engineer.")]
+
+    def test_instructions_appended_as_preferences(self):
+        system, _ = rt.build_prompt(self._slots(), "resume text", _job(), "", "",
+                                    custom_instructions="Emphasize leadership and cloud architecture.")
+        assert "Emphasize leadership and cloud architecture." in system
+        assert "preference" in system.lower()       # framed as candidate preferences
+
+    def test_no_preferences_block_without_instructions(self):
+        system, _ = rt.build_prompt(self._slots(), "r", _job(), "", "")
+        assert "preference" not in system.lower()
+
+    def test_loads_instructions_from_profile_yml(self, tmp_path):
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "profile.yml").write_text(
+            "tailoring:\n  instructions: Keep bullets to one line.\n", encoding="utf-8")
+        assert rt._tailoring_instructions(tmp_path) == "Keep bullets to one line."
+
+    def test_missing_instructions_is_empty(self, tmp_path):
+        assert rt._tailoring_instructions(tmp_path) == ""
+
+
 # ── classification ───────────────────────────────────────────────────────────
 
 class TestExtractSlots:
