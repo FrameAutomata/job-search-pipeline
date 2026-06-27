@@ -297,6 +297,57 @@ class TestNeedsHumanFlow:
         client.post(f"/api/jobs/apply-cancel/{job_id}")
 
 
+class TestAutoApply:
+    """Manual-review OFF (auto): the worker runs the engine in mode='auto' so it
+    fills AND submits in one turn — marking Applied with no review hold. The
+    default (no auto flag) stays manual review. A wall still pauses for the user
+    (a captcha can't be auto-cleared), so 'at your own risk' auto is for the roles
+    that don't need a human."""
+
+    def test_auto_submits_without_review_hold(self, client, engine, tmp_path):
+        import json as _json
+        from pipeline.app import data as app_data
+        engine["result"] = ApplyResult(code=APPLIED, submitted=True)   # filled + submitted in one turn
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1", "auto": True}).json()["job_id"]
+        s = _wait_status(client, job_id, {"submitted", "ready", "failed"})
+        assert s["status"] == "submitted"                 # straight to submitted — no review hold
+        assert ("apply_to", "auto") in engine["calls"]    # drove the engine in auto mode
+        ov = _json.loads(app_data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))
+        assert ov.get("1", {}).get("status") == "Applied"   # marked Applied
+
+    def test_default_is_manual_review(self, client, engine):
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        assert _wait_status(client, job_id, {"ready", "failed"})["status"] == "ready"
+        client.post(f"/api/jobs/apply-cancel/{job_id}")
+        assert ("apply_to", "review") in engine["calls"]  # default stays review
+
+
+class TestApplyDesktopNotification:
+    """A native OS toast (the same pipeline/notify.py plyer mechanism the pipeline
+    run uses) fires when a role is ready for review or needs the user at a wall —
+    so a batch you've stepped away from pulls you back with an OS notification +
+    sound, not a browser beep."""
+
+    def test_ready_fires_os_notification(self, client, engine, monkeypatch):
+        import pipeline.notify
+        calls = []
+        monkeypatch.setattr(pipeline.notify, "notify", lambda title, msg: calls.append((title, msg)))
+        job_id = client.post("/api/jobs/apply-async", json={"num": "1"}).json()["job_id"]
+        _wait_status(client, job_id, {"ready", "failed"})
+        client.post(f"/api/jobs/apply-cancel/{job_id}")
+        assert any("Acme" in msg for _, msg in calls)   # company-bearing OS notification
+
+    def test_needs_human_fires_os_notification(self, client, engine, monkeypatch):
+        import pipeline.notify
+        calls = []
+        monkeypatch.setattr(pipeline.notify, "notify", lambda title, msg: calls.append((title, msg)))
+        engine["result"] = ApplyResult(code=NEEDS_HUMAN, reason="captcha")
+        job_id = client.post("/api/jobs/apply-async", json={"num": "2"}).json()["job_id"]  # agent role
+        _wait_status(client, job_id, {"needs_human", "failed"})
+        client.post(f"/api/jobs/apply-cancel/{job_id}")
+        assert any("Globex" in msg for _, msg in calls)
+
+
 class TestApplyQueue:
     """GET /api/jobs/apply-queue — the ordered roles a batch-apply run would walk:
     Evaluated, score >= min_score, highest first, every navigable role (not just

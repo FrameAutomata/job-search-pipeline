@@ -1381,6 +1381,24 @@ def _apply_dispatch(job):
     )
 
 
+def _apply_os_notify(company: str, kind: str) -> None:
+    """Native OS toast — the same pipeline/notify.py (plyer) mechanism a pipeline
+    run uses, so it shows on the OS with the system sound, not a browser beep. The
+    message differs by reason so a glance tells you whether a wall needs you or a
+    filled form is ready to review (esp. in a batch you've stepped away from)."""
+    from pipeline import notify
+    company = company or "A role"
+    if kind == "login_issue":
+        notify.notify("Apply — sign-in needed",
+                      f"{company}: sign in / create the account in the open browser, then Continue.")
+    elif kind == "needs_human":
+        notify.notify("Apply — CAPTCHA needs you",
+                      f"{company}: solve the challenge in the open browser, then Continue.")
+    else:
+        notify.notify("Apply — ready to review",
+                      f"{company}: review the drafted answers, then submit.")
+
+
 def _run_apply_review(job_id: str) -> None:
     """Worker: launch a visible browser, fill the Easy Apply form (bailing early
     if the user cancels mid-fill), stop at the Submit step and surface the
@@ -1408,8 +1426,12 @@ def _run_apply_review(job_id: str) -> None:
                 tailor_min_score=env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
             )
             resume = apply_pkg._resolve_resume(co_local, job)
+            # Manual review (the default) fills and parks for the user to Submit; auto
+            # ("at your own risk") fills AND submits in one turn. A wall still drops to
+            # the review hold below — a captcha can't be auto-cleared.
+            auto = bool(task.get("auto"))
             result = engine_mod.apply_to(
-                page, job, engine, mode="review", resume_path=resume,
+                page, job, engine, mode=("auto" if auto else "review"), resume_path=resume,
                 should_cancel=lambda: _apply_decision(job_id) == "cancel",
             )
 
@@ -1425,6 +1447,7 @@ def _run_apply_review(job_id: str) -> None:
             while resumable and result.code in _HUMAN_WALL and rounds < _MAX_HUMAN_ROUNDS:
                 rounds += 1
                 _set_apply(job_id, status="needs_human", code=result.code, reason=result.reason)
+                _apply_os_notify(job.company, result.code)
                 with _apply_lock:
                     task["decision"] = None
                     task["event"].clear()
@@ -1457,9 +1480,15 @@ def _run_apply_review(job_id: str) -> None:
                 _set_apply(job_id, status="failed", code=result.code, reason=result.reason)
                 return
 
+            if result.submitted:   # auto mode filled AND submitted in one turn — no review hold
+                apply_pkg._mark_status(applications_md, job, "Applied")
+                _set_apply(job_id, status="submitted")
+                return
+
             _set_apply(job_id, status="ready",
                        answers=[list(a) for a in result.answers],
                        needs_review=list(getattr(engine, "unanswered", [])))
+            _apply_os_notify(job.company, "ready")
 
             task["event"].wait(timeout=_apply_hold_timeout())
             # Resolve the outcome atomically: an endpoint may have raced the
@@ -1491,6 +1520,7 @@ def _run_apply_review(job_id: str) -> None:
 
 class ApplyAsyncRequest(BaseModel):
     num: str
+    auto: bool = False   # skip the review hold and submit in one turn (at your own risk)
 
 
 @app.post("/api/jobs/apply-async")
@@ -1521,6 +1551,8 @@ def apply_async(req: ApplyAsyncRequest) -> JSONResponse:
             "status": "pending", "num": job.num, "company": job.company,
             "role": job.role, "answers": [], "needs_review": [], "code": None,
             "reason": None, "job": job, "event": threading.Event(), "decision": None,
+            "auto": req.auto,   # auto-submit (no review hold) when the user opted in
+
             # Pin the tracker + local career-ops at session start so a mid-hold
             # Refresh rewriting the tracker can't redirect the Applied/Discarded write.
             "applications_md": _career_ops() / "data" / "applications.md",

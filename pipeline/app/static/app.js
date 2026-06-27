@@ -895,36 +895,10 @@ function humanWallCopy(s) {
   };
 }
 
-// One short beep + a desktop notification when the agent needs the user. Fired
-// once per entry into needs_human (the prev-status check in renderApply gates it).
-// Beep + a desktop notification to pull the user back when a role needs them —
-// shared by the CAPTCHA/login hold and the batch "ready to review" ping.
-function pingNotify(title, body) {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    osc.connect(ctx.destination); osc.frequency.value = 880;
-    osc.start(); osc.stop(ctx.currentTime + 0.25);
-  } catch (_) {}
-  try {
-    if (window.Notification) {
-      if (Notification.permission === "granted") {
-        new Notification(title, { body });
-      } else if (Notification.permission !== "denied") {
-        Notification.requestPermission();
-      }
-    }
-  } catch (_) {}
-}
-
-function notifyNeedsHuman(s) {
-  const copy = humanWallCopy(s);
-  pingNotify(copy.title, `${s.company || "A role"} — ${copy.notify}.`);
-}
-
-function notifyReady(s) {
-  pingNotify("Ready to review", `${s.company || "A role"} — review the drafted answers and submit.`);
-}
+// The attention-grabbing notification (ready-to-review / a wall needs you) is a
+// native OS toast fired server-side by the apply worker (pipeline/notify.py — the
+// same mechanism as a pipeline run), so it shows on the OS with the system sound
+// even when this tab isn't focused. The SPA just renders the in-page panel.
 
 function renderApply(s) {
   const p = applyEls.panel;
@@ -939,7 +913,6 @@ function renderApply(s) {
   if (s.status === "needs_human") {
     if (prev !== "needs_human") {
       applyEls.deciding = false;   // a fresh wall — re-enable the buttons
-      notifyNeedsHuman(s);
     }
     if (applyEls.deciding) return;
     const copy = humanWallCopy(s);
@@ -973,7 +946,6 @@ function renderApply(s) {
     // A decision is in flight (we already showed "Submitting…/Cancelling…") —
     // don't rebuild the form with live buttons before the worker flips status.
     if (applyEls.deciding) return;
-    if (applyEls.batch && prev !== "ready") notifyReady(s);   // ping once per role
     p.className = "apply-panel";
     const rows = (s.answers || [])
       .map((a) => `<tr><td>${escapeHtml(a[0])}</td><td>${escapeHtml(a[1])}</td></tr>`)
@@ -1054,6 +1026,7 @@ const batchEls = {
   btn: document.getElementById("batch-apply-btn"),
   panel: document.getElementById("batch-panel"),
   minScore: document.getElementById("batch-min-score"),
+  manualReview: document.getElementById("batch-manual-review"),
   startBtn: document.getElementById("batch-start"),
   stopBtn: document.getElementById("batch-stop"),
   progress: document.getElementById("batch-progress"),
@@ -1083,7 +1056,9 @@ async function startBatch() {
     batchEls.startBtn.disabled = false;
     return;
   }
-  applyEls.batch = { roles, idx: 0, outcomes: {} };
+  // Manual review on (default) -> each role parks for your Submit; off -> auto-submit.
+  const auto = !(batchEls.manualReview?.checked ?? true);
+  applyEls.batch = { roles, idx: 0, outcomes: {}, auto };
   applyEls.panel = batchEls.review;     // renderApply draws the current role here
   batchEls.stopBtn.hidden = false;
   processBatchRole();
@@ -1103,7 +1078,7 @@ async function processBatchRole() {
   try {
     const r = await fetch("/api/jobs/apply-async", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ num: String(role.num) }),
+      body: JSON.stringify({ num: String(role.num), auto: b.auto }),
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) return batchOnTerminal({ status: "failed", code: "start", reason: body.detail || `${r.status}` });
