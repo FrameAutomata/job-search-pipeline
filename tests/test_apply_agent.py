@@ -117,26 +117,23 @@ class TestRunAgent:
         class FakePopen:
             def __init__(self, cmd, **kw):
                 captured["cmd"] = cmd
-                captured["stdin_written"] = []
                 self.returncode = 0
-                self.stdout = iter([
+
+            def communicate(self, input=None, timeout=None):
+                captured["input"] = input
+                captured["timeout"] = timeout
+                return ("\n".join([
                     json.dumps({"type": "assistant", "message": {"content": [
                         {"type": "text", "text": "filled the form"}]}}),
                     json.dumps({"type": "result", "result": "RESULT:APPLIED"}),
-                ])
-
-                class _Stdin:
-                    def write(self_, s): captured["stdin_written"].append(s)
-                    def close(self_): pass
-                self.stdin = _Stdin()
-
-            def wait(self, timeout=None): return 0
+                ]), "")
 
         monkeypatch.setattr(agent.subprocess, "Popen", FakePopen)
         r = agent.run_agent("PROMPT-BODY", cdp_endpoint="http://localhost:9222",
                             model="opus", dry_run=False)
         assert r.code == APPLIED and r.submitted is True
-        assert captured["stdin_written"] == ["PROMPT-BODY"]
+        assert captured["input"] == "PROMPT-BODY"        # prompt fed via communicate
+        assert captured["timeout"] is not None           # the read is deadline-bounded
         cmd = captured["cmd"]
         assert cmd[0] == "claude"
         assert "--output-format" in cmd and "stream-json" in cmd
@@ -149,14 +146,9 @@ class TestRunAgent:
         class BoomPopen:
             def __init__(self, cmd, **kw):
                 self.returncode = 0
-                self.stdout = iter([])
 
-                class _Stdin:
-                    def write(self_, s): raise BrokenPipeError("claude died")
-                    def close(self_): pass
-                self.stdin = _Stdin()
-
-            def wait(self, timeout=None): return 0
+            def communicate(self, input=None, timeout=None):
+                raise BrokenPipeError("claude died")
 
             def kill(self): pass
 
@@ -168,12 +160,48 @@ class TestRunAgent:
         class FakePopen:
             def __init__(self, cmd, **kw):
                 self.returncode = 0
-                self.stdout = iter([json.dumps({"type": "result", "result": "RESULT:APPLIED dry run"})])
-                class _S:
-                    def write(self_, s): pass
-                    def close(self_): pass
-                self.stdin = _S()
-            def wait(self, timeout=None): return 0
+            def communicate(self, input=None, timeout=None):
+                return (json.dumps({"type": "result", "result": "RESULT:APPLIED dry run"}), "")
+            def kill(self): pass
         monkeypatch.setattr(agent.subprocess, "Popen", FakePopen)
         r = agent.run_agent("P", cdp_endpoint="http://localhost:9222", dry_run=True)
         assert r.code == APPLIED and r.submitted is False
+
+    def test_transcript_logged_only_when_env_set(self, tmp_path, monkeypatch):
+        # The opt-in APPLY_AGENT_LOG dump is what made the iCIMS hCaptcha diagnosis
+        # possible — verify it writes the prompt + transcript when set, and is a
+        # silent no-op (no file, no raise) when unset.
+        log = tmp_path / "agent.log"
+        monkeypatch.delenv("APPLY_AGENT_LOG", raising=False)
+        agent._maybe_log_transcript("P", "T")            # no env -> no-op
+        assert not log.exists()
+        monkeypatch.setenv("APPLY_AGENT_LOG", str(log))
+        agent._maybe_log_transcript("THE-PROMPT", "THE-TRANSCRIPT")
+        text = log.read_text(encoding="utf-8")
+        assert "THE-PROMPT" in text and "THE-TRANSCRIPT" in text
+
+    def test_runaway_agent_is_killed_at_timeout(self, monkeypatch):
+        # A wedged agent (e.g. looping browser_click on the disabled button at an
+        # iCIMS account wall) must NOT hang the run forever: the timeout has to
+        # govern the blocking read itself, so run_agent kills the process and
+        # returns failed("timeout"). Regression for the live hang on the iCIMS role.
+        killed = {"n": 0}
+
+        class HangPopen:
+            def __init__(self, cmd, **kw):
+                self.returncode = None
+                self.captured_timeout = None
+
+            def communicate(self, input=None, timeout=None):
+                self.captured_timeout = timeout
+                if timeout is not None:               # the real read: never returns
+                    raise agent.subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
+                return ("", "")                        # the post-kill reap
+
+            def kill(self):
+                killed["n"] += 1
+
+        monkeypatch.setattr(agent.subprocess, "Popen", lambda cmd, **kw: HangPopen(cmd, **kw))
+        r = agent.run_agent("P", cdp_endpoint="http://localhost:9222", timeout=2)
+        assert r.code == "failed" and r.reason == "timeout"
+        assert killed["n"] >= 1                         # the wedged subprocess was actually killed

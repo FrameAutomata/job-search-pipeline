@@ -113,6 +113,21 @@ def parse_result(output: str, *, submitted: bool) -> ApplyResult:
     return failed("no_result_line")
 
 
+def _maybe_log_transcript(prompt: str, output: str) -> None:
+    """When APPLY_AGENT_LOG is set, append the prompt + the agent's collapsed
+    transcript to that file. The transcript is otherwise discarded once parsed,
+    which makes a surprising RESULT (e.g. NEEDS_HUMAN where LOGIN_ISSUE was
+    expected) impossible to diagnose after the run. Opt-in, best-effort."""
+    path = os.environ.get("APPLY_AGENT_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*72}\nPROMPT:\n{prompt}\n{'-'*72}\nTRANSCRIPT:\n{output}\n")
+    except OSError:
+        pass
+
+
 def run_agent(prompt: str, *, cdp_endpoint: str, model: str | None = None,
               dry_run: bool = False, timeout: int = _DEFAULT_TIMEOUT,
               claude_bin: str = "claude", imap_env: dict | None = None) -> ApplyResult:
@@ -146,20 +161,25 @@ def run_agent(prompt: str, *, cdp_endpoint: str, model: str | None = None,
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
             errors="replace", env=env)
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-        output = _collect_agent_text(proc.stdout)
-        proc.wait(timeout=timeout)
+        # communicate() enforces the timeout on the blocking read ITSELF. Reading
+        # stdout to EOF first and only then calling proc.wait(timeout=) never bounds
+        # a wedged agent — the read blocks forever (e.g. the agent looping clicks on
+        # a disabled account-wall button), so the wait is never reached and the run
+        # hangs. With communicate the deadline always fires.
+        stdout, _ = proc.communicate(input=prompt, timeout=timeout)
     except FileNotFoundError:
         return failed("claude_not_found")
     except subprocess.TimeoutExpired:
-        if proc:
-            proc.kill()
+        proc.kill()
+        try:
+            proc.communicate(timeout=5)   # reap the killed child (no zombie/pipe)
+        except Exception:
+            pass
         return failed("timeout")
     except Exception as e:
-        # Any other subprocess failure (e.g. claude dies mid-stdin-write ->
-        # BrokenPipeError) must become an ApplyResult, not escape into the apply
-        # loop — the engine always returns a verdict.
+        # Any other subprocess failure (e.g. claude dies mid-write -> BrokenPipe)
+        # must become an ApplyResult, not escape into the apply loop — the engine
+        # always returns a verdict.
         if proc:
             proc.kill()
         return failed(f"agent_error:{type(e).__name__}")
@@ -169,4 +189,6 @@ def run_agent(prompt: str, *, cdp_endpoint: str, model: str | None = None,
         except OSError:
             pass
 
+    output = _collect_agent_text(stdout.splitlines())
+    _maybe_log_transcript(prompt, output)
     return parse_result(output, submitted=not dry_run)
