@@ -201,6 +201,11 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "email": form.get("email") or "",
             "phone": form.get("phone") or "",
             "location": form.get("location") or "",
+            # Full mailing address (optional) for apply forms that require a street
+            # (Workday/iCIMS); setup-profile.mjs writes these into location.*.
+            "street": form.get("street") or "",
+            "state": form.get("state") or "",
+            "postalCode": form.get("postal_code") or "",
             "linkedin": form.get("linkedin") or "",
             "github": form.get("github") or "",
             "portfolio_url": form.get("website") or "",

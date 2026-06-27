@@ -81,6 +81,11 @@ class ApplyProfile:
     phone: str = ""
     city: str = ""
     country: str = ""
+    # Full mailing address — required by Workday/iCIMS-class forms that ask for a
+    # street address, not just city/country (the missing_address apply failure).
+    street: str = ""
+    state: str = ""
+    postal_code: str = ""
     linkedin: str = ""
     github: str = ""
     # Work authorization (Phase 1 model)
@@ -191,6 +196,9 @@ class ApplyProfile:
             phone=str(cand.get("phone", "")).strip(),
             city=str(cand.get("city") or loc.get("city") or "").strip(),
             country=str(loc.get("country", "")).strip(),
+            street=str(loc.get("street") or "").strip(),
+            state=str(loc.get("state") or "").strip(),
+            postal_code=str(loc.get("postal_code") or "").strip(),
             linkedin=str(cand.get("linkedin", "")).strip(),
             github=str(cand.get("github", "")).strip(),
             citizenship=str(wa.get("citizenship", "")).strip(),
@@ -218,6 +226,12 @@ class ApplyProfile:
             f"Phone: {self.phone}",
             f"Location: {self.city}, {self.country}".strip(", "),
         ]
+        # Full street address for forms that demand one (Workday/iCIMS). Only when a
+        # street is set — otherwise the City/Country Location line above is all we have.
+        if self.street:
+            region = " ".join(p for p in (self.state, self.postal_code) if p)
+            parts = [self.street, self.city, region, self.country]
+            lines.append("Address: " + ", ".join(p for p in parts if p))
         if self.linkedin:
             lines.append(f"LinkedIn: {self.linkedin}")
         if self.github:

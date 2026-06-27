@@ -1077,6 +1077,10 @@ function generateProfile(info, criteria) {
     location: {
       country: homeCountry,
       city: (info.location || '').split(',')[0].trim(),
+      // Full mailing address for apply forms that demand a street (Workday/iCIMS).
+      street: info.street || '',
+      state: info.state || '',
+      postal_code: info.postalCode || '',
       timezone: timezone,
       visa_status: info.requiresSponsorship ? 'Requires sponsorship' : 'No sponsorship needed',
     },

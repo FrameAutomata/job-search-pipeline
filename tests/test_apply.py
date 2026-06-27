@@ -116,6 +116,38 @@ class TestApplyProfile:
         p = ApplyProfile.load(tmp_path)
         assert p.full_name == "" and p.salary_target is None
 
+    def test_loads_full_mailing_address(self, tmp_path):
+        co = self._write(tmp_path, """
+            location:
+              country: United States
+              city: Dallas
+              state: TX
+              street: 123 Main St
+              postal_code: "75201"
+        """)
+        p = ApplyProfile.load(co)
+        assert p.street == "123 Main St"
+        assert p.state == "TX"
+        assert p.postal_code == "75201"
+
+    def test_summary_lines_surface_address_for_workday_forms(self, tmp_path):
+        # Workday/iCIMS-class forms require a full street address; surface it to the
+        # agent (this is the missing_address failure from the batch run).
+        co = self._write(tmp_path, """
+            location: {country: United States, city: Dallas, state: TX, street: 123 Main St, postal_code: "75201"}
+        """)
+        lines = ApplyProfile.load(co).summary_lines()
+        joined = "\n".join(lines)
+        assert any(l.startswith("Address:") for l in lines)
+        assert "123 Main St" in joined and "75201" in joined and "TX" in joined
+
+    def test_no_address_line_when_street_unset(self, tmp_path):
+        # Without a street, don't emit a half-empty Address line — the City/Country
+        # Location line still covers what we know.
+        co = self._write(tmp_path, "location: {city: Dallas, country: United States}")
+        lines = ApplyProfile.load(co).summary_lines()
+        assert not any(l.startswith("Address:") for l in lines)
+
     def test_loads_apply_credentials_from_env(self, tmp_path, monkeypatch):
         # Auto-apply creds live in .env (local-only), not profile.yml.
         co = self._write(tmp_path, "candidate:\n  email: tom@example.com\n")
