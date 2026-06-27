@@ -535,25 +535,38 @@ def _check_provider(provider: str) -> str | None:
 
 
 def resolve_caller(provider: str | None = None, model: str | None = None, *,
-                   lead_env: str | None = None, disable_thinking: bool = False):
+                   lead_env: str | None = None, lead_provider_env: str | None = None,
+                   disable_thinking: bool = False):
     """Build an LLM caller, resolving provider and model from one place (the apply
     answers, cover letters, and the apply stage all funnel through here instead of
     each re-implementing the precedence chain).
 
-    provider: explicit, else BATCH_PROVIDER / first provider key found.
+    provider: `lead_provider_env` (e.g. TAILOR_PROVIDER, a deliberate per-caller
+        override) if set wins, else the explicit arg, else BATCH_PROVIDER / first
+        provider key found. The dedicated env wins over the arg because the apply
+        stage threads the EVAL provider in as `provider=`, and a tailor override
+        must beat that inherited value, not lose to it.
     model: explicit → `lead_env` override (e.g. COVER_MODEL) → APPLY_MODEL →
         BATCH_MODEL → the provider's default. Each may be a comma-separated
         failover chain. Raises a clear error (never a bare KeyError) when the
-        provider is unknown/unconfigured."""
-    provider = (provider or _detect_provider() or "").strip()
+        provider is unknown/unconfigured.
+
+    lead_provider_env: a provider chosen specifically for THIS caller (TAILOR_PROVIDER
+        — evaluate on one provider, tailor on another). When set, the model resolves
+        from explicit → lead_env → the provider's default ONLY; APPLY_MODEL/BATCH_MODEL
+        are skipped, since those name a model for the EVAL provider and would be a
+        wrong/invalid id on a different one (e.g. a Gemini model id sent to Anthropic)."""
+    dedicated = (os.environ.get(lead_provider_env, "").strip() if lead_provider_env else "")
+    provider = (dedicated or provider or _detect_provider() or "").strip()
     if not provider:
         raise RuntimeError(
             "no LLM provider configured — set a provider key (GEMINI_API_KEY, "
             "DEEPINFRA_API_KEY, ...) or BATCH_PROVIDER in .env"
         )
-    chain = [model, os.environ.get(lead_env) if lead_env else None,
-             os.environ.get("APPLY_MODEL"), os.environ.get("BATCH_MODEL"),
-             PROVIDER_DEFAULTS.get(provider)]
+    lead = os.environ.get(lead_env) if lead_env else None
+    chain = ([model, lead, PROVIDER_DEFAULTS.get(provider)] if dedicated else
+             [model, lead, os.environ.get("APPLY_MODEL"), os.environ.get("BATCH_MODEL"),
+              PROVIDER_DEFAULTS.get(provider)])
     model = next((m for m in chain if m), None)
     if not model:
         raise RuntimeError(f"unknown LLM provider '{provider}' — no default model; "

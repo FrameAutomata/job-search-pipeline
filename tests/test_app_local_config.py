@@ -31,8 +31,8 @@ def env(tmp_path, monkeypatch):
     from pipeline.app import server
     importlib.reload(server)                         # re-runs load_dotenv(real .env)...
     monkeypatch.setattr(server, "ROOT", tmp_path)    # .env writes land in tmp_path/.env
-    for k in _ATS_KEYS:
-        monkeypatch.delenv(k, raising=False)         # ...so clear the real creds it pulled in
+    for k in (*_ATS_KEYS, "TAILOR_PROVIDER", "TAILOR_MODEL"):
+        monkeypatch.delenv(k, raising=False)         # ...so clear the real creds/models it pulled in
     snapshot = dict(os.environ)
     yield TestClient(server.app), tmp_path, server
     os.environ.clear()
@@ -80,6 +80,34 @@ class TestWriteAtsCreds:
               imap_host="imap.gmail.com", imap_port="", imap_password="ip")
         envtext = (root / ".env").read_text(encoding="utf-8")
         assert "APPLY_IMAP_PORT" not in envtext
+
+
+class TestTailorConfig:
+    """Separate evaluation vs tailoring models/providers, set from the UI: writes
+    TAILOR_PROVIDER/TAILOR_MODEL (+ the tailor provider's key) to .env; the config
+    GET reports them so the form can pre-fill."""
+
+    def test_writes_tailor_provider_and_model(self, env):
+        client, root, server = env
+        r = _post(client, tailor_provider="anthropic", tailor_model="claude-x")
+        assert r.status_code == 200
+        envtext = (root / ".env").read_text(encoding="utf-8")
+        assert "TAILOR_PROVIDER=anthropic" in envtext
+        assert "TAILOR_MODEL=claude-x" in envtext
+
+    def test_writes_tailor_provider_api_key(self, env):
+        client, root, server = env
+        _post(client, tailor_provider="anthropic", tailor_api_key="sk-ant-xyz")
+        envtext = (root / ".env").read_text(encoding="utf-8")
+        assert "ANTHROPIC_API_KEY=sk-ant-xyz" in envtext
+
+    def test_get_reports_tailor_config(self, env, monkeypatch):
+        client, root, server = env
+        monkeypatch.setenv("TAILOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("TAILOR_MODEL", "claude-x")
+        cur = client.get("/api/onboard/providers").json()["current"]
+        assert cur["tailor_provider"] == "anthropic"
+        assert cur["tailor_model"] == "claude-x"
 
 
 class TestConfigGetReportsStatus:

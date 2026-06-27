@@ -246,11 +246,26 @@
               <option value="">— auto-detect —</option>
             </select>
           </label>
-          <label>Model override <span class="muted">(optional)</span>
+          <label>Evaluation model <span class="muted">(optional)</span>
             <input id="local-model-input" placeholder="leave blank for provider default" />
           </label>
         </div>
         <p id="local-model-hint" class="hint" hidden></p>
+
+        <div class="grid2" style="margin-top:10px">
+          <label>Tailoring provider <span class="muted">(optional)</span>
+            <select id="local-tailor-provider">
+              <option value="">— same as evaluation —</option>
+            </select>
+          </label>
+          <label>Tailoring model <span class="muted">(optional)</span>
+            <input id="local-tailor-model" placeholder="a stronger model for resume prose" />
+          </label>
+        </div>
+        <label style="margin-top:8px">Tailoring provider API key <span class="muted">(only if it differs from evaluation &amp; isn't set yet)</span>
+          <input id="local-tailor-key" type="password" autocomplete="new-password" placeholder="written to .env; leave blank to keep the existing key" />
+        </label>
+        <p class="hint">Résumé tailoring is low-volume, so it can use a stronger (or different-provider) model than bulk evaluation — quality matters more than cost there. Blank = use the evaluation model/provider.</p>
 
         <label style="margin-top:8px">Interactive CLI <span class="muted">(for --batch and career skills)</span>
           <select id="local-cli-select">

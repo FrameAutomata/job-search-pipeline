@@ -614,6 +614,7 @@ def _resolve_caller(provider: str | None, model: str | None):
     from pipeline.batch_evaluate import resolve_caller
     from pipeline.apply.answers import thinking_disabled
     return resolve_caller(provider, model, lead_env="TAILOR_MODEL",
+                          lead_provider_env="TAILOR_PROVIDER",
                           disable_thinking=thinking_disabled())
 
 

@@ -389,6 +389,22 @@ async function loadLocalProviders() {
     // Current model.
     modelInput.value = d.current.batch_model || "";
 
+    // Tailoring provider/model (optional — blank inherits the eval provider/model).
+    // Every provider is selectable (a key can be supplied below), so none disabled.
+    const tailorSelect = document.getElementById("local-tailor-provider");
+    const tailorModel = document.getElementById("local-tailor-model");
+    if (tailorSelect) {
+      tailorSelect.innerHTML = '<option value="">— same as evaluation —</option>';
+      for (const p of d.api_providers) {
+        const opt = document.createElement("option");
+        opt.value = p.name;
+        opt.textContent = p.name + (p.configured ? " ✓" : " (needs key)");
+        tailorSelect.appendChild(opt);
+      }
+      if (d.current.tailor_provider) tailorSelect.value = d.current.tailor_provider;
+    }
+    if (tailorModel) tailorModel.value = d.current.tailor_model || "";
+
     // Current Gemini free-tier opt-in.
     const freeTierCb = document.getElementById("gemini-free-tier");
     const freeTierRow = document.getElementById("gemini-free-tier-row");
@@ -453,6 +469,9 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   // (it'd be a no-op anyway). Allowed for Gemini + auto-detect.
   const geminiFreeTier = (provider === "" || provider === "gemini")
     && document.getElementById("gemini-free-tier").checked;
+  const tailorProvider = document.getElementById("local-tailor-provider")?.value || "";
+  const tailorModel    = document.getElementById("local-tailor-model")?.value.trim() || "";
+  const tailorKey      = document.getElementById("local-tailor-key")?.value || "";
   btn.disabled = true;
   msgEl.hidden = true;
   try {
@@ -463,6 +482,8 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
       // pasted Gmail app-password keeps its internal spaces; blank = keep existing.
       body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
                              gemini_free_tier: geminiFreeTier,
+                             tailor_provider: tailorProvider, tailor_model: tailorModel,
+                             tailor_api_key: tailorKey,
                              ats_email: document.getElementById("ats-email-input")?.value.trim() || "",
                              ats_password: document.getElementById("ats-password-input")?.value || "",
                              imap_host: document.getElementById("imap-host-input")?.value.trim() || "",

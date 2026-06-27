@@ -14,6 +14,7 @@ from pipeline.batch_evaluate import (
     _detect_provider,
     _is_rate_limit_error,
     _is_transient_provider_error,
+    PROVIDER_DEFAULTS,
     resolve_caller,
     run,
 )
@@ -47,6 +48,62 @@ class TestResolveCaller:
                             lambda provider, model, **kw: captured.update(provider=provider, model=model))
         resolve_caller("deepinfra", lead_env="COVER_MODEL")
         assert captured["model"] == "cover-model"
+
+    def _capture_build(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr("pipeline.batch_evaluate._build_caller",
+                            lambda provider, model, **kw: captured.update(provider=provider, model=model))
+        return captured
+
+    def test_lead_provider_env_selects_a_dedicated_provider(self, monkeypatch):
+        # TAILOR_PROVIDER picks the provider for THIS caller, over BATCH_PROVIDER —
+        # so you can evaluate on Gemini but tailor on Anthropic.
+        for v in ("TAILOR_MODEL", "APPLY_MODEL", "BATCH_MODEL"):
+            monkeypatch.delenv(v, raising=False)
+        monkeypatch.setenv("BATCH_PROVIDER", "gemini")
+        monkeypatch.setenv("TAILOR_PROVIDER", "anthropic")
+        cap = self._capture_build(monkeypatch)
+        resolve_caller(lead_env="TAILOR_MODEL", lead_provider_env="TAILOR_PROVIDER")
+        assert cap["provider"] == "anthropic"
+
+    def test_dedicated_provider_does_not_fall_back_to_eval_model(self, monkeypatch):
+        # The killer bug to avoid: TAILOR_PROVIDER=anthropic but no TAILOR_MODEL must
+        # NOT inherit BATCH_MODEL (a Gemini id) — it uses the tailor provider's default.
+        monkeypatch.delenv("TAILOR_MODEL", raising=False)
+        monkeypatch.setenv("BATCH_MODEL", "gemini-3.1-flash-lite")
+        monkeypatch.setenv("TAILOR_PROVIDER", "anthropic")
+        cap = self._capture_build(monkeypatch)
+        resolve_caller(lead_env="TAILOR_MODEL", lead_provider_env="TAILOR_PROVIDER")
+        assert cap["model"] != "gemini-3.1-flash-lite"
+        assert cap["model"] == PROVIDER_DEFAULTS["anthropic"]
+
+    def test_dedicated_provider_wins_over_an_explicit_arg(self, monkeypatch):
+        # Regression: the apply stage threads the EVAL provider in as provider=, so a
+        # tailor override (TAILOR_PROVIDER) must beat that inherited arg — not lose to
+        # it. (Triggered by an explicit --batch-provider.)
+        monkeypatch.setenv("TAILOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("TAILOR_MODEL", "claude-x")
+        cap = self._capture_build(monkeypatch)
+        resolve_caller("gemini", lead_env="TAILOR_MODEL", lead_provider_env="TAILOR_PROVIDER")
+        assert cap["provider"] == "anthropic"   # TAILOR_PROVIDER, not the passed "gemini"
+
+    def test_dedicated_provider_uses_its_own_lead_model(self, monkeypatch):
+        monkeypatch.setenv("TAILOR_PROVIDER", "anthropic")
+        monkeypatch.setenv("TAILOR_MODEL", "claude-custom-x")
+        cap = self._capture_build(monkeypatch)
+        resolve_caller(lead_env="TAILOR_MODEL", lead_provider_env="TAILOR_PROVIDER")
+        assert cap["provider"] == "anthropic" and cap["model"] == "claude-custom-x"
+
+    def test_no_lead_provider_keeps_the_eval_chain(self, monkeypatch):
+        # Guard: with TAILOR_PROVIDER unset, behavior is unchanged — eval provider +
+        # the BATCH_MODEL fallback.
+        monkeypatch.delenv("TAILOR_PROVIDER", raising=False)
+        monkeypatch.delenv("TAILOR_MODEL", raising=False)
+        monkeypatch.setenv("BATCH_PROVIDER", "gemini")
+        monkeypatch.setenv("BATCH_MODEL", "gemini-eval-x")
+        cap = self._capture_build(monkeypatch)
+        resolve_caller(lead_env="TAILOR_MODEL", lead_provider_env="TAILOR_PROVIDER")
+        assert cap["provider"] == "gemini" and cap["model"] == "gemini-eval-x"
 
 
 class TestDetectProvider:

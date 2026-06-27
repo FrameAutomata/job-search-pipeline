@@ -853,6 +853,9 @@ def get_providers() -> JSONResponse:
             "batch_model": os.environ.get("BATCH_MODEL", ""),
             "batch_cli": os.environ.get("BATCH_CLI", "claude"),
             "gemini_free_tier": gemini_limits.conforming_enabled(),
+            # Tailoring model/provider (blank = inherit the eval model/provider).
+            "tailor_provider": os.environ.get("TAILOR_PROVIDER", ""),
+            "tailor_model": os.environ.get("TAILOR_MODEL", ""),
             # Off-site ATS creds: non-secret fields for form pre-fill + booleans
             # for the passwords (never echo the secret values back to the browser).
             "ats_email": os.environ.get("APPLY_ATS_EMAIL", ""),
@@ -871,6 +874,12 @@ class LocalConfigRequest(BaseModel):
     batch_cli: str = ""
     api_key: str = ""   # optional — write the provider's API key to .env too
     gemini_free_tier: bool = False   # conform eval/tailoring to Gemini free-tier limits
+    # Resume tailoring can use a different (usually stronger) model — and even a
+    # different provider — than bulk evaluation. Blank tailor_* = inherit the eval
+    # model/provider. tailor_api_key (optional) is the tailor provider's key.
+    tailor_provider: str = ""
+    tailor_model: str = ""
+    tailor_api_key: str = ""
     # Off-site ATS account credentials for the agentic apply engine. LOCAL-ONLY
     # secrets (auto-apply never runs in the cloud) — written to .env, never to
     # profile.yml / GitHub Secrets. Blank = leave the existing value untouched (the
@@ -882,24 +891,33 @@ class LocalConfigRequest(BaseModel):
     imap_password: str = ""
 
 
+def _validate_provider(name: str, label: str) -> str:
+    """Lowercase + validate a provider name against the known set (400 on a typo);
+    returns the normalized name, empty when unset. Shared by the eval and tailoring
+    provider fields so the check lives in one place."""
+    norm = name.strip().lower()
+    if norm and norm not in _KNOWN_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown {label} {norm!r}. Valid: {', '.join(sorted(_KNOWN_PROVIDERS))}",
+        )
+    return norm
+
+
 @app.post("/api/onboard/local-config")
 def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     """Write BATCH_PROVIDER, BATCH_MODEL, BATCH_CLI (and optionally the
     provider API key) to the local .env and update os.environ immediately."""
     from dotenv import set_key, unset_key
 
-    provider = req.batch_provider.strip().lower()
-    if provider and provider not in _KNOWN_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown provider {provider!r}. Valid: {', '.join(sorted(_KNOWN_PROVIDERS))}",
-        )
+    provider = _validate_provider(req.batch_provider, "provider")
     cli = req.batch_cli.strip()
     if cli and cli not in _KNOWN_CLIS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown CLI {cli!r}. Valid: {', '.join(_KNOWN_CLIS)}",
         )
+    tailor_provider = _validate_provider(req.tailor_provider, "tailoring provider")
 
     env_path = ROOT / ".env"
     if not env_path.exists():
@@ -926,6 +944,15 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
     # Opt into Gemini free-tier conforming (RPM pacing + RPD capping).
     _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
+
+    # Tailoring model/provider (blank = inherit the eval model/provider). Write the
+    # tailor provider's API key too when given, so a cross-provider tailor (e.g.
+    # evaluate on Gemini, tailor on Anthropic) can authenticate.
+    _set("TAILOR_PROVIDER", tailor_provider)
+    _set("TAILOR_MODEL", req.tailor_model.strip())
+    tailor_key = req.tailor_api_key.strip()
+    if tailor_key and tailor_provider and tailor_provider in onboard.PROVIDER_SECRETS:
+        _set(onboard.PROVIDER_SECRETS[tailor_provider], tailor_key)
 
     # Off-site ATS account credentials -> local .env. Write ONLY non-blank values
     # so re-saving settings preserves a password the form didn't re-send (it never
