@@ -98,28 +98,31 @@ def _never_do() -> str:
 
 # The CapSolver solve flow. Kept a NON-f string so the literal JS braces don't
 # need escaping; the API key is spliced via .replace.
-_CAPTCHA_FLOW = """== CAPTCHA (solve via CapSolver REST — proxyless) ==
-API base: https://api.capsolver.com  | key: __CAPSOLVER_KEY__
-When ANY CAPTCHA appears (hCaptcha / reCAPTCHA / Turnstile), solve it via the API
-(server-side token — you never solve it visually). Do this after navigation and
-after Apply/Submit/Login clicks.
+_CAPTCHA_FLOW = """== CAPTCHA ==
+CapSolver REST (proxyless) — API base: https://api.capsolver.com  | key: __CAPSOLVER_KEY__
+- hCaptcha (.h-captcha, visible OR invisible): CapSolver NO LONGER SUPPORTS hCaptcha
+  (its API returns "We don't support this service"). Do NOT create a CapSolver task for
+  it and do NOT trigger/execute the widget (that only escalates an invisible one into a
+  visible image grid). An hCaptcha -> RESULT:NEEDS_HUMAN straight away — a person clears
+  it in the open browser and the UI resumes you.
+- reCAPTCHA / Turnstile / FunCaptcha: solve via CapSolver below (server-side token — you
+  never solve it visually). Do this after navigation and after Apply/Submit/Login clicks.
 
-DETECT (browser_evaluate): find the widget type + sitekey. Check hCaptcha BEFORE
-reCAPTCHA (both use data-sitekey). Cloudflare Turnstile = .cf-turnstile; reCAPTCHA
-= .g-recaptcha; hCaptcha = .h-captcha.
+DETECT (browser_evaluate): find the widget type + sitekey. hCaptcha = .h-captcha (-> stop,
+NEEDS_HUMAN; do not solve). Cloudflare Turnstile = .cf-turnstile; reCAPTCHA = .g-recaptcha.
 
-SOLVE — createTask then poll then inject (separate browser_evaluate calls):
+SOLVE (reCAPTCHA / Turnstile / FunCaptcha) — createTask then poll then inject:
 1. POST https://api.capsolver.com/createTask with
    {"clientKey": "__CAPSOLVER_KEY__", "task": {"type": TASK_TYPE,
     "websiteURL": PAGE_URL, "websiteKey": SITE_KEY}}
-   TASK_TYPE (proxyless): hcaptcha->HCaptchaTaskProxyLess,
-   recaptchav2->ReCaptchaV2TaskProxyLess, recaptchav3->ReCaptchaV3TaskProxyLess,
-   turnstile->AntiTurnstileTaskProxyLess, funcaptcha->FunCaptchaTaskProxyLess.
+   TASK_TYPE (proxyless): recaptchav2->ReCaptchaV2TaskProxyLess,
+   recaptchav3->ReCaptchaV3TaskProxyLess, turnstile->AntiTurnstileTaskProxyLess,
+   funcaptcha->FunCaptchaTaskProxyLess.
 2. POST /getTaskResult with {"clientKey": "__CAPSOLVER_KEY__", "taskId": TASK_ID}
    every 3s, max 10 polls. status "ready" -> token in solution.token (Turnstile)
-   or solution.gRecaptchaResponse (re/hCaptcha).
+   or solution.gRecaptchaResponse (reCAPTCHA).
 3. INJECT the token into the widget's response field (e.g. [name="cf-turnstile-response"],
-   [name="g-recaptcha-response"], [name="h-captcha-response"]), then click Submit/Verify.
+   [name="g-recaptcha-response"]), then click Submit/Verify.
 If createTask returns errorId > 0, or after 30s, go to MANUAL FALLBACK.
 
 MANUAL FALLBACK: try the audio challenge or solve a simple text/logic puzzle
@@ -172,8 +175,11 @@ def _login_rules(profile: ApplyProfile, *, ats_password: str,
         # this prompt is built and consumed locally (auto-apply never runs in the
         # cloud), so the secret never leaves the machine.
         lines.append(f"- Sign in with that email and this password: {ats_password}")
-        lines.append("- If no account exists yet, CREATE one (sign up) with the same "
-                     "email and password.")
+        lines.append("- TRY SIGNING IN FIRST. Only if there is no account yet, CREATE one "
+                     "(sign up) with the same email and password.")
+        lines.append("- If a sign-up attempt reports the email is ALREADY REGISTERED, an "
+                     "account already exists (you likely created it on a past run) — go "
+                     "back and sign in with the password above; do NOT keep re-registering.")
     else:
         lines.append("- Try the candidate's email; if it needs a password you don't "
                      "have, do not guess it.")

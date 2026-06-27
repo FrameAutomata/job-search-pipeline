@@ -59,6 +59,16 @@ class TestBuildPrompt:
         assert "NOT CONFIGURED" in p or "manual" in p.lower()
         assert "clientKey: ''" not in p                  # don't bake an empty-key live call
 
+    def test_hcaptcha_fast_paths_to_human_not_capsolver(self):
+        """CapSolver discontinued hCaptcha, so the agent must NOT burn a CapSolver
+        round-trip on it (the iCIMS dry-run showed it triggering the invisible
+        widget into a visible challenge for nothing). An hCaptcha -> NEEDS_HUMAN
+        straight away; only reCAPTCHA / Turnstile still go through CapSolver."""
+        p = build_prompt(_job(), _profile(), capsolver_key="CAPKEY123")
+        assert "HCaptchaTaskProxyLess" not in p           # the dead task type is gone
+        assert "no longer supports hcaptcha" in p.lower() # the why, so the agent trusts it
+        assert "AntiTurnstileTaskProxyLess" in p          # reCAPTCHA/Turnstile path stays
+
     def test_salary_never_states_figure_uses_negotiable_or_target(self):
         p = build_prompt(_job(), _profile(salary_target=150000))
         assert "negotiable" in p.lower() or "150" in p
@@ -138,6 +148,15 @@ class TestLoginAndSignup:
         p = build_prompt(_job(), _profile(), ats_password="hunter2")
         assert "hunter2" in p                    # the agent needs the value to type it
         assert "account" in p.lower() and ("create" in p.lower() or "sign up" in p.lower())
+
+    def test_existing_account_signs_in_rather_than_re_registering(self):
+        """An account auto-apply (or the user) already made must be signed into, not
+        re-created with the same fixed password: try sign-in FIRST, and if a create
+        attempt reports the email is already registered, switch to signing in
+        instead of looping on registration."""
+        p = build_prompt(_job(), _profile(), ats_password="hunter2").lower()
+        assert "signing in first" in p           # sign-in is the primary path
+        assert "already registered" in p         # already-registered -> sign in, don't re-register
 
     def test_without_password_routes_to_login_issue(self):
         p = build_prompt(_job(), _profile())     # no creds
