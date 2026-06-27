@@ -817,6 +817,10 @@ function isApplyableJob(job) {
 }
 
 function resetApplyPanel() {
+  // During a batch the controller owns the apply lifecycle — and applyEls.panel
+  // points at the batch's review slot — so navigating away / closing a report
+  // must NOT cancel the run or clear the batch UI out from under it.
+  if (applyEls.batch) return;
   clearTimeout(applyEls.timer);
   // Cancel a still-live session so navigating away doesn't orphan the held
   // browser and 409-block the next apply until the hold timeout (a terminal /
@@ -833,6 +837,7 @@ function resetApplyPanel() {
 
 async function startApply() {
   if (!selectedJob) return;
+  if (applyEls.batch) return;   // a batch owns the apply flow — don't start a competing single session
   applyEls.btn.disabled = true;
   applyEls.panel.hidden = false;
   applyEls.panel.className = "apply-panel";
@@ -892,8 +897,9 @@ function humanWallCopy(s) {
 
 // One short beep + a desktop notification when the agent needs the user. Fired
 // once per entry into needs_human (the prev-status check in renderApply gates it).
-function notifyNeedsHuman(s) {
-  const copy = humanWallCopy(s);
+// Beep + a desktop notification to pull the user back when a role needs them —
+// shared by the CAPTCHA/login hold and the batch "ready to review" ping.
+function pingNotify(title, body) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const osc = ctx.createOscillator();
@@ -903,14 +909,21 @@ function notifyNeedsHuman(s) {
   try {
     if (window.Notification) {
       if (Notification.permission === "granted") {
-        new Notification(copy.title, {
-          body: `${s.company || "A role"} — ${copy.notify}.`,
-        });
+        new Notification(title, { body });
       } else if (Notification.permission !== "denied") {
         Notification.requestPermission();
       }
     }
   } catch (_) {}
+}
+
+function notifyNeedsHuman(s) {
+  const copy = humanWallCopy(s);
+  pingNotify(copy.title, `${s.company || "A role"} — ${copy.notify}.`);
+}
+
+function notifyReady(s) {
+  pingNotify("Ready to review", `${s.company || "A role"} — review the drafted answers and submit.`);
 }
 
 function renderApply(s) {
@@ -960,6 +973,7 @@ function renderApply(s) {
     // A decision is in flight (we already showed "Submitting…/Cancelling…") —
     // don't rebuild the form with live buttons before the worker flips status.
     if (applyEls.deciding) return;
+    if (applyEls.batch && prev !== "ready") notifyReady(s);   // ping once per role
     p.className = "apply-panel";
     const rows = (s.answers || [])
       .map((a) => `<tr><td>${escapeHtml(a[0])}</td><td>${escapeHtml(a[1])}</td></tr>`)
@@ -983,6 +997,9 @@ function renderApply(s) {
   applyEls.btn.disabled = false;
   applyEls.deciding = false;
   applyEls.jobId = null;   // session is over — don't cancel it again on navigate-away
+  // In a batch, the controller records the outcome and advances to the next role
+  // (a Cancel here = "skip this one"); it owns the per-role + summary rendering.
+  if (applyEls.batch) { batchOnTerminal(s); return; }
   if (s.status === "submitted") {
     p.className = "apply-panel ok";
     p.innerHTML = "<p>✓ Submitted — marked Applied.</p>";
@@ -1024,6 +1041,137 @@ async function decideApply(decision) {
       `<p>${escapeHtml(String(e.message || e))} — the form is still open; restoring…</p>`;
     applyEls.timer = setTimeout(pollApply, 1500);
   }
+}
+
+// ── Batch apply ──────────────────────────────────────────────────────────────
+// Walk the Evaluated queue (score-ordered) one role at a time, reusing the exact
+// single-role flow: each fills, parks at review (or a needs_human wall), notifies
+// you, and waits for your Submit (or Cancel = skip) before moving on. Nothing is
+// submitted without your click. The per-role review reuses renderApply by pointing
+// applyEls.panel at the batch's review slot; the two renderApply hooks above fire
+// the "ready" ping and call batchOnTerminal to advance.
+const batchEls = {
+  btn: document.getElementById("batch-apply-btn"),
+  panel: document.getElementById("batch-panel"),
+  minScore: document.getElementById("batch-min-score"),
+  startBtn: document.getElementById("batch-start"),
+  stopBtn: document.getElementById("batch-stop"),
+  progress: document.getElementById("batch-progress"),
+  review: document.getElementById("batch-review"),
+};
+
+batchEls.btn?.addEventListener("click", () => { batchEls.panel.hidden = !batchEls.panel.hidden; });
+batchEls.startBtn?.addEventListener("click", startBatch);
+batchEls.stopBtn?.addEventListener("click", stopBatch);
+
+async function startBatch() {
+  if (applyEls.batch || applyEls.jobId) return;   // one apply flow at a time
+  const minScore = parseFloat(batchEls.minScore?.value) || 4.0;
+  batchEls.startBtn.disabled = true;
+  batchEls.progress.innerHTML = "<p>Building the queue…</p>";
+  let roles;
+  try {
+    const r = await fetch(`/api/jobs/apply-queue?min_score=${minScore}`);
+    roles = ((await r.json()) || {}).roles || [];
+  } catch (e) {
+    batchEls.progress.innerHTML = `<p class="error">Couldn't build the queue: ${escapeHtml(String(e.message || e))}</p>`;
+    batchEls.startBtn.disabled = false;
+    return;
+  }
+  if (!roles.length) {
+    batchEls.progress.innerHTML = `<p>No Evaluated roles scoring ≥ ${minScore} to apply to.</p>`;
+    batchEls.startBtn.disabled = false;
+    return;
+  }
+  applyEls.batch = { roles, idx: 0, outcomes: {} };
+  applyEls.panel = batchEls.review;     // renderApply draws the current role here
+  batchEls.stopBtn.hidden = false;
+  processBatchRole();
+}
+
+async function processBatchRole() {
+  const b = applyEls.batch;
+  if (!b) return;
+  if (b.idx >= b.roles.length) return finishBatch(false);
+  const role = b.roles[b.idx];
+  renderBatchProgress();
+  batchEls.review.hidden = false;
+  batchEls.review.className = "apply-panel";
+  batchEls.review.innerHTML = `<p>Opening ${escapeHtml(role.company)} — filling the form, watch the window…</p>`;
+  applyEls.lastStatus = null;
+  applyEls.deciding = false;
+  try {
+    const r = await fetch("/api/jobs/apply-async", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ num: String(role.num) }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) return batchOnTerminal({ status: "failed", code: "start", reason: body.detail || `${r.status}` });
+    applyEls.jobId = body.job_id;
+    pollApply();
+  } catch (e) {
+    batchOnTerminal({ status: "failed", reason: String(e.message || e) });
+  }
+}
+
+function batchOnTerminal(s) {
+  const b = applyEls.batch;
+  if (!b) return;
+  const role = b.roles[b.idx];
+  b.outcomes[role.num] = { submitted: "submitted", cancelled: "skipped", expired: "expired" }[s.status]
+    || (s.status === "failed" ? `failed${s.reason ? `: ${s.reason}` : ""}` : s.status || "failed");
+  applyEls.jobId = null;
+  b.idx += 1;
+  processBatchRole();
+}
+
+function stopBatch() {
+  if (!applyEls.batch) return;
+  if (applyEls.jobId) fetch(`/api/jobs/apply-cancel/${applyEls.jobId}`, { method: "POST" }).catch(() => {});
+  applyEls.jobId = null;
+  finishBatch(true);
+}
+
+function finishBatch(stopped) {
+  const b = applyEls.batch;
+  applyEls.batch = null;
+  applyEls.panel = document.getElementById("apply-panel");   // restore the single-role panel
+  applyEls.jobId = null;
+  batchEls.stopBtn.hidden = true;
+  batchEls.startBtn.disabled = false;
+  batchEls.review.hidden = true;
+  batchEls.review.innerHTML = "";
+  const counts = {};
+  Object.values((b && b.outcomes) || {}).forEach((o) => {
+    const key = batchOutcomeKind(o);
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  const summary = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing processed";
+  renderBatchProgress();
+  batchEls.progress.insertAdjacentHTML("afterbegin",
+    `<p class="${stopped ? "warn" : "ok"}"><b>Batch ${stopped ? "stopped" : "complete"}.</b> ${escapeHtml(summary)}.</p>`);
+  loadJobs();   // refresh the board so any Applied rows reflect their new status
+}
+
+// "failed:timeout" -> "failed": the leading word is the outcome bucket used for
+// both the progress icon/state and the summary counts.
+function batchOutcomeKind(outcome) {
+  return outcome ? String(outcome).split(":")[0] : "done";
+}
+
+function renderBatchProgress() {
+  const b = applyEls.batch;
+  if (!b) return;
+  const ICON = { submitted: "✓", skipped: "–", expired: "–", current: "▶", queued: "·" };
+  const items = b.roles.map((role, i) => {
+    const outcome = b.outcomes[role.num];
+    const state = i < b.idx ? batchOutcomeKind(outcome)
+      : i === b.idx ? "current" : "queued";
+    const tag = (state !== "current" && state !== "queued")
+      ? ` <span class="muted">— ${escapeHtml(state)}</span>` : "";
+    return `<li class="batch-${state}">${ICON[state] || "✗"} ${escapeHtml(role.company)} — ${escapeHtml(role.role)} <span class="muted">(${role.score})</span>${tag}</li>`;
+  }).join("");
+  batchEls.progress.innerHTML = `<ol class="batch-list">${items}</ol>`;
 }
 
 loadCaps();

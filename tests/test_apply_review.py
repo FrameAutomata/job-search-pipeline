@@ -297,6 +297,30 @@ class TestNeedsHumanFlow:
         client.post(f"/api/jobs/apply-cancel/{job_id}")
 
 
+class TestApplyQueue:
+    """GET /api/jobs/apply-queue — the ordered roles a batch-apply run would walk:
+    Evaluated, score >= min_score, highest first, every navigable role (not just
+    LinkedIn). Read-only; the SPA drives apply-async per role from this list."""
+
+    def test_returns_evaluated_roles_highest_score_first(self, client, engine):
+        body = client.get("/api/jobs/apply-queue?min_score=4.0").json()
+        assert [r["num"] for r in body["roles"]] == ["3", "1", "2"]   # 4.8, 4.5, 4.2
+        top = body["roles"][0]
+        assert top["company"] == "Initech" and top["score"] == 4.8
+
+    def test_respects_min_score(self, client, engine):
+        body = client.get("/api/jobs/apply-queue?min_score=4.6").json()
+        assert [r["num"] for r in body["roles"]] == ["3"]            # only the 4.8 clears
+
+    def test_includes_offsite_and_indeed_not_just_linkedin(self, client, engine):
+        # The batch admits every navigable role the apply engine can drive (matching
+        # apply-async), so the greenhouse (#2) and indeed (#3) rows are in, not only
+        # the LinkedIn one — i.e. the endpoint must NOT use queue.select's
+        # linkedin_only default.
+        nums = [r["num"] for r in client.get("/api/jobs/apply-queue?min_score=4.0").json()["roles"]]
+        assert {"1", "2", "3"} == set(nums)
+
+
 class TestLoginWallFlow:
     """The agent hits an ATS sign-in / account-creation wall it can't pass on its
     own (RESULT:LOGIN_ISSUE). In the UI a human IS present, so the worker holds the

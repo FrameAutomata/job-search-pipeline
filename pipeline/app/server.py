@@ -1539,6 +1539,21 @@ def apply_status(job_id: str) -> JSONResponse:
         return JSONResponse(_apply_public(task))
 
 
+@app.get("/api/jobs/apply-queue")
+def apply_queue(min_score: float = 4.0) -> JSONResponse:
+    """The roles a batch-apply run would walk, in order: Evaluated, score >=
+    min_score, highest first, across every navigable engine (LinkedIn + Indeed +
+    the off-site agentic catch-all) — matching what apply-async admits. Read-only;
+    the SPA drives apply-async per role from this list. Reuses the CLI's
+    queue.select so the batch and the command line pick the same roles."""
+    from pipeline.apply import queue as _queue
+    jobs = _queue.select(_career_ops(), min_score=min_score,
+                         sites=("linkedin", "indeed", "agent"))
+    return JSONResponse({"min_score": min_score, "roles": [
+        {"num": j.num, "company": j.company, "role": j.role, "score": j.score}
+        for j in jobs]})
+
+
 @app.post("/api/jobs/apply-submit/{job_id}")
 def apply_submit(job_id: str) -> JSONResponse:
     """Confirm: signal the held worker to click Submit. Valid only from
