@@ -28,12 +28,12 @@ def env(tmp_path, monkeypatch):
     co = tmp_path / "career-ops"
     (co / "data").mkdir(parents=True)
     monkeypatch.setenv("CAREER_OPS_PATH", str(co))
-    for k in _ATS_KEYS:
-        monkeypatch.delenv(k, raising=False)
-    snapshot = dict(os.environ)
     from pipeline.app import server
-    importlib.reload(server)
-    monkeypatch.setattr(server, "ROOT", tmp_path)   # .env writes land in tmp_path/.env
+    importlib.reload(server)                         # re-runs load_dotenv(real .env)...
+    monkeypatch.setattr(server, "ROOT", tmp_path)    # .env writes land in tmp_path/.env
+    for k in _ATS_KEYS:
+        monkeypatch.delenv(k, raising=False)         # ...so clear the real creds it pulled in
+    snapshot = dict(os.environ)
     yield TestClient(server.app), tmp_path, server
     os.environ.clear()
     os.environ.update(snapshot)

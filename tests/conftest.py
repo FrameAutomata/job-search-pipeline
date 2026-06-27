@@ -207,7 +207,12 @@ def _isolate_provider_env(monkeypatch):
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "APPLY_MODEL", "COVER_MODEL",
                 "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
                 "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-                "OLLAMA_BASE_URL"):
+                "OLLAMA_BASE_URL",
+                # Auto-apply account creds (local-only, real values live in .env) —
+                # clear them too so profile/credential tests assert against a known
+                # empty baseline, not the developer's actual APPLY_* secrets.
+                "APPLY_ATS_EMAIL", "APPLY_ATS_PASSWORD", "APPLY_IMAP_HOST",
+                "APPLY_IMAP_PORT", "APPLY_IMAP_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
 
 
