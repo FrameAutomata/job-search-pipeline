@@ -52,6 +52,57 @@ class TestParseDatePosted:
         assert filter_mod.parse_date_posted("not a date") is None
 
 
+class TestExtractResumeTextDispatch:
+    """filter.extract_resume_text now delegates to pipeline.resume_text, so a
+    DOCX/ODT resume scores the same as a PDF."""
+
+    def test_extracts_docx(self, tmp_path):
+        from docx import Document
+        d = Document()
+        d.add_paragraph("Jane Dev")
+        d.add_paragraph("Python, AWS, Kubernetes")
+        f = tmp_path / "resume.docx"
+        d.save(str(f))
+        text = filter_mod.extract_resume_text(f)
+        assert "Python, AWS, Kubernetes" in text
+
+
+class TestResolveResumePath:
+    """When RESUME_PATH is unset, a resume dropped in resumes/ as .docx or .odt
+    is discovered without editing .env (today only resume.pdf is found)."""
+
+    def _resumes_dir(self, tmp_path):
+        d = tmp_path / "resumes"
+        d.mkdir()
+        return d
+
+    def test_prefers_explicit_existing_path(self, tmp_path):
+        d = self._resumes_dir(tmp_path)
+        (d / "custom.docx").write_bytes(b"x")
+        chosen = filter_mod._resolve_resume_path(str(d / "custom.docx"), tmp_path)
+        assert chosen == (d / "custom.docx")
+
+    def test_discovers_dropped_docx_when_unset(self, tmp_path):
+        d = self._resumes_dir(tmp_path)
+        (d / "resume.docx").write_bytes(b"x")
+        chosen = filter_mod._resolve_resume_path("", tmp_path)
+        assert chosen == (d / "resume.docx")
+
+    def test_discovers_dropped_odt_when_unset(self, tmp_path):
+        d = self._resumes_dir(tmp_path)
+        (d / "resume.odt").write_bytes(b"x")
+        chosen = filter_mod._resolve_resume_path("", tmp_path)
+        assert chosen == (d / "resume.odt")
+
+    def test_pdf_wins_over_docx_when_both_present(self, tmp_path):
+        """Deterministic precedence — pdf first, matching the historical default."""
+        d = self._resumes_dir(tmp_path)
+        (d / "resume.pdf").write_bytes(b"x")
+        (d / "resume.docx").write_bytes(b"x")
+        chosen = filter_mod._resolve_resume_path("", tmp_path)
+        assert chosen == (d / "resume.pdf")
+
+
 class TestFindSkillsSection:
     """Test filter.find_skills_section function."""
 

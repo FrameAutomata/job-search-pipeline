@@ -11,6 +11,7 @@ Supported providers
   groq         llama-3.3-70b-versatile (default)       GROQ_API_KEY
   deepinfra    deepseek-ai/DeepSeek-V4-Flash (def)     DEEPINFRA_API_KEY
   openrouter   meta-llama/llama-3.3-70b-instruct (def) OPENROUTER_API_KEY
+  deepseek     deepseek-chat     (default)             DEEPSEEK_API_KEY
   ollama       qwen2.5:32b       (default)             OLLAMA_BASE_URL (default: http://localhost:11434)
 
 Hosted open-model providers (deepinfra, openrouter) serve open-weight models
@@ -23,8 +24,11 @@ OpenAI-compatible endpoint (e.g. local vLLM server, internal proxy, a
 provider we haven't enumerated above). Use BATCH_PROVIDER=openai +
 OPENAI_API_KEY=<their-key> + OPENAI_BASE_URL=<their-url>.
 
+DeepSeek's own API (DEEPSEEK_API_KEY, https://api.deepseek.com) is a first-class
+provider — cheaper than DeepInfra hosting the same weights, for high-volume runs.
+
 Provider auto-detection: BATCH_PROVIDER env var, then first key found in the
-order: gemini → groq → deepinfra → openrouter → openai → anthropic.
+order: gemini → groq → deepinfra → openrouter → deepseek → openai → anthropic.
 
 Requirements (install only the provider you need):
   pip install anthropic                  # anthropic
@@ -91,6 +95,10 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     # Override via BATCH_MODEL.
     "deepinfra": "deepseek-ai/DeepSeek-V4-Flash",
     "openrouter": "meta-llama/llama-3.3-70b-instruct",
+    # DeepSeek's own API (cheaper than DeepInfra hosting the same weights).
+    # "deepseek-chat" is the stable flagship alias; override via BATCH_MODEL for a
+    # specific version (e.g. DeepSeek-V4-Pro).
+    "deepseek": "deepseek-chat",
     "ollama": "qwen2.5:32b",
 }
 
@@ -102,6 +110,7 @@ PROVIDER_BASE_URLS: dict[str, str] = {
     "groq": "https://api.groq.com/openai/v1",
     "deepinfra": "https://api.deepinfra.com/v1/openai",
     "openrouter": "https://openrouter.ai/api/v1",
+    "deepseek": "https://api.deepseek.com",
 }
 
 
@@ -476,20 +485,14 @@ def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = 
         return _build_openai_compat_caller(
             model, api_key=os.environ["OPENAI_API_KEY"], base_url=base_url,
         )
-    if provider == "groq":
+    if provider in PROVIDER_BASE_URLS:
+        # Hosted OpenAI-compatible providers (groq/deepinfra/deepseek/openrouter):
+        # one branch keyed off the shared tables so adding a provider is a
+        # table-only change. Passing `toggle` uniformly is safe — it's already
+        # gated to _THINKING_TOGGLE_PROVIDERS, so it's False for e.g. groq.
         return _build_openai_compat_caller(
-            model, api_key=os.environ["GROQ_API_KEY"],
-            base_url=PROVIDER_BASE_URLS["groq"],
-        )
-    if provider == "deepinfra":
-        return _build_openai_compat_caller(
-            model, api_key=os.environ["DEEPINFRA_API_KEY"],
-            base_url=PROVIDER_BASE_URLS["deepinfra"], disable_thinking=toggle,
-        )
-    if provider == "openrouter":
-        return _build_openai_compat_caller(
-            model, api_key=os.environ["OPENROUTER_API_KEY"],
-            base_url=PROVIDER_BASE_URLS["openrouter"], disable_thinking=toggle,
+            model, api_key=os.environ[_PROVIDER_KEYS[provider]],
+            base_url=PROVIDER_BASE_URLS[provider], disable_thinking=toggle,
         )
     if provider == "ollama":
         # `or DEFAULT` not `get(VAR, DEFAULT)` — see BATCH_MODEL fix below for
@@ -512,6 +515,7 @@ _PROVIDER_KEYS: dict[str, str] = {
     "groq": "GROQ_API_KEY",
     "deepinfra": "DEEPINFRA_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
@@ -535,29 +539,42 @@ def _check_provider(provider: str) -> str | None:
 
 
 def resolve_caller(provider: str | None = None, model: str | None = None, *,
-                   lead_env: str | None = None, disable_thinking: bool = False):
-    """Build an LLM caller, resolving provider and model from one place (the apply
-    answers, cover letters, and the apply stage all funnel through here instead of
-    each re-implementing the precedence chain).
+                   lead_env: str | None = None, lead_provider_env: str | None = None,
+                   disable_thinking: bool = False):
+    """Build an LLM caller, resolving provider and model from one place (cover
+    letters, resume tailoring, and the article digest all funnel through here
+    instead of each re-implementing the precedence chain).
 
-    provider: explicit, else BATCH_PROVIDER / first provider key found.
-    model: explicit → `lead_env` override (e.g. COVER_MODEL) → APPLY_MODEL →
-        BATCH_MODEL → the provider's default. Each may be a comma-separated
-        failover chain. Raises a clear error (never a bare KeyError) when the
-        provider is unknown/unconfigured."""
-    provider = (provider or _detect_provider() or "").strip()
+    provider: `lead_provider_env` (e.g. TAILOR_PROVIDER, a deliberate per-caller
+        override) if set wins, else the explicit arg, else BATCH_PROVIDER / first
+        provider key found. The dedicated env wins over the arg because callers
+        thread the EVAL provider in as `provider=`, and a tailor override must
+        beat that inherited value, not lose to it.
+    model: explicit → `lead_env` override (e.g. COVER_MODEL) → BATCH_MODEL →
+        the provider's default. Each may be a comma-separated failover chain.
+        Raises a clear error (never a bare KeyError) when the provider is
+        unknown/unconfigured.
+
+    lead_provider_env: a provider chosen specifically for THIS caller (TAILOR_PROVIDER
+        — evaluate on one provider, tailor on another). When set, the model resolves
+        from explicit → lead_env → the provider's default ONLY; BATCH_MODEL is
+        skipped, since it names a model for the EVAL provider and would be a
+        wrong/invalid id on a different one (e.g. a Gemini model id sent to Anthropic)."""
+    dedicated = (os.environ.get(lead_provider_env, "").strip() if lead_provider_env else "")
+    provider = (dedicated or provider or _detect_provider() or "").strip()
     if not provider:
         raise RuntimeError(
             "no LLM provider configured — set a provider key (GEMINI_API_KEY, "
             "DEEPINFRA_API_KEY, ...) or BATCH_PROVIDER in .env"
         )
-    chain = [model, os.environ.get(lead_env) if lead_env else None,
-             os.environ.get("APPLY_MODEL"), os.environ.get("BATCH_MODEL"),
-             PROVIDER_DEFAULTS.get(provider)]
+    lead = os.environ.get(lead_env) if lead_env else None
+    chain = ([model, lead, PROVIDER_DEFAULTS.get(provider)] if dedicated else
+             [model, lead, os.environ.get("BATCH_MODEL"),
+              PROVIDER_DEFAULTS.get(provider)])
     model = next((m for m in chain if m), None)
     if not model:
         raise RuntimeError(f"unknown LLM provider '{provider}' — no default model; "
-                           "set APPLY_MODEL/BATCH_MODEL or use a known provider")
+                           "set BATCH_MODEL or use a known provider")
     return _build_caller(provider, model, disable_thinking=disable_thinking)
 
 

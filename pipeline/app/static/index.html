@@ -26,11 +26,33 @@
       <button id="refresh-btn" title="Download the latest results from GitHub">↻ Refresh</button>
       <button id="run-btn" title="Trigger a new pipeline run in the cloud">▶ Run now</button>
       <button id="run-local-btn" title="Run the pipeline on this machine and show its results">💻 Run local</button>
+      <button id="handoff-btn" title="Build the work-order your browser agent applies from (batch hand-off)">🤝 Hand off</button>
       <button id="recheck-btn" title="Re-check the liveness of evaluated roles and discard postings that have closed">🩺 Re-check liveness</button>
       <a id="setup-link" href="/onboard" title="Set up or update your profile and search config">⚙ Setup</a>
       <button id="update-btn" title="A newer version of the app is available from the template — merge it in and push" hidden>⬆ Update available</button>
     </div>
     <div id="action-msg" class="action-msg" hidden></div>
+    <div id="handoff-panel" class="local-run-panel" hidden>
+      <div class="local-run-options">
+        <label>Board
+          <select id="handoff-board">
+            <option value="both">Both boards</option>
+            <option value="linkedin">LinkedIn only</option>
+            <option value="indeed">Indeed only</option>
+          </select>
+        </label>
+        <label>Limit <input id="handoff-limit" type="number" min="1" placeholder="all" style="width:5em" /></label>
+        <label class="check"><input type="checkbox" id="handoff-tailor" /> Pre-tailor resumes</label>
+        <button id="handoff-start" class="primary">Build work-order</button>
+      </div>
+      <p class="hint">Builds <b>next-roles.jsonl</b> / <b>.md</b> — every evaluated, not-yet-handled role,
+        ranked best-first — for your browser agent to apply from through your own logged-in browser.
+        When it finishes, copy the kickoff prompt into your agent. The agent records each outcome back
+        into the file; the next build folds those in so handled roles never reappear.
+        <b>Pre-tailor</b> generates a tailored resume per company (needs <code>resumes/resume.docx</code>;
+        spends LLM calls, can take minutes).</p>
+      <div id="handoff-result"></div>
+    </div>
     <div id="local-run-panel" class="local-run-panel" hidden>
       <div class="local-run-options">
         <label>Passes
@@ -77,12 +99,10 @@
         <button id="report-close" title="Close">✕</button>
         <a id="report-link" href="#" target="_blank" rel="noopener">Open posting ↗</a>
         <select id="report-status" title="Set status for this role"></select>
-        <button id="apply-btn" class="apply-btn" title="Fill the application form (LinkedIn Easy Apply / Indeed SmartApply) for review" hidden>Apply ↗</button>
         <span class="spacer"></span>
         <span id="skill-actions" class="skill-actions"></span>
       </div>
       <div id="skill-panel" class="skill-panel" hidden></div>
-      <div id="apply-panel" class="apply-panel" hidden></div>
       <article id="report-body"></article>
     </aside>
   </main>

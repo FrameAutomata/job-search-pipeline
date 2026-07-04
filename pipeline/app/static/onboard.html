@@ -21,12 +21,21 @@
       <!-- 1. Resume -->
       <section class="step" data-step="0">
         <h2>Your resume</h2>
-        <p class="hint">Upload your resume as a PDF. We extract the text for keyword
-          scoring and the cloud evaluator — it never leaves your machine except as
-          an encrypted GitHub secret. We'll also auto-fill the About step from it.</p>
-        <label>Resume (PDF)
-          <input id="resume" type="file" accept="application/pdf,.pdf" required />
+        <p class="hint">Upload your resume as a <strong>DOCX</strong>, <strong>ODT</strong>,
+          or PDF. DOCX/ODT are recommended — the AI tailors an editable resume per
+          job far more cleanly than a PDF. We extract the text for keyword scoring
+          and the cloud evaluator; it never leaves your machine except as an
+          encrypted GitHub secret. We'll also auto-fill the About step from it.</p>
+        <label>Resume (DOCX, ODT, or PDF)
+          <input id="resume" type="file"
+            accept=".docx,.odt,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.oasis.opendocument.text"
+            required />
         </label>
+        <label style="margin-top:10px">Resume tailoring instructions <span class="muted">(optional)</span>
+          <textarea name="tailoring_instructions" rows="3" autocomplete="off"
+            placeholder="e.g. Emphasize leadership and cloud architecture; keep bullets to one line; lead with impact, not buzzwords."></textarea>
+        </label>
+        <p class="hint">Free-text guidance the AI follows when tailoring your resume for each job — applied within the honesty rules (it can reorder and re-emphasize, never invent experience).</p>
       </section>
 
       <!-- 2. About -->
@@ -37,6 +46,9 @@
           <label>Email<input name="email" type="email" placeholder="jane@example.com" /></label>
           <label>Phone (optional)<input name="phone" placeholder="+1 (555) 123-4567" /></label>
           <label>Location<input name="location" placeholder="Dallas, TX" /></label>
+          <label>Street address (optional)<input name="street" placeholder="123 Main St" autocomplete="off" /></label>
+          <label>State / Province (optional)<input name="state" placeholder="TX" autocomplete="off" /></label>
+          <label>ZIP / Postal code (optional)<input name="postal_code" placeholder="75201" autocomplete="off" /></label>
           <label>LinkedIn (optional)<input name="linkedin" placeholder="linkedin.com/in/janedev" /></label>
           <label>GitHub (optional)<input name="github" placeholder="github.com/janedev" /></label>
           <label>Website / portfolio (optional)<input name="website" placeholder="janedev.dev" /></label>
@@ -209,6 +221,7 @@
               <option value="anthropic">Anthropic</option>
               <option value="deepinfra">DeepInfra</option>
               <option value="openrouter">OpenRouter</option>
+              <option value="deepseek">DeepSeek</option>
             </select>
           </label>
           <label>Model override (optional)
@@ -238,11 +251,29 @@
               <option value="">— auto-detect —</option>
             </select>
           </label>
-          <label>Model override <span class="muted">(optional)</span>
+          <label>Evaluation model <span class="muted">(optional)</span>
             <input id="local-model-input" placeholder="leave blank for provider default" />
           </label>
         </div>
         <p id="local-model-hint" class="hint" hidden></p>
+        <label style="margin-top:8px">API key <span class="muted">(for the provider above — e.g. DeepSeek; leave blank to keep the saved one)</span>
+          <input id="local-api-key" type="password" autocomplete="new-password" placeholder="written to .env" />
+        </label>
+
+        <div class="grid2" style="margin-top:10px">
+          <label>Tailoring provider <span class="muted">(optional)</span>
+            <select id="local-tailor-provider">
+              <option value="">— same as evaluation —</option>
+            </select>
+          </label>
+          <label>Tailoring model <span class="muted">(optional)</span>
+            <input id="local-tailor-model" placeholder="a stronger model for resume prose" />
+          </label>
+        </div>
+        <label style="margin-top:8px">Tailoring provider API key <span class="muted">(only if it differs from evaluation &amp; isn't set yet)</span>
+          <input id="local-tailor-key" type="password" autocomplete="new-password" placeholder="written to .env; leave blank to keep the existing key" />
+        </label>
+        <p class="hint">Résumé tailoring is low-volume, so it can use a stronger (or different-provider) model than bulk evaluation — quality matters more than cost there. Blank = use the evaluation model/provider.</p>
 
         <label style="margin-top:8px">Interactive CLI <span class="muted">(for --batch and career skills)</span>
           <select id="local-cli-select">
@@ -268,26 +299,8 @@
         <div id="local-save-msg" class="action-msg" hidden></div>
       </section>
 
-      <!-- 8. Auto-apply -->
+      <!-- 8. Review -->
       <section class="step" data-step="7" hidden>
-        <h2>Auto-apply <span class="muted">(optional — local only)</span></h2>
-        <p class="hint">Auto-apply fills and submits applications from your own machine (never in the
-          cloud). Choose the platforms to auto-apply on — each needs a one-time sign-in so the local
-          browser carries your session. A window opens for you to log in; the session is saved for later.</p>
-        <label class="chk"><input type="checkbox" name="auto_apply_linkedin" /> Auto-apply to LinkedIn Easy Apply roles</label>
-        <div class="login-row" data-platform="linkedin" hidden>
-          <button type="button" class="login-btn" data-platform="linkedin">Log in to LinkedIn</button>
-          <span class="login-status muted"></span>
-        </div>
-        <label class="chk"><input type="checkbox" name="auto_apply_indeed" /> Auto-apply to Indeed SmartApply roles</label>
-        <div class="login-row" data-platform="indeed" hidden>
-          <button type="button" class="login-btn" data-platform="indeed">Log in to Indeed</button>
-          <span class="login-status muted"></span>
-        </div>
-      </section>
-
-      <!-- 9. Review -->
-      <section class="step" data-step="8" hidden>
         <h2>Review &amp; submit</h2>
         <p class="hint">This generates your profile, CV, and search config, then
           writes them — plus your API key — as encrypted GitHub secrets on

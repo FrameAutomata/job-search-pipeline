@@ -233,9 +233,6 @@ async function openReport(job) {
   selectedNum = job.report_num;
   selectedJob = job;
   resetSkillPanel();
-  resetApplyPanel();
-  applyEls.btn.hidden = !isApplyableJob(job);
-  applyEls.btn.disabled = false;
   render();
   els.reportLink.href = extractUrl(job) || "#";
   els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : "Evaluated";
@@ -302,7 +299,6 @@ els.hideActionedChk.addEventListener("change", () => {
   render();
 });
 els.reportClose.addEventListener("click", () => {
-  resetApplyPanel();   // cancel any live apply session + stop its poll loop
   els.reportPane.hidden = true;
   selectedNum = null;
   render();
@@ -628,7 +624,91 @@ els.pushBtn.addEventListener("click", async () => {
   }
 });
 
+// ── browser-agent handoff (batch) ───────────────────────────────────────────
+// Builds the work-order server-side, then hands the user a paste-ready kickoff
+// prompt — the UI never launches a browser agent (none expose a session API).
+
+const handoffUi = {
+  btn: document.getElementById("handoff-btn"),
+  panel: document.getElementById("handoff-panel"),
+  start: document.getElementById("handoff-start"),
+  result: document.getElementById("handoff-result"),
+  timer: null,
+};
+
+handoffUi.btn.addEventListener("click", () => {
+  handoffUi.panel.hidden = !handoffUi.panel.hidden;
+});
+
+handoffUi.start.addEventListener("click", async () => {
+  const board = document.getElementById("handoff-board").value;
+  // Only a positive integer counts as a limit — "0", "e", or garbage would
+  // otherwise coerce to NaN/falsy and silently mean "no limit".
+  const parsedLimit = parseInt(document.getElementById("handoff-limit").value, 10);
+  const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
+  const tailor = document.getElementById("handoff-tailor").checked;
+  handoffUi.start.disabled = true;
+  handoffUi.result.innerHTML = `<p class="hint">Building the work-order${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
+  try {
+    const resp = await fetch("/api/handoff/build", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board, limit, tailor }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `build failed (${resp.status})`);
+    pollHandoffBuild(body.job_id);
+  } catch (e) {
+    handoffUi.result.innerHTML = `<p class="hint" style="color:var(--bad)">${escapeHtml(String(e.message || e))}</p>`;
+    handoffUi.start.disabled = false;
+  }
+});
+
+async function pollHandoffBuild(jobId) {
+  clearTimeout(handoffUi.timer);
+  let resp;
+  try {
+    resp = await fetch(`/api/handoff/build-status/${jobId}`);
+  } catch {
+    handoffUi.timer = setTimeout(() => pollHandoffBuild(jobId), 3000);  // network blip
+    return;
+  }
+  const t = await resp.json().catch(() => ({}));
+  if (resp.ok && t.status === "running") {
+    handoffUi.timer = setTimeout(() => pollHandoffBuild(jobId), 1500);
+    return;
+  }
+  // Terminal — including a 404/unknown status (e.g. the server restarted and
+  // forgot the task): without this branch the poller would retry a permanent
+  // 404 forever and wedge the Start button.
+  handoffUi.start.disabled = false;
+  if (!resp.ok || t.status !== "done") {
+    const msg = t.error || t.detail || "build failed — check the server log";
+    handoffUi.result.innerHTML = `<p class="hint" style="color:var(--bad)">${escapeHtml(msg)}</p>`;
+    return;
+  }
+  const r = t.result;
+  handoffUi.result.innerHTML =
+    `<p><b>${r.fresh}</b> fresh role${r.fresh === 1 ? "" : "s"} written to
+      <code>${escapeHtml(r.work_order)}</code></p>
+     <div class="skill-choice"><button id="handoff-copy-kickoff">Copy agent kickoff prompt</button></div>`;
+  wireCopy("handoff-copy-kickoff", r.kickoff,
+           (btn) => { btn.textContent = "Copied — paste it into your browser agent"; });
+}
+
 // ── career-ops skills ──────────────────────────────────────────────────────
+
+// Wire a copy-to-clipboard button. `onOk` gets the button on success; the
+// default failure path tells the user to copy manually (clipboard access can
+// be denied). One helper so the three copy sites can't drift.
+function wireCopy(btnId, text, onOk, onFail) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(text); onOk(btn); }
+    catch { (onFail || ((b) => { b.textContent = "Couldn't copy — select it and copy manually"; }))(btn); }
+  });
+}
 
 const skillActions = document.getElementById("skill-actions");
 const skillPanel = document.getElementById("skill-panel");
@@ -642,7 +722,8 @@ async function loadCaps() {
   renderSkillActions();
 }
 
-// One button per skill in the report header. Rendered once caps are known.
+// One button per skill in the report header, plus the browser-agent hand-off
+// (which needs no CLI/API capability — it just builds a paste-ready prompt).
 function renderSkillActions() {
   skillActions.innerHTML = "";
   for (const skill of CAPS.skills || []) {
@@ -651,6 +732,32 @@ function renderSkillActions() {
     btn.title = `Run "${skill.label}" for this role`;
     btn.addEventListener("click", () => startSkill(skill));
     skillActions.appendChild(btn);
+  }
+  const handoffBtn = document.createElement("button");
+  handoffBtn.textContent = "🤝 Hand off";
+  handoffBtn.title = "Copy a paste-ready prompt handing this role to your browser agent";
+  handoffBtn.addEventListener("click", handoffRolePrompt);
+  skillActions.appendChild(handoffBtn);
+}
+
+async function handoffRolePrompt() {
+  if (!selectedJob) return;
+  showSkill("Building the hand-off prompt…", "");
+  try {
+    const resp = await fetch(`/api/handoff/role-prompt/${encodeURIComponent(String(selectedJob.num))}`);
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `hand-off failed (${resp.status})`);
+    skillPanel.hidden = false;
+    skillPanel.className = "skill-panel";
+    skillPanel.innerHTML =
+      `<p>Paste this into your browser agent (it applies through your own logged-in browser):</p>
+       <pre class="skill-cmd"><code>${escapeHtml(body.prompt)}</code></pre>
+       <div class="skill-choice"><button id="handoff-role-copy">Copy prompt</button></div>`;
+    wireCopy("handoff-role-copy", body.prompt,
+             () => showSkill("Prompt copied.", "ok"),
+             () => showSkill("Couldn't copy — select the prompt and copy manually.", "error"));
+  } catch (e) {
+    showSkill(String(e.message || e), "error");
   }
 }
 
@@ -752,10 +859,9 @@ function renderCliResult(body) {
        ${canLaunch ? `<button id="skill-run">▶ Run in terminal</button>` : ""}
        <button id="skill-copy">Copy command</button>
      </div>`;
-  document.getElementById("skill-copy").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(body.command); showSkill("Command copied.", "ok"); }
-    catch { showSkill("Couldn't copy — select the command and copy manually.", "error"); }
-  });
+  wireCopy("skill-copy", body.command,
+           () => showSkill("Command copied.", "ok"),
+           () => showSkill("Couldn't copy — select the command and copy manually.", "error"));
   if (canLaunch) {
     document.getElementById("skill-run").addEventListener("click", () => runInTerminal(body));
   }
@@ -793,180 +899,7 @@ function renderPrereq(note) {
   return escapeHtml(note).replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
-// ── apply review-and-submit ─────────────────────────────────────────────────
-// Open a visible browser, fill the LinkedIn Easy Apply form, review the drafted
-// answers, then Submit (or Cancel). The server holds the browser open between
-// fill and submit; we just poll status and surface Submit/Cancel.
-
-const applyEls = {
-  btn: document.getElementById("apply-btn"),
-  panel: document.getElementById("apply-panel"),
-  jobId: null,
-  timer: null,
-  deciding: false,   // a Submit/Cancel POST is in flight — don't rebuild the panel
-};
-
-applyEls.btn.addEventListener("click", startApply);
-
-function isLinkedInJob(job) {
-  return /linkedin\.com\/jobs\/view\//i.test(extractUrl(job) || "");
-}
-
-function isIndeedJob(job) {
-  // Anchor the jk= param to indeed.com so a foreign URL carrying ?jk= can't
-  // match — mirrors pipeline/apply/queue.py is_indeed_job.
-  return /indeed\.com\/viewjob|indeed\.com[^\s]*[?&]jk=/i.test(extractUrl(job) || "");
-}
-
-// The apply button shows for postings the deterministic engines can drive.
-// LinkedIn /jobs/view URLs are all Easy-Apply-driveable. Indeed, though, only
-// exposes SmartApply on a subset of listings and JobSpy gives no per-job flag —
-// so we gate the Indeed button on job.easy_apply (set from the easy_apply search
-// pass via the bridge's URL side channel; see pipeline/app/data.py).
-function isApplyableJob(job) {
-  return isLinkedInJob(job) || (isIndeedJob(job) && !!job.easy_apply);
-}
-
-function resetApplyPanel() {
-  clearTimeout(applyEls.timer);
-  // Cancel a still-live session so navigating away doesn't orphan the held
-  // browser and 409-block the next apply until the hold timeout (a terminal /
-  // submitting session 409s here, which is fine — the .catch swallows it).
-  if (applyEls.jobId) {
-    fetch(`/api/jobs/apply-cancel/${applyEls.jobId}`, { method: "POST" }).catch(() => {});
-  }
-  applyEls.jobId = null;
-  applyEls.deciding = false;
-  applyEls.panel.hidden = true;
-  applyEls.panel.innerHTML = "";
-}
-
-async function startApply() {
-  if (!selectedJob) return;
-  applyEls.btn.disabled = true;
-  applyEls.panel.hidden = false;
-  applyEls.panel.className = "apply-panel";
-  applyEls.panel.innerHTML = "<p>Opening a browser and filling the form — watch the window…</p>";
-  try {
-    const resp = await fetch("/api/jobs/apply-async", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ num: String(selectedJob.num) }),
-    });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(body.detail || `apply failed (${resp.status})`);
-    applyEls.jobId = body.job_id;
-    pollApply();
-  } catch (e) {
-    applyEls.panel.className = "apply-panel error";
-    applyEls.panel.innerHTML = `<p>${escapeHtml(String(e.message || e))}</p>`;
-    applyEls.btn.disabled = false;
-  }
-}
-
-async function pollApply() {
-  clearTimeout(applyEls.timer);
-  if (!applyEls.jobId) return;
-  let s;
-  try {
-    s = await (await fetch(`/api/jobs/apply-status/${applyEls.jobId}`)).json();
-  } catch (_) {
-    applyEls.timer = setTimeout(pollApply, 1500);  // network blip — keep polling
-    return;
-  }
-  renderApply(s);
-  if (["pending", "ready", "submitting", "cancelling"].includes(s.status)) {
-    applyEls.timer = setTimeout(pollApply, s.status === "ready" ? 2500 : 1000);
-  }
-}
-
-function renderApply(s) {
-  const p = applyEls.panel;
-  p.hidden = false;
-  if (s.status === "pending") {
-    p.className = "apply-panel";
-    p.innerHTML = "<p>Opening a browser and filling the form — watch the window…</p>";
-    return;
-  }
-  if (s.status === "submitting") {
-    p.className = "apply-panel";
-    p.innerHTML = "<p>Submitting…</p>";
-    return;
-  }
-  if (s.status === "cancelling") {
-    p.className = "apply-panel";
-    p.innerHTML = "<p>Cancelling…</p>";
-    return;
-  }
-  if (s.status === "ready") {
-    // A decision is in flight (we already showed "Submitting…/Cancelling…") —
-    // don't rebuild the form with live buttons before the worker flips status.
-    if (applyEls.deciding) return;
-    p.className = "apply-panel";
-    const rows = (s.answers || [])
-      .map((a) => `<tr><td>${escapeHtml(a[0])}</td><td>${escapeHtml(a[1])}</td></tr>`)
-      .join("");
-    const review = (s.needs_review || []).length
-      ? `<p class="warn">⚠ ${s.needs_review.length} field(s) need your review: ${escapeHtml(s.needs_review.join("; "))}</p>`
-      : "";
-    p.innerHTML =
-      `<p><b>Review the drafted answers, then submit.</b> Nothing is sent until you click Submit.</p>
-       ${review}
-       <table class="apply-answers"><tbody>${rows || "<tr><td>(no fields drafted)</td><td></td></tr>"}</tbody></table>
-       <div class="apply-actions">
-         <button id="apply-do-submit" class="primary">Submit application</button>
-         <button id="apply-do-cancel">Cancel</button>
-       </div>`;
-    document.getElementById("apply-do-submit").addEventListener("click", () => decideApply("submit"));
-    document.getElementById("apply-do-cancel").addEventListener("click", () => decideApply("cancel"));
-    return;
-  }
-  // Terminal states.
-  applyEls.btn.disabled = false;
-  applyEls.deciding = false;
-  applyEls.jobId = null;   // session is over — don't cancel it again on navigate-away
-  if (s.status === "submitted") {
-    p.className = "apply-panel ok";
-    p.innerHTML = "<p>✓ Submitted — marked Applied.</p>";
-    loadJobs();
-  } else if (s.status === "expired") {
-    p.className = "apply-panel warn";
-    p.innerHTML = "<p>This posting is no longer accepting applications — marked Discarded.</p>";
-    loadJobs();
-  } else if (s.status === "cancelled") {
-    p.className = "apply-panel";
-    p.innerHTML = "<p>Cancelled — nothing was submitted.</p>";
-  } else if (s.status === "timeout") {
-    p.className = "apply-panel";
-    p.innerHTML = "<p>Timed out waiting for a decision — the browser was closed. Click Apply to retry.</p>";
-  } else {
-    p.className = "apply-panel error";
-    p.innerHTML = `<p>Couldn't apply: ${escapeHtml(s.code || "failed")}${s.reason ? " — " + escapeHtml(s.reason) : ""}</p>`;
-  }
-}
-
-async function decideApply(decision) {
-  if (!applyEls.jobId) return;
-  applyEls.deciding = true;   // suppress the ready-panel rebuild until the worker flips
-  applyEls.panel.innerHTML = `<p>${decision === "submit" ? "Submitting" : "Cancelling"}…</p>`;
-  try {
-    const resp = await fetch(`/api/jobs/apply-${decision}/${applyEls.jobId}`, { method: "POST" });
-    if (!resp.ok) {
-      const b = await resp.json().catch(() => ({}));
-      throw new Error(b.detail || `failed (${resp.status})`);
-    }
-    pollApply();  // the worker moves to submitting -> submitted/cancelled; poll surfaces it
-  } catch (e) {
-    // The POST didn't take — the session is still as it was. Clear `deciding`
-    // and resume polling so the reviewable form (with buttons) returns.
-    applyEls.deciding = false;
-    applyEls.panel.className = "apply-panel error";
-    applyEls.panel.innerHTML =
-      `<p>${escapeHtml(String(e.message || e))} — the form is still open; restoring…</p>`;
-    applyEls.timer = setTimeout(pollApply, 1500);
-  }
-}
-
+// Boot: populate capabilities + the board, and check for a template update.
 loadCaps();
 loadJobs();
 checkTemplateUpdate();

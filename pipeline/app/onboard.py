@@ -16,6 +16,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from pipeline.batch_evaluate import _PROVIDER_KEYS
+
 # US states (50 + DC) and Canadian provinces — mirror of the sets in
 # setup-profile.mjs, used to keep "City, ST" pairs together and infer country.
 _US_STATES = {
@@ -29,15 +31,11 @@ _CA_PROVINCES = {
     "AB", "BC", "MB", "NB", "NL", "NS", "ON", "PE", "QC", "SK", "NT", "NU", "YT",
 }
 
-# provider name (as the UI sends it) -> the secret the workflows read.
-PROVIDER_SECRETS = {
-    "gemini": "GEMINI_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "deepinfra": "DEEPINFRA_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-}
+# provider name (as the UI sends it) -> the secret the workflows read. Derived
+# from the eval stage's own key table so a provider added there automatically
+# reaches the wizard (this used to be a hand-copy that had to be edited in
+# lockstep — the DeepSeek addition proved the drift risk).
+PROVIDER_SECRETS = dict(_PROVIDER_KEYS)
 
 # Generated file -> secret name. The first four are required by the workflow;
 # PROFILE_MD_B64 is optional but always generated, so we include it.
@@ -201,6 +199,13 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "email": form.get("email") or "",
             "phone": form.get("phone") or "",
             "location": form.get("location") or "",
+            # Full mailing address (optional) for apply forms that require a street
+            # (Workday/iCIMS); setup-profile.mjs writes these into location.*.
+            "street": form.get("street") or "",
+            "state": form.get("state") or "",
+            "postalCode": form.get("postal_code") or "",
+            # Free-text resume-tailoring guidance -> profile.yml tailoring.instructions.
+            "tailoringInstructions": form.get("tailoring_instructions") or "",
             "linkedin": form.get("linkedin") or "",
             "github": form.get("github") or "",
             "portfolio_url": form.get("website") or "",
@@ -296,19 +301,14 @@ def parse_resume_info(text: str) -> dict:
     return info
 
 
-def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """Extract text from an uploaded resume PDF using pdfplumber (the same lib
-    filter.py uses for keyword scoring)."""
-    import pdfplumber
+def extract_resume_text(data: bytes, filename: str) -> str:
+    """Extract text from an uploaded resume, dispatching on the upload's filename
+    suffix (PDF/DOCX/ODT). Delegates to pipeline.resume_text so the UI and the
+    keyword-scoring filter share one extraction implementation. Raises ValueError
+    for an unsupported format."""
+    from pipeline import resume_text
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(pdf_bytes)
-        tmp = f.name
-    try:
-        with pdfplumber.open(tmp) as pdf:
-            return "\n".join((p.extract_text() or "") for p in pdf.pages)
-    finally:
-        os.unlink(tmp)
+    return resume_text.extract_resume_bytes(data, filename)
 
 
 # ── generation + collection ────────────────────────────────────────────────

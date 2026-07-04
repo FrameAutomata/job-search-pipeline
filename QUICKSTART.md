@@ -14,7 +14,7 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, no 3.13 wheel)
 - Node.js 18+ (career-ops + profile setup)
-- A resume PDF
+- A resume — DOCX, ODT, or PDF (DOCX recommended: per-job resume tailoring slot-edits a DOCX, and editable formats extract more cleanly than PDF)
 - At least one of:
   - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI — any of these can be backed by a local [Ollama](https://ollama.com) model via `OLLAMA_MODEL`
   - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
@@ -59,7 +59,7 @@ The wizard generates your profile **and** writes it to your private repo's GitHu
    ```
    Open http://localhost:8000 and click **⚙ Setup**. The status line up top shows the target repo, its visibility, and whether it's already configured.
 4. **Walk through the steps:**
-   - **Resume** — upload your resume PDF (text is extracted locally; the About step is auto-filled from it)
+   - **Resume** — upload your resume as DOCX, ODT, or PDF (DOCX recommended — per-job tailoring slot-edits a DOCX). Text is extracted locally; the About step is auto-filled from it
    - **About you** — name, email, location, optional phone / LinkedIn / GitHub / website
    - **Roles & compensation** — target roles, roles to avoid, target / minimum comp, location flexibility
    - **Search settings** — locations (`City, ST` pairs stay together; put "Remote" in a chunk for a remote pass), distance, recency (`hours_old`), max results, job boards, and an optional easy-apply pass (runs every 4 h in the cloud)
@@ -94,7 +94,7 @@ Either path creates / rewrites:
 - `career-ops/modes/_profile.md` — your career narrative and deal-breakers
 - `config/search.yml` — `searches:` block regenerated from your locations; `filter:` / `screen:` blocks preserved
 
-The wizard (Option A) also saves your uploaded resume as `resumes/resume.pdf` + `resumes/resume.txt` (the extracted text used for keyword scoring); Option B reads the resume path you point it at.
+The wizard (Option A) also saves your uploaded resume under its own extension — `resumes/resume.docx` / `.odt` / `.pdf` — plus `resumes/resume.txt` (the extracted text used for keyword scoring). A saved `resume.docx` doubles as the source resume tailoring slot-edits per job (the `--handoff-tailor` work-order enrichment). Option B reads the resume path you point it at.
 
 To re-run profile setup at any time, re-open the wizard or run `node setup-profile.mjs`. Re-running rewrites the `searches:` block from scratch.
 
@@ -196,7 +196,7 @@ State persists in `career-ops/batch/batch-state.tsv` — safe to interrupt and r
 .\run.ps1 --evaluate-batch --batch-concurrency 5        # more parallel workers
 ```
 
-Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. The first one with a configured API key wins. Override with `BATCH_PROVIDER`.
+Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic. The first one with a configured API key wins. Override with `BATCH_PROVIDER`.
 
 | Provider | Env var | Default model | Cost | Notes |
 |---|---|---|---|---|
@@ -304,7 +304,7 @@ job-search-pipeline/
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CAREER_OPS_PATH` | `./career-ops` | Path to career-ops directory |
-| `RESUME_PATH` | auto-detected | Path to your resume PDF (or `.txt` sibling if present — skips PDF extraction) |
+| `RESUME_PATH` | auto-detected | Path to your resume (DOCX / ODT / PDF). Unset → auto-discovers `resumes/resume.{pdf,docx,odt}`. A `.txt` sibling, if present, is used directly and skips extraction. |
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
 | `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides detection) |

@@ -31,7 +31,6 @@ from pipeline import gemini_limits
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
-    env_float,
     max_report_num,
     max_tracker_num,
     write_job_result,
@@ -44,7 +43,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
-from pipeline import recheck
+from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -65,21 +64,6 @@ UI_CACHE = ROOT / ".ui-cache" / "latest"
 _add_job_tasks: dict[str, dict] = {}
 _add_job_lock = threading.Lock()
 
-# Apply-review sessions: job_id → task dict. The worker holds ONE live browser
-# open between fill and submit (Playwright is thread-affine), so it blocks on the
-# task's decision Event; the submit/cancel endpoints signal it. Single-flight:
-# only one session may be non-terminal at a time (one visible browser).
-_apply_tasks: dict[str, dict] = {}
-_apply_lock = threading.Lock()
-# Non-terminal statuses (block a new session AND are never evicted). "submitting"
-# / "cancelling" are transient states the worker sets, under the lock, between
-# the hold and the Playwright action — so a Cancel that races an in-flight submit
-# sees a non-"ready" status and is rejected.
-_APPLY_ACTIVE = frozenset({"pending", "ready", "submitting", "cancelling"})
-# Cap on retained TERMINAL tasks so _apply_tasks doesn't grow unbounded over a
-# long-lived server; apply_async prunes the oldest on each new session.
-_APPLY_TASK_CAP = 50
-
 # Cloud workflow filenames (must match .github/workflows/*.yml).
 DAILY_WORKFLOW = "daily-pipeline.yml"
 EDIT_WORKFLOW = "edit-tracker.yml"
@@ -89,8 +73,8 @@ EDIT_WORKFLOW = "edit-tracker.yml"
 # several — in case more artifact-producing workflows are added later.)
 PIPELINE_WORKFLOWS = [DAILY_WORKFLOW]
 
-# Pending status changes the user hasn't pushed yet. Written by kanban drags
-# here AND by the apply stage when it auto-submits — one channel, owned by
+# Pending status changes the user hasn't pushed yet. Written by kanban drags —
+# one channel, owned by
 # pipeline.app.data (atomic writes + an in-process lock). The server delegates
 # rather than re-implementing read/modify/write, and resolves the path at call
 # time so tests that redirect data.STATUS_OVERRIDES_FILE take effect.
@@ -217,11 +201,11 @@ def list_jobs() -> JSONResponse:
                 del pushed[num]
             _save_pushed_overrides(pushed)
 
-    # Apply pending-overrides: local kanban drags + apply auto-submits not yet
+    # Apply pending-overrides: local kanban drags + recheck discards not yet
     # pushed. A plain (num-keyed) override lands on the row with that num; an
-    # identity-anchored one (from apply, whose num may be from a different
-    # tracker) lands on the row matching its company/role — so it marks the row
-    # actually applied to, not whichever row coincidentally shares the num.
+    # identity-anchored one (from the liveness recheck, whose num may be from a
+    # different tracker) lands on the row matching its company/role — so it
+    # marks the intended row, not whichever row coincidentally shares the num.
     #
     # Prebuild O(1) lookups so the overlay is O(rows + overrides), not
     # O(rows x overrides): identity anchors are keyed by (norm_company, norm_role),
@@ -263,7 +247,7 @@ def set_status(change: StatusChange) -> JSONResponse:
             detail=f"Unknown status {change.status!r}. Valid: {', '.join(data.CANONICAL_STATES)}",
         )
     # Through the locked read/modify/write accessor so a concurrent push or
-    # apply auto-submit can't lose this drag (or be lost by it).
+    # recheck discard can't lose this drag (or be lost by it).
     data.record_status_override(str(change.num), change.status)
     return JSONResponse({"ok": True, "pending": len(_load_overrides())})
 
@@ -339,7 +323,7 @@ def push_status() -> JSONResponse:
             raise HTTPException(status_code=502, detail=str(e))
         # Clear the keys we pushed PLUS the dead Discard overrides (re-reading
         # under the lock), leaving only the genuinely-pending unresolved ones so
-        # an apply auto-submit recorded during the gh round-trip isn't dropped.
+        # a recheck discard recorded during the gh round-trip isn't dropped.
         pushed_keys = [k for k in overrides if k not in unresolved]
         data.clear_status_overrides(pushed_keys + stale_discards)
         # Persist dispatched overrides so they survive Refresh and restarts until
@@ -486,6 +470,12 @@ def run_local(req: LocalRunRequest) -> JSONResponse:
             raise HTTPException(status_code=409,
                                 detail="A liveness re-check is in progress. Wait for it to "
                                        "finish — both write the tracker.")
+    # Same for a work-order build: it reads the tracker (and may be tailoring
+    # for minutes) — the mirror of handoff_build's _refuse_during_local_run.
+    if _handoff_running():
+        raise HTTPException(status_code=409,
+                            detail="A work-order build is in progress. Wait for it to "
+                                   "finish — the pipeline run would rewrite the tracker under it.")
     try:
         state = local_run.start({"passes": req.passes, "evaluate": req.evaluate})
     except RuntimeError as e:
@@ -711,37 +701,6 @@ def launch_skill(req: SkillLaunchRequest) -> JSONResponse:
     })
 
 
-class ApplyLoginRequest(BaseModel):
-    platform: str
-
-
-@app.post("/api/apply/login")
-def apply_login(req: ApplyLoginRequest) -> JSONResponse:
-    """Open a terminal that signs in to a platform's apply session (LinkedIn /
-    Indeed) — the one-click login the onboarding 'Auto-apply' step offers.
-    Auto-apply is local-only, so the session is captured here on the user's
-    machine. The command is built server-side (no client-supplied command)."""
-    if not skills.terminal_available():
-        raise HTTPException(
-            status_code=501,
-            detail="Run-in-terminal isn't wired up on this OS yet. Run the login "
-                   "command in your own terminal instead.",
-        )
-    try:
-        command = skills.apply_login_command(req.platform)
-    except skills.SkillError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    try:
-        info = skills.launch_in_terminal(command, str(ROOT))
-    except skills.SkillError as e:
-        raise HTTPException(status_code=501, detail=str(e))
-    except OSError as e:  # rare: temp-file or Popen problem
-        raise HTTPException(status_code=502, detail=f"Couldn't open a terminal: {e}")
-    return JSONResponse({
-        "ok": True, "launched": True, "platform": req.platform, "command": command, **info,
-    })
-
-
 @app.get("/api/skills/output/{filename}")
 def skill_output(filename: str) -> FileResponse:
     """Download a generated skill artifact from the local career-ops output/."""
@@ -789,7 +748,8 @@ def onboard_load_config() -> JSONResponse:
     """Return the last-submitted onboarding form (minus api_key) so the wizard
     can prefill every field on a revisit. Returns {"form": null, "has_resume":
     false} on a first-time setup so the UI knows it's not in edit mode."""
-    resume_present = (ROOT / "resumes" / "resume.pdf").exists()
+    from pipeline.resume_text import IMPORT_SUFFIXES
+    resume_present = any((ROOT / "resumes" / f"resume{s}").exists() for s in IMPORT_SUFFIXES)
     return JSONResponse({
         "form": onboard.load_sidecar(ROOT),
         "has_resume": resume_present,
@@ -798,15 +758,18 @@ def onboard_load_config() -> JSONResponse:
 
 @app.post("/api/onboard/parse-resume")
 async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
-    """Extract contact details from an uploaded resume PDF to autofill the
-    onboarding 'About' step. Pure local parse — no gh calls, nothing written."""
-    pdf_bytes = await resume.read()
-    if not pdf_bytes:
+    """Extract contact details from an uploaded resume (PDF / DOCX / ODT) to
+    autofill the onboarding 'About' step. Pure local parse — no gh calls,
+    nothing written."""
+    data = await resume.read()
+    if not data:
         raise HTTPException(status_code=400, detail="resume file is empty")
     try:
-        text = onboard.extract_pdf_text(pdf_bytes)
+        text = onboard.extract_resume_text(data, resume.filename or "")
+    except ValueError as e:  # unsupported format
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"could not read PDF: {e}")
+        raise HTTPException(status_code=400, detail=f"could not read resume: {e}")
     return JSONResponse(onboard.parse_resume_info(text))
 
 
@@ -845,6 +808,9 @@ def get_providers() -> JSONResponse:
             "batch_model": os.environ.get("BATCH_MODEL", ""),
             "batch_cli": os.environ.get("BATCH_CLI", "claude"),
             "gemini_free_tier": gemini_limits.conforming_enabled(),
+            # Tailoring model/provider (blank = inherit the eval model/provider).
+            "tailor_provider": os.environ.get("TAILOR_PROVIDER", ""),
+            "tailor_model": os.environ.get("TAILOR_MODEL", ""),
         },
         "provider_defaults": dict(PROVIDER_DEFAULTS),
     })
@@ -856,6 +822,25 @@ class LocalConfigRequest(BaseModel):
     batch_cli: str = ""
     api_key: str = ""   # optional — write the provider's API key to .env too
     gemini_free_tier: bool = False   # conform eval/tailoring to Gemini free-tier limits
+    # Resume tailoring can use a different (usually stronger) model — and even a
+    # different provider — than bulk evaluation. Blank tailor_* = inherit the eval
+    # model/provider. tailor_api_key (optional) is the tailor provider's key.
+    tailor_provider: str = ""
+    tailor_model: str = ""
+    tailor_api_key: str = ""
+
+
+def _validate_provider(name: str, label: str) -> str:
+    """Lowercase + validate a provider name against the known set (400 on a typo);
+    returns the normalized name, empty when unset. Shared by the eval and tailoring
+    provider fields so the check lives in one place."""
+    norm = name.strip().lower()
+    if norm and norm not in _KNOWN_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown {label} {norm!r}. Valid: {', '.join(sorted(_KNOWN_PROVIDERS))}",
+        )
+    return norm
 
 
 @app.post("/api/onboard/local-config")
@@ -864,17 +849,30 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     provider API key) to the local .env and update os.environ immediately."""
     from dotenv import set_key, unset_key
 
-    provider = req.batch_provider.strip().lower()
-    if provider and provider not in _KNOWN_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown provider {provider!r}. Valid: {', '.join(sorted(_KNOWN_PROVIDERS))}",
-        )
+    provider = _validate_provider(req.batch_provider, "provider")
     cli = req.batch_cli.strip()
     if cli and cli not in _KNOWN_CLIS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown CLI {cli!r}. Valid: {', '.join(_KNOWN_CLIS)}",
+        )
+    tailor_provider = _validate_provider(req.tailor_provider, "tailoring provider")
+
+    # A key can only be written under its provider's env var — with the select
+    # on "auto-detect" (blank) there is nowhere to put it, and silently
+    # returning ok while dropping the key strands the user with "no LLM
+    # provider configured" later. Reject loudly instead.
+    if req.api_key.strip() and not provider:
+        raise HTTPException(
+            status_code=400,
+            detail="Pick a provider for this API key — auto-detect can't tell "
+                   "which provider the key belongs to.",
+        )
+    if req.tailor_api_key.strip() and not tailor_provider:
+        raise HTTPException(
+            status_code=400,
+            detail="Pick a tailoring provider for this API key — leaving it on "
+                   "'inherit' can't tell which provider the key belongs to.",
         )
 
     env_path = ROOT / ".env"
@@ -902,6 +900,15 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
     # Opt into Gemini free-tier conforming (RPM pacing + RPD capping).
     _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
+
+    # Tailoring model/provider (blank = inherit the eval model/provider). Write the
+    # tailor provider's API key too when given, so a cross-provider tailor (e.g.
+    # evaluate on Gemini, tailor on Anthropic) can authenticate.
+    _set("TAILOR_PROVIDER", tailor_provider)
+    _set("TAILOR_MODEL", req.tailor_model.strip())
+    tailor_key = req.tailor_api_key.strip()
+    if tailor_key and tailor_provider and tailor_provider in onboard.PROVIDER_SECRETS:
+        _set(onboard.PROVIDER_SECRETS[tailor_provider], tailor_key)
 
     return JSONResponse({"ok": True, "updated": updated})
 
@@ -970,33 +977,47 @@ async def onboard_submit(
         )
 
     resumes_dir = ROOT / "resumes"
-    pdf_path = resumes_dir / "resume.pdf"
     txt_path = resumes_dir / "resume.txt"
 
-    # Resume: prefer a freshly-uploaded PDF; fall back to the persisted one
-    # from a prior submit. UploadFile is always non-None when the multipart
-    # field exists, so check filename/size rather than identity.
-    pdf_bytes = await resume.read() if resume is not None else b""
-    if pdf_bytes:
+    # Resume: prefer a freshly-uploaded file (PDF/DOCX/ODT); fall back to the
+    # persisted text from a prior submit. UploadFile is always non-None when the
+    # multipart field exists, so check size rather than identity.
+    resume_bytes = await resume.read() if resume is not None else b""
+    if resume_bytes:
+        filename = (resume.filename or "").strip()
+        suffix = Path(filename).suffix.lower()
         try:
-            resume_text = onboard.extract_pdf_text(pdf_bytes)
-        except Exception as e:  # pdfplumber raises various errors on bad PDFs
-            raise HTTPException(status_code=400, detail=f"could not read PDF: {e}")
+            resume_text = onboard.extract_resume_text(resume_bytes, filename)
+        except ValueError as e:  # unsupported format
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:  # libraries raise various errors on bad files
+            raise HTTPException(status_code=400, detail=f"could not read resume: {e}")
         if not resume_text.strip():
             raise HTTPException(
                 status_code=400,
-                detail="No text found in the PDF (is it a scanned image?).",
+                detail="No text found in the resume (is it a scanned image or empty?).",
             )
         resumes_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path.write_bytes(pdf_bytes)
+        # Persist under the real extension (resume.pdf / resume.docx / resume.odt)
+        # so a DOCX import doubles as the resume-tailoring source
+        # (resume_tailor.source_docx() defaults to resumes/resume.docx).
+        # Retire sibling formats first: the filter's probe is pdf-first, so a
+        # stale resume.pdf left beside a fresh resume.docx would keep winning
+        # keyword scoring forever (split-brain resume — review bug). The latest
+        # upload is THE resume.
+        from pipeline.resume_text import IMPORT_SUFFIXES
+        for other in IMPORT_SUFFIXES:
+            if other != suffix:
+                (resumes_dir / f"resume{other}").unlink(missing_ok=True)
+        (resumes_dir / f"resume{suffix}").write_bytes(resume_bytes)
         txt_path.write_text(resume_text, encoding="utf-8")
     elif txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
     else:
         raise HTTPException(
             status_code=400,
-            detail=("No resume on file — upload a PDF on the first onboarding "
-                    "step before submitting."),
+            detail=("No resume on file — upload a PDF, DOCX, or ODT on the first "
+                    "onboarding step before submitting."),
         )
 
     # Generate artifacts via the shared node generator, then collect base64.
@@ -1251,242 +1272,117 @@ def add_job_status(job_id: str) -> JSONResponse:
     return JSONResponse(task)
 
 
-# ── apply review-and-submit ─────────────────────────────────────────────────
+# ── browser-agent handoff ────────────────────────────────────────────────────
+# The UI never launches a browser agent (none expose a programmatic session
+# API) — it builds the work-order + paste-ready prompts the user hands to
+# whichever agent they use. Batch = the old "Batch apply" slot; per-role = a
+# prompt from the report pane.
 
-def _apply_hold_timeout() -> float:
-    """Seconds to hold the browser open waiting for the user's Submit/Cancel
-    (APPLY_HOLD_TIMEOUT env, default 300). After this the session auto-closes so
-    a forgotten review never leaks a live browser."""
-    return env_float("APPLY_HOLD_TIMEOUT", 300.0)
-
-
-def _apply_job_for_num(num: str):
-    """Build an ApplyJob from the tracker row with this num (the active data
-    dir), pulling the posting URL from the notes cell. None if no such row."""
-    from pipeline.apply.queue import ApplyJob
-    for row in data.load_jobs(_career_ops())["rows"]:
-        if str(row.get("num")) == str(num):
-            return ApplyJob(
-                num=str(row.get("num")),
-                company=row.get("company", ""),
-                role=row.get("role", ""),
-                url=data.extract_url(row.get("notes", "")),
-                score=row.get("score_value"),
-                report_path=row.get("report_path", ""),
-            )
-    return None
+# The one build slot: {"id", "status": running|done|failed, "result"?, "error"?}.
+# A singleton (not a task registry like add-job) because builds are
+# single-flight by design — a new build simply replaces the finished one.
+_handoff_task: dict | None = None
+_handoff_lock = threading.Lock()
 
 
-def _set_apply(job_id: str, **fields) -> None:
-    with _apply_lock:
-        task = _apply_tasks.get(job_id)
-        if task is not None:
-            task.update(fields)
+class HandoffBuildRequest(BaseModel):
+    board: str = "both"
+    limit: int | None = None
+    tailor: bool = False
 
 
-def _apply_decision(job_id: str) -> str | None:
-    """The recorded decision for a session (read under the lock) — backs the
-    worker's should_cancel hook."""
-    with _apply_lock:
-        task = _apply_tasks.get(job_id)
-        return task.get("decision") if task else None
+def _handoff_running() -> bool:
+    with _handoff_lock:
+        return bool(_handoff_task and _handoff_task.get("status") == "running")
 
 
-def _evict_apply_tasks() -> None:
-    """Drop the oldest TERMINAL tasks beyond _APPLY_TASK_CAP. Called under
-    _apply_lock; active sessions (pending/ready/submitting/cancelling) are kept."""
-    terminal = [jid for jid, t in _apply_tasks.items()
-                if t.get("status") not in _APPLY_ACTIVE]
-    for jid in terminal[:max(0, len(terminal) - _APPLY_TASK_CAP)]:
-        _apply_tasks.pop(jid, None)
+def _finish_handoff(job_id: str, **fields) -> None:
+    global _handoff_task
+    with _handoff_lock:
+        if _handoff_task and _handoff_task.get("id") == job_id:
+            _handoff_task = {"id": job_id, **fields}
 
 
-# Only these task fields are returned to the client (the held ApplyJob / Event
-# aren't JSON-serializable and stay server-side).
-_APPLY_PUBLIC = ("status", "num", "company", "role", "answers", "needs_review", "code", "reason")
-
-
-def _apply_public(task: dict) -> dict:
-    return {k: task.get(k) for k in _APPLY_PUBLIC}
-
-
-def _apply_dispatch(job):
-    """Per-site apply wiring for the review worker: (launch-context factory,
-    login-check, engine module, login-fail message). Indeed uses the patchright
-    session + the captured login; LinkedIn the bundled-Chromium Easy Apply engine."""
-    from pipeline.apply import browser, linkedin, indeed
-    from pipeline.apply.queue import job_site
-    if job_site(job.url) == "indeed":
-        return (
-            lambda: browser.launch_indeed(headless=False),
-            lambda page: browser.is_logged_in_indeed(page),
-            indeed,
-            "not signed in to Indeed — open the onboarding 'Auto-apply' step and "
-            "'Log in to Indeed' first (the automated browser can't sign in itself).",
-        )
-    return (
-        lambda: browser.launch(headless=False),
-        lambda page: browser.ensure_logged_in(page, headless=False),
-        linkedin,
-        "not signed in to LinkedIn (run the UI's apply review and sign in to the "
-        "window when prompted).",
-    )
-
-
-def _run_apply_review(job_id: str) -> None:
-    """Worker: launch a visible browser, fill the Easy Apply form (bailing early
-    if the user cancels mid-fill), stop at the Submit step and surface the
-    drafted answers, then block until the user submits/cancels (or the hold times
-    out). Submit clicks Submit and marks the row Applied; a closed posting marks
-    it Discarded. The tracker path + local career-ops are captured at session
-    start, so a mid-hold Refresh rewriting the tracker can't misdirect the write."""
-    task = _apply_tasks[job_id]
-    job = task["job"]
-    applications_md = task["applications_md"]
-    co_local = task["co_local"]
+def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
     try:
-        from pipeline.apply.result import CANCELLED, EXPIRED
-        from pipeline import apply as apply_pkg
-        open_session, login_ok, engine_mod, login_fail = _apply_dispatch(job)
-        report_root = applications_md.parent.parent
-        with open_session() as page:
-            if not login_ok(page):
-                _set_apply(job_id, status="failed", code="login_issue", reason=login_fail)
-                return
-            engine = apply_pkg.build_engine(co_local, provider=None, model=None)
-            apply_pkg.configure_engine_for_job(
-                engine, job, career_ops=co_local, report_root=report_root,
-                provider=None, model=None,
-                tailor_min_score=env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
-            )
-            resume = apply_pkg._resolve_resume(co_local, job)
-            result = engine_mod.apply_to(
-                page, job, engine, mode="review", resume_path=resume,
-                should_cancel=lambda: _apply_decision(job_id) == "cancel",
-            )
-
-            if result.code == CANCELLED:
-                _set_apply(job_id, status="cancelled")
-                return
-            if result.code == EXPIRED:
-                apply_pkg._mark_status(applications_md, job, "Discarded")
-                _set_apply(job_id, status="expired", code=result.code, reason=result.reason)
-                return
-            if not result.applied:
-                _set_apply(job_id, status="failed", code=result.code, reason=result.reason)
-                return
-
-            _set_apply(job_id, status="ready",
-                       answers=[list(a) for a in result.answers],
-                       needs_review=list(getattr(engine, "unanswered", [])))
-
-            task["event"].wait(timeout=_apply_hold_timeout())
-            # Resolve the outcome atomically: an endpoint may have raced the
-            # timeout, so the RECORDED decision (not wait()'s return) is truth.
-            # Moving to a transient status under the lock means a later
-            # submit/cancel sees a non-"ready" status and is rejected.
-            with _apply_lock:
-                decision = task.get("decision")
-                task["status"] = {"submit": "submitting",
-                                  "cancel": "cancelling"}.get(decision, "timeout")
-                final = task["status"]
-
-            if final == "submitting":
-                sub = engine_mod.submit_application(page)
-                if sub.submitted:
-                    apply_pkg._mark_status(applications_md, job, "Applied")
-                    _set_apply(job_id, status="submitted")
-                else:
-                    _set_apply(job_id, status="failed", code=sub.code, reason=sub.reason)
-            elif final == "cancelling":
-                _set_apply(job_id, status="cancelled")
-            # else: timeout — just close the browser (the `with` exits).
-    except ImportError as e:
-        _set_apply(job_id, status="failed", code="playwright_missing", reason=str(e))
-    except Exception as e:  # never let a browser hiccup wedge the session in "pending"
-        msg = (str(e).splitlines() or [""])[0] or type(e).__name__
-        _set_apply(job_id, status="failed", code="exception", reason=msg[:200])
+        # Pass the server's ROOT-anchored career-ops so a RELATIVE
+        # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
+        # own default only anchors an absolute value (review L2).
+        rc = handoff.run(board=board, limit=limit, tailor=tailor,
+                         career_ops=_career_ops_local())
+        if rc != 0:
+            _finish_handoff(job_id, status="failed",
+                            error="handoff exited non-zero — no scored roles found "
+                                  "(run an evaluation first, or point --queue at a scored export)")
+            return
+        work_order = handoff.default_out_dir() / handoff.WORK_ORDER_JSONL
+        _finish_handoff(job_id, status="done", result={
+            "fresh": sum(1 for _ in handoff._iter_jsonl(work_order)),
+            "work_order": str(work_order),
+            "kickoff": handoff.kickoff_prompt(work_order),
+        })
+    except Exception as exc:  # surface, never wedge the slot in "running"
+        _finish_handoff(job_id, status="failed", error=str(exc))
 
 
-class ApplyAsyncRequest(BaseModel):
-    num: str
-
-
-@app.post("/api/jobs/apply-async")
-def apply_async(req: ApplyAsyncRequest) -> JSONResponse:
-    """Start a visible apply-review session for tracker row `num`. 404 if the
-    row is unknown, 400 if it isn't a LinkedIn Easy Apply or Indeed SmartApply
-    posting, 409 if a session is already in progress (one browser at a time)."""
-    job = _apply_job_for_num(req.num)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"No triaged role #{req.num}.")
-    from pipeline.apply.queue import job_site
-    if job_site(job.url) not in ("linkedin", "indeed"):
-        raise HTTPException(
-            status_code=400,
-            detail="This role has no LinkedIn or Indeed job URL — the review-and-submit "
-                   "flow applies to LinkedIn Easy Apply and Indeed SmartApply postings.",
-        )
-    with _apply_lock:
-        if any(t["status"] in _APPLY_ACTIVE for t in _apply_tasks.values()):
+@app.post("/api/handoff/build")
+def handoff_build(req: HandoffBuildRequest) -> JSONResponse:
+    """Build the work-order in the background (tailoring can take minutes).
+    Single-flight: one build at a time, and never while a local pipeline run
+    is rewriting the tracker under us (run_local refuses the reverse too)."""
+    global _handoff_task
+    _refuse_during_local_run()
+    with _handoff_lock:
+        if _handoff_task and _handoff_task.get("status") == "running":
             raise HTTPException(status_code=409,
-                                detail="An apply review session is already in progress. "
-                                       "Finish or cancel it first.")
-        _evict_apply_tasks()
+                                detail="A work-order build is already in progress.")
         job_id = str(uuid.uuid4())
-        _apply_tasks[job_id] = {
-            "status": "pending", "num": job.num, "company": job.company,
-            "role": job.role, "answers": [], "needs_review": [], "code": None,
-            "reason": None, "job": job, "event": threading.Event(), "decision": None,
-            # Pin the tracker + local career-ops at session start so a mid-hold
-            # Refresh rewriting the tracker can't redirect the Applied/Discarded write.
-            "applications_md": _career_ops() / "data" / "applications.md",
-            "co_local": _career_ops_local(),
-        }
-    threading.Thread(target=_run_apply_review, args=(job_id,), daemon=True).start()
+        _handoff_task = {"id": job_id, "status": "running"}
+    threading.Thread(target=_run_handoff_build,
+                     args=(job_id, req.board, req.limit, req.tailor),
+                     daemon=True).start()
     return JSONResponse({"job_id": job_id})
 
 
-@app.get("/api/jobs/apply-status/{job_id}")
-def apply_status(job_id: str) -> JSONResponse:
-    with _apply_lock:
-        task = _apply_tasks.get(job_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="Unknown apply session.")
-        return JSONResponse(_apply_public(task))
+@app.get("/api/handoff/build-status/{job_id}")
+def handoff_build_status(job_id: str) -> JSONResponse:
+    with _handoff_lock:
+        task = dict(_handoff_task) if _handoff_task and _handoff_task.get("id") == job_id else None
+    if task is None:
+        raise HTTPException(status_code=404, detail="Unknown build task")
+    task.pop("id", None)
+    return JSONResponse(task)
 
 
-@app.post("/api/jobs/apply-submit/{job_id}")
-def apply_submit(job_id: str) -> JSONResponse:
-    """Confirm: signal the held worker to click Submit. Valid only from
-    'ready' — the worker is blocked there waiting for this."""
-    with _apply_lock:
-        task = _apply_tasks.get(job_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="Unknown apply session.")
-        if task["status"] != "ready":
-            raise HTTPException(status_code=409,
-                                detail=f"Session isn't awaiting submit (status={task['status']}).")
-        task["decision"] = "submit"
-        task["event"].set()
-    return JSONResponse({"ok": True})
+@app.get("/api/handoff/role-prompt/{num}")
+def handoff_role_prompt(num: str) -> JSONResponse:
+    """A paste-ready, agent-agnostic prompt for handing off ONE tracker role to
+    the user's browser agent. This route gathers the UI-layer facts (row,
+    report, cached resume); handoff.role_prompt renders them so the writeback
+    contract lives beside its parser."""
+    row = _find_role(num)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No triaged role #{num}.")
+    url = data.extract_url(row.get("notes", ""))
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="This role has no posting URL in its tracker notes — nothing to hand off.",
+        )
+    from pipeline.resume_tailor import find_existing
 
-
-@app.post("/api/jobs/apply-cancel/{job_id}")
-def apply_cancel(job_id: str) -> JSONResponse:
-    """Signal the worker to stop — interrupts the fill (pending) or the review
-    hold (ready). Rejected once the worker has committed to a submit/cancel or
-    finished (an in-flight submit can't be un-clicked)."""
-    with _apply_lock:
-        task = _apply_tasks.get(job_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="Unknown apply session.")
-        if task["status"] not in ("pending", "ready"):
-            raise HTTPException(status_code=409,
-                                detail=f"Session can't be cancelled now (status={task['status']}).")
-        task["decision"] = "cancel"
-        task["event"].set()
-    return JSONResponse({"ok": True})
+    company = row.get("company", "")
+    career_ops = _career_ops_local()
+    # Number-based lookup (not the link target) — tolerant of report renames,
+    # same convention as the skills launchpad.
+    report = data.find_report_file(career_ops / "reports", row.get("report_num", ""))
+    prompt = handoff.role_prompt(
+        company, row.get("role", ""), url,
+        report=report,
+        profile=career_ops / "config" / "profile.yml",
+        resume=find_existing(career_ops, company),
+    )
+    return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})
 
 
 class _NoCacheStaticFiles(StaticFiles):

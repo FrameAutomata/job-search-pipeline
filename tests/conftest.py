@@ -183,7 +183,7 @@ def _clear_keyword_cache(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def _isolate_status_overrides(monkeypatch, tmp_path):
     """Redirect the UI's pending-status override file to tmp so tests (e.g.
-    apply auto-submit paths) never write the real .ui-cache state."""
+    kanban drag / recheck-discard paths) never write the real .ui-cache state."""
     from pipeline.app import data as app_data
     monkeypatch.setattr(
         app_data, "STATUS_OVERRIDES_FILE", tmp_path / "_status-overrides.json"
@@ -204,9 +204,13 @@ def _isolate_provider_env(monkeypatch):
         import pipeline.app.server  # noqa: F401 — same; optional UI dep
     except Exception:
         pass
-    for var in ("BATCH_PROVIDER", "BATCH_MODEL", "APPLY_MODEL", "COVER_MODEL",
-                "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
-                "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    # Key vars derive from the provider table so a newly added provider can't
+    # leak the developer's real key into tests (the DeepSeek addition slipped
+    # past one hand-copied list — review finding).
+    from pipeline.batch_evaluate import _PROVIDER_KEYS
+    for var in ("BATCH_PROVIDER", "BATCH_MODEL", "COVER_MODEL",
+                "TAILOR_PROVIDER", "TAILOR_MODEL",
+                *_PROVIDER_KEYS.values(),
                 "OLLAMA_BASE_URL"):
         monkeypatch.delenv(var, raising=False)
 

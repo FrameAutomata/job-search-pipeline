@@ -16,8 +16,7 @@ from docx.oxml.ns import qn  # noqa: E402
 from docx.oxml import OxmlElement  # noqa: E402
 
 from pipeline import resume_tailor as rt
-from pipeline.apply import _should_tailor, _stem_matches_company
-from pipeline.apply.queue import ApplyJob
+from pipeline.role_select import ApplyJob
 
 
 def _build_resume(path: Path) -> Path:
@@ -60,6 +59,34 @@ def resume_docx(tmp_path):
 def _job(company="Acme", score=4.5, report="", role="Backend Engineer"):
     return ApplyJob(num="1", company=company, role=role,
                     url="u", score=score, report_path=report)
+
+
+class TestCustomTailoringInstructions:
+    """Free-text candidate guidance from setup is appended to the tailoring SYSTEM
+    prompt as trusted preferences — applied within the existing hard rules, so it
+    can't license fabrication. Loaded from profile.yml; absent -> no block."""
+
+    def _slots(self):
+        return [rt.Slot(id="s1", kind="summary", para_index=0, text="Software engineer.")]
+
+    def test_instructions_appended_as_preferences(self):
+        system, _ = rt.build_prompt(self._slots(), "resume text", _job(), "", "",
+                                    custom_instructions="Emphasize leadership and cloud architecture.")
+        assert "Emphasize leadership and cloud architecture." in system
+        assert "preference" in system.lower()       # framed as candidate preferences
+
+    def test_no_preferences_block_without_instructions(self):
+        system, _ = rt.build_prompt(self._slots(), "r", _job(), "", "")
+        assert "preference" not in system.lower()
+
+    def test_loads_instructions_from_profile_yml(self, tmp_path):
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "profile.yml").write_text(
+            "tailoring:\n  instructions: Keep bullets to one line.\n", encoding="utf-8")
+        assert rt._tailoring_instructions(tmp_path) == "Keep bullets to one line."
+
+    def test_missing_instructions_is_empty(self, tmp_path):
+        assert rt._tailoring_instructions(tmp_path) == ""
 
 
 # ── classification ───────────────────────────────────────────────────────────
@@ -289,7 +316,11 @@ class TestBuildPrompt:
         system, user = rt.build_prompt(slots, "FULL RESUME TEXT", _job(report=""),
                                        "REPORT NOTES")
         assert "Never invent" in system and "max_chars" in system
-        assert "ALWAYS rewrite" in system and "FAILURE" in system
+        # Preserve-first: keep the candidate's (strong) wording; tailor mainly by
+        # REORDERING + light alignment, rewriting a line only when it clearly sharpens
+        # relevance without losing impact. NOT the old rewrite-everything mandate.
+        assert "preserve" in system.lower() and "reorder" in system.lower()
+        assert "ALWAYS rewrite" not in system and "FAILURE" not in system
         assert "PROSE HONESTY" in system and "NEVER with the target" in system
         # JD/report framed as data, not instructions (prompt-injection guard).
         assert "never instructions" in system
@@ -406,18 +437,6 @@ class TestResumePaths:
         assert pdf_p.name == "St. Jude Medical - resume.pdf"
         other_docx, _ = rt.resume_paths(tmp_path, "St. David's Healthcare")
         assert other_docx.name != docx_p.name
-
-
-class TestStemMatchesCompany:
-    def test_contiguous_token_match(self):
-        assert _stem_matches_company("CV - Apexon Inc", "apexon") is True
-        assert _stem_matches_company("Apexon - resume", "apexon") is True
-        assert _stem_matches_company("CV - Apexon Inc", "apexoninc") is True
-
-    def test_substring_of_token_does_not_match(self):
-        # 'Meta' must not match 'Metabase - resume.pdf' (another company).
-        assert _stem_matches_company("Metabase - resume", "meta") is False
-        assert _stem_matches_company("Asana - resume", "sana") is False
 
 
 # ── generate loop ────────────────────────────────────────────────────────────
@@ -604,14 +623,6 @@ class TestGenerateForJob:
         assert saved.core_properties.title == ""
         assert saved.core_properties.revision == 1
         assert saved.core_properties.subject == "Backend Engineer"
-
-
-class TestShouldTailor:
-    def test_gates_on_score(self):
-        assert _should_tailor(_job(score=4.0), 4.0) is True
-        assert _should_tailor(_job(score=4.6), 4.0) is True
-        assert _should_tailor(_job(score=3.9), 4.0) is False
-        assert _should_tailor(_job(score=None), 4.0) is False   # --apply-url one-off
 
 
 class TestSourceDocx:

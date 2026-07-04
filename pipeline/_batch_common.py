@@ -63,6 +63,27 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def env_int(name: str, default: int) -> int:
+    """The integer sibling of env_float — a never-crash int env override
+    (malformed / set-but-empty warns and falls back)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[config] ignoring invalid {name}={raw!r} (using {default})")
+        return default
+
+
+def thinking_disabled() -> bool:
+    """Reasoning/thinking is unnecessary for short tailoring output and cover
+    letters (and slows/garbles vLLM-served reasoning models like MiMo/Qwen3), so
+    disable it by default for those use cases. Set APPLY_ENABLE_THINKING=true to
+    keep it on (e.g. if a provider rejects the toggle)."""
+    return os.environ.get("APPLY_ENABLE_THINKING", "").strip().lower() not in ("1", "true", "yes")
+
+
 def pid_alive(pid: int) -> bool:
     """Best-effort liveness check for a process id (used by the cross-process
     eval lock and the UI's local-run orphan guard).

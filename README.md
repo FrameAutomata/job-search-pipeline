@@ -44,7 +44,7 @@ See [Guided onboarding](#guided-onboarding-onboard) below and the [QUICKSTART se
 
 #### Option B — set the secrets by hand
 
-First generate the profile artifacts locally with `node setup-profile.mjs`. That writes `cv.md`, `profile.yml`, `_profile.md`, and `search.yml`, but **not** `resumes/resume.txt` — create that yourself from your resume's plain text (e.g. `pdftotext resume.pdf resumes/resume.txt`, or copy-paste the text into the file). Then in your private copy on github.com go to **Settings → Secrets and variables → Actions → New repository secret** and add one base64-encoded secret per file:
+First generate the profile artifacts locally with `node setup-profile.mjs` (point it at a DOCX, ODT, or PDF resume — DOCX/ODT recommended, since resume tailoring slot-edits an editable copy per job for the browser-agent work-order). That writes `cv.md`, `profile.yml`, `_profile.md`, and `search.yml`, but **not** `resumes/resume.txt` — create that yourself from your resume's plain text (e.g. `python -m pipeline.resume_text resumes/resume.docx > resumes/resume.txt`, or copy-paste the text into the file). Then in your private copy on github.com go to **Settings → Secrets and variables → Actions → New repository secret** and add one base64-encoded secret per file:
 
    | Secret | File to encode |
    |--------|----------------|
@@ -147,7 +147,7 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CAREER_OPS_PATH` | `./career-ops` | Path to career-ops directory |
-| `RESUME_PATH` | auto-detected | Path to your resume PDF |
+| `RESUME_PATH` | auto-detected | Path to your resume (DOCX / ODT / PDF; DOCX/ODT recommended). Unset → auto-discovers `resumes/resume.{pdf,docx,odt}` |
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
 | `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides auto-detection) |
@@ -281,10 +281,12 @@ The UI shows whichever paths each skill can use (an agent CLI on your PATH, an A
 
 Instead of running the CLI setup + `base64` + `gh secret set` by hand, the
 **⚙ Setup** wizard does it from the browser. Walk through a short form — upload
-your resume PDF, enter target roles / compensation / locations / boards, pick an
-LLM provider and paste its API key — and on submit the server:
+your resume (DOCX, ODT, or PDF — DOCX/ODT recommended), enter target roles /
+compensation / locations / boards, pick an LLM provider and paste its API key —
+and on submit the server:
 
-1. extracts your resume text with `pdfplumber`,
+1. extracts your resume text (`pipeline/resume_text.py` dispatches by format:
+   pdfplumber for PDF, python-docx for DOCX, odfpy for ODT),
 2. generates `profile.yml`, `cv.md`, `_profile.md`, and `search.yml` via
    `setup-profile.mjs --from-json` (same generators as the CLI — one source of truth),
 3. base64-encodes them and writes all required **GitHub secrets** (`gh secret set`,
