@@ -642,7 +642,10 @@ handoffUi.btn.addEventListener("click", () => {
 
 handoffUi.start.addEventListener("click", async () => {
   const board = document.getElementById("handoff-board").value;
-  const rawLimit = document.getElementById("handoff-limit").value.trim();
+  // Only a positive integer counts as a limit — "0", "e", or garbage would
+  // otherwise coerce to NaN/falsy and silently mean "no limit".
+  const parsedLimit = parseInt(document.getElementById("handoff-limit").value, 10);
+  const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
   const tailor = document.getElementById("handoff-tailor").checked;
   handoffUi.start.disabled = true;
   handoffUi.result.innerHTML = `<p class="hint">Building the work-order${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
@@ -650,7 +653,7 @@ handoffUi.start.addEventListener("click", async () => {
     const resp = await fetch("/api/handoff/build", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ board, limit: rawLimit ? Number(rawLimit) : null, tailor }),
+      body: JSON.stringify({ board, limit, tailor }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || `build failed (${resp.status})`);
