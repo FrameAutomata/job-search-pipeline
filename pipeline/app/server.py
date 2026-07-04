@@ -1305,7 +1305,11 @@ def _finish_handoff(job_id: str, **fields) -> None:
 
 def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
     try:
-        rc = handoff.run(board=board, limit=limit, tailor=tailor)
+        # Pass the server's ROOT-anchored career-ops so a RELATIVE
+        # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
+        # own default only anchors an absolute value (review L2).
+        rc = handoff.run(board=board, limit=limit, tailor=tailor,
+                         career_ops=_career_ops_local())
         if rc != 0:
             _finish_handoff(job_id, status="failed",
                             error="handoff exited non-zero — no scored roles found "

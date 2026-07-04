@@ -84,6 +84,10 @@ class TestBuildEndpoint:
         assert fake_run.captured["board"] == "linkedin"
         assert fake_run.captured["limit"] == 25
         assert fake_run.captured["tailor"] is True
+        # L2: the UI passes its ROOT-anchored career-ops so a relative
+        # CAREER_OPS_PATH resolves the same as everywhere else in the server.
+        assert fake_run.captured["career_ops"] is not None
+        assert str(fake_run.captured["career_ops"]).endswith("career-ops")
         # Result reports what was built and where.
         result = body["result"]
         assert result["fresh"] == 1

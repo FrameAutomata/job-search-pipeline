@@ -58,9 +58,11 @@ STATUS_PRECEDENCE: dict[str, int] = {
 RESUME_BASE_AI = "content_adhoc"       # AI / agentic / backend / full-stack / general SWE
 RESUME_BASE_STANDARD = "content_standard"  # production-support / SRE / mainframe / devops / pure-frontend
 
-# Queue rows already acted on (tracker vocabulary, canonicalized) — never
-# re-emitted in a work-order.
-_ACTED_ON_STATUSES = frozenset({"Applied", "Rejected", "Interview", "Offer", "Discarded", "SKIP"})
+# A row is actionable ONLY while still "Evaluated" — an allowlist, matching
+# role_select._PENDING_STATUSES. A denylist here failed OPEN: it silently
+# admitted "Responded" (a real CANONICAL_STATES value) and any future status,
+# re-applying to a role the employer already replied to (review bug M2).
+_ACTIONABLE_STATUS = "Evaluated"
 
 
 @dataclass
@@ -86,6 +88,7 @@ class QueueRole:
     role: str
     url: str
     status: str = ""
+    report: str = ""         # career-ops-relative eval report path; feeds tailoring
 
     @property
     def board(self) -> str:
@@ -105,6 +108,7 @@ class WorkOrderItem:
     resume_base: str
     status: str = ""         # agent writes back: claimed | applied | handoff | skip:<reason>
     resume_pdf: str = ""     # optional: pre-tailored resume file (--tailor enrichment)
+    report: str = ""         # career-ops-relative eval report path (proof-points for tailoring)
 
 
 # ── Normalization / keys ───────────────────────────────────────────────────────
@@ -446,6 +450,7 @@ def load_queue(path: Path) -> list[QueueRole]:
             role=str(o.get("role") or "").strip(),
             url=str(o.get("url") or "").strip(),
             status=str(o.get("status") or "").strip(),
+            report=str(o.get("report") or "").strip(),
         ))
     return out
 
@@ -465,10 +470,11 @@ def load_queue_from_tracker(career_ops: Path) -> list[QueueRole]:
         url = _data.extract_url(row.get("notes", ""))
         if score is None or not url:
             continue
-        # Tracker statuses are authoritative here — emit only actionable rows
-        # (an Applied/Interview/Discarded row is never work-order material, and
-        # keeping them out makes the "N scored" summary mean the real pool).
-        if row.get("status_canonical") in _ACTED_ON_STATUSES:
+        # Tracker statuses are authoritative here — emit only still-Evaluated
+        # rows (anything acted on, incl. Responded, is never work-order
+        # material, and keeping them out makes the "N scored" summary mean the
+        # real pool).
+        if row.get("status_canonical") != _ACTIONABLE_STATUS:
             continue
         out.append(QueueRole(
             num=str(row.get("num") or ""),
@@ -477,6 +483,7 @@ def load_queue_from_tracker(career_ops: Path) -> list[QueueRole]:
             role=str(row.get("role") or "").strip(),
             url=url,
             status=str(row.get("status_canonical") or "").strip(),
+            report=str(row.get("report_path") or "").strip(),
         ))
     return out
 
@@ -643,10 +650,14 @@ def build_work_order(
             continue
         # The queue's own status column is a second signal (rows can carry
         # tracker statuses from the export) — honor it via the tracker's
-        # canonicalizer so aliases ("Aplicada") count too. Anything acted on
-        # is out: re-applying to an Interview/Offer company is worse than a
+        # canonicalizer so aliases ("Evaluada") count too. Exclude any KNOWN
+        # acted-on state (Responded/Interview/Applied/… all canonicalize to a
+        # non-blank value ≠ Evaluated); a blank/unset status stays fresh (the
+        # export's fresh rows are Evaluated, and an unknown blank is not a known
+        # acted-on state). Re-applying to a responded company is worse than a
         # missed fresh role.
-        if _data.canonical_status(q.status) in _ACTED_ON_STATUSES:
+        cs = _data.canonical_status(q.status)
+        if cs and cs != _ACTIONABLE_STATUS:
             continue
         if board != "both" and q.board != board:
             continue
@@ -657,13 +668,16 @@ def build_work_order(
         fresh.append(q)
 
     fresh.sort(key=lambda q: q.score, reverse=True)
-    if limit is not None:
+    # Non-positive limit means "no limit": --limit 0 must not empty the
+    # work-order, and --limit -3 must not slice off the 3 lowest (review L1).
+    if limit and limit > 0:
         fresh = fresh[:limit]
 
     return [
         WorkOrderItem(
             rank=i + 1, num=q.num, score=q.score, company=q.company, role=q.role,
             board=q.board, url=q.url, resume_base=suggest_resume_base(q.role),
+            report=q.report,
         )
         for i, q in enumerate(fresh)
     ]
@@ -746,8 +760,11 @@ def _make_tailor_fn(career_ops: Path):
         return cell[0](system, user)
 
     def tailor(item: WorkOrderItem):
+        # report_path feeds generate_for_job's proof-point branch (report_base
+        # defaults to career_ops, where the path is rooted) so tailoring uses
+        # the evaluation report, not JD text alone (review M1).
         job = ApplyJob(num=item.num, company=item.company, role=item.role,
-                       url=item.url, score=item.score)
+                       url=item.url, score=item.score, report_path=item.report)
         return rt.generate_for_job(career_ops, job, caller=shared_caller)
 
     return tailor

@@ -689,3 +689,86 @@ class TestOutDirEnv:
         assert handoff.default_out_dir() == tmp_path / "agent-home"
         monkeypatch.delenv("HANDOFF_OUT_DIR")
         assert handoff.default_out_dir() == handoff.ROOT / "output" / "handoff"
+
+
+# ── 8. Code-review fixes (2026-07-04, PR #86 high-recall round) ────────────────
+class TestActionableIsAllowlist:
+    """M2: a denylist of acted-on statuses failed OPEN — it omitted "Responded"
+    (a real canonical state), so a role the employer already replied to came
+    back as fresh. Only "Evaluated" is actionable (allowlist, matching
+    role_select._PENDING_STATUSES)."""
+
+    @pytest.mark.parametrize("status", ["Responded", "Interview", "Offer",
+                                        "Discarded", "SKIP", "Applied", "Rejected"])
+    def test_non_evaluated_queue_row_excluded(self, status):
+        q = handoff.QueueRole(num="1", score=4.5, company="Acme", role="SWE",
+                              url="https://www.linkedin.com/jobs/view/1", status=status)
+        assert handoff.build_work_order([q], []) == []
+
+    def test_evaluated_row_included(self):
+        q = handoff.QueueRole(num="1", score=4.5, company="Acme", role="SWE",
+                              url="https://www.linkedin.com/jobs/view/1", status="Evaluated")
+        assert len(handoff.build_work_order([q], [])) == 1
+
+    def test_tracker_responded_row_excluded(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-07-01 | Acme | SWE | 4.5/5 | Responded | X | [001](reports/001.md) | https://www.linkedin.com/jobs/view/1 |\n"
+            "| 2 | 2026-07-01 | Globex | Dev | 4.2/5 | Evaluated | X | [002](reports/002.md) | https://www.linkedin.com/jobs/view/2 |\n",
+            encoding="utf-8")
+        rows = handoff.load_queue_from_tracker(co)
+        assert [r.company for r in rows] == ["Globex"]     # Responded excluded
+
+
+class TestReportPathThreaded:
+    """M1: --handoff-tailor built resumes from JD text only because the tailor
+    adapter dropped report_path — the evaluation report's proof-points that
+    generate_for_job consumes were never passed. report flows queue -> item ->
+    ApplyJob.report_path (report_base defaults to career_ops)."""
+
+    def test_load_queue_reads_report(self, tmp_path):
+        p = tmp_path / "q.jsonl"
+        p.write_text(json.dumps({"num": "1", "score": 4.8, "company": "Acme",
+                                 "role": "AI Engineer", "url": "u", "status": "Evaluated",
+                                 "report": "reports/001-acme.md"}) + "\n", encoding="utf-8")
+        assert handoff.load_queue(p)[0].report == "reports/001-acme.md"
+
+    def test_report_flows_into_work_order_item(self):
+        q = handoff.QueueRole(num="1", score=4.8, company="Acme", role="AI Engineer",
+                              url="https://www.linkedin.com/jobs/view/1", status="Evaluated",
+                              report="reports/001-acme.md")
+        assert handoff.build_work_order([q], [])[0].report == "reports/001-acme.md"
+
+    def test_tailor_passes_report_path_to_generate(self, monkeypatch, tmp_path):
+        import pipeline.resume_tailor as rt
+        seen = {}
+        monkeypatch.setattr(rt, "_resolve_caller", lambda p, m: (lambda s, u: "{}"))
+        monkeypatch.setattr(rt, "generate_for_job",
+                            lambda co, job, **kw: seen.update(report_path=job.report_path) or None)
+        fn = handoff._make_tailor_fn(tmp_path)
+        fn(handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="AI Engineer",
+                                 board="linkedin", url="u", resume_base="content_adhoc",
+                                 report="reports/001-acme.md"))
+        assert seen["report_path"] == "reports/001-acme.md"
+
+
+class TestLimitGuard:
+    """L1: fresh[:limit] with no positivity check — --limit 0 emptied the
+    work-order, --limit -3 dropped the 3 lowest. Non-positive means "no limit"
+    (matching the UI-JS guard)."""
+
+    def _queue(self, n):
+        return [handoff.QueueRole(num=str(i), score=float(9 - i), company=f"C{i}",
+                                  role="R", url=f"https://www.linkedin.com/jobs/view/{i}",
+                                  status="Evaluated") for i in range(n)]
+
+    @pytest.mark.parametrize("limit", [0, -3, None])
+    def test_non_positive_limit_means_no_limit(self, limit):
+        assert len(handoff.build_work_order(self._queue(3), [], limit=limit)) == 3
+
+    def test_positive_limit_applies(self):
+        assert len(handoff.build_work_order(self._queue(3), [], limit=2)) == 2
