@@ -208,27 +208,6 @@ def launch_in_terminal(command: str, cwd: str) -> dict:
     )
 
 
-# ── Auto-apply account sign-in (local) ───────────────────────────────────────
-# Auto-apply needs a logged-in browser session per platform, captured once
-# locally (the cloud never applies). These build the standalone orchestrate.py
-# login command the onboarding "Log in" buttons launch in a terminal.
-_APPLY_LOGIN_FLAGS = {"linkedin": "--login-linkedin", "indeed": "--capture-indeed-login"}
-
-
-def _venv_python() -> str:
-    """Repo-relative venv python; the launcher cd's into the repo root first."""
-    return r".venv\Scripts\python.exe" if os.name == "nt" else ".venv/bin/python"
-
-
-def apply_login_command(platform: str) -> str:
-    """The local CLI command that opens a browser to sign in to `platform`'s apply
-    session (LinkedIn / Indeed). Built server-side — no client-supplied command."""
-    flag = _APPLY_LOGIN_FLAGS.get(platform)
-    if not flag:
-        raise SkillError(f"Unknown apply platform {platform!r}.")
-    return f'"{_venv_python()}" orchestrate.py {flag}'
-
-
 # ── Skill registry ───────────────────────────────────────────────────────────
 # Each skill maps to a career-ops mode. `api=True` means the work fits a single
 # bounded provider call (we implement a runner below); otherwise it's CLI-only

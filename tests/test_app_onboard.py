@@ -214,6 +214,25 @@ class TestNodeRoundTrip:
         assert wa["work_permit_type"] == "Needs sponsorship"
 
 
+class TestExtractResumeText:
+    """onboard.extract_resume_text(bytes, filename) dispatches by the uploaded
+    filename's suffix so the UI accepts DOCX/ODT as well as PDF."""
+
+    def test_extracts_docx_bytes(self, tmp_path):
+        from docx import Document
+        d = Document()
+        d.add_paragraph("Jane Dev")
+        d.add_paragraph("Python, AWS")
+        f = tmp_path / "src.docx"
+        d.save(str(f))
+        text = onboard.extract_resume_text(f.read_bytes(), "Jane_Resume.docx")
+        assert "Jane Dev" in text and "Python, AWS" in text
+
+    def test_unsupported_format_raises(self):
+        with pytest.raises(ValueError):
+            onboard.extract_resume_text(b"x", "resume.rtf")
+
+
 class TestRunGenerationErrors:
     def test_node_missing_raises_clear_error(self, tmp_path, mocker):
         mocker.patch("pipeline.app.onboard.subprocess.run", side_effect=FileNotFoundError())

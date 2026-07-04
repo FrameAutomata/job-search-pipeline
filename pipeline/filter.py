@@ -13,13 +13,19 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pdfplumber
 import yake
 import yaml
 from dotenv import load_dotenv
 
+from pipeline import resume_text as _resume_text
+
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
+
+# Resume files probed under resumes/ when RESUME_PATH is unset — derived from
+# the import formats (IMPORT_SUFFIXES starts with .pdf, preserving the
+# historical default) so adding a format can't leave this probe list behind.
+_RESUME_PROBE_NAMES = tuple(f"resume{s}" for s in _resume_text.IMPORT_SUFFIXES)
 
 JOBS_PATH = ROOT / "output" / "jobs.csv"
 OUTPUT_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -66,9 +72,33 @@ def load_config(path: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def extract_resume_text(pdf_path: Path) -> str:
-    with pdfplumber.open(pdf_path) as pdf:
-        return "\n".join((p.extract_text() or "") for p in pdf.pages)
+def extract_resume_text(resume_path: Path) -> str:
+    """Extract resume text, dispatching on the file's format (PDF/DOCX/ODT/TXT).
+    Thin delegate to pipeline.resume_text so scoring and the UI share one
+    implementation."""
+    return _resume_text.extract_resume_text(resume_path)
+
+
+def _resolve_resume_path(resume_env: str, root: Path) -> Path:
+    """Pick the resume file to score from.
+
+    An explicit RESUME_PATH (absolute or repo-relative) is honored verbatim —
+    returned even if missing, so the caller's not-found error names exactly what
+    the user pointed at rather than silently falling back. Only when RESUME_PATH
+    is unset/empty do we probe resumes/ for resume.pdf, then resume.docx, then
+    resume.odt, so a user can drop a DOCX or ODT without editing .env. Falls back
+    to resumes/resume.pdf (the historical default) when nothing is found."""
+    env = (resume_env or "").strip()
+    if env:
+        p = Path(env)
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        return p
+    for name in _RESUME_PROBE_NAMES:
+        candidate = (root / "resumes" / name).resolve()
+        if candidate.exists():
+            return candidate
+    return (root / "resumes" / "resume.pdf").resolve()
 
 
 def find_skills_section(text: str) -> str:
@@ -288,13 +318,11 @@ def run(config_path: Path) -> Path:
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
 
-    # `or DEFAULT` rather than the `get(VAR, DEFAULT)` form so an explicitly
-    # empty RESUME_PATH (e.g. from a workflow `RESUME_PATH: ${{ vars.X || '' }}`
-    # pattern) falls back to the default instead of breaking with an empty path.
-    resume_env = os.environ.get("RESUME_PATH") or "resumes/resume.pdf"
-    resume_path = Path(resume_env)
-    if not resume_path.is_absolute():
-        resume_path = (ROOT / resume_path).resolve()
+    # Resolve via _resolve_resume_path so an unset RESUME_PATH still discovers a
+    # dropped resume.docx/resume.odt, not just resume.pdf. An explicitly empty
+    # RESUME_PATH (e.g. a workflow `${{ vars.X || '' }}` pattern) is treated the
+    # same as unset.
+    resume_path = _resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)
 
     resume_txt = resume_path.with_suffix(".txt")
     if resume_txt.exists():
@@ -308,11 +336,13 @@ def run(config_path: Path) -> Path:
     else:
         raise FileNotFoundError(
             f"Resume not found at {resume_path} (or {resume_txt.name}). "
-            "Drop your resume PDF there or set RESUME_PATH in .env."
+            "Drop your resume (PDF, DOCX, or ODT) in resumes/ or set RESUME_PATH "
+            "in .env."
         )
 
     if not resume_text.strip():
-        print("[filter] WARNING: no text extracted from resume — is it a scanned PDF?")
+        print("[filter] WARNING: no text extracted from resume — is it a scanned "
+              "PDF or an empty document?")
 
     keywords = _load_or_extract_keywords(resume_text, source_path)
     for kw, w in overrides.items():

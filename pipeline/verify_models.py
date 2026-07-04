@@ -2,7 +2,7 @@
 
 A model deprecation is a *silent* run-failure — a stale default or failover-chain
 entry just errors at call time. This checks the models you actually run (every
-provider's `PROVIDER_DEFAULTS` plus the BATCH_MODEL/APPLY_MODEL/COVER_MODEL
+provider's `PROVIDER_DEFAULTS` plus the BATCH_MODEL/TAILOR_MODEL/COVER_MODEL
 failover chains, which attach to the configured/active provider) against each
 provider's `/models` endpoint, so you can re-run it after editing model config
 or on a schedule.
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 _TIMEOUT = 40
 _UA = "job-search-pipeline/verify-models"  # some catalogs reject a UA-less request
 _DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
-_CHAIN_VARS = ("BATCH_MODEL", "APPLY_MODEL", "COVER_MODEL")
+_CHAIN_VARS = ("BATCH_MODEL", "TAILOR_MODEL", "COVER_MODEL")
 
 # Catalog sentinel: a key WAS present but the fetch failed (timeout / 5xx / bad
 # shape). Distinct from None ("skipped — no key"), so a provider outage surfaces
@@ -54,18 +54,28 @@ def _active_provider(env) -> str | None:
 
 def collect_configured(env=None) -> dict[str, set[str]]:
     """`{provider: {models to verify}}` — every provider's default model, plus
-    the failover-chain models (BATCH/APPLY/COVER_MODEL) attached to the active
-    provider (those chains are written in that provider's ID format). An unknown
+    the failover-chain models (BATCH/TAILOR/COVER_MODEL) attached to the
+    provider whose ID format they're written in. TAILOR_MODEL belongs to
+    TAILOR_PROVIDER when that split is configured (resolve_caller's
+    lead_provider_env contract) — checking it against the eval provider's
+    catalog would false-alarm on every cross-provider setup. An unknown
     active provider can't host a chain here; run() flags it separately."""
     env = os.environ if env is None else env
     configured: dict[str, set[str]] = {p: {default} for p, default in PROVIDER_DEFAULTS.items()}
     active = _active_provider(env)
-    if active in configured:
-        for var in _CHAIN_VARS:
-            for model in (env.get(var) or "").split(","):
-                model = model.strip()
-                if model:
-                    configured[active].add(model)
+    tailor_provider = (env.get("TAILOR_PROVIDER") or "").strip().lower()
+
+    def _attach(var: str, provider: str | None) -> None:
+        if provider not in configured:
+            return
+        for model in (env.get(var) or "").split(","):
+            model = model.strip()
+            if model:
+                configured[provider].add(model)
+
+    for var in _CHAIN_VARS:
+        provider = tailor_provider if (var == "TAILOR_MODEL" and tailor_provider) else active
+        _attach(var, provider)
     return configured
 
 

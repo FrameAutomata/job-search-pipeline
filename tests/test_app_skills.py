@@ -44,9 +44,11 @@ def client(tmp_path, monkeypatch):
     # after the reload: server.py calls load_dotenv() at module level, which
     # reload re-runs — re-adding the developer's real .env keys if we cleared
     # before. (load_dotenv(override=False) repopulates vars we just deleted.)
+    # Key vars derive from the provider table so a new provider can't slip past
+    # a hand-copied list (the DeepSeek addition did exactly that — review bug).
+    from pipeline.batch_evaluate import _PROVIDER_KEYS
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "BATCH_CLI", "SKILL_PATH_DEFAULT",
-                "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
-                "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                *_PROVIDER_KEYS.values()):
         monkeypatch.delenv(var, raising=False)
     # status-overrides is isolated by the autouse _isolate_status_overrides
     # conftest fixture; isolate the pushed-overrides + cache paths here so no
@@ -365,39 +367,3 @@ def test_same_origin_post_allowed(client):
 def test_get_unaffected_by_origin(client):
     r = client.get("/api/jobs", headers={"Origin": "http://evil.example"})
     assert r.status_code == 200
-
-
-# ── apply-login (auto-apply platform sign-in) ────────────────────────────────
-
-class TestApplyLogin:
-    def test_command_indeed(self):
-        from pipeline.app import skills
-        cmd = skills.apply_login_command("indeed")
-        assert "orchestrate.py" in cmd and "--capture-indeed-login" in cmd
-
-    def test_command_linkedin(self):
-        from pipeline.app import skills
-        assert "--login-linkedin" in skills.apply_login_command("linkedin")
-
-    def test_command_unknown_raises(self):
-        from pipeline.app import skills
-        with pytest.raises(skills.SkillError):
-            skills.apply_login_command("monster")
-
-    def test_endpoint_launches(self, client, mocker):
-        mocker.patch("pipeline.app.skills.terminal_available", return_value=True)
-        launch = mocker.patch("pipeline.app.skills.launch_in_terminal",
-                              return_value={"launcher": "cmd", "script": "x"})
-        r = client.post("/api/apply/login", json={"platform": "indeed"})
-        assert r.status_code == 200
-        assert launch.called and "--capture-indeed-login" in launch.call_args[0][0]
-
-    def test_endpoint_invalid_platform_400(self, client, mocker):
-        mocker.patch("pipeline.app.skills.terminal_available", return_value=True)
-        r = client.post("/api/apply/login", json={"platform": "monster"})
-        assert r.status_code == 400
-
-    def test_endpoint_no_terminal_501(self, client, mocker):
-        mocker.patch("pipeline.app.skills.terminal_available", return_value=False)
-        r = client.post("/api/apply/login", json={"platform": "linkedin"})
-        assert r.status_code == 501

@@ -4,7 +4,7 @@
 // multipart to /api/onboard, which generates the profile artifacts and writes
 // them as GitHub secrets.
 
-const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local eval", "Auto-apply", "Review"];
+const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local eval", "Review"];
 
 const form = document.getElementById("wizard");
 const steps = [...document.querySelectorAll(".step")];
@@ -65,8 +65,6 @@ function showAction(text, kind) {
 // (a bare checkbox is absent when unchecked, which collides with consent's
 // default-on), and restored by .checked rather than .value.
 const CONSENT_TOGGLES = ["data_processing_consent", "save_answers", "share_answers"];
-// Auto-apply platform opt-ins (local-only pref; checkbox -> boolean).
-const APPLY_TOGGLES = ["auto_apply_linkedin", "auto_apply_indeed"];
 
 // Collect the form into a plain object (sites -> array of checked values).
 function collectForm() {
@@ -80,9 +78,6 @@ function collectForm() {
   obj.include_easy_apply = form.querySelector('input[name="include_easy_apply"]').checked;
   for (const name of CONSENT_TOGGLES) {
     obj[name] = form.querySelector(`input[name="${name}"]`).checked ? "yes" : "no";
-  }
-  for (const name of APPLY_TOGGLES) {
-    obj[name] = form.querySelector(`input[name="${name}"]`).checked;
   }
   return obj;
 }
@@ -114,7 +109,7 @@ function validateStep(i) {
   // Resume is required for first-time setup. In edit mode the prior resume
   // already lives on disk and a re-upload is optional, so skip the guard.
   if (i === 0 && !resumeInput.files[0] && !editMode) {
-    showAction("Please choose a PDF resume to continue.", "error");
+    showAction("Please choose a resume (DOCX, ODT, or PDF) to continue.", "error");
     return false;
   }
   actionMsg.hidden = true;
@@ -127,7 +122,7 @@ function validateStep(i) {
 function prefillForm(saved) {
   for (const [k, v] of Object.entries(saved)) {
     if (k === "sites" || k === "include_easy_apply") continue;
-    if (CONSENT_TOGGLES.includes(k) || APPLY_TOGGLES.includes(k)) continue;
+    if (CONSENT_TOGGLES.includes(k)) continue;
     if (v === undefined || v === null || v === "") continue;
     const el = form.querySelector(`[name="${k}"]`);
     if (el && el.tagName !== "FIELDSET") el.value = v;
@@ -143,11 +138,6 @@ function prefillForm(saved) {
     const cb = form.querySelector(`input[name="${name}"]`);
     if (cb) cb.checked = name in saved ? saved[name] === "yes" : name === "data_processing_consent";
   });
-  // Auto-apply opt-ins (boolean); dispatch change so the login row re-syncs.
-  APPLY_TOGGLES.forEach((name) => {
-    const cb = form.querySelector(`input[name="${name}"]`);
-    if (cb) { cb.checked = !!saved[name]; cb.dispatchEvent(new Event("change")); }
-  });
 }
 
 function enterEditMode(hasResume) {
@@ -157,7 +147,7 @@ function enterEditMode(hasResume) {
   const resumeHint = document.querySelector('[data-step="0"] .hint');
   if (resumeHint && hasResume) {
     resumeHint.textContent =
-      "Resume already on file. Upload a new PDF to replace it, or skip this step to keep the existing one.";
+      "Resume already on file. Upload a new DOCX, ODT, or PDF to replace it, or skip this step to keep the existing one.";
   }
   // API key optional: same idea — placeholder explains.
   const apiKeyEl = form.querySelector('input[name="api_key"]');
@@ -195,43 +185,6 @@ nextBtn.addEventListener("click", async () => {
   showStep(current + 1);
 });
 backBtn.addEventListener("click", () => showStep(current - 1));
-
-// Auto-apply step: reveal a platform's "Log in" button when its opt-in is checked,
-// and launch the one-time local sign-in (opens a terminal + browser) on click.
-function wireAutoApply() {
-  document.querySelectorAll('input[name^="auto_apply_"]').forEach((cb) => {
-    const platform = cb.name.replace("auto_apply_", "");
-    const row = document.querySelector(`.login-row[data-platform="${platform}"]`);
-    const sync = () => { if (row) row.hidden = !cb.checked; };
-    cb.addEventListener("change", sync);
-    sync();
-  });
-  document.querySelectorAll(".login-btn").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const status = btn.parentElement.querySelector(".login-status");
-      btn.disabled = true;
-      if (status) status.textContent = "Opening sign-in…";
-      try {
-        const r = await fetch("/api/apply/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ platform: btn.dataset.platform }),
-        });
-        const data = await r.json().catch(() => ({}));
-        if (status) {
-          status.textContent = r.ok
-            ? "A window opened — sign in there, then come back."
-            : data.detail || "Couldn't open the login window.";
-        }
-      } catch {
-        if (status) status.textContent = "Couldn't reach the server.";
-      } finally {
-        btn.disabled = false;
-      }
-    });
-  });
-}
-wireAutoApply();
 
 // When a resume is chosen, parse it and autofill the About fields. Only fills
 // fields the user hasn't already typed into, so it never clobbers manual edits.
@@ -440,20 +393,6 @@ async function loadLocalProviders() {
     }
     cliSelect.addEventListener("change", updateCliHint);
     updateCliHint();
-
-    // Pre-fill the off-site ATS account fields from the (non-secret) current
-    // config. Passwords are never sent back, so they stay blank — a blank save
-    // preserves the stored value — and the placeholder just signals "already set".
-    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ""; };
-    setVal("ats-email-input", d.current.ats_email);
-    setVal("imap-host-input", d.current.imap_host);
-    setVal("imap-port-input", d.current.imap_port);
-    const setPwPlaceholder = (id, isSet) => {
-      const el = document.getElementById(id);
-      if (el) el.placeholder = isSet ? "•••••••• (saved — leave blank to keep)" : "(none set)";
-    };
-    setPwPlaceholder("ats-password-input", d.current.ats_password_set);
-    setPwPlaceholder("imap-password-input", d.current.imap_password_set);
   } catch (e) {
     detection.textContent = "Could not detect providers: " + (e.message || e);
   }
@@ -469,6 +408,7 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   // (it'd be a no-op anyway). Allowed for Gemini + auto-detect.
   const geminiFreeTier = (provider === "" || provider === "gemini")
     && document.getElementById("gemini-free-tier").checked;
+  const apiKey         = document.getElementById("local-api-key")?.value || "";
   const tailorProvider = document.getElementById("local-tailor-provider")?.value || "";
   const tailorModel    = document.getElementById("local-tailor-model")?.value.trim() || "";
   const tailorKey      = document.getElementById("local-tailor-key")?.value || "";
@@ -478,25 +418,14 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
     const resp = await fetch("/api/onboard/local-config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // Passwords are sent raw (the server strips surrounding whitespace) so a
-      // pasted Gmail app-password keeps its internal spaces; blank = keep existing.
       body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
+                             api_key: apiKey,
                              gemini_free_tier: geminiFreeTier,
                              tailor_provider: tailorProvider, tailor_model: tailorModel,
-                             tailor_api_key: tailorKey,
-                             ats_email: document.getElementById("ats-email-input")?.value.trim() || "",
-                             ats_password: document.getElementById("ats-password-input")?.value || "",
-                             imap_host: document.getElementById("imap-host-input")?.value.trim() || "",
-                             imap_port: document.getElementById("imap-port-input")?.value.trim() || "",
-                             imap_password: document.getElementById("imap-password-input")?.value || "" }),
+                             tailor_api_key: tailorKey }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || "save failed");
-    // Clear the password inputs after a successful save so the secret doesn't
-    // linger in the DOM; the placeholder will refresh to "saved" on next load.
-    for (const id of ["ats-password-input", "imap-password-input"]) {
-      const el = document.getElementById(id); if (el) el.value = "";
-    }
     msgEl.textContent = `Saved to .env (${body.updated.join(", ")}). Changes take effect immediately.`;
     msgEl.className = "action-msg ok";
   } catch (e) {

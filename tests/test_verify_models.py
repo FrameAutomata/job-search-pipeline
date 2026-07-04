@@ -5,7 +5,7 @@ model config.
 
 The network fetch is injected (`fetcher`), so the pure logic is hermetic:
 - collect_configured(env): which (provider -> models) to check, from
-  PROVIDER_DEFAULTS plus the BATCH_MODEL/APPLY_MODEL/COVER_MODEL failover chains
+  PROVIDER_DEFAULTS plus the BATCH_MODEL/TAILOR_MODEL/COVER_MODEL failover chains
   (chains attach to the configured/active provider).
 - classify(configured, catalogs): per (provider, model) -> ok | missing |
   skipped (skipped when a provider's catalog couldn't be fetched / no key).
@@ -27,7 +27,7 @@ class TestCollectConfigured:
 
     def test_chain_models_attach_to_configured_provider(self):
         env = {"BATCH_PROVIDER": "deepinfra", "BATCH_MODEL": "org/A,org/B",
-               "APPLY_MODEL": "org/C", "COVER_MODEL": "org/A"}
+               "TAILOR_MODEL": "org/C", "COVER_MODEL": "org/A"}
         cfg = vm.collect_configured(env)
         assert {"org/A", "org/B", "org/C"} <= cfg["deepinfra"]
         # A provider that isn't the configured one carries only its own default.
@@ -39,6 +39,17 @@ class TestCollectConfigured:
         env = {"GROQ_API_KEY": "x", "BATCH_MODEL": "groq/thing"}
         cfg = vm.collect_configured(env)
         assert "groq/thing" in cfg["groq"]
+
+    def test_tailor_model_attaches_to_tailor_provider(self):
+        # Review bug: the split-provider setup (eval on DeepInfra, tailor on
+        # Anthropic) checked TAILOR_MODEL against DeepInfra's catalog — a
+        # guaranteed false "missing" while the real chain went unverified.
+        env = {"BATCH_PROVIDER": "deepinfra", "BATCH_MODEL": "org/A",
+               "TAILOR_PROVIDER": "anthropic", "TAILOR_MODEL": "claude-x"}
+        cfg = vm.collect_configured(env)
+        assert "claude-x" in cfg["anthropic"]
+        assert "claude-x" not in cfg["deepinfra"]
+        assert "org/A" in cfg["deepinfra"]
 
 
 class TestClassify:

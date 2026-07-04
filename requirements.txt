@@ -1,28 +1,20 @@
 python-jobspy
-pdfplumber
+pdfplumber          # PDF resume text extraction (scoring)
+odfpy               # ODT resume text extraction (scoring); python-docx (below) handles DOCX
 pyyaml
 python-dotenv
 yake
 plyer
 anthropic
 
-# Optional — install only the provider(s) you use with --evaluate-batch:
-# pip install google-genai          # Gemini (free tier available)
+# LLM providers for --evaluate-batch (both installed by default — small, pure-Python):
+google-genai                       # Gemini (free tier available; default cloud provider)
 openai                             # OpenAI, Groq, DeepInfra, and Ollama (all OpenAI-compatible)
 
-# Optional — auto-apply (--apply), LOCAL ONLY. Drives a real logged-in browser,
-# so it's never used in the cloud workflows. After installing, fetch the browser:
-#   pip install playwright && playwright install chromium
-# playwright
-# Indeed auto-apply additionally needs patchright — a stealth Playwright fork that
-# clears Indeed's Cloudflare challenge (plain Playwright/Chromium gets walled).
-# Drives the system Chrome (channel="chrome"), so no extra browser download.
-#   pip install patchright
-# patchright
-
-# Per-job tailored resumes during auto-apply (slot-edits a copy of
-# resumes/resume.docx so the formatting stays exactly yours). Pure-Python and
-# tiny, so installed by default — the feature is on whenever resume.docx exists.
-# One-page verification additionally uses LibreOffice when installed (optional
-# system dependency; without it the budget-guarded .docx is uploaded instead).
+# DOCX text extraction for resume import (scoring) AND per-job tailored resumes
+# for the browser-agent work-order (slot-edits a copy of resumes/resume.docx so
+# the formatting stays exactly yours). Pure-Python and tiny, so installed by
+# default — tailoring is on whenever resume.docx exists. One-page verification
+# additionally uses LibreOffice when installed (optional system dependency;
+# without it the budget-guarded .docx is used instead).
 python-docx

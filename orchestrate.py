@@ -1,4 +1,10 @@
-"""Chain scrape -> filter -> screen -> bridge -> batch_prep. Each step can be skipped with a flag."""
+"""Chain scrape -> filter -> screen -> bridge -> batch_prep. Each step can be skipped with a flag.
+
+Applying is NOT a pipeline stage: the pipeline finds and evaluates roles, then
+--handoff emits a work-order (output/handoff/next-roles.jsonl + .md) for
+whatever browser agent the user prefers (Claude Cowork, OpenClaw, a local
+Agent-SDK runner, ...) to work through with the user's own logged-in browser.
+"""
 
 import argparse
 import os
@@ -35,37 +41,22 @@ def main() -> int:
                          "requests per model.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
-    ap.add_argument("--apply", action="store_true",
-                    help="Auto-apply to evaluated LinkedIn Easy Apply jobs (local only — "
-                         "needs a logged-in browser). Off by default.")
-    ap.add_argument("--apply-mode", choices=["review", "dry-run", "auto"], default="review",
-                    help="review: fill the form and stop before Submit (default); "
-                         "dry-run: rehearse only; auto: submit unattended (at your own risk).")
-    ap.add_argument("--apply-min-score", type=float, default=4.0,
-                    help="Only apply to jobs scoring >= this (default: 4.0)")
-    ap.add_argument("--apply-limit", type=int, default=0,
-                    help="Max applications to attempt this run (0 = no cap)")
-    ap.add_argument("--apply-url", type=str, default=None,
-                    help="Apply to a single specific job URL, bypassing the tracker "
-                         "queue (one-off apply, or to reproduce a specific posting).")
-    ap.add_argument("--apply-refresh", action=argparse.BooleanOptionalAction, default=True,
-                    help="Pull the latest tracker from the most recent GitHub pipeline "
-                         "artifact before applying (default on; --no-apply-refresh to use "
-                         "the local applications.md). Falls back to local when offline.")
-    ap.add_argument("--apply-tailor-min-score", type=float,
-                    default=env_float("APPLY_TAILOR_MIN_SCORE", 4.0),
-                    help="Jobs scoring >= this get a per-job tailored resume (slot-edited "
-                         "copy of resumes/resume.docx, one-page verified). Default 4.0; "
-                         "set high (e.g. 99) to always use the default resume.")
-    ap.add_argument("--headless", action="store_true",
-                    help="Run the apply browser headless (only works once you've logged in once)")
-    ap.add_argument("--capture-indeed-login", action="store_true",
-                    help="One-time: open a normal Chrome to sign in to Indeed, then capture "
-                         "the session into the apply profile (required before --apply can do "
-                         "Indeed jobs). Standalone — skips the pipeline stages.")
-    ap.add_argument("--login-linkedin", action="store_true",
-                    help="One-time: open the LinkedIn apply browser and park for sign-in so "
-                         "the session persists for --apply. Standalone — skips the pipeline stages.")
+    ap.add_argument("--handoff", action="store_true",
+                    help="After evaluation, build the browser-agent work-order "
+                         "(output/handoff/next-roles.jsonl + .md): every evaluated, "
+                         "not-yet-handled role, ranked best-first, for your browser "
+                         "agent to apply through your own logged-in browser.")
+    ap.add_argument("--handoff-board", choices=["linkedin", "indeed", "both"], default="both",
+                    help="Restrict the work-order to one board (default: both)")
+    ap.add_argument("--handoff-limit", type=int, default=None,
+                    help="Cap the work-order at the top N roles")
+    ap.add_argument("--handoff-tailor", action="store_true",
+                    help="With --handoff: pre-tailor a candidate-named resume per "
+                         "work-order row (needs resumes/resume.docx) so the agent "
+                         "gets ready-to-upload files")
+    ap.add_argument("--handoff-tailor-min-score", type=float, default=None,
+                    help="With --handoff-tailor: only pre-tailor rows scoring >= "
+                         "this (default: APPLY_TAILOR_MIN_SCORE env, else 4.0)")
     ap.add_argument("--recheck-liveness", action="store_true",
                     help="Re-check liveness of evaluated tracker roles and mark "
                          "closed/gone ones Discarded. Off by default; the daily "
@@ -101,18 +92,6 @@ def main() -> int:
     # silently uses the CWD as the career-ops path. The `or` form treats
     # unset and empty-string both as "use the default".
     career_ops = resolve(os.environ.get("CAREER_OPS_PATH") or "career-ops")
-
-    if args.capture_indeed_login:
-        # One-time setup: sign in to Indeed in a normal browser and capture the
-        # live session into the patchright apply profile. Standalone — it doesn't
-        # need a search config and skips the pipeline stages.
-        from pipeline.apply import browser
-        return 0 if browser.capture_indeed_login() else 1
-
-    if args.login_linkedin:
-        # One-time setup: park the LinkedIn apply browser for sign-in. Standalone.
-        from pipeline.apply import browser
-        return 0 if browser.login_linkedin() else 1
 
     config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG") or "config/search.yml")
     if not config_path.exists():
@@ -162,10 +141,10 @@ def main() -> int:
 
     if args.recheck_liveness:
         # Re-check the tracker's still-open roles and Discard the ones whose
-        # posting has closed. Runs before --apply, but that only keeps a dead
-        # role out of the apply queue under --no-apply-refresh: with refresh on
-        # (the default) apply re-downloads the cloud tracker and won't see these
-        # local Discards. recheck.run prints its own summary.
+        # posting has closed. (Note: this cleans the TRACKER; the --handoff
+        # work-order is built from the scored-queue export, which recheck does
+        # not rewrite — the browser agent still verifies each posting live.)
+        # recheck.run prints its own summary.
         from pipeline import recheck
         notify.notify("Pipeline", "Re-checking tracker liveness...")
         if args.recheck_drain:
@@ -173,24 +152,26 @@ def main() -> int:
         else:
             recheck.run(career_ops, timeout=args.recheck_timeout)
 
-    if args.apply:
-        # Local import: the apply stage pulls in Playwright lazily, so the rest
-        # of the pipeline never pays for it.
-        from pipeline import apply
-        notify.notify("Pipeline", "Applying to qualified jobs...")
-        apply_mode = "dry-run" if args.dry_run else args.apply_mode
-        apply.run(
-            career_ops,
-            mode=apply_mode,
-            min_score=args.apply_min_score,
-            limit=args.apply_limit,
-            headless=args.headless,
-            refresh=args.apply_refresh,
-            target_url=args.apply_url,
-            provider=args.batch_provider,
-            model=args.batch_model,
-            tailor_min_score=args.apply_tailor_min_score,
-        )
+    if args.handoff:
+        if args.dry_run:
+            # --dry-run promises "print without doing it": the handoff stage
+            # rewrites the tracker/work-order and --handoff-tailor spends real
+            # LLM calls + renders, so it must not run during a rehearsal.
+            print("[handoff] skipped (--dry-run)")
+            return 0
+        # Terminal stage: emit the work-order for the user's browser agent.
+        # Lazy import keeps the hot pipeline path free of it. (handoff reads
+        # HANDOFF_JOB_LOG itself; queue = the scored-export jsonl when present,
+        # else career-ops' applications.md.)
+        from pipeline import handoff
+        notify.notify("Pipeline", "Building the browser-agent work-order...")
+        rc = handoff.run(board=args.handoff_board, limit=args.handoff_limit,
+                         tailor=args.handoff_tailor,
+                         tailor_min_score=args.handoff_tailor_min_score,
+                         career_ops=career_ops,
+                         workers=args.batch_concurrency)
+        if rc != 0:
+            return rc
 
     return 0
 

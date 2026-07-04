@@ -1,20 +1,9 @@
 """Tests for pipeline/cover_letters.py (pure logic + run with a fake caller)."""
 
-from pathlib import Path
-
-import pytest
-
 from pipeline import cover_letters
-from pipeline.apply import queue
-from pipeline.apply.profile import ApplyProfile
+from pipeline import role_select as queue
+from pipeline.candidate_profile import ApplyProfile
 
-
-def _playwright_available() -> bool:
-    try:
-        import playwright.sync_api  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
 _TRACKER = """\
 # Applications Tracker
@@ -83,51 +72,6 @@ class TestGenerateForJob:
             tmp_path, job, caller=lambda s, u: "Generated letter\nThomas")
         assert text == "Generated letter\nThomas"
         assert (tmp_path / "output" / "Apexon - cover.md").exists()
-
-
-class TestCoverPdf:
-    def test_pdf_path_naming(self, tmp_path):
-        assert cover_letters.cover_pdf_path(tmp_path, "Apexon").name == "Apexon - cover.pdf"
-
-    def test_ensure_none_without_letter(self, tmp_path):
-        assert cover_letters.ensure_cover_pdf(tmp_path, "Apexon") is None
-
-    def test_ensure_returns_existing_pdf_without_rendering(self, tmp_path, monkeypatch):
-        out = tmp_path / "output"
-        out.mkdir()
-        (out / "Apexon - cover.md").write_text("Dear team", encoding="utf-8")
-        (out / "Apexon - cover.pdf").write_bytes(b"%PDF-1.4 existing")
-        monkeypatch.setattr(cover_letters, "render_pdf",
-                            lambda *a, **k: pytest.fail("should not re-render"))
-        p = cover_letters.ensure_cover_pdf(tmp_path, "Apexon")
-        assert p is not None and p.name == "Apexon - cover.pdf"
-
-    def test_ensure_renders_from_md_when_missing(self, tmp_path, monkeypatch):
-        out = tmp_path / "output"
-        out.mkdir()
-        (out / "Apexon - cover.md").write_text("Dear Apexon team", encoding="utf-8")
-        seen = {}
-        def fake_render(text, path):
-            seen["text"] = text
-            Path(path).write_bytes(b"%PDF-rendered")
-            return True
-        monkeypatch.setattr(cover_letters, "render_pdf", fake_render)
-        p = cover_letters.ensure_cover_pdf(tmp_path, "Apexon")
-        assert p is not None and p.exists()
-        assert seen["text"] == "Dear Apexon team"
-
-    def test_ensure_returns_none_when_render_fails(self, tmp_path, monkeypatch):
-        out = tmp_path / "output"
-        out.mkdir()
-        (out / "Apexon - cover.md").write_text("Dear team", encoding="utf-8")
-        monkeypatch.setattr(cover_letters, "render_pdf", lambda *a, **k: False)
-        assert cover_letters.ensure_cover_pdf(tmp_path, "Apexon") is None
-
-    @pytest.mark.skipif(not _playwright_available(), reason="playwright not installed")
-    def test_render_pdf_creates_real_pdf(self, tmp_path):
-        pdf = tmp_path / "letter.pdf"
-        ok = cover_letters.render_pdf("First paragraph.\n\nSecond paragraph.\n\nThomas", pdf)
-        assert ok and pdf.exists() and pdf.read_bytes()[:5] == b"%PDF-"
 
 
 class TestRun:

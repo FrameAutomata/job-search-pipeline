@@ -1,38 +1,30 @@
-"""Local-config endpoint: writing off-site ATS account credentials to .env.
-
-These are LOCAL-ONLY secrets (auto-apply never runs in the cloud), so the UI
-setup writes them to the local .env via the same dotenv path as the provider
-keys — never to profile.yml or GitHub Secrets. The config GET reports only
-whether a password is set (a boolean), never the secret value itself, so the
-browser never receives the passwords back.
-"""
+"""Local-config endpoint: writing eval/tailoring provider config + API keys to
+the local .env (never to profile.yml or GitHub Secrets), with immediate
+os.environ effect so the running server picks changes up without a restart."""
 import importlib
 import os
 
 import pytest
 from fastapi.testclient import TestClient
 
-_ATS_KEYS = ("APPLY_ATS_EMAIL", "APPLY_ATS_PASSWORD", "APPLY_IMAP_HOST",
-            "APPLY_IMAP_PORT", "APPLY_IMAP_PASSWORD")
-
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """A reloaded server whose ROOT (and thus .env) points at a temp dir, with a
-    clean ATS env so each test starts from a known, isolated state.
+    clean provider env so each test starts from a known, isolated state.
 
     save_local_config mutates os.environ directly (so changes take effect without a
     restart) — and monkeypatch can't undo a write to a key that started absent. So
     snapshot the whole environ here and restore it on teardown, otherwise written
-    ATS creds leak into later tests (e.g. the profile default-email test)."""
+    config leaks into later tests."""
     co = tmp_path / "career-ops"
     (co / "data").mkdir(parents=True)
     monkeypatch.setenv("CAREER_OPS_PATH", str(co))
     from pipeline.app import server
     importlib.reload(server)                         # re-runs load_dotenv(real .env)...
     monkeypatch.setattr(server, "ROOT", tmp_path)    # .env writes land in tmp_path/.env
-    for k in (*_ATS_KEYS, "TAILOR_PROVIDER", "TAILOR_MODEL"):
-        monkeypatch.delenv(k, raising=False)         # ...so clear the real creds/models it pulled in
+    for k in ("TAILOR_PROVIDER", "TAILOR_MODEL"):
+        monkeypatch.delenv(k, raising=False)         # ...so clear the real models it pulled in
     snapshot = dict(os.environ)
     yield TestClient(server.app), tmp_path, server
     os.environ.clear()
@@ -43,43 +35,33 @@ def _post(client, **fields):
     return client.post("/api/onboard/local-config", json=fields)
 
 
-class TestWriteAtsCreds:
-    def test_post_writes_all_ats_creds_to_env(self, env):
-        client, root, server = env
-        r = _post(client, ats_email="apply@example.com", ats_password="s3cret-pw",
-                  imap_host="imap.gmail.com", imap_port="993",
-                  imap_password="abcd efgh ijkl mnop")
-        assert r.status_code == 200
-        envtext = (root / ".env").read_text(encoding="utf-8")
-        assert "APPLY_ATS_EMAIL=apply@example.com" in envtext
-        assert "APPLY_ATS_PASSWORD=s3cret-pw" in envtext
-        assert "APPLY_IMAP_HOST=imap.gmail.com" in envtext
-        assert "APPLY_IMAP_PORT=993" in envtext
-        assert "APPLY_IMAP_PASSWORD=abcd efgh ijkl mnop" in envtext
-        # and visible to the running server immediately
-        import os
-        assert os.environ["APPLY_ATS_PASSWORD"] == "s3cret-pw"
+class TestEvalProviderKey:
+    """The eval provider's own API key goes to .env via the local-config endpoint —
+    the path the Local-settings panel uses to add e.g. DEEPSEEK_API_KEY."""
 
-    def test_blank_password_preserves_existing(self, env):
+    def test_writes_eval_provider_api_key(self, env):
         client, root, server = env
-        _post(client, ats_email="apply@example.com", ats_password="keep-me",
-              imap_host="imap.gmail.com", imap_password="keep-imap")
-        # A later settings save that doesn't re-enter the passwords must NOT wipe
-        # them (the form never receives the existing secret to echo back).
-        r = _post(client, ats_email="apply@example.com", ats_password="",
-                  imap_host="imap.gmail.com", imap_password="")
+        r = _post(client, batch_provider="deepseek", api_key="sk-ds-eval")
         assert r.status_code == 200
-        envtext = (root / ".env").read_text(encoding="utf-8")
-        assert "APPLY_ATS_PASSWORD=keep-me" in envtext
-        assert "APPLY_IMAP_PASSWORD=keep-imap" in envtext
+        assert "DEEPSEEK_API_KEY=sk-ds-eval" in (root / ".env").read_text(encoding="utf-8")
 
-    def test_blank_port_not_written(self, env):
-        # No port -> the profile loader defaults it to 993; don't write an empty one.
+    def test_api_key_without_provider_is_rejected_not_dropped(self, env):
+        # Review bug: with the provider select on "auto-detect" (value ""), a
+        # pasted key returned {"ok": true} while silently writing nothing.
         client, root, server = env
-        _post(client, ats_email="a@b.com", ats_password="pw",
-              imap_host="imap.gmail.com", imap_port="", imap_password="ip")
-        envtext = (root / ".env").read_text(encoding="utf-8")
-        assert "APPLY_IMAP_PORT" not in envtext
+        r = _post(client, batch_provider="", api_key="sk-orphan")
+        assert r.status_code == 400
+        assert "provider" in r.json()["detail"].lower()
+        # Rejected before any write — .env either untouched or never created.
+        env_file = root / ".env"
+        assert not env_file.exists() or "sk-orphan" not in env_file.read_text(encoding="utf-8")
+
+    def test_tailor_key_without_tailor_provider_is_rejected(self, env):
+        client, root, server = env
+        r = _post(client, tailor_provider="", tailor_api_key="sk-orphan-tailor")
+        assert r.status_code == 400
+        env_file = root / ".env"
+        assert not env_file.exists() or "sk-orphan-tailor" not in env_file.read_text(encoding="utf-8")
 
 
 class TestTailorConfig:
@@ -108,29 +90,3 @@ class TestTailorConfig:
         cur = client.get("/api/onboard/providers").json()["current"]
         assert cur["tailor_provider"] == "anthropic"
         assert cur["tailor_model"] == "claude-x"
-
-
-class TestConfigGetReportsStatus:
-    def test_get_reports_ats_status_without_leaking_secrets(self, env, monkeypatch):
-        client, root, server = env
-        monkeypatch.setenv("APPLY_ATS_EMAIL", "apply@example.com")
-        monkeypatch.setenv("APPLY_ATS_PASSWORD", "TOP-SECRET-PW")
-        monkeypatch.setenv("APPLY_IMAP_HOST", "imap.gmail.com")
-        monkeypatch.setenv("APPLY_IMAP_PASSWORD", "TOP-SECRET-IMAP")
-        body = client.get("/api/onboard/providers").json()
-        cur = body["current"]
-        assert cur["ats_email"] == "apply@example.com"
-        assert cur["imap_host"] == "imap.gmail.com"
-        assert cur["ats_password_set"] is True
-        assert cur["imap_password_set"] is True
-        # the actual passwords must never be echoed back to the browser
-        import json
-        assert "TOP-SECRET-PW" not in json.dumps(body)
-        assert "TOP-SECRET-IMAP" not in json.dumps(body)
-
-    def test_get_reports_unset_when_absent(self, env):
-        client, root, server = env
-        cur = client.get("/api/onboard/providers").json()["current"]
-        assert cur["ats_password_set"] is False
-        assert cur["imap_password_set"] is False
-        assert cur["ats_email"] == ""

@@ -16,8 +16,7 @@ from docx.oxml.ns import qn  # noqa: E402
 from docx.oxml import OxmlElement  # noqa: E402
 
 from pipeline import resume_tailor as rt
-from pipeline.apply import _should_tailor, _stem_matches_company
-from pipeline.apply.queue import ApplyJob
+from pipeline.role_select import ApplyJob
 
 
 def _build_resume(path: Path) -> Path:
@@ -317,7 +316,11 @@ class TestBuildPrompt:
         system, user = rt.build_prompt(slots, "FULL RESUME TEXT", _job(report=""),
                                        "REPORT NOTES")
         assert "Never invent" in system and "max_chars" in system
-        assert "ALWAYS rewrite" in system and "FAILURE" in system
+        # Preserve-first: keep the candidate's (strong) wording; tailor mainly by
+        # REORDERING + light alignment, rewriting a line only when it clearly sharpens
+        # relevance without losing impact. NOT the old rewrite-everything mandate.
+        assert "preserve" in system.lower() and "reorder" in system.lower()
+        assert "ALWAYS rewrite" not in system and "FAILURE" not in system
         assert "PROSE HONESTY" in system and "NEVER with the target" in system
         # JD/report framed as data, not instructions (prompt-injection guard).
         assert "never instructions" in system
@@ -434,18 +437,6 @@ class TestResumePaths:
         assert pdf_p.name == "St. Jude Medical - resume.pdf"
         other_docx, _ = rt.resume_paths(tmp_path, "St. David's Healthcare")
         assert other_docx.name != docx_p.name
-
-
-class TestStemMatchesCompany:
-    def test_contiguous_token_match(self):
-        assert _stem_matches_company("CV - Apexon Inc", "apexon") is True
-        assert _stem_matches_company("Apexon - resume", "apexon") is True
-        assert _stem_matches_company("CV - Apexon Inc", "apexoninc") is True
-
-    def test_substring_of_token_does_not_match(self):
-        # 'Meta' must not match 'Metabase - resume.pdf' (another company).
-        assert _stem_matches_company("Metabase - resume", "meta") is False
-        assert _stem_matches_company("Asana - resume", "sana") is False
 
 
 # ── generate loop ────────────────────────────────────────────────────────────
@@ -632,14 +623,6 @@ class TestGenerateForJob:
         assert saved.core_properties.title == ""
         assert saved.core_properties.revision == 1
         assert saved.core_properties.subject == "Backend Engineer"
-
-
-class TestShouldTailor:
-    def test_gates_on_score(self):
-        assert _should_tailor(_job(score=4.0), 4.0) is True
-        assert _should_tailor(_job(score=4.6), 4.0) is True
-        assert _should_tailor(_job(score=3.9), 4.0) is False
-        assert _should_tailor(_job(score=None), 4.0) is False   # --apply-url one-off
 
 
 class TestSourceDocx:

@@ -436,7 +436,7 @@ def test_onboard_writes_secrets_on_private_repo(client, tmp_path, mocker):
     mocker.patch.object(server, "ROOT", tmp_path)  # don't write into the real repo
     mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
     mocker.patch.object(server.gh, "current_repo", return_value="me/private")
-    mocker.patch.object(server.onboard, "extract_pdf_text", return_value="resume text body")
+    mocker.patch.object(server.onboard, "extract_resume_text", return_value="resume text body")
     gen = mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
     mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
         "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
@@ -459,6 +459,68 @@ def test_onboard_writes_secrets_on_private_repo(client, tmp_path, mocker):
     assert (tmp_path / "resumes" / "resume.pdf").exists()
     assert (tmp_path / "resumes" / "resume.txt").read_text(encoding="utf-8") == "resume text body"
     gen.assert_called_once()
+
+
+def test_onboard_saves_docx_under_real_extension(client, tmp_path, mocker):
+    """A DOCX import is persisted as resumes/resume.docx (not resume.pdf), so it
+    doubles as the apply-stage tailoring source. resume.txt is written too."""
+    import json as _json
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.onboard, "extract_resume_text", return_value="docx body")
+    mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD",
+    })
+    mocker.patch.object(server.gh, "set_secret")
+    mocker.patch.object(server.gh, "set_variable")
+
+    r = client.post(
+        "/api/onboard",
+        files={"resume": ("Jane_Resume.docx", b"PK\x03\x04 fake-docx",
+                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        data={"form": _json.dumps({"name": "Jane", "provider": "gemini", "api_key": "k"})},
+    )
+    assert r.status_code == 200, r.json()
+    assert (tmp_path / "resumes" / "resume.docx").exists()
+    assert not (tmp_path / "resumes" / "resume.pdf").exists()
+    assert (tmp_path / "resumes" / "resume.txt").read_text(encoding="utf-8") == "docx body"
+
+
+def test_onboard_reupload_retires_stale_sibling_formats(client, tmp_path, mocker):
+    """Review bug: re-onboarding with a new format left the OLD resume.pdf on
+    disk, and the filter's pdf-first probe kept scoring against it forever
+    (split-brain: scoring used the stale PDF, tailoring the new DOCX). The
+    latest upload must be THE resume — siblings are deleted."""
+    import json as _json
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.onboard, "extract_resume_text", return_value="docx body")
+    mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD",
+    })
+    mocker.patch.object(server.gh, "set_secret")
+    mocker.patch.object(server.gh, "set_variable")
+
+    (tmp_path / "resumes").mkdir()
+    (tmp_path / "resumes" / "resume.pdf").write_bytes(b"%PDF-1.4 stale old resume")
+
+    r = client.post(
+        "/api/onboard",
+        files={"resume": ("Jane_Resume.docx", b"PK\x03\x04 fake-docx",
+                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        data={"form": _json.dumps({"name": "Jane", "provider": "gemini", "api_key": "k"})},
+    )
+    assert r.status_code == 200, r.json()
+    assert (tmp_path / "resumes" / "resume.docx").exists()
+    assert not (tmp_path / "resumes" / "resume.pdf").exists()   # stale sibling retired
 
 
 def test_onboard_refuses_public_repo(client, tmp_path, mocker):
@@ -484,18 +546,18 @@ def test_onboard_rejects_unreadable_pdf(client, tmp_path, mocker):
     from pipeline.app import server
     mocker.patch.object(server, "ROOT", tmp_path)
     mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
-    mocker.patch.object(server.onboard, "extract_pdf_text",
+    mocker.patch.object(server.onboard, "extract_resume_text",
                         side_effect=Exception("not a pdf"))
     r = _onboard_post(client, {"provider": "gemini", "api_key": "k"})
     assert r.status_code == 400
-    assert "could not read PDF" in r.json()["detail"]
+    assert "could not read resume" in r.json()["detail"]
 
 
 def test_onboard_parse_resume_autofills_from_text(client, mocker):
     from pipeline.app import server
     # Mock PDF extraction; parse_resume_info runs for real on the text.
     mocker.patch.object(
-        server.onboard, "extract_pdf_text",
+        server.onboard, "extract_resume_text",
         return_value="Jane Dev\njane@example.com | Dallas, TX | github.com/janedev\n",
     )
     r = client.post(
@@ -512,14 +574,14 @@ def test_onboard_parse_resume_autofills_from_text(client, mocker):
 
 def test_onboard_parse_resume_rejects_unreadable_pdf(client, mocker):
     from pipeline.app import server
-    mocker.patch.object(server.onboard, "extract_pdf_text",
+    mocker.patch.object(server.onboard, "extract_resume_text",
                         side_effect=Exception("not a pdf"))
     r = client.post(
         "/api/onboard/parse-resume",
         files={"resume": ("resume.pdf", b"%PDF junk", "application/pdf")},
     )
     assert r.status_code == 400
-    assert "could not read PDF" in r.json()["detail"]
+    assert "could not read resume" in r.json()["detail"]
 
 
 def test_onboard_load_config_returns_null_when_no_sidecar(client, tmp_path, mocker):
@@ -562,7 +624,7 @@ def test_onboard_writes_sidecar_after_successful_submit(client, tmp_path, mocker
     mocker.patch.object(server, "ROOT", tmp_path)
     mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
     mocker.patch.object(server.gh, "current_repo", return_value="me/private")
-    mocker.patch.object(server.onboard, "extract_pdf_text", return_value="resume text")
+    mocker.patch.object(server.onboard, "extract_resume_text", return_value="resume text")
     mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
     mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
         "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
@@ -597,8 +659,8 @@ def test_onboard_reuses_existing_resume_when_none_uploaded(client, tmp_path, moc
     (resumes / "resume.txt").write_text("existing resume text", encoding="utf-8")
     mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
     mocker.patch.object(server.gh, "current_repo", return_value="me/private")
-    # extract_pdf_text MUST NOT be called — we're reusing the .txt directly.
-    extract = mocker.patch.object(server.onboard, "extract_pdf_text",
+    # extract_resume_text MUST NOT be called — we're reusing the .txt directly.
+    extract = mocker.patch.object(server.onboard, "extract_resume_text",
                                   side_effect=AssertionError("unexpected PDF extract"))
     build = mocker.patch.object(server.onboard, "build_onboarding_json",
                                 wraps=server.onboard.build_onboarding_json)
@@ -638,7 +700,7 @@ def test_onboard_skips_provider_key_write_when_api_key_blank(client, tmp_path, m
     mocker.patch.object(server, "ROOT", tmp_path)
     mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
     mocker.patch.object(server.gh, "current_repo", return_value="me/private")
-    mocker.patch.object(server.onboard, "extract_pdf_text", return_value="resume text")
+    mocker.patch.object(server.onboard, "extract_resume_text", return_value="resume text")
     mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
     mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
         "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",

@@ -26,23 +26,11 @@
       <button id="refresh-btn" title="Download the latest results from GitHub">↻ Refresh</button>
       <button id="run-btn" title="Trigger a new pipeline run in the cloud">▶ Run now</button>
       <button id="run-local-btn" title="Run the pipeline on this machine and show its results">💻 Run local</button>
-      <button id="batch-apply-btn" title="Batch apply: fill every Evaluated role in turn and review each before submitting">⚡ Batch apply</button>
       <button id="recheck-btn" title="Re-check the liveness of evaluated roles and discard postings that have closed">🩺 Re-check liveness</button>
       <a id="setup-link" href="/onboard" title="Set up or update your profile and search config">⚙ Setup</a>
       <button id="update-btn" title="A newer version of the app is available from the template — merge it in and push" hidden>⬆ Update available</button>
     </div>
     <div id="action-msg" class="action-msg" hidden></div>
-    <div id="batch-panel" class="local-run-panel" hidden>
-      <div class="local-run-options">
-        <label>Min score <input id="batch-min-score" type="number" step="0.1" min="0" value="4.0" style="width:5em" /></label>
-        <label class="check"><input type="checkbox" id="batch-manual-review" checked /> Manual review</label>
-        <button id="batch-start" class="primary">Start batch</button>
-        <button id="batch-stop" hidden>Stop batch</button>
-      </div>
-      <p class="hint">Fills every Evaluated role scoring at or above this, one at a time, and notifies you (OS notification + sound) when each needs you. <b>Manual review on</b> (default): you review and Submit each (Cancel skips it) — nothing is submitted without your click. <b>Off (at your own risk):</b> each role is submitted automatically; a role that hits a CAPTCHA still pauses for you.</p>
-      <div id="batch-progress"></div>
-      <div id="batch-review" class="apply-panel" hidden></div>
-    </div>
     <div id="local-run-panel" class="local-run-panel" hidden>
       <div class="local-run-options">
         <label>Passes
@@ -89,12 +77,10 @@
         <button id="report-close" title="Close">✕</button>
         <a id="report-link" href="#" target="_blank" rel="noopener">Open posting ↗</a>
         <select id="report-status" title="Set status for this role"></select>
-        <button id="apply-btn" class="apply-btn" title="Fill the application form (LinkedIn Easy Apply / Indeed SmartApply) for review" hidden>Apply ↗</button>
         <span class="spacer"></span>
         <span id="skill-actions" class="skill-actions"></span>
       </div>
       <div id="skill-panel" class="skill-panel" hidden></div>
-      <div id="apply-panel" class="apply-panel" hidden></div>
       <article id="report-body"></article>
     </aside>
   </main>

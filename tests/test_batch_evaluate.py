@@ -9,41 +9,75 @@ import pytest
 
 from pipeline import batch_evaluate as eval_mod
 from pipeline.batch_evaluate import (
+    _build_caller,
     _call_with_retry,
     _check_provider,
     _detect_provider,
     _is_rate_limit_error,
     _is_transient_provider_error,
+    _PROVIDER_KEYS,
+    PROVIDER_BASE_URLS,
     PROVIDER_DEFAULTS,
     resolve_caller,
     run,
 )
 
 
+class TestDeepSeekProvider:
+    """DeepSeek's direct API (OpenAI-compatible, cheaper than DeepInfra hosting the
+    same weights) as a first-class provider for cheap mass evaluation."""
+
+    def test_registered_in_every_provider_table(self):
+        assert "deepseek" in PROVIDER_DEFAULTS
+        assert _PROVIDER_KEYS["deepseek"] == "DEEPSEEK_API_KEY"
+        assert "api.deepseek.com" in PROVIDER_BASE_URLS["deepseek"]
+        from pipeline.app import onboard
+        assert onboard.PROVIDER_SECRETS["deepseek"] == "DEEPSEEK_API_KEY"
+
+    def test_detect_provider_finds_deepseek_by_key(self, monkeypatch):
+        monkeypatch.delenv("BATCH_PROVIDER", raising=False)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds")
+        assert _detect_provider() == "deepseek"
+
+    def test_build_caller_targets_the_direct_api(self, monkeypatch):
+        cap = {}
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-key")
+        monkeypatch.setattr("pipeline.batch_evaluate._build_openai_compat_caller",
+                            lambda model, api_key, base_url=None, **kw:
+                                cap.update(model=model, api_key=api_key, base_url=base_url))
+        _build_caller("deepseek", "deepseek-chat")
+        assert cap["api_key"] == "sk-ds-key"
+        assert "api.deepseek.com" in cap["base_url"]
+        assert cap["model"] == "deepseek-chat"
+
+
 class TestResolveCaller:
-    """One shared caller-builder used by apply answers, cover letters, and the
-    apply stage — provider/model precedence in a single place."""
+    """One shared caller-builder used by cover letters, tailoring, and the
+    article digest — provider/model precedence in a single place."""
 
     def test_unknown_provider_raises_clear_error_not_keyerror(self, monkeypatch):
         # Unknown provider with no model override must raise a helpful RuntimeError,
         # never a bare KeyError from PROVIDER_DEFAULTS[provider].
-        for v in ("APPLY_MODEL", "BATCH_MODEL", "COVER_MODEL"):
+        for v in ("BATCH_MODEL", "COVER_MODEL"):
             monkeypatch.delenv(v, raising=False)
         with pytest.raises(RuntimeError):
             resolve_caller("nonsense-provider")
 
     def test_no_provider_configured_raises(self, monkeypatch):
-        for v in ("BATCH_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "DEEPINFRA_API_KEY",
-                  "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        # Derive from the provider table — a hand-copied list here missed
+        # DEEPSEEK_API_KEY when that provider landed (review finding), making
+        # the test's outcome depend on the developer's .env.
+        from pipeline.batch_evaluate import _PROVIDER_KEYS
+        for v in ("BATCH_PROVIDER", *_PROVIDER_KEYS.values()):
             monkeypatch.delenv(v, raising=False)
         with pytest.raises(RuntimeError):
             resolve_caller()
 
     def test_lead_env_takes_precedence(self, monkeypatch):
-        # COVER_MODEL (lead_env) should win over APPLY_MODEL/BATCH_MODEL.
+        # COVER_MODEL (lead_env) should win over BATCH_MODEL.
         captured = {}
         monkeypatch.setenv("COVER_MODEL", "cover-model")
-        monkeypatch.setenv("APPLY_MODEL", "apply-model")
+        monkeypatch.setenv("BATCH_MODEL", "batch-model")
         monkeypatch.setattr("pipeline.batch_evaluate._build_caller",
                             lambda provider, model, **kw: captured.update(provider=provider, model=model))
         resolve_caller("deepinfra", lead_env="COVER_MODEL")
@@ -58,7 +92,7 @@ class TestResolveCaller:
     def test_lead_provider_env_selects_a_dedicated_provider(self, monkeypatch):
         # TAILOR_PROVIDER picks the provider for THIS caller, over BATCH_PROVIDER —
         # so you can evaluate on Gemini but tailor on Anthropic.
-        for v in ("TAILOR_MODEL", "APPLY_MODEL", "BATCH_MODEL"):
+        for v in ("TAILOR_MODEL", "BATCH_MODEL"):
             monkeypatch.delenv(v, raising=False)
         monkeypatch.setenv("BATCH_PROVIDER", "gemini")
         monkeypatch.setenv("TAILOR_PROVIDER", "anthropic")

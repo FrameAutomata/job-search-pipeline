@@ -2,6 +2,8 @@
 
 Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor via **JobSpy**, scores results against a resume using YAKE keyword extraction, optionally screens for liveness, then bridges surviving jobs into **career-ops** for AI-powered evaluation. Supports interactive evaluation via any agent CLI (`--batch`) or synchronous parallel API evaluation across any LLM provider (`--evaluate-batch`).
 
+**Applying is not a pipeline stage.** The pipeline finds and evaluates roles; the terminal `--handoff` stage emits an agent-agnostic **work-order** (`output/handoff/next-roles.jsonl` + `.md`) that the user hands to whatever browser agent they prefer (Claude Cowork, OpenClaw, a local Agent-SDK/`claude -p` runner, …). The agent applies through the user's own logged-in browser, writes each outcome back into the work-order's `status` column (`claimed` / `applied` / `handoff` / `skip:<reason>`), and the next `--handoff` run folds those into the status tracker (`role-status.jsonl`) so handled roles never reappear.
+
 ---
 
 ## Pipeline stages
@@ -14,8 +16,9 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | Bridge       | `pipeline/bridge.py`        | `filtered_jobs.csv` → `career-ops/data/pipeline.md` + `scan-history.tsv`  |
 | Batch prep   | `pipeline/batch_prep.py`    | bridge output → `career-ops/batch/batch-input.tsv` + `batch/jds/*.txt`    |
 | Batch evaluate | `pipeline/batch_evaluate.py` | `batch-input.tsv` → parallel LLM evaluation → `reports/*.md` + `tracker-additions/*.tsv` |
+| Handoff      | `pipeline/handoff.py`       | queue (scored-export jsonl if present, else `career-ops/data/applications.md`) + `role-status.jsonl` (+ optional prose JOB_LOG) → `output/handoff/next-roles.{jsonl,md}` for the user's browser agent |
 
-`orchestrate.py` chains all stages. Each stage can be skipped independently via `--skip-<stage>`.
+`orchestrate.py` chains all stages. Each stage can be skipped independently via `--skip-<stage>`; `--handoff` opts into the terminal work-order build (`--handoff-board`, `--handoff-limit`, `--handoff-tailor`).
 
 ---
 
@@ -35,6 +38,13 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 # Skip stages when re-running
 ./run.ps1 --skip-scrape --skip-filter --batch
 ./run.ps1 --skip-scrape --skip-filter --evaluate-batch
+
+# Build the browser-agent work-order. Queue = the scored-export jsonl when one
+# exists, else career-ops/data/applications.md (so --recheck-liveness Discards
+# keep dead roles out on the tracker path; the agent re-verifies postings live
+# either way). --handoff-tailor pre-tailors a resume per row.
+./run.ps1 --skip-scrape --skip-filter --handoff
+./run.ps1 --skip-scrape --skip-filter --handoff --handoff-board linkedin --handoff-limit 25 --handoff-tailor
 ```
 
 ```bash
@@ -54,9 +64,11 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 | `run-ui.ps1` / `run-ui.sh`              | Launch the local triage UI (`pipeline/app`, FastAPI on localhost) — read-only results view       |
 | `pipeline/app/`                         | Local web UI — `server.py` (FastAPI routes + a localhost-only cross-origin guard), `data.py` (parse applications.md + render reports), `skills.py` (career-ops skill launchpad: capability detection + a skill registry — résumé-markdown via API or CLI, and PDF / interview-prep / apply via CLI hand-off), `self_update.py` (pull the maintainer's template changes via `git fetch/merge/push`), `reset.py` (start-over: snapshot then wipe job-search state, keep setup; clear the cloud cache), `static/` (SPA). Deps in `requirements-ui.txt`. |
 | `config/search.yml`                     | **Edit this** — searches, filters, screening config                                              |
-| `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`, `SKILL_PATH_DEFAULT`; tailoring: `RESUME_DOCX_PATH` (default `resumes/resume.docx`), `APPLY_TAILOR_MIN_SCORE` (default 4.0), `TAILOR_MODEL`, `SOFFICE_PATH`; UI apply review: `APPLY_HOLD_TIMEOUT` (seconds the browser is held open awaiting Submit/Cancel, default 300); liveness recheck (`--recheck-liveness`): `RECHECK_BUDGET` (stalest roles re-checked per run, default 100), `RECHECK_MIN_AGE_HOURS` (don't re-check a role confirmed within this window, default 6) — together they cap the per-run fetch burst that trips LinkedIn's rate limiter; manual backlog drain (`--recheck-drain`, or auto in the UI when the backlog exceeds the budget): `RECHECK_DRAIN_COOLDOWN` (seconds between budgeted sweeps, default 60), `RECHECK_DRAIN_MAX_CYCLES` (hard cap on sweeps, default 20). The re-check only verifies sites with an unauthenticated liveness path (LinkedIn's guest endpoint); Indeed/Glassdoor serve JS anti-bot walls a fetch can't classify, so they're reported `unverifiable` and skipped (CapSolver/headless support tracked in issue #75) |
-| `resumes/resume.pdf`                    | Resume used to extract scoring keywords                                                          |
-| `resumes/resume.docx`                   | Source for per-job **tailored resumes** (`pipeline/resume_tailor.py`) — the apply stage slot-edits a copy per company (summary / bullets / skills values only; headers, employers, dates untouchable), verifies one page via LibreOffice against the pristine copy's baseline, and uploads the verified PDF. Jobs scoring below `APPLY_TAILOR_MIN_SCORE` (or `--apply-tailor-min-score`) use the default resume. Cached as `career-ops/output/<Company> - resume.docx/.pdf`; hand-edited files win if newer. |
+| `.env`                                  | Env vars: `RESUME_PATH`, `CAREER_OPS_PATH`, `BATCH_CLI`, `ANTHROPIC_API_KEY`, `BATCH_MODEL`, `SKILL_PATH_DEFAULT`; tailoring: `RESUME_DOCX_PATH` (default `resumes/resume.docx`), `APPLY_TAILOR_MIN_SCORE` (default 4.0), `TAILOR_MODEL`, `SOFFICE_PATH`; handoff: `HANDOFF_JOB_LOG` (optional prose log to reconcile); liveness recheck (`--recheck-liveness`): `RECHECK_BUDGET` (stalest roles re-checked per run, default 100), `RECHECK_MIN_AGE_HOURS` (don't re-check a role confirmed within this window, default 6) — together they cap the per-run fetch burst that trips LinkedIn's rate limiter; manual backlog drain (`--recheck-drain`, or auto in the UI when the backlog exceeds the budget): `RECHECK_DRAIN_COOLDOWN` (seconds between budgeted sweeps, default 60), `RECHECK_DRAIN_MAX_CYCLES` (hard cap on sweeps, default 20). The re-check only verifies sites with an unauthenticated liveness path (LinkedIn's guest endpoint); Indeed/Glassdoor serve JS anti-bot walls a fetch can't classify, so they're reported `unverifiable` and skipped (CapSolver/headless support tracked in issue #75) |
+| `resumes/resume.{pdf,docx,odt}`         | Resume used to extract scoring keywords. Import any of the three (DOCX/ODT recommended — also feeds tailoring below); `pipeline/resume_text.py` dispatches extraction by extension. `extract_resume_text()` in [pipeline/filter.py](pipeline/filter.py) delegates to it; the filter auto-discovers `resume.{pdf,docx,odt}` when `RESUME_PATH` is unset. |
+| `resumes/resume.docx`                   | Source for per-job **tailored resumes** (`pipeline/resume_tailor.py`) — `--handoff-tailor` slot-edits a copy per company (summary / bullets / skills values only; headers, employers, dates untouchable), verifies one page via LibreOffice against the pristine copy's baseline, and puts the verified PDF's path in the work-order row for the browser agent to upload. Jobs scoring below `APPLY_TAILOR_MIN_SCORE` (or `--handoff-tailor-min-score`) get no pre-tailored file. Cached as `career-ops/output/<Company> - resume.docx/.pdf`; hand-edited files win if newer. |
+| `output/handoff/next-roles.{jsonl,md}`  | The **work-order** for the browser agent — fresh scored roles ranked best-first, each with board/url/score/resume-base (and `resume_pdf` under `--handoff-tailor`) plus a `status` column the agent writes back (`claimed`/`applied`/`handoff`/`skip:<reason>`). |
+| `output/handoff/role-status.jsonl`      | The **status tracker** — one line per handled role keyed `company::role` (case/board/req-id normalized). Seeded from a prose JOB_LOG when `HANDOFF_JOB_LOG`/`--job-log` points at one; extended by agent writeback each run. The machine source of truth for "what's done". |
 | `output/jobs.csv`                       | Raw scrape output                                                                                |
 | `output/filtered_jobs.csv`              | Score-filtered and screened jobs                                                                 |
 | `career-ops/data/pipeline.md`           | Pending evaluation queue (checkbox list)                                                         |
@@ -110,7 +122,7 @@ Net effect: we pay ~dozens of fetches per run for the jobs that actually survive
 
 ## Filtering logic
 
-Keywords are extracted from `resumes/resume.pdf` (no hardcoded vocab):
+Keywords are extracted from the resume (`resumes/resume.{pdf,docx,odt}`, no hardcoded vocab):
 
 - YAKE 1–3 gram extraction (weight 1) + explicit Skills-section tokens (weight 2)
 - `score_job()` matches keywords against title + description + skills fields
@@ -166,7 +178,7 @@ Evaluates jobs synchronously using any LLM provider. Results are immediate — n
 ./run.ps1 --evaluate-batch --batch-concurrency 5   # more parallel workers
 ```
 
-Provider auto-detection order: Gemini → Groq → OpenAI → Anthropic (first env key found).
+Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic (first env key found).
 
 | Provider | Env var | Free tier |
 |---|---|---|

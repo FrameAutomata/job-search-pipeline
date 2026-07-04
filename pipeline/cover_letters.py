@@ -1,16 +1,14 @@
 """Pre-generate tailored cover letters for high-fit pending jobs.
 
-Runs ahead of the apply stage (not during it) so the slow free-text generation
-stays out of the time-sensitive browser session, and so each letter is a file
-you can read and edit before anything is submitted. Draws on what career-ops
-already produced — your CV (cv.md) and the job's evaluation report (its
-proof-point phrases) — and writes `career-ops/output/<company> - cover.md`,
-which the apply engine's `_find_tailored_cover_letter` picks up automatically.
+Each letter is a file you can read and edit before your browser agent submits
+anything. Draws on what career-ops already produced — your CV (cv.md) and the
+job's evaluation report (its proof-point phrases) — and writes
+`career-ops/output/<company> - cover.md` for the agent (or you) to attach.
 
 Reuses the pipeline's multi-provider LLM caller (same provider/model as
---evaluate-batch). Opt-in via orchestrate's --cover-letters; skips jobs whose
-letter already exists unless force=True. Never invents experience — the prompt
-constrains the model to facts from the CV/report."""
+--evaluate-batch). Skips jobs whose letter already exists unless force=True.
+Never invents experience — the prompt constrains the model to facts from the
+CV/report."""
 
 from __future__ import annotations
 
@@ -19,8 +17,8 @@ import re
 from pathlib import Path
 
 from pipeline._batch_common import atomic_write_text, normalize_company, read_text
-from pipeline.apply import queue
-from pipeline.apply.profile import ApplyProfile
+from pipeline import role_select as queue
+from pipeline.candidate_profile import ApplyProfile
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -35,15 +33,10 @@ def _safe_company(company: str) -> str:
 
 
 def cover_path(out_dir: Path, company: str) -> Path:
-    """The file the generator writes and the applier looks for: '<Company> -
-    cover.md'. The applier matches any .md/.txt whose name contains the company
-    slug and 'cover', so this naming is what links the two stages."""
+    """The file the generator writes: '<Company> - cover.md'. find_existing
+    matches any .md/.txt whose name contains the company slug and 'cover', so
+    this naming is what makes a hand-written letter win over regeneration."""
     return Path(out_dir) / f"{_safe_company(company)} - cover.md"
-
-
-def cover_pdf_path(career_ops: Path, company: str) -> Path:
-    """The PDF rendered from the cover letter (for forms that want an upload)."""
-    return cover_path(Path(career_ops) / "output", company).with_suffix(".pdf")
 
 
 # Cap on JD text fed into prompts (cover letters and resume tailoring).
@@ -133,7 +126,7 @@ def _resolve_caller(provider: str | None, model: str | None):
     # task — disable thinking so the model writes directly (faster, and avoids the
     # truncated/garbled tails reasoning models produce when they burn the budget).
     from pipeline.batch_evaluate import resolve_caller
-    from pipeline.apply.answers import thinking_disabled
+    from pipeline._batch_common import thinking_disabled
     return resolve_caller(provider, model, lead_env="COVER_MODEL",
                           disable_thinking=thinking_disabled())
 
@@ -161,65 +154,6 @@ def find_existing(career_ops: Path, company: str) -> str:
     return read_text(max(matches, key=lambda p: p.stat().st_mtime))
 
 
-def render_pdf(text: str, pdf_path: Path) -> bool:
-    """Render plain cover-letter text to a simple PDF via headless Chromium
-    (Playwright is already an apply dependency — no extra package). Returns False
-    if Playwright/Chromium isn't available or rendering fails (the caller then
-    skips the upload rather than erroring).
-
-    Runs in a SEPARATE thread: during an apply run we're already inside a
-    sync_playwright() context on the main thread, and Playwright forbids nesting
-    sync contexts in one thread — so a direct call there would throw."""
-    import concurrent.futures
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return bool(ex.submit(_render_pdf_sync, str(text or ""), str(pdf_path)).result(timeout=90))
-    except Exception:
-        return False
-
-
-def _render_pdf_sync(text: str, pdf_path: str) -> bool:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return False
-    import html as _html
-    paras = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
-    body = "\n".join(f"<p>{_html.escape(p).replace(chr(10), '<br>')}</p>" for p in paras)
-    doc = ("<!doctype html><html><head><meta charset='utf-8'><style>"
-           "body{font-family:Georgia,'Times New Roman',serif;font-size:11pt;"
-           "line-height:1.5;color:#111;} p{margin:0 0 12pt;}"
-           "</style></head><body>" + body + "</body></html>")
-    try:
-        Path(pdf_path).parent.mkdir(parents=True, exist_ok=True)
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            try:
-                page = browser.new_page()
-                page.set_content(doc, wait_until="load")
-                page.pdf(path=str(pdf_path), format="Letter",
-                         margin={"top": "1in", "bottom": "1in", "left": "1in", "right": "1in"})
-            finally:
-                browser.close()
-        return True
-    except Exception:
-        return False
-
-
-def ensure_cover_pdf(career_ops: Path, company: str) -> Path | None:
-    """Return a PDF of this company's cover letter, rendering it from the saved
-    .md text if one doesn't exist yet. None when there's no letter text or the
-    render fails. Used for forms whose cover-letter field is a file upload."""
-    career_ops = Path(career_ops)
-    text = find_existing(career_ops, company)
-    if not text:
-        return None
-    pdf = cover_pdf_path(career_ops, company)
-    if pdf.exists():
-        return pdf
-    return pdf if render_pdf(text, pdf) else None
-
-
 def generate_for_job(career_ops: Path, job, *, caller=None,
                      provider: str | None = None, model: str | None = None,
                      report_base: Path | None = None, force: bool = False) -> str:
@@ -227,9 +161,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
     (unless force), otherwise generate one, save it to
     career-ops/output/<company> - cover.md, and return its text. "" on failure.
 
-    This is the request-gated entry point: the apply engine calls it only when a
-    form actually has a cover-letter field, so we never generate unrequested
-    letters. `caller` lets the applier reuse its already-built LLM caller."""
+    `caller` lets a bulk caller (run / the handoff enrichment) reuse one
+    already-built LLM caller across jobs."""
     career_ops = Path(career_ops)
     if not force:
         existing = find_existing(career_ops, job.company)
@@ -269,11 +202,11 @@ def run(
     """Bulk pre-generate cover letters for pending jobs scoring >= min_score.
 
     NOTE: this generates a letter for every high-fit job regardless of whether
-    that job's form actually asks for one — so it's a power-user pre-warm, not
-    the default flow. The apply engine generates lazily (only when a form has a
-    cover-letter field). Standalone: `python -m pipeline.cover_letters`."""
+    that job's form actually asks for one — a power-user pre-warm the browser
+    agent (or the user) can attach when a form wants a letter. Standalone:
+    `python -m pipeline.cover_letters`."""
     career_ops = Path(career_ops)
-    jobs = queue.select(career_ops, min_score=min_score, limit=limit, linkedin_only=False)
+    jobs = queue.select(career_ops, min_score=min_score, limit=limit)
     if not jobs:
         print(f"[cover] no pending jobs scoring >= {min_score}")
         return 0

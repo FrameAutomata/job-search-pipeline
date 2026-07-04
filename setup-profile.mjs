@@ -4,11 +4,12 @@
  * Career-Ops Profile Setup
  *
  * Auto-generates profile.yml and cv.md from your resume and search.yml config.
- * Uses AI to extract resume information, no Python dependencies needed.
+ * Reads PDF natively (pdf-parse); DOCX/ODT are read via the shared Python
+ * extractor (pipeline/resume_text.py), so no extra npm deps are needed.
  *
  * Usage:
  *   node setup-profile.mjs                                      # Interactive setup
- *   node setup-profile.mjs --resume path/to/resume.pdf          # Use specific resume
+ *   node setup-profile.mjs --resume path/to/resume.docx         # Use specific resume (DOCX/ODT/PDF)
  *   node setup-profile.mjs --auto                               # Minimal prompts
  *   node setup-profile.mjs --cli opencode                       # Use local LLM
  *   node setup-profile.mjs --resume resume.txt --cli opencode   # Combine options
@@ -17,7 +18,7 @@
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import YAML from 'yaml';
 import pdfParse from 'pdf-parse';
 
@@ -163,10 +164,16 @@ async function findResume(cliPath) {
     }
   }
 
-  // Check default locations
+  // Check default locations. PDF first (historical default), then DOCX/ODT —
+  // matching pipeline/filter.py's probe order so both entry points agree on
+  // which file wins when several exist.
   const defaultLocations = [
     path.join(ROOT, 'resumes', 'resume.pdf'),
+    path.join(ROOT, 'resumes', 'resume.docx'),
+    path.join(ROOT, 'resumes', 'resume.odt'),
     path.join(ROOT, 'resume.pdf'),
+    path.join(ROOT, 'resume.docx'),
+    path.join(ROOT, 'resume.odt'),
     path.join(ROOT, 'cv.pdf'),
   ];
 
@@ -177,7 +184,7 @@ async function findResume(cliPath) {
   // Ask user
   log('Resume not found automatically.');
   const resumePath = await prompt(
-    'Enter path to your resume (PDF or text file): '
+    'Enter path to your resume (DOCX, ODT, PDF, or text file): '
   );
   if (!fs.existsSync(resumePath)) {
     error(`File not found: ${resumePath}`);
@@ -191,8 +198,47 @@ async function findResume(cliPath) {
 // Extract Resume Text
 // ============================================================
 
+// Locate the Python interpreter to delegate DOCX/ODT extraction to. Prefer the
+// project venv (created by setup) so odfpy/python-docx are guaranteed present;
+// fall back to a PATH python.
+function venvPython() {
+  const candidates = [
+    path.join(ROOT, '.venv', 'Scripts', 'python.exe'), // Windows
+    path.join(ROOT, '.venv', 'bin', 'python'),         // macOS/Linux
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+// DOCX/ODT have no good pure-Node reader without extra deps, so reuse the one
+// Python extractor the rest of the pipeline uses. Returns null on failure so the
+// caller can fall back to AI extraction.
+function extractViaPython(resumePath) {
+  try {
+    const out = execFileSync(
+      venvPython(), ['-m', 'pipeline.resume_text', resumePath],
+      {
+        cwd: ROOT, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+        // Windows Python encodes a PIPED stdout with the locale code page
+        // (cp1252), which this utf-8 decode would mangle into mojibake (em
+        // dashes -> U+FFFD) or crash Python outright on non-cp1252 resume
+        // chars. Force UTF-8 end to end (verified live: without this an em
+        // dash arrived as \x97).
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      },
+    );
+    return out || null;
+  } catch (e) {
+    warn(`DOCX/ODT extraction failed: ${(e.stderr || e.message || '').toString().trim()}`);
+    return null;
+  }
+}
+
 async function extractResumeText(resumePath) {
-  if (resumePath.endsWith('.pdf')) {
+  const lower = resumePath.toLowerCase();
+  if (lower.endsWith('.pdf')) {
     try {
       const pdfBuffer = fs.readFileSync(resumePath);
       const data = await pdfParse(pdfBuffer);
@@ -202,6 +248,11 @@ async function extractResumeText(resumePath) {
       warn('Falling back to AI extraction...');
       return null; // Signal to use AI extraction
     }
+  } else if (lower.endsWith('.docx') || lower.endsWith('.odt')) {
+    const text = extractViaPython(resumePath);
+    if (text && text.trim()) return text;
+    warn('Falling back to AI extraction...');
+    return null; // Signal to use AI extraction
   } else {
     return fs.readFileSync(resumePath, 'utf-8');
   }
@@ -216,9 +267,11 @@ async function extractResumeViaAI(resumePath, cli = 'claude') {
 
   let resumeContent;
 
-  if (resumePath.endsWith('.pdf')) {
-    // For PDFs, tell the user to provide text version or we'll use a different approach
-    warn('For PDF files, please convert to text or copy-paste the content.');
+  const lower = resumePath.toLowerCase();
+  if (lower.endsWith('.pdf') || lower.endsWith('.docx') || lower.endsWith('.odt')) {
+    // Binary formats can't be read as text here; the primary extractor already
+    // tried. Ask the user to provide a text version rather than feed garbage.
+    warn('For PDF/DOCX/ODT files, please convert to text or copy-paste the content.');
     return null;
   } else {
     resumeContent = fs.readFileSync(resumePath, 'utf-8');
