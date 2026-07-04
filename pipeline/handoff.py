@@ -758,6 +758,18 @@ def render_work_order_jsonl(items: list[WorkOrderItem]) -> str:
     return "\n".join(json.dumps(asdict(i), ensure_ascii=False) for i in items) + ("\n" if items else "")
 
 
+# The agent-facing writeback vocabulary, stated ONCE — the work-order .md, the
+# batch kickoff prompt, and the per-role prompt all render from this, and
+# load_writeback() is the parser that accepts it. A status added/renamed here
+# and in STATUS_PRECEDENCE/load_writeback is the whole change.
+WRITEBACK_STATUSES = (
+    ("claimed", "you are working on it now (claim-before-apply when sessions run in parallel)"),
+    ("applied", "submitted successfully"),
+    ("handoff", "prepped but blocked on the human (account, password, CAPTCHA, verification code)"),
+    ("skip:<reason>", "evaluated and passed on (keep the reason short)"),
+)
+
+
 def render_work_order_md(items: list[WorkOrderItem], *, total_queue: int, touched: int) -> str:
     """Human/agent-readable work-order with a short how-to header + status
     legend. Agent-agnostic — never names a specific browser agent."""
@@ -771,10 +783,7 @@ def render_work_order_md(items: list[WorkOrderItem], *, total_queue: int, touche
         f"(suggested base in the `resume base` column), apply, then record the outcome in `{WORK_ORDER_JSONL}`",
         "by setting that row's `status` field:",
         "",
-        "- `claimed` — you are working on it now (claim-before-apply when sessions run in parallel)",
-        "- `applied` — submitted successfully",
-        "- `handoff` — prepped but blocked on the human (account, password, CAPTCHA, verification code)",
-        "- `skip:<reason>` — evaluated and passed on (keep the reason short)",
+        *(f"- `{token}` — {gloss}" for token, gloss in WRITEBACK_STATUSES),
         "",
         "The next pipeline run folds these statuses into the tracker, so recorded roles never reappear.",
         "",
@@ -790,6 +799,80 @@ def render_work_order_md(items: list[WorkOrderItem], *, total_queue: int, touche
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
+def default_out_dir() -> Path:
+    """Where the work-order lands when no out_dir is given: HANDOFF_OUT_DIR,
+    else output/handoff. The env exists so the files land somewhere the user's
+    browser agent can actually reach (e.g. the folder a desktop-agent session
+    is connected to). One resolver shared by run(), the CLI, orchestrate, and
+    the UI endpoints, so they can never write/read different places."""
+    env = (os.environ.get("HANDOFF_OUT_DIR") or "").strip()
+    return Path(env) if env else ROOT / "output" / "handoff"
+
+
+def _writeback_contract(work_order: Path) -> str:
+    """The closing paragraph every agent prompt ends with: where to record the
+    outcome and the status vocabulary (rendered from WRITEBACK_STATUSES so the
+    prompts can't drift from what load_writeback parses)."""
+    statuses = "; ".join(f'"{token}" — {gloss}' for token, gloss in WRITEBACK_STATUSES)
+    return (
+        f"Record each outcome in {work_order} by setting that row's \"status\" "
+        f"field: {statuses}. The pipeline folds these statuses into its tracker "
+        "on the next run, so recorded roles never reappear."
+    )
+
+
+def kickoff_prompt(work_order: Path) -> str:
+    """The paste-ready batch prompt for a browser agent — names the work-order
+    file and the writeback contract, and deliberately names no specific agent
+    (this template ships to users of any of them)."""
+    work_order = Path(work_order)
+    return (
+        "Work the job-application work-order at:\n"
+        f"  {work_order}\n"
+        f"  (human-readable copy: {work_order.with_name(WORK_ORDER_MD)})\n\n"
+        "Go top to bottom. For each row: open its url, judge fit from the live "
+        "posting (the score only sets reading order), tailor the resume "
+        "(resume_base names a base; a non-empty resume_pdf is pre-tailored), "
+        "and apply through the browser.\n\n"
+        + _writeback_contract(work_order)
+    )
+
+
+def role_prompt(company: str, role: str, url: str, *,
+                report: Path | None = None,
+                profile: Path | None = None,
+                resume: Path | None = None) -> str:
+    """The paste-ready prompt for handing ONE role to a browser agent. The
+    caller (the UI route) gathers the facts/paths; this module renders them so
+    the writeback contract and the appended-row schema — which must mirror the
+    keys load_writeback() reads — live beside their parser."""
+    work_order = default_out_dir() / WORK_ORDER_JSONL
+    lines = [
+        "Apply to this role through the browser, then record the outcome.",
+        "",
+        f"Company: {company}",
+        f"Role: {role}",
+        f"Posting: {url}",
+    ]
+    if report:
+        lines.append(f"Evaluation report: {report}")
+    if profile:
+        lines.append(f"Candidate profile: {profile}")
+    if resume:
+        lines.append(f"Tailored resume: {resume}")
+    else:
+        lines.append("Resume: no tailored copy cached — tailor one from "
+                     "resumes/resume.docx, or apply with your default resume.")
+    fallback_row = json.dumps({"company": company, "role": role, "url": url,
+                               "status": "applied"})
+    lines += [
+        "",
+        _writeback_contract(work_order),
+        f"If the role isn't listed there, append a JSON line: {fallback_row}",
+    ]
+    return "\n".join(lines)
+
+
 def run(
     *,
     queue_path: Path | None = None,
@@ -808,7 +891,7 @@ def run(
     same inputs. This is the programmatic entry point orchestrate calls; main()
     is its argparse wrapper."""
     queue_path = Path(queue_path) if queue_path else ROOT / "output" / "evaluated-roles-by-score.jsonl"
-    out_dir = Path(out_dir) if out_dir else ROOT / "output" / "handoff"
+    out_dir = Path(out_dir) if out_dir else default_out_dir()
     co = Path(career_ops) if career_ops else Path(os.environ.get("CAREER_OPS_PATH") or ROOT / "career-ops")
     if job_log is None:
         env_log = (os.environ.get("HANDOFF_JOB_LOG") or "").strip()

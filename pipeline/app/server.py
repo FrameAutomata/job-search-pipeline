@@ -43,7 +43,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
-from pipeline import recheck
+from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -470,6 +470,12 @@ def run_local(req: LocalRunRequest) -> JSONResponse:
             raise HTTPException(status_code=409,
                                 detail="A liveness re-check is in progress. Wait for it to "
                                        "finish — both write the tracker.")
+    # Same for a work-order build: it reads the tracker (and may be tailoring
+    # for minutes) — the mirror of handoff_build's _refuse_during_local_run.
+    if _handoff_running():
+        raise HTTPException(status_code=409,
+                            detail="A work-order build is in progress. Wait for it to "
+                                   "finish — the pipeline run would rewrite the tracker under it.")
     try:
         state = local_run.start({"passes": req.passes, "evaluate": req.evaluate})
     except RuntimeError as e:
@@ -1264,6 +1270,115 @@ def add_job_status(job_id: str) -> JSONResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="Unknown job")
     return JSONResponse(task)
+
+
+# ── browser-agent handoff ────────────────────────────────────────────────────
+# The UI never launches a browser agent (none expose a programmatic session
+# API) — it builds the work-order + paste-ready prompts the user hands to
+# whichever agent they use. Batch = the old "Batch apply" slot; per-role = a
+# prompt from the report pane.
+
+# The one build slot: {"id", "status": running|done|failed, "result"?, "error"?}.
+# A singleton (not a task registry like add-job) because builds are
+# single-flight by design — a new build simply replaces the finished one.
+_handoff_task: dict | None = None
+_handoff_lock = threading.Lock()
+
+
+class HandoffBuildRequest(BaseModel):
+    board: str = "both"
+    limit: int | None = None
+    tailor: bool = False
+
+
+def _handoff_running() -> bool:
+    with _handoff_lock:
+        return bool(_handoff_task and _handoff_task.get("status") == "running")
+
+
+def _finish_handoff(job_id: str, **fields) -> None:
+    global _handoff_task
+    with _handoff_lock:
+        if _handoff_task and _handoff_task.get("id") == job_id:
+            _handoff_task = {"id": job_id, **fields}
+
+
+def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
+    try:
+        rc = handoff.run(board=board, limit=limit, tailor=tailor)
+        if rc != 0:
+            _finish_handoff(job_id, status="failed",
+                            error="handoff exited non-zero — no scored roles found "
+                                  "(run an evaluation first, or point --queue at a scored export)")
+            return
+        work_order = handoff.default_out_dir() / handoff.WORK_ORDER_JSONL
+        _finish_handoff(job_id, status="done", result={
+            "fresh": sum(1 for _ in handoff._iter_jsonl(work_order)),
+            "work_order": str(work_order),
+            "kickoff": handoff.kickoff_prompt(work_order),
+        })
+    except Exception as exc:  # surface, never wedge the slot in "running"
+        _finish_handoff(job_id, status="failed", error=str(exc))
+
+
+@app.post("/api/handoff/build")
+def handoff_build(req: HandoffBuildRequest) -> JSONResponse:
+    """Build the work-order in the background (tailoring can take minutes).
+    Single-flight: one build at a time, and never while a local pipeline run
+    is rewriting the tracker under us (run_local refuses the reverse too)."""
+    global _handoff_task
+    _refuse_during_local_run()
+    with _handoff_lock:
+        if _handoff_task and _handoff_task.get("status") == "running":
+            raise HTTPException(status_code=409,
+                                detail="A work-order build is already in progress.")
+        job_id = str(uuid.uuid4())
+        _handoff_task = {"id": job_id, "status": "running"}
+    threading.Thread(target=_run_handoff_build,
+                     args=(job_id, req.board, req.limit, req.tailor),
+                     daemon=True).start()
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/handoff/build-status/{job_id}")
+def handoff_build_status(job_id: str) -> JSONResponse:
+    with _handoff_lock:
+        task = dict(_handoff_task) if _handoff_task and _handoff_task.get("id") == job_id else None
+    if task is None:
+        raise HTTPException(status_code=404, detail="Unknown build task")
+    task.pop("id", None)
+    return JSONResponse(task)
+
+
+@app.get("/api/handoff/role-prompt/{num}")
+def handoff_role_prompt(num: str) -> JSONResponse:
+    """A paste-ready, agent-agnostic prompt for handing off ONE tracker role to
+    the user's browser agent. This route gathers the UI-layer facts (row,
+    report, cached resume); handoff.role_prompt renders them so the writeback
+    contract lives beside its parser."""
+    row = _find_role(num)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No triaged role #{num}.")
+    url = data.extract_url(row.get("notes", ""))
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="This role has no posting URL in its tracker notes — nothing to hand off.",
+        )
+    from pipeline.resume_tailor import find_existing
+
+    company = row.get("company", "")
+    career_ops = _career_ops_local()
+    # Number-based lookup (not the link target) — tolerant of report renames,
+    # same convention as the skills launchpad.
+    report = data.find_report_file(career_ops / "reports", row.get("report_num", ""))
+    prompt = handoff.role_prompt(
+        company, row.get("role", ""), url,
+        report=report,
+        profile=career_ops / "config" / "profile.yml",
+        resume=find_existing(career_ops, company),
+    )
+    return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})
 
 
 class _NoCacheStaticFiles(StaticFiles):

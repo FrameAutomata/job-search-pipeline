@@ -624,7 +624,88 @@ els.pushBtn.addEventListener("click", async () => {
   }
 });
 
+// ── browser-agent handoff (batch) ───────────────────────────────────────────
+// Builds the work-order server-side, then hands the user a paste-ready kickoff
+// prompt — the UI never launches a browser agent (none expose a session API).
+
+const handoffUi = {
+  btn: document.getElementById("handoff-btn"),
+  panel: document.getElementById("handoff-panel"),
+  start: document.getElementById("handoff-start"),
+  result: document.getElementById("handoff-result"),
+  timer: null,
+};
+
+handoffUi.btn.addEventListener("click", () => {
+  handoffUi.panel.hidden = !handoffUi.panel.hidden;
+});
+
+handoffUi.start.addEventListener("click", async () => {
+  const board = document.getElementById("handoff-board").value;
+  const rawLimit = document.getElementById("handoff-limit").value.trim();
+  const tailor = document.getElementById("handoff-tailor").checked;
+  handoffUi.start.disabled = true;
+  handoffUi.result.innerHTML = `<p class="hint">Building the work-order${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
+  try {
+    const resp = await fetch("/api/handoff/build", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board, limit: rawLimit ? Number(rawLimit) : null, tailor }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `build failed (${resp.status})`);
+    pollHandoffBuild(body.job_id);
+  } catch (e) {
+    handoffUi.result.innerHTML = `<p class="hint" style="color:var(--bad)">${escapeHtml(String(e.message || e))}</p>`;
+    handoffUi.start.disabled = false;
+  }
+});
+
+async function pollHandoffBuild(jobId) {
+  clearTimeout(handoffUi.timer);
+  let resp;
+  try {
+    resp = await fetch(`/api/handoff/build-status/${jobId}`);
+  } catch {
+    handoffUi.timer = setTimeout(() => pollHandoffBuild(jobId), 3000);  // network blip
+    return;
+  }
+  const t = await resp.json().catch(() => ({}));
+  if (resp.ok && t.status === "running") {
+    handoffUi.timer = setTimeout(() => pollHandoffBuild(jobId), 1500);
+    return;
+  }
+  // Terminal — including a 404/unknown status (e.g. the server restarted and
+  // forgot the task): without this branch the poller would retry a permanent
+  // 404 forever and wedge the Start button.
+  handoffUi.start.disabled = false;
+  if (!resp.ok || t.status !== "done") {
+    const msg = t.error || t.detail || "build failed — check the server log";
+    handoffUi.result.innerHTML = `<p class="hint" style="color:var(--bad)">${escapeHtml(msg)}</p>`;
+    return;
+  }
+  const r = t.result;
+  handoffUi.result.innerHTML =
+    `<p><b>${r.fresh}</b> fresh role${r.fresh === 1 ? "" : "s"} written to
+      <code>${escapeHtml(r.work_order)}</code></p>
+     <div class="skill-choice"><button id="handoff-copy-kickoff">Copy agent kickoff prompt</button></div>`;
+  wireCopy("handoff-copy-kickoff", r.kickoff,
+           (btn) => { btn.textContent = "Copied — paste it into your browser agent"; });
+}
+
 // ── career-ops skills ──────────────────────────────────────────────────────
+
+// Wire a copy-to-clipboard button. `onOk` gets the button on success; the
+// default failure path tells the user to copy manually (clipboard access can
+// be denied). One helper so the three copy sites can't drift.
+function wireCopy(btnId, text, onOk, onFail) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(text); onOk(btn); }
+    catch { (onFail || ((b) => { b.textContent = "Couldn't copy — select it and copy manually"; }))(btn); }
+  });
+}
 
 const skillActions = document.getElementById("skill-actions");
 const skillPanel = document.getElementById("skill-panel");
@@ -638,7 +719,8 @@ async function loadCaps() {
   renderSkillActions();
 }
 
-// One button per skill in the report header. Rendered once caps are known.
+// One button per skill in the report header, plus the browser-agent hand-off
+// (which needs no CLI/API capability — it just builds a paste-ready prompt).
 function renderSkillActions() {
   skillActions.innerHTML = "";
   for (const skill of CAPS.skills || []) {
@@ -647,6 +729,32 @@ function renderSkillActions() {
     btn.title = `Run "${skill.label}" for this role`;
     btn.addEventListener("click", () => startSkill(skill));
     skillActions.appendChild(btn);
+  }
+  const handoffBtn = document.createElement("button");
+  handoffBtn.textContent = "🤝 Hand off";
+  handoffBtn.title = "Copy a paste-ready prompt handing this role to your browser agent";
+  handoffBtn.addEventListener("click", handoffRolePrompt);
+  skillActions.appendChild(handoffBtn);
+}
+
+async function handoffRolePrompt() {
+  if (!selectedJob) return;
+  showSkill("Building the hand-off prompt…", "");
+  try {
+    const resp = await fetch(`/api/handoff/role-prompt/${encodeURIComponent(String(selectedJob.num))}`);
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `hand-off failed (${resp.status})`);
+    skillPanel.hidden = false;
+    skillPanel.className = "skill-panel";
+    skillPanel.innerHTML =
+      `<p>Paste this into your browser agent (it applies through your own logged-in browser):</p>
+       <pre class="skill-cmd"><code>${escapeHtml(body.prompt)}</code></pre>
+       <div class="skill-choice"><button id="handoff-role-copy">Copy prompt</button></div>`;
+    wireCopy("handoff-role-copy", body.prompt,
+             () => showSkill("Prompt copied.", "ok"),
+             () => showSkill("Couldn't copy — select the prompt and copy manually.", "error"));
+  } catch (e) {
+    showSkill(String(e.message || e), "error");
   }
 }
 
@@ -748,10 +856,9 @@ function renderCliResult(body) {
        ${canLaunch ? `<button id="skill-run">▶ Run in terminal</button>` : ""}
        <button id="skill-copy">Copy command</button>
      </div>`;
-  document.getElementById("skill-copy").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(body.command); showSkill("Command copied.", "ok"); }
-    catch { showSkill("Couldn't copy — select the command and copy manually.", "error"); }
-  });
+  wireCopy("skill-copy", body.command,
+           () => showSkill("Command copied.", "ok"),
+           () => showSkill("Couldn't copy — select the command and copy manually.", "error"));
   if (canLaunch) {
     document.getElementById("skill-run").addEventListener("click", () => runInTerminal(body));
   }

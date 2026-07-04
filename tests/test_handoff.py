@@ -643,3 +643,49 @@ class TestSharedTailorCaller:
         assert captured[0]("sys", "user") == "{}"
         # …and exactly once across invocations (one shared rate limiter).
         assert resolved == [1]
+
+
+class TestOutDirEnv:
+    """HANDOFF_OUT_DIR points the work-order at a directory the user's browser
+    agent can actually reach (e.g. the folder a Cowork session is connected
+    to). Resolved inside run()/default_out_dir() so the CLI, orchestrate, and
+    the UI all honor it from one place; an explicit out_dir still wins."""
+
+    TRACKER = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 1 | 2026-07-01 | Acme | Engineer | 4.2/5 | Evaluated | X | [001](reports/001.md) | https://www.linkedin.com/jobs/view/1 — fit |\n"
+    )
+
+    def _career_ops(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(self.TRACKER, encoding="utf-8")
+        return co
+
+    def test_env_dir_used_when_out_dir_omitted(self, tmp_path, monkeypatch):
+        agent_home = tmp_path / "agent-home"
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(agent_home))
+        rc = handoff.run(queue_path=tmp_path / "missing.jsonl",
+                         career_ops=self._career_ops(tmp_path))
+        assert rc == 0
+        assert (agent_home / handoff.WORK_ORDER_JSONL).exists()
+        assert (agent_home / handoff.DEFAULT_TRACKER_NAME).exists()
+
+    def test_explicit_out_dir_beats_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(tmp_path / "env-dir"))
+        explicit = tmp_path / "explicit"
+        rc = handoff.run(queue_path=tmp_path / "missing.jsonl",
+                         career_ops=self._career_ops(tmp_path),
+                         out_dir=explicit)
+        assert rc == 0
+        assert (explicit / handoff.WORK_ORDER_JSONL).exists()
+        assert not (tmp_path / "env-dir").exists()
+
+    def test_default_out_dir_helper_exposed(self, tmp_path, monkeypatch):
+        # The UI reads results/prompt paths from the same resolver run() uses.
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(tmp_path / "agent-home"))
+        assert handoff.default_out_dir() == tmp_path / "agent-home"
+        monkeypatch.delenv("HANDOFF_OUT_DIR")
+        assert handoff.default_out_dir() == handoff.ROOT / "output" / "handoff"
