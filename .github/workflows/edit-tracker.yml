@@ -16,6 +16,11 @@ name: Edit Tracker
 #
 # We accept base64 because GitHub Actions inputs don't accept multi-line text
 # reliably and applications.md easily has multi-line table cells.
+#
+# For a tracker too LARGE for the inline base64 input (GitHub caps workflow_dispatch
+# inputs at ~64KB), upload it as an asset named "applications.md" on a release and
+# pass that release tag via applications_md_release_tag — the run fetches it with
+# its own token, so a private tracker never leaves the private repo.
 
 on:
   workflow_dispatch:
@@ -26,6 +31,10 @@ on:
         type: string
       status_overrides_json:
         description: "Status-only changes: JSON object of {\"num\": \"Status\"} pairs (e.g. {\"1\":\"Applied\",\"3\":\"SKIP\"}). Used by the UI push button — much smaller than a full-file dispatch, avoids the GitHub input size limit."
+        required: false
+        type: string
+      applications_md_release_tag:
+        description: "Full-file replacement for trackers TOO LARGE for the inline base64 input (which hits GitHub's ~64KB input limit). Upload applications.md as an asset named 'applications.md' on a release with this tag in THIS private repo, then pass the tag here. The asset is fetched with the run's token, so a private tracker stays private."
         required: false
         type: string
 
@@ -72,9 +81,14 @@ jobs:
         env:
           MD_B64: ${{ inputs.applications_md_b64 }}
           OVERRIDES: ${{ inputs.status_overrides_json }}
+          RELEASE_TAG: ${{ inputs.applications_md_release_tag }}
         run: |
-          if [ -z "$MD_B64" ] && [ -z "$OVERRIDES" ]; then
-            echo "::error::Provide either applications_md_b64 (full tracker replacement) or status_overrides_json (status-only changes)."
+          if [ -z "$MD_B64" ] && [ -z "$OVERRIDES" ] && [ -z "$RELEASE_TAG" ]; then
+            echo "::error::Provide one of: applications_md_b64 (inline full-file), applications_md_release_tag (large full-file via release asset), or status_overrides_json (status-only changes)."
+            exit 1
+          fi
+          if [ -n "$MD_B64" ] && [ -n "$RELEASE_TAG" ]; then
+            echo "::error::Provide only one full-file source — applications_md_b64 OR applications_md_release_tag, not both."
             exit 1
           fi
 
@@ -95,6 +109,33 @@ jobs:
           key: pipeline-state-v1-${{ github.run_id }}
           restore-keys: |
             pipeline-state-v1-
+
+      - name: Fetch full applications.md from release asset
+        if: inputs.applications_md_release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.applications_md_release_tag }}
+        run: |
+          mkdir -p career-ops/data
+          # Token-authed download keeps a private tracker private. The asset must
+          # be named exactly "applications.md" on the given release/tag.
+          if ! gh release download "$RELEASE_TAG" -R "${{ github.repository }}" \
+               -p applications.md -O career-ops/data/applications.md.new --clobber; then
+            echo "::error::Could not download an 'applications.md' asset from release tag '$RELEASE_TAG'. Create it with: gh release create $RELEASE_TAG -R ${{ github.repository }} applications.md"
+            exit 1
+          fi
+
+          # Same smell check as the inline path: must be the tracker, not a stray file.
+          if ! head -n 1 career-ops/data/applications.md.new | grep -q "Applications Tracker"; then
+            echo "::error::Downloaded asset does not start with '# Applications Tracker' — refusing to overwrite."
+            head -n 3 career-ops/data/applications.md.new
+            exit 1
+          fi
+
+          mv career-ops/data/applications.md.new career-ops/data/applications.md
+          echo "Installed applications.md from release asset '$RELEASE_TAG':"
+          wc -l career-ops/data/applications.md
+          head -n 5 career-ops/data/applications.md
 
       - name: Decode and validate new applications.md
         if: inputs.applications_md_b64 != ''
