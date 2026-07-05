@@ -184,6 +184,9 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 |---|---|---|
 | Gemini | `GEMINI_API_KEY` | 1,500 req/day, no credit card |
 | Groq | `GROQ_API_KEY` | Yes — fast open-source models |
+| DeepInfra | `DEEPINFRA_API_KEY` | No — pay-as-you-go open-weight models |
+| OpenRouter | `OPENROUTER_API_KEY` | No — pay-as-you-go, many models via one key |
+| DeepSeek | `DEEPSEEK_API_KEY` | No — pay-as-you-go, cheaper than frontier |
 | OpenAI | `OPENAI_API_KEY` | No |
 | Anthropic | `ANTHROPIC_API_KEY` | No |
 | Ollama | `OLLAMA_BASE_URL` | Local — no API key needed |
