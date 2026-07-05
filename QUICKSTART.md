@@ -17,7 +17,7 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 - A resume — DOCX, ODT, or PDF (DOCX recommended: per-job resume tailoring slot-edits a DOCX, and editable formats extract more cleanly than PDF)
 - At least one of:
   - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI — any of these can be backed by a local [Ollama](https://ollama.com) model via `OLLAMA_MODEL`
-  - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
+  - An LLM API key for `--evaluate-batch` (synchronous parallel evaluation). Free-tier options: `GEMINI_API_KEY`, `GROQ_API_KEY`. Pay-as-you-go open-weight options: `DEEPINFRA_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`. Frontier paid: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. See the "Which provider should I pick?" section below for choosing among them.
 
 ---
 
@@ -206,6 +206,7 @@ Provider auto-detection order: Gemini → Groq → DeepInfra → OpenRouter → 
 | Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier with tight TPM ceiling | Fast inference, but the per-minute token limit binds tightly on our large prompts — best for small runs. |
 | DeepInfra | `DEEPINFRA_API_KEY` | `deepseek-ai/DeepSeek-V4-Flash` | Pay-as-you-go (cheaper than frontier) | Hosted open-weight models. Pricing typically a fraction of frontier API rates per token. |
 | OpenRouter | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct` | Pay-as-you-go (varies by model) | Meta-aggregator — one key, switch models via `BATCH_MODEL`. Pricing varies by which backend model you select. |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat` | Pay-as-you-go (cheaper than frontier) | DeepSeek's first-party API — cheaper than DeepInfra hosting the same open weights. Sign up at platform.deepseek.com. |
 | Ollama | `OLLAMA_BASE_URL` | `qwen2.5:32b` | Free (you operate the server) | Local self-hosted. Not reachable from GHA cloud workflow without exposing the server publicly. |
 
 For current per-token pricing, check each provider's pricing page — rates change too often to enumerate here reliably.
@@ -311,6 +312,6 @@ job-search-pipeline/
 | `BATCH_MODEL` | per-provider default | Model name for `--evaluate-batch` |
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Model name passed as `--model` to whichever CLI `--batch` uses (works with any `BATCH_CLI`) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint for `--evaluate-batch --batch-provider ollama` |
-| `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → OpenAI → Anthropic. |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic. |
 | `OPENAI_BASE_URL` | OpenAI default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint (local vLLM, custom proxy, etc.) |
 | `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the triage UI (résumé tailoring, etc.): `ask` (pick each time), `api` (always the provider call), or `cli` (always hand off to your agent). See the [README UI section](README.md#running-career-ops-skills-from-the-ui). |
