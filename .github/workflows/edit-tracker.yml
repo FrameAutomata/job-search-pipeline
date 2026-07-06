@@ -95,6 +95,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # This path list MUST stay byte-for-byte identical to daily-pipeline.yml's
+      # cache path list. GitHub derives the cache "version" from the path set, and
+      # restore-keys only matches same-version caches — if the two lists drift, a
+      # tracker installed here lands in a cache the daily can never restore (it
+      # silently builds its own lineage instead). That exact drift once dropped
+      # recheck-state.tsv + easy-apply-urls.txt here and broke every push.
       - name: Restore pipeline state cache
         uses: actions/cache/restore@v4
         with:
@@ -102,6 +108,8 @@ jobs:
             career-ops/data/scan-history.tsv
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/recheck-state.tsv
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
@@ -215,6 +223,8 @@ jobs:
             career-ops/data/scan-history.tsv
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/recheck-state.tsv
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
