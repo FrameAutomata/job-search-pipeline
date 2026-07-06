@@ -14,6 +14,7 @@ import json
 import pytest
 
 from pipeline import handoff
+from pipeline.app import data as app_data
 
 
 # A compact but representative JOB_LOG.md. Exercises every parseable shape:
@@ -860,6 +861,125 @@ class TestOutDirEnv:
         assert handoff.default_out_dir() == handoff.ROOT / "output" / "handoff"
 
 
+class TestTrackerStatusSync:
+    """Bridge: agent writeback surfaces in career-ops' applications.md — the
+    tracker the UI renders and the cloud maintains. applied->Applied, skip->SKIP;
+    handoff/claimed stay dedup-only. Anchored by company/role identity (cloud
+    row-numbers are minted independently), reusing the UI's record_status_changes
+    so a pending cloud override is queued for the edit-tracker push. The autouse
+    conftest fixture isolates the override file to tmp."""
+
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 7 | 2026-07-01 | Acme | AI Engineer | 4.5/5 | Evaluated | X | [007](reports/007.md) | https://www.linkedin.com/jobs/view/7 |\n"
+        "| 8 | 2026-07-01 | Globex | Backend Engineer | 4.2/5 | Evaluated | X | [008](reports/008.md) | https://www.indeed.com/viewjob?jk=8 |\n"
+    )
+
+    def _apps(self, tmp_path, text=None):
+        p = tmp_path / "applications.md"
+        p.write_text(text or self.APPS, encoding="utf-8")
+        return p
+
+    def _wb(self, company, role, status):
+        return handoff.TrackedRole(key=handoff.role_key(company, role),
+                                   company=company, role=role, status=status)
+
+    def _status(self, apps_md, company, role):
+        want = handoff.role_key(company, role)
+        for row in app_data.parse_applications(apps_md):
+            if handoff.role_key(row["company"], row["role"]) == want:
+                return row.get("status_canonical")
+        return None
+
+    def _apps_status(self, tmp_path, status):
+        # The APPS fixture with Acme's row set to `status`.
+        return self._apps(tmp_path, self.APPS.replace(
+            "| Acme | AI Engineer | 4.5/5 | Evaluated",
+            f"| Acme | AI Engineer | 4.5/5 | {status}"))
+
+    def test_applied_marks_applied_and_queues_cloud_override(self, tmp_path):
+        apps = self._apps(tmp_path)
+        n = handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "applied")], apps)
+        assert n == 1
+        assert self._status(apps, "Acme", "AI Engineer") == "Applied"
+        # A pending, identity-anchored cloud override is queued for edit-tracker.
+        vals = [v for v in app_data.load_status_overrides().values()
+                if app_data.override_identity(v) == ("Acme", "AI Engineer")]
+        assert vals and app_data.override_status(vals[0]) == "Applied"
+
+    def test_skip_marks_skip(self, tmp_path):
+        apps = self._apps(tmp_path)
+        handoff.sync_tracker_statuses([self._wb("Globex", "Backend Engineer", "skipped")], apps)
+        assert self._status(apps, "Globex", "Backend Engineer") == "SKIP"
+
+    def test_handoff_and_claimed_not_synced(self, tmp_path):
+        apps = self._apps(tmp_path)
+        n = handoff.sync_tracker_statuses(
+            [self._wb("Acme", "AI Engineer", "handoff"),
+             self._wb("Globex", "Backend Engineer", "claimed")], apps)
+        assert n == 0
+        assert self._status(apps, "Acme", "AI Engineer") == "Evaluated"
+        assert self._status(apps, "Globex", "Backend Engineer") == "Evaluated"
+
+    def test_already_applied_row_is_idempotent(self, tmp_path):
+        # A row already reflected (not Evaluated) is left untouched — no re-write,
+        # no re-queued cloud override.
+        apps = self._apps_status(tmp_path, "Applied")
+        assert handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "applied")], apps) == 0
+        assert app_data.load_status_overrides() == {}
+
+    def test_does_not_downgrade_a_further_along_status(self, tmp_path):
+        # M1: a stale `applied` writeback must not revert a manually-advanced row.
+        apps = self._apps_status(tmp_path, "Responded")
+        assert handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "applied")], apps) == 0
+        assert self._status(apps, "Acme", "AI Engineer") == "Responded"
+
+    def test_skip_does_not_clobber_applied(self, tmp_path):
+        # M1: `skip:already-applied` on an already-Applied row must not downgrade it.
+        apps = self._apps_status(tmp_path, "Applied")
+        assert handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "skipped")], apps) == 0
+        assert self._status(apps, "Acme", "AI Engineer") == "Applied"
+
+    def test_resolves_across_legal_suffix_and_decoration_variance(self, tmp_path):
+        # M2: the writeback identity differs from the tracker's by a legal suffix
+        # AND a "- Remote" decoration, but role_key normalizes both, so the row
+        # still resolves (and the override anchors on the tracker's clean identity).
+        apps = self._apps(tmp_path,
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 4 | 2026-07-01 | Ryan | Backend Engineer | 4.3/5 | Evaluated | X | [004](reports/004.md) | https://www.indeed.com/viewjob?jk=4 |\n")
+        n = handoff.sync_tracker_statuses(
+            [self._wb("Ryan, LLC", "Backend Engineer - Remote", "applied")], apps)
+        assert n == 1
+        assert self._status(apps, "Ryan", "Backend Engineer") == "Applied"
+        vals = list(app_data.load_status_overrides().values())
+        assert vals and app_data.override_identity(vals[0]) == ("Ryan", "Backend Engineer")
+
+    def test_queued_override_reanchors_on_a_renumbered_tracker(self, tmp_path):
+        # The point of identity anchoring: the queued override carries
+        # company/role, so a push re-resolves it onto the correct row even when
+        # the cloud tracker numbers that role differently (8 locally -> 42 cloud).
+        apps = self._apps(tmp_path)
+        handoff.sync_tracker_statuses([self._wb("Globex", "Backend Engineer", "applied")], apps)
+        cloud = self.APPS.replace("| 8 |", "| 42 |")
+        _, payload, unresolved = app_data.resolve_overrides_for_push(
+            cloud, app_data.load_status_overrides())
+        assert not unresolved
+        assert payload.get("42") == "Applied"      # re-anchored onto the cloud's num
+
+    def test_role_absent_from_tracker_is_skipped(self, tmp_path):
+        apps = self._apps(tmp_path)
+        assert handoff.sync_tracker_statuses(
+            [self._wb("Nowhere", "Ghost Engineer", "applied")], apps) == 0
+
+    def test_missing_applications_md_is_noop(self, tmp_path):
+        assert handoff.sync_tracker_statuses(
+            [self._wb("Acme", "AI Engineer", "applied")], tmp_path / "nope.md") == 0
+
+
 class TestRunPerSiteSessions:
     """Integration: run() writes one next-roles-<site>.{jsonl,md} per site, a
     single shared role-status.jsonl, and folds agent writeback from the per-site
@@ -1001,6 +1121,57 @@ class TestRunPerSiteSessions:
         assert self._companies(out, "indeed") == ["Oddball"]
         assert self._companies(out, "glassdoor") == ["Glasso"]
         assert not (out / handoff.WORK_ORDER_JSONL).exists()   # no stray "" session file
+
+    def _career_ops_with_row(self, tmp_path, status="Evaluated"):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            f"| 3 | 2026-07-01 | Acme | AI Engineer | 4.6/5 | {status} | X | [003](reports/003.md) "
+            "| https://www.linkedin.com/jobs/view/3 |\n", encoding="utf-8")
+        return co
+
+    def _seed_applied_writeback(self, out):
+        out.mkdir(exist_ok=True)
+        handoff.work_order_paths(out, "linkedin")[0].write_text(json.dumps({
+            "rank": 1, "company": "Acme", "role": "AI Engineer",
+            "url": "https://www.linkedin.com/jobs/view/3", "status": "applied"}) + "\n",
+            encoding="utf-8")
+
+    def test_run_reflects_applied_writeback_into_applications_md(self, tmp_path):
+        # The agent applied to a tracker role (status in a per-site work-order).
+        # run() folds it into role-status.jsonl AND marks the tracker Applied +
+        # queues a cloud override.
+        co = self._career_ops_with_row(tmp_path)
+        out = tmp_path / "handoff"
+        self._seed_applied_writeback(out)
+        assert handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co) == 0
+        rows = {r["company"]: r for r in app_data.parse_applications(co / "data" / "applications.md")}
+        assert rows["Acme"]["status_canonical"] == "Applied"                    # UI Kanban
+        tracker = handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)
+        assert any(t.key == handoff.role_key("Acme", "AI Engineer") and t.status == "applied"
+                   for t in tracker)                                             # dedup ledger
+        assert any(app_data.override_identity(v) == ("Acme", "AI Engineer")
+                   for v in app_data.load_status_overrides().values())          # cloud push queue
+
+    def test_run_tracker_sync_is_idempotent(self, tmp_path):
+        co = self._career_ops_with_row(tmp_path)
+        out = tmp_path / "handoff"
+        self._seed_applied_writeback(out)
+        # A scored-export queue so the re-run still has a queue after the tracker's
+        # only row flips to Applied (the tracker-sourced queue would then be empty).
+        q = tmp_path / "q.jsonl"
+        q.write_text(json.dumps({"num": "3", "score": 4.6, "company": "Acme", "role": "AI Engineer",
+                                 "url": "https://www.linkedin.com/jobs/view/3", "status": "Evaluated"}) + "\n",
+                     encoding="utf-8")
+        assert handoff.run(queue_path=q, out_dir=out, career_ops=co) == 0
+        # Simulate a push clearing the override queue, then re-run: the role is
+        # already Applied in role-status.jsonl, so nothing is re-queued.
+        app_data.save_status_overrides({})
+        assert handoff.run(queue_path=q, out_dir=out, career_ops=co) == 0
+        assert app_data.load_status_overrides() == {}
 
 
 # ── 8. Code-review fixes (2026-07-04, PR #86 high-recall round) ────────────────

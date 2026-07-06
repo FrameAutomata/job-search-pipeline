@@ -707,6 +707,49 @@ def reconcile(
     return merge_tracked(existing, parsed, writeback or [])
 
 
+# Agent writeback statuses that surface in career-ops' applications.md (the UI
+# Kanban / cloud tracker). handoff/claimed/drafted are transient or have no clean
+# terminal state — they stay in role-status.jsonl for dedup only.
+_TRACKER_STATUS = {"applied": "Applied", "skipped": "SKIP"}
+
+
+def sync_tracker_statuses(harvested: list[TrackedRole], applications_md) -> int:
+    """Reflect newly-actioned agent outcomes into career-ops' applications.md —
+    the tracker the UI renders and the cloud maintains: applied -> Applied,
+    skip -> SKIP. Only a role whose applications.md row is still ACTIONABLE
+    (Evaluated) is transitioned, so this NEVER downgrades or clobbers a
+    further-along status (Applied/Responded/Interview/Offer/Rejected/Discarded/
+    SKIP) — however it was set (agent, Kanban drag, cloud Refresh) — and it is
+    idempotent (an already-reflected row is no longer Evaluated). Rows are matched
+    on the SAME normalized identity the handoff dedups on (role_key), so a
+    legal-suffix / decoration difference between the writeback and the tracker
+    (e.g. "Ryan, LLC / SWE - Remote" vs "Ryan / SWE") still resolves. Reuses the
+    UI's record_status_changes, so the local Status cell is rewritten AND a
+    pending cloud override — anchored on the tracker row's own identity, so it
+    re-resolves against the cloud tracker — is queued (dispatched via the
+    edit-tracker push). Handoff is local-only, so this only writes local state.
+    Returns the number of tracker rows updated."""
+    applications_md = Path(applications_md)
+    if not applications_md.exists():
+        return 0
+    pending = [t for t in harvested if t.status in _TRACKER_STATUS]
+    if not pending:
+        return 0
+    # Index the tracker by role_key -> row, reading each row's CURRENT status so
+    # the write is gated on it (never trust role-status.jsonl, which non-handoff
+    # channels don't update).
+    tracker = {role_key(r["company"], r["role"]): r
+               for r in _data.parse_applications(applications_md)}
+    changes = []
+    for t in pending:
+        row = tracker.get(t.key)
+        if row is None or row.get("status_canonical") != _ACTIONABLE_STATUS:
+            continue                       # absent, or no longer actionable (don't clobber)
+        changes.append((row["num"], _TRACKER_STATUS[t.status], row["company"], row["role"]))
+    _data.record_status_changes(applications_md, changes)   # no-ops on []
+    return len(changes)
+
+
 # ── Work-order ─────────────────────────────────────────────────────────────────
 # Titles routed to the non-AI base per RUN_BOOK Step 5: production-support /
 # SRE / mainframe / devops / pure-frontend. Everything else uses the AI base.
@@ -910,7 +953,8 @@ def render_work_order_jsonl(items: list[WorkOrderItem]) -> str:
 # The agent-facing writeback vocabulary, stated ONCE — the work-order .md, the
 # batch kickoff prompt, and the per-role prompt all render from this, and
 # load_writeback() is the parser that accepts it. A status added/renamed here
-# and in STATUS_PRECEDENCE/load_writeback is the whole change.
+# and in STATUS_PRECEDENCE/load_writeback is the whole change — plus _TRACKER_STATUS
+# if the new status is a terminal outcome that should surface in applications.md.
 WRITEBACK_STATUSES = (
     ("claimed", "you are working on it now (claim-before-apply when sessions run in parallel)"),
     ("applied", "submitted successfully"),
@@ -1133,6 +1177,14 @@ def run(
     if late:
         tracked = merge_tracked(tracked, late)   # already deduped by load_all_writeback
         write_tracker(tracker_path, tracked)
+
+    # Reflect newly applied/skipped roles into career-ops' applications.md so they
+    # surface in the UI Kanban and, via the queued override -> edit-tracker push,
+    # the cloud. Gated on the tracker row still being Evaluated (never clobbers a
+    # further-along status); role-status.jsonl stays the dedup ledger regardless.
+    synced = sync_tracker_statuses(late, co / "data" / "applications.md")
+    if synced:
+        print(f"[handoff] applications.md: marked {synced} role(s) from agent writeback")
 
     # Write one next-roles-<site>.{jsonl,md} per session.
     written: set[Path] = set()
