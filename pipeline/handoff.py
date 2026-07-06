@@ -15,13 +15,17 @@ Two moving parts:
    forward, the browser agent appends structured lines (or a work-order
    writeback) so we never again depend on parsing prose.
 
-2. A work-order (``next-roles.jsonl`` + ``next-roles.md``) — the scored queue
-   minus everything already in the tracker, ranked best-first, each row carrying
-   a suggested resume base and an empty ``status`` column the agent writes back.
+2. A work-order per job site (``next-roles-<board>.jsonl`` + ``.md``) — the scored
+   queue minus everything already in the tracker, partitioned by the site each
+   posting URL belongs to and ranked best-first within each site, every row
+   carrying a suggested resume base and an empty ``status`` column the agent
+   writes back. One session per site lets the agent log into each site once and
+   work its roles, then move on. The tracker (1) is shared across all sessions.
 
-`reconcile()` builds (1) from JOB_LOG.md; `build_work_order()` builds (2).
-`run()` wires them together as a re-runnable stage (orchestrate calls it
-directly); `main()` is its argparse wrapper for `python -m pipeline.handoff`.
+`reconcile()` builds (1) from JOB_LOG.md; `build_sessions()` builds (2) (over
+`build_work_order()`, which produces the single deduped/ranked list). `run()`
+wires them together as a re-runnable stage (orchestrate calls it directly);
+`main()` is its argparse wrapper for `python -m pipeline.handoff`.
 """
 
 from __future__ import annotations
@@ -39,9 +43,44 @@ from pipeline.app import data as _data
 ROOT = Path(__file__).resolve().parent.parent
 
 # ── File-name conventions (shared by CLI + tests so they can't drift) ──────────
+# The work-order is split into one session per site: next-roles-<board>.jsonl
+# / .md (see work_order_paths). WORK_ORDER_JSONL is the LEGACY combined name —
+# still read on writeback (an agent may be finishing a pre-upgrade file) and used
+# as the "both"/generic fallback, but run() no longer writes it.
 DEFAULT_TRACKER_NAME = "role-status.jsonl"
 WORK_ORDER_JSONL = "next-roles.jsonl"
-WORK_ORDER_MD = "next-roles.md"
+_WORK_ORDER_GLOB = "next-roles*.jsonl"   # matches per-site files AND the legacy one
+
+
+def _is_combined(board: str) -> bool:
+    """True for the "all sites" selector / legacy combined build (not one site)."""
+    return board in ("", "both")
+
+
+def _work_order_stem(board: str) -> str:
+    return "next-roles" if _is_combined(board) else f"next-roles-{board}"
+
+
+def work_order_paths(out_dir, board: str) -> tuple[Path, Path]:
+    """The (jsonl, md) work-order pair for one site's session:
+    next-roles-<board>.jsonl / .md. ("both"/"" → the legacy combined name.)"""
+    out_dir, stem = Path(out_dir), _work_order_stem(board)
+    return out_dir / f"{stem}.jsonl", out_dir / f"{stem}.md"
+
+
+def _board_from_filename(name: str) -> str:
+    """Inverse of work_order_paths for the jsonl name: 'next-roles-indeed.jsonl'
+    → 'indeed'; the legacy 'next-roles.jsonl' → 'both'."""
+    stem = Path(name).stem
+    prefix = "next-roles-"
+    return stem[len(prefix):] if stem.startswith(prefix) else "both"
+
+
+def _work_order_jsonls(out_dir, *, include_legacy: bool = True) -> list[Path]:
+    """The work-order jsonl files present in out_dir, sorted. include_legacy=False
+    drops the combined next-roles.jsonl, leaving only the per-site sessions."""
+    paths = sorted(Path(out_dir).glob(_WORK_ORDER_GLOB))
+    return paths if include_legacy else [p for p in paths if p.name != WORK_ORDER_JSONL]
 
 # Terminal statuses a role can carry in the tracker. Any role present in the
 # tracker (whatever its status) is "touched" and excluded from the work-order.
@@ -72,7 +111,7 @@ class TrackedRole:
     company: str
     role: str
     status: str
-    board: str = ""          # "linkedin" | "indeed" | "waas" | ""
+    board: str = ""          # a KNOWN_BOARDS tag (linkedin/indeed/glassdoor/…), or "" if unknown
     url: str = ""
     reason: str = ""
     date: str = ""
@@ -210,28 +249,82 @@ def _paren_texts(role: str) -> frozenset[str]:
     return frozenset(out)
 
 
+# A posting URL → board tag. Tags align to JobSpy's Site enum values (lowercase;
+# "zip_recruiter" with an underscore) so the handoff's site vocabulary matches
+# config/search.yml. The scraper's own `site` column is dropped at the bridge and
+# the queue is rebuilt from applications.md (URL only), so the board is re-derived
+# from the URL domain here. Substring match on a lowercased URL. Order matters
+# only in that the first hit wins; the domains are disjoint in practice.
+_BOARD_DOMAINS: tuple[tuple[str, str], ...] = (
+    ("linkedin.com", "linkedin"),
+    ("indeed.com", "indeed"),
+    ("glassdoor.", "glassdoor"),          # glassdoor.com / .co.uk / .ca / ...
+    ("ziprecruiter.com", "zip_recruiter"),
+    ("bayt.com", "bayt"),
+    ("naukri.com", "naukri"),
+    ("bdjobs.com", "bdjobs"),
+    ("workatastartup.com", "waas"),
+)
+# The catch-all: anything not recognized above (incl. Google-sourced employer/ATS
+# links, which don't carry a stable job-board domain) gets its own session.
+OTHER_BOARD = "other"
+# Every value board_of() can emit — the site vocabulary the CLI/UI expose as
+# --handoff-board choices. "both" is a selector over these, not a board itself.
+KNOWN_BOARDS: frozenset[str] = frozenset(tag for _, tag in _BOARD_DOMAINS) | {OTHER_BOARD}
+
+# Free-text synonyms for _board_from_text (JOB_LOG cells like "Indeed→ryan.wd1..").
+# Kept parallel to _BOARD_DOMAINS so the URL and prose taggers agree on the vocab.
+_BOARD_TEXT_SYNONYMS: tuple[tuple[str, str], ...] = (
+    ("linkedin", "linkedin"),
+    ("indeed", "indeed"),
+    ("glassdoor", "glassdoor"),
+    ("ziprecruiter", "zip_recruiter"),
+    ("zip recruiter", "zip_recruiter"),
+    ("zip_recruiter", "zip_recruiter"),
+    ("bayt", "bayt"),
+    ("naukri", "naukri"),
+    ("bdjobs", "bdjobs"),
+    ("workatastartup", "waas"),
+    ("work at a startup", "waas"),
+    ("waas", "waas"),
+)
+
+# Human labels for the per-site work-order header / kickoff prompt.
+_BOARD_LABELS: dict[str, str] = {
+    "linkedin": "LinkedIn", "indeed": "Indeed", "glassdoor": "Glassdoor",
+    "zip_recruiter": "ZipRecruiter", "bayt": "Bayt", "naukri": "Naukri",
+    "bdjobs": "BDJobs", "waas": "Work-at-a-Startup", OTHER_BOARD: "other-site",
+}
+
+
 def board_of(url: str) -> str:
-    """Map a URL to a board tag: linkedin | indeed | waas | other."""
+    """Map a URL to a board tag (linkedin, indeed, glassdoor, zip_recruiter,
+    bayt, naukri, bdjobs, waas); an unrecognized domain → "other"."""
     u = (url or "").lower()
-    if "linkedin.com" in u:
-        return "linkedin"
-    if "indeed.com" in u:
-        return "indeed"
-    if "workatastartup.com" in u:
-        return "waas"
-    return "other"
+    for needle, tag in _BOARD_DOMAINS:
+        if needle in u:
+            return tag
+    return OTHER_BOARD
 
 
 def _board_from_text(text: str) -> str:
-    """Best-effort board tag from a free-text cell like "Indeed→ryan.wd1..."."""
+    """Best-effort board tag from a free-text cell like "Indeed→ryan.wd1...".
+    Empty string when nothing matches (unknown, not "other")."""
     t = (text or "").lower()
-    if "linkedin" in t:
-        return "linkedin"
-    if "indeed" in t:
-        return "indeed"
-    if "workatastartup" in t or "waas" in t or "work at a startup" in t:
-        return "waas"
+    for needle, tag in _BOARD_TEXT_SYNONYMS:
+        if needle in t:
+            return tag
     return ""
+
+
+def _board_label(board: str) -> str:
+    return _BOARD_LABELS.get(board, board)
+
+
+def _site_prefix(board: str) -> str:
+    """A trailing-spaced human label for a per-site session header/prompt
+    ('LinkedIn ', 'Indeed ', …); '' for the combined/legacy build."""
+    return "" if _is_combined(board) else f"{_board_label(board)} "
 
 
 # ── Parsing JOB_LOG.md (historical backfill) ───────────────────────────────────
@@ -549,14 +642,27 @@ def load_writeback(work_order_jsonl: Path) -> list[TrackedRole]:
     return out
 
 
-def drop_late_writeback(items: list[WorkOrderItem], out_dir: Path) -> tuple[list[WorkOrderItem], list[TrackedRole]]:
-    """Re-read the on-disk work-order right before overwriting it and drop any
+def load_all_writeback(out_dir) -> list[TrackedRole]:
+    """Harvest agent-written statuses from EVERY work-order file in out_dir: each
+    per-site next-roles-<board>.jsonl plus the legacy combined next-roles.jsonl
+    (an agent may still be finishing one written before the per-site upgrade).
+    Deduped by key via merge_tracked."""
+    groups = [load_writeback(p) for p in _work_order_jsonls(out_dir)]
+    return merge_tracked(*groups) if groups else []
+
+
+def drop_late_writeback(items: list[WorkOrderItem], out_dir: Path, *,
+                        late: list[TrackedRole] | None = None) -> tuple[list[WorkOrderItem], list[TrackedRole]]:
+    """Re-read the on-disk work-orders right before overwriting them and drop any
     item whose row gained a status since the run started. A browser agent may
-    be working the previous work-order WHILE this run tailors for minutes —
+    be working the previous work-order(s) WHILE this run tailors for minutes —
     without this second read its statuses would be clobbered by the overwrite
-    and the same roles re-emitted status-empty (double-apply risk). Returns
-    (surviving items renumbered, the late statuses to fold into the tracker)."""
-    late = load_writeback(Path(out_dir) / WORK_ORDER_JSONL)
+    and the same roles re-emitted status-empty (double-apply risk). Reads every
+    per-site file (and the legacy one) via load_all_writeback, unless a
+    precomputed `late` is passed (run() shares one read across all its sessions).
+    Returns (surviving items renumbered, the late statuses to fold into the tracker)."""
+    if late is None:
+        late = load_all_writeback(out_dir)
     if not late:
         return items, []
     late_keys = {t.key for t in late}
@@ -683,6 +789,32 @@ def build_work_order(
     ]
 
 
+def build_sessions(
+    queue: list[QueueRole],
+    tracker: list[TrackedRole],
+    limit: int | None = None,
+) -> dict[str, list[WorkOrderItem]]:
+    """Partition the fresh work-order into one session per site the scraper
+    searches from — so a browser agent can log into each site once and work its
+    roles. Reuses build_work_order (all the dedup/fuzzy/status logic and its
+    tests) to get the globally-deduped, score-descending list, then groups by
+    board and applies `limit` PER SESSION (each site capped independently),
+    renumbering ranks 1..N within each session. A company::role key appears in
+    exactly one session because build_work_order dedups globally first."""
+    ranked = build_work_order(queue, tracker, board="both", limit=None)
+    sessions: dict[str, list[WorkOrderItem]] = {}
+    for item in ranked:                       # already score-descending
+        sessions.setdefault(item.board, []).append(item)
+    for board, items in sessions.items():
+        # Same non-positive-means-no-limit guard as build_work_order (review L1).
+        if limit and limit > 0:
+            items = items[:limit]
+        for rank, item in enumerate(items, start=1):
+            item.rank = rank
+        sessions[board] = items
+    return sessions
+
+
 def enrich_with_resumes(items: list[WorkOrderItem], tailor_fn, *, min_score: float,
                         workers: int = 1) -> list[WorkOrderItem]:
     """Optionally attach a pre-tailored, candidate-named resume file to each row
@@ -787,17 +919,21 @@ WRITEBACK_STATUSES = (
 )
 
 
-def render_work_order_md(items: list[WorkOrderItem], *, total_queue: int, touched: int) -> str:
-    """Human/agent-readable work-order with a short how-to header + status
-    legend. Agent-agnostic — never names a specific browser agent."""
+def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
+                         total_queue: int, touched: int) -> str:
+    """Human/agent-readable work-order for one site's session, with a short
+    how-to header + status legend. Names THIS site's jsonl as the writeback
+    target. Agent-agnostic — never names a specific browser agent."""
+    jsonl_name = f"{_work_order_stem(board)}.jsonl"
+    site = _site_prefix(board)
     lines = [
-        "# Work order — fresh roles for a browser agent",
+        f"# Work order — fresh {site}roles for a browser agent",
         "",
-        f"{len(items)} fresh roles (of {total_queue} scored; {touched} already handled and excluded).",
+        f"{len(items)} fresh {site}roles (of {total_queue} scored; {touched} already handled and excluded).",
         "Work top-down. The score set reading order only — judge each role from the live posting.",
         "",
         "For each role: open the URL, qualify it against the profile, tailor the resume",
-        f"(suggested base in the `resume base` column), apply, then record the outcome in `{WORK_ORDER_JSONL}`",
+        f"(suggested base in the `resume base` column), apply, then record the outcome in `{jsonl_name}`",
         "by setting that row's `status` field:",
         "",
         *(f"- `{token}` — {gloss}" for token, gloss in WRITEBACK_STATUSES),
@@ -838,21 +974,44 @@ def _writeback_contract(work_order: Path) -> str:
     )
 
 
-def kickoff_prompt(work_order: Path) -> str:
-    """The paste-ready batch prompt for a browser agent — names the work-order
-    file and the writeback contract, and deliberately names no specific agent
-    (this template ships to users of any of them)."""
+def kickoff_prompt(work_order: Path, board: str = "") -> str:
+    """The paste-ready batch prompt for a browser agent working ONE site's
+    session — names that session's work-order file (+ its .md sibling) and the
+    writeback contract, and deliberately names no specific agent (this template
+    ships to users of any of them)."""
     work_order = Path(work_order)
+    site = _site_prefix(board)
     return (
-        "Work the job-application work-order at:\n"
+        f"Work the {site}job-application work-order at:\n"
         f"  {work_order}\n"
-        f"  (human-readable copy: {work_order.with_name(WORK_ORDER_MD)})\n\n"
+        f"  (human-readable copy: {work_order.with_suffix('.md')})\n\n"
         "Go top to bottom. For each row: open its url, judge fit from the live "
         "posting (the score only sets reading order), tailor the resume "
         "(resume_base names a base; a non-empty resume_pdf is pre-tailored), "
         "and apply through the browser.\n\n"
         + _writeback_contract(work_order)
     )
+
+
+def session_summaries(out_dir) -> list[dict]:
+    """Enumerate the per-site sessions written to out_dir: one dict per NON-EMPTY
+    next-roles-<site>.jsonl carrying its board, human label, file path, fresh
+    count, and a paste-ready kickoff prompt. The UI reads results from this so the
+    filename→session mapping lives in one place (not re-derived at each consumer)."""
+    out: list[dict] = []
+    for wo in _work_order_jsonls(out_dir, include_legacy=False):
+        fresh = sum(1 for _ in _iter_jsonl(wo))
+        if not fresh:
+            continue
+        board = _board_from_filename(wo.name)
+        out.append({
+            "board": board,
+            "label": _board_label(board),
+            "work_order": str(wo),
+            "fresh": fresh,
+            "kickoff": kickoff_prompt(wo, board=board),
+        })
+    return out
 
 
 def role_prompt(company: str, role: str, url: str, *,
@@ -863,7 +1022,8 @@ def role_prompt(company: str, role: str, url: str, *,
     caller (the UI route) gathers the facts/paths; this module renders them so
     the writeback contract and the appended-row schema — which must mirror the
     keys load_writeback() reads — live beside their parser."""
-    work_order = default_out_dir() / WORK_ORDER_JSONL
+    # The role's writeback target is its own site's session file.
+    work_order = work_order_paths(default_out_dir(), board_of(url))[0]
     lines = [
         "Apply to this role through the browser, then record the outcome.",
         "",
@@ -931,15 +1091,20 @@ def run(
     tracker_path = Path(tracker) if tracker else out_dir / DEFAULT_TRACKER_NAME
     job_log_text = job_log.read_text(encoding="utf-8") if job_log and job_log.exists() else ""
     existing = load_tracker(tracker_path)
-    # Fold in any statuses the agent wrote into the previous work-order before
-    # we overwrite it.
-    writeback = load_writeback(out_dir / WORK_ORDER_JSONL)
+    # Fold in any statuses the agent wrote into the previous work-order(s) — one
+    # per site now, plus a legacy combined file if one predates the upgrade —
+    # before we overwrite them.
+    writeback = load_all_writeback(out_dir)
     known = {norm_company(q.company) for q in queue if q.company}
 
     tracked = reconcile(job_log_text, existing, writeback=writeback, known_companies=known)
     write_tracker(tracker_path, tracked)
 
-    items = build_work_order(queue, tracked, board=board, limit=limit)
+    # One session per site the scraper searches from (ranked + limited within
+    # each site). A specific --board narrows the build to that one site.
+    sessions = build_sessions(queue, tracked, limit=limit)
+    if not _is_combined(board):
+        sessions = {board: sessions.get(board, [])}
 
     if tailor:
         min_score = tailor_min_score if tailor_min_score is not None else env_float("APPLY_TAILOR_MIN_SCORE", 4.0)
@@ -948,27 +1113,59 @@ def run(
         except ImportError as e:
             print(f"[handoff] --tailor unavailable ({e}) — emitting the work-order without resume files")
         else:
-            # Per-row tailoring is LLM/fetch/render-bound and independent. The
-            # pool width follows the eval stage's knob (same default) unless
-            # the caller threads its own through.
-            enrich_with_resumes(items, tailor_fn, min_score=min_score,
+            # Tailoring caches per company, so it must dedup ACROSS sessions:
+            # flatten every session's rows in global score order and let
+            # enrich_with_resumes pick the single best row per company. Rows are
+            # mutated in place, so the session lists see the attached resume.
+            all_items = sorted((i for items in sessions.values() for i in items),
+                               key=lambda i: i.score, reverse=True)
+            enrich_with_resumes(all_items, tailor_fn, min_score=min_score,
                                 workers=max(1, workers or env_int("BATCH_CONCURRENCY", 3)))
 
     # A long tailor run leaves a window where a live agent session wrote new
-    # statuses into the old work-order — fold those in rather than clobbering.
-    items, late = drop_late_writeback(items, out_dir)
+    # statuses into an old work-order — drop those rows from each session and
+    # fold the statuses into the tracker rather than clobbering (double-apply
+    # risk). One read of every per-site file (+ the legacy one), shared across
+    # sessions (load_all_writeback is directory-wide, not per-session).
+    late = load_all_writeback(out_dir)
+    for b in list(sessions):
+        sessions[b], _ = drop_late_writeback(sessions[b], out_dir, late=late)
     if late:
-        tracked = merge_tracked(tracked, late)
+        tracked = merge_tracked(tracked, late)   # already deduped by load_all_writeback
         write_tracker(tracker_path, tracked)
 
-    atomic_write_text(out_dir / WORK_ORDER_JSONL, render_work_order_jsonl(items))
-    atomic_write_text(out_dir / WORK_ORDER_MD,
-                      render_work_order_md(items, total_queue=len(queue), touched=len(tracked)))
+    # Write one next-roles-<site>.{jsonl,md} per session.
+    written: set[Path] = set()
+    for b, items in sessions.items():
+        jsonl_path, md_path = work_order_paths(out_dir, b)
+        atomic_write_text(jsonl_path, render_work_order_jsonl(items))
+        atomic_write_text(md_path, render_work_order_md(
+            items, board=b, total_queue=len(queue), touched=len(tracked)))
+        written.update((jsonl_path, md_path))
+
+    # Empty any leftover work-order file whose site produced nothing this run so
+    # an agent never re-works a stale list. On a build-all run that's every
+    # not-written file; a narrowed build must leave the OTHER sites' sessions
+    # intact — but the legacy combined next-roles.jsonl is never a valid per-site
+    # session, so it's always swept (else a pre-upgrade file lingers).
+    combined = _is_combined(board)
+    for stale in _work_order_jsonls(out_dir):
+        if stale in written:
+            continue
+        if not combined and stale.name != WORK_ORDER_JSONL:
+            continue
+        atomic_write_text(stale, render_work_order_jsonl([]))
+        atomic_write_text(stale.with_suffix(".md"), render_work_order_md(
+            [], board=_board_from_filename(stale.name),
+            total_queue=len(queue), touched=len(tracked)))
 
     # ASCII-only: Windows consoles often run cp1252, where fancy arrows crash print.
-    print(f"[handoff] {len(queue)} scored -> {len(tracked)} tracked -> {len(items)} fresh")
+    total_fresh = sum(len(v) for v in sessions.values())
+    print(f"[handoff] {len(queue)} scored -> {len(tracked)} tracked -> "
+          f"{total_fresh} fresh across {len(sessions)} session(s)")
     print(f"[handoff] tracker:    {tracker_path}")
-    print(f"[handoff] work-order: {out_dir / WORK_ORDER_JSONL}")
+    for b in sorted(sessions):
+        print(f"[handoff] session {b}: {work_order_paths(out_dir, b)[0]}")
     return 0
 
 
@@ -987,9 +1184,11 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"Status tracker path (default: <out-dir>/{DEFAULT_TRACKER_NAME})")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="Directory for the work-order files (default: output/handoff)")
-    ap.add_argument("--board", choices=["linkedin", "indeed", "both"], default="both")
+    ap.add_argument("--board", choices=["both", *sorted(KNOWN_BOARDS)], default="both",
+                    help="Restrict the build to one site's session (default: both = "
+                         "a session per site the scraper searches from)")
     ap.add_argument("--limit", type=int, default=None,
-                    help="Cap the work-order to the top N roles")
+                    help="Cap EACH site's session to the top N roles (per-site, not a global total)")
     ap.add_argument("--tailor", action="store_true",
                     help="Pre-tailor a candidate-named resume per row (reuses the "
                          "resume-tailoring stage; needs resumes/resume.docx) so the "

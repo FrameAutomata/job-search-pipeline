@@ -16,6 +16,8 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from pipeline import handoff  # noqa: E402
+
 
 TRACKER = (
     "# Applications Tracker\n\n"
@@ -46,16 +48,17 @@ def client(tmp_path, monkeypatch):
     return TestClient(server.app)
 
 
-def _fake_run(out_dir, rows=0):
-    """A handoff.run stand-in that writes a work-order with `rows` entries."""
+def _fake_run(out_dir, rows=0, board="linkedin"):
+    """A handoff.run stand-in that writes ONE site's work-order with `rows`
+    entries (the real run writes next-roles-<site>.{jsonl,md} per site)."""
     def run(**kw):
         run.captured = kw
         out_dir.mkdir(parents=True, exist_ok=True)
+        jsonl, md = handoff.work_order_paths(out_dir, board)
         lines = [json.dumps({"rank": i + 1, "company": "Acme", "role": "AI Engineer",
-                             "url": "u", "status": ""}) for i in range(rows)]
-        (out_dir / "next-roles.jsonl").write_text(
-            "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-        (out_dir / "next-roles.md").write_text("# Work order\n", encoding="utf-8")
+                             "board": board, "url": "u", "status": ""}) for i in range(rows)]
+        jsonl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        md.write_text("# Work order\n", encoding="utf-8")
         return 0
     return run
 
@@ -88,23 +91,39 @@ class TestBuildEndpoint:
         # CAREER_OPS_PATH resolves the same as everywhere else in the server.
         assert fake_run.captured["career_ops"] is not None
         assert str(fake_run.captured["career_ops"]).endswith("career-ops")
-        # Result reports what was built and where.
+        # Result reports one session per site — here a single LinkedIn session.
         result = body["result"]
-        assert result["fresh"] == 1
-        assert result["work_order"].endswith("next-roles.jsonl")
-        assert "agent-home" in result["work_order"]   # HANDOFF_OUT_DIR honored
+        assert result["total_fresh"] == 1
+        assert len(result["sessions"]) == 1
+        s = result["sessions"][0]
+        assert s["board"] == "linkedin"
+        assert s["fresh"] == 1
+        assert s["work_order"].endswith("next-roles-linkedin.jsonl")
+        assert "agent-home" in s["work_order"]   # HANDOFF_OUT_DIR honored
 
     def test_result_includes_agent_agnostic_kickoff_prompt(self, client, tmp_path, monkeypatch):
-        fake_run = _fake_run(tmp_path / "agent-home")
+        fake_run = _fake_run(tmp_path / "agent-home", rows=1)
         monkeypatch.setattr("pipeline.handoff.run", fake_run)
         r = client.post("/api/handoff/build", json={})
         body = _wait_done(client, r.json()["job_id"])
-        kickoff = body["result"]["kickoff"]
-        # Paste-ready: names the work-order file and the writeback statuses,
-        # and never hard-codes a specific browser agent.
-        assert "next-roles.jsonl" in kickoff
+        sessions = body["result"]["sessions"]
+        assert len(sessions) == 1
+        kickoff = sessions[0]["kickoff"]
+        # Paste-ready per site: names that site's work-order file and the
+        # writeback statuses, and never hard-codes a specific browser agent.
+        assert "next-roles-linkedin.jsonl" in kickoff
         assert "applied" in kickoff and "skip:" in kickoff
         assert "cowork" not in kickoff.lower()
+
+    def test_empty_build_reports_no_sessions(self, client, tmp_path, monkeypatch):
+        # A build that finds nothing fresh (0 rows written) reports zero sessions
+        # rather than a phantom empty one.
+        monkeypatch.setattr("pipeline.handoff.run", _fake_run(tmp_path / "agent-home", rows=0))
+        r = client.post("/api/handoff/build", json={})
+        body = _wait_done(client, r.json()["job_id"])
+        assert body["status"] == "done"
+        assert body["result"]["sessions"] == []
+        assert body["result"]["total_fresh"] == 0
 
     def test_build_single_flight_409(self, client, monkeypatch):
         release = threading.Event()
@@ -122,6 +141,15 @@ class TestBuildEndpoint:
         finally:
             release.set()
         _wait_done(client, first.json()["job_id"])
+
+    def test_build_rejects_unknown_board(self, client, monkeypatch):
+        # `board` is unconstrained on the wire; an unknown one is rejected before
+        # a build spins up (else run() writes a stray next-roles-<garbage>.jsonl).
+        called = []
+        monkeypatch.setattr("pipeline.handoff.run", lambda **kw: called.append(kw) or 0)
+        r = client.post("/api/handoff/build", json={"board": "linkdin"})
+        assert r.status_code == 400
+        assert not called            # never reached handoff.run
 
     def test_build_refused_during_local_pipeline_run(self, client, monkeypatch):
         from pipeline.app import server
@@ -151,7 +179,7 @@ class TestRolePrompt:
         assert "https://www.linkedin.com/jobs/view/101" in prompt
         assert "001-acme.md" in prompt          # evaluation report path
         assert "profile.yml" in prompt          # candidate facts pointer
-        assert "next-roles.jsonl" in prompt     # writeback target
+        assert "next-roles-linkedin.jsonl" in prompt   # writeback target (the role's site file)
         assert "applied" in prompt and "skip:" in prompt
         assert "cowork" not in prompt.lower()   # agent-agnostic (public template)
 

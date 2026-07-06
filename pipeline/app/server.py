@@ -1315,11 +1315,13 @@ def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool)
                             error="handoff exited non-zero — no scored roles found "
                                   "(run an evaluation first, or point --queue at a scored export)")
             return
-        work_order = handoff.default_out_dir() / handoff.WORK_ORDER_JSONL
+        # One session per site: hand back a paste-ready kickoff prompt for each
+        # non-empty per-site work-order run() just wrote (session_summaries owns
+        # the filename→session mapping; a site emptied this run is skipped).
+        sessions = handoff.session_summaries(handoff.default_out_dir())
         _finish_handoff(job_id, status="done", result={
-            "fresh": sum(1 for _ in handoff._iter_jsonl(work_order)),
-            "work_order": str(work_order),
-            "kickoff": handoff.kickoff_prompt(work_order),
+            "sessions": sessions,
+            "total_fresh": sum(s["fresh"] for s in sessions),
         })
     except Exception as exc:  # surface, never wedge the slot in "running"
         _finish_handoff(job_id, status="failed", error=str(exc))
@@ -1331,6 +1333,11 @@ def handoff_build(req: HandoffBuildRequest) -> JSONResponse:
     Single-flight: one build at a time, and never while a local pipeline run
     is rewriting the tracker under us (run_local refuses the reverse too)."""
     global _handoff_task
+    # `board` is an unconstrained str on the wire; reject an unknown one before it
+    # reaches handoff.run() (where a narrowed build would write a stray empty
+    # next-roles-<garbage>.jsonl). "both" = a session per site.
+    if req.board != "both" and req.board not in handoff.KNOWN_BOARDS:
+        raise HTTPException(status_code=400, detail=f"Unknown board '{req.board}'.")
     _refuse_during_local_run()
     with _handoff_lock:
         if _handoff_task and _handoff_task.get("status") == "running":

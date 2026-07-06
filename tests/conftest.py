@@ -215,6 +215,19 @@ def _isolate_provider_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_handoff_env(monkeypatch):
+    """Keep handoff runs hermetic. The developer's .env (leaked via load_dotenv
+    at import time — see _isolate_provider_env) sets HANDOFF_JOB_LOG and
+    HANDOFF_OUT_DIR to real paths: a real JOB_LOG.md would seed the tracker with
+    the developer's actual applied/skipped roles (run() reads HANDOFF_JOB_LOG
+    when no job_log is passed), and a real out-dir would make run() read/write
+    outside tmp_path. Clear both before every test; tests that need them set them
+    explicitly via monkeypatch.setenv."""
+    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def patch_bridge_paths(monkeypatch, tmp_path):
     """Patch bridge.FILTERED_PATH to tmp_path and return the path."""

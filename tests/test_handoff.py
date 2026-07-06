@@ -178,11 +178,35 @@ class TestBoardOf:
     @pytest.mark.parametrize("url,expected", [
         ("https://www.linkedin.com/jobs/view/123", "linkedin"),
         ("https://www.indeed.com/viewjob?jk=abc", "indeed"),
+        # Every other JobSpy site is now its own board (was "other").
+        ("https://www.glassdoor.com/job-listing/abc", "glassdoor"),
+        ("https://www.glassdoor.co.uk/job-listing/abc", "glassdoor"),  # any TLD
+        ("https://www.ziprecruiter.com/jobs/abc", "zip_recruiter"),    # JobSpy enum spelling
+        ("https://www.bayt.com/en/job/abc", "bayt"),
+        ("https://www.naukri.com/job-listings-abc", "naukri"),
+        ("https://bdjobs.com/jobdetails?id=abc", "bdjobs"),
         ("https://www.workatastartup.com/jobs/94300", "waas"),
+        # Unrecognized domains (incl. Google-sourced employer/ATS URLs) → catch-all.
+        ("https://boards.greenhouse.io/acme/jobs/1", "other"),
         ("https://example.com/careers/1", "other"),
     ])
     def test_board_of(self, url, expected):
         assert handoff.board_of(url) == expected
+
+    def test_known_boards_covers_jobspy_sites(self):
+        # KNOWN_BOARDS is the vocabulary the CLI/UI expose and every value
+        # board_of() can emit; it must cover the JobSpy sites we tag by URL.
+        assert {"linkedin", "indeed", "glassdoor", "zip_recruiter",
+                "bayt", "naukri", "bdjobs"} <= handoff.KNOWN_BOARDS
+        assert "other" in handoff.KNOWN_BOARDS          # the catch-all session
+        assert "both" not in handoff.KNOWN_BOARDS       # "both" is a selector, not a board
+
+    def test_board_labels_cover_known_boards(self):
+        # Every board board_of() can emit needs a human label — else the raw tag
+        # (e.g. "zip_recruiter") leaks into work-order headers and kickoff prompts.
+        # Guards the label table from drifting when a new site is added.
+        missing = [b for b in handoff.KNOWN_BOARDS if b not in handoff._BOARD_LABELS]
+        assert not missing, f"KNOWN_BOARDS with no _BOARD_LABELS entry: {missing}"
 
 
 # ── 2. Parsing JOB_LOG.md ──────────────────────────────────────────────────────
@@ -343,6 +367,75 @@ class TestBuildWorkOrder:
         assert [i.company for i in items] == ["Curri", "Crogl"]
 
 
+def _multi_site_queue():
+    """A fresh (untouched) queue spanning several sites: 2 linkedin, 2 indeed,
+    1 glassdoor, 1 zip_recruiter, and 1 unrecognized domain (→ other)."""
+    rows = [
+        ("Curri", "Software Engineer", 4.7, "https://www.linkedin.com/jobs/view/1"),
+        ("Crogl", "AI Engineer", 4.6, "https://www.linkedin.com/jobs/view/2"),
+        ("Oddball", "Backend Engineer", 4.4, "https://www.indeed.com/viewjob?jk=a1"),
+        ("Solugenix", "Full Stack Engineer", 3.8, "https://www.indeed.com/viewjob?jk=a2"),
+        ("Glasso", "Platform Engineer", 4.5, "https://www.glassdoor.com/job-listing/x"),
+        ("Zippy", "Software Engineer", 4.1, "https://www.ziprecruiter.com/jobs/z"),
+        ("Mystery", "AI Engineer", 4.0, "https://boards.greenhouse.io/mystery/jobs/9"),
+    ]
+    return [handoff.QueueRole(num=str(i + 1), score=s, company=c, role=r,
+                              url=u, status="Evaluated")
+            for i, (c, r, s, u) in enumerate(rows)]
+
+
+class TestBuildSessions:
+    """The generalization: instead of one board-filtered work-order, partition
+    the fresh queue into one session per site the scraper searches from."""
+
+    def test_partitions_by_site(self):
+        sessions = handoff.build_sessions(_multi_site_queue(), [])
+        assert set(sessions) == {"linkedin", "indeed", "glassdoor",
+                                 "zip_recruiter", "other"}
+        for board, items in sessions.items():
+            assert all(i.board == board for i in items)
+
+    def test_unknown_domain_lands_in_other(self):
+        sessions = handoff.build_sessions(_multi_site_queue(), [])
+        assert {i.company for i in sessions["other"]} == {"Mystery"}
+
+    def test_ranks_renumbered_per_session(self):
+        sessions = handoff.build_sessions(_multi_site_queue(), [])
+        # Each session is independently ranked 1..N, best score first.
+        assert [i.rank for i in sessions["linkedin"]] == [1, 2]
+        assert [i.company for i in sessions["linkedin"]] == ["Curri", "Crogl"]
+        assert [i.rank for i in sessions["indeed"]] == [1, 2]
+        assert [i.company for i in sessions["indeed"]] == ["Oddball", "Solugenix"]
+
+    def test_every_fresh_role_in_exactly_one_session(self):
+        queue = _multi_site_queue()
+        sessions = handoff.build_sessions(queue, [])
+        keys = [handoff.role_key(i.company, i.role)
+                for items in sessions.values() for i in items]
+        assert len(keys) == len(queue)          # nothing dropped
+        assert len(set(keys)) == len(keys)      # nothing duplicated across sessions
+
+    def test_limit_is_per_session(self):
+        # limit=1 caps EACH session at its single best role, not 1 role total.
+        sessions = handoff.build_sessions(_multi_site_queue(), [], limit=1)
+        assert all(len(items) == 1 for items in sessions.values())
+        assert sessions["linkedin"][0].company == "Curri"   # the site's top score
+        assert sessions["indeed"][0].company == "Oddball"
+
+    @pytest.mark.parametrize("limit", [0, -3, None])
+    def test_non_positive_limit_means_no_limit(self, limit):
+        sessions = handoff.build_sessions(_multi_site_queue(), [], limit=limit)
+        assert len(sessions["linkedin"]) == 2
+
+    def test_touched_roles_excluded_from_sessions(self):
+        # A role already in the tracker (any site) never appears in a session.
+        tracker = [handoff.TrackedRole(
+            key=handoff.role_key("Curri", "Software Engineer"),
+            company="Curri", role="Software Engineer", status="applied")]
+        sessions = handoff.build_sessions(_multi_site_queue(), tracker)
+        assert "Curri" not in {i.company for items in sessions.values() for i in items}
+
+
 class TestRender:
     def test_jsonl_lines_parse_with_expected_keys(self, queue_file):
         queue = handoff.load_queue(queue_file)
@@ -362,6 +455,23 @@ class TestRender:
         assert "Curri" in md and "Solugenix" in md
         # Must not hard-code a specific browser agent (template ships to everyone).
         assert "cowork" not in md.lower()
+
+    def test_md_for_a_site_names_that_sites_file(self):
+        items = handoff.build_sessions(_multi_site_queue(), [])["linkedin"]
+        md = handoff.render_work_order_md(items, board="linkedin",
+                                          total_queue=7, touched=0)
+        # The writeback legend must point at THIS site's file, not the generic one.
+        assert "next-roles-linkedin.jsonl" in md
+        assert "linkedin" in md.lower()
+        assert "cowork" not in md.lower()          # still agent-agnostic
+
+    def test_kickoff_prompt_names_site_files(self, tmp_path):
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        assert wo.name == "next-roles-linkedin.jsonl"
+        prompt = handoff.kickoff_prompt(wo, board="linkedin")
+        assert "next-roles-linkedin.jsonl" in prompt
+        assert "next-roles-linkedin.md" in prompt   # human-readable sibling
+        assert "cowork" not in prompt.lower()
 
 
 # ── 5. Tailoring enrichment ────────────────────────────────────────────────────
@@ -412,7 +522,7 @@ class TestEnrichment:
 
 # ── 6. CLI ─────────────────────────────────────────────────────────────────────
 class TestMain:
-    def test_main_writes_tracker_and_work_order(self, tmp_path, queue_file):
+    def test_main_writes_tracker_and_per_site_work_orders(self, tmp_path, queue_file):
         job_log = tmp_path / "JOB_LOG.md"
         job_log.write_text(SAMPLE_JOB_LOG, encoding="utf-8")
         out_dir = tmp_path / "handoff"
@@ -427,15 +537,20 @@ class TestMain:
         assert rc == 0
         assert tracker.exists()
 
-        wo_jsonl = out_dir / handoff.WORK_ORDER_JSONL
-        wo_md = out_dir / handoff.WORK_ORDER_MD
-        assert wo_jsonl.exists() and wo_md.exists()
+        def companies(board):
+            jsonl, md = handoff.work_order_paths(out_dir, board)
+            assert jsonl.exists() and md.exists()
+            return [json.loads(l)["company"]
+                    for l in jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
 
-        companies = [json.loads(l)["company"] for l in wo_jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
-        assert companies == ["Curri", "Crogl", "Oddball", "Solugenix"]
-        # Applied/handoff/skipped roles must be absent from the hand-off.
+        # One session per site, each ranked best-first (queue_file: Curri/Crogl
+        # are LinkedIn, Oddball/Solugenix are Indeed).
+        assert companies("linkedin") == ["Curri", "Crogl"]
+        assert companies("indeed") == ["Oddball", "Solugenix"]
+        # Applied/handoff/skipped roles must be absent from every session.
+        allc = companies("linkedin") + companies("indeed")
         for gone in ("Ryan", "Temu", "JPMorganChase", "micro1", "Falconer"):
-            assert gone not in companies
+            assert gone not in allc
 
     def test_main_is_rerunnable_and_idempotent(self, tmp_path, queue_file):
         job_log = tmp_path / "JOB_LOG.md"
@@ -444,10 +559,11 @@ class TestMain:
         tracker = tmp_path / handoff.DEFAULT_TRACKER_NAME
         args = ["--queue", str(queue_file), "--job-log", str(job_log),
                 "--tracker", str(tracker), "--out-dir", str(out_dir)]
+        li = handoff.work_order_paths(out_dir, "linkedin")[0]
         assert handoff.main(args) == 0
-        first = (out_dir / handoff.WORK_ORDER_JSONL).read_text(encoding="utf-8")
+        first = li.read_text(encoding="utf-8")
         assert handoff.main(args) == 0
-        assert (out_dir / handoff.WORK_ORDER_JSONL).read_text(encoding="utf-8") == first
+        assert li.read_text(encoding="utf-8") == first
 
 
 # ── 7. Code-review regressions (2026-07-03 review round) ──────────────────────
@@ -574,6 +690,57 @@ class TestLateWritebackFold:
         kept, late = handoff.drop_late_writeback(items, tmp_path)
         assert kept == items and late == []
 
+    def test_late_status_in_per_site_file_is_caught(self, tmp_path):
+        # The status now lands in a per-site file (next-roles-<board>.jsonl), not
+        # the legacy combined file — drop_late_writeback must read them all.
+        handoff.work_order_paths(tmp_path, "linkedin")[0].write_text(json.dumps({
+            "company": "Acme", "role": "SWE",
+            "url": "https://www.linkedin.com/jobs/view/1", "status": "applied",
+        }) + "\n", encoding="utf-8")
+        items = [
+            handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="SWE",
+                                  board="linkedin", url="https://www.linkedin.com/jobs/view/1",
+                                  resume_base="content_adhoc"),
+            handoff.WorkOrderItem(rank=2, num="2", score=4.0, company="Globex", role="Dev",
+                                  board="indeed", url="https://www.indeed.com/viewjob?jk=b",
+                                  resume_base="content_adhoc"),
+        ]
+        kept, late = handoff.drop_late_writeback(items, tmp_path)
+        assert [i.company for i in kept] == ["Globex"]
+        assert [i.rank for i in kept] == [1]      # ranks renumbered
+        assert {t.key for t in late} == {handoff.role_key("Acme", "SWE")}
+
+
+class TestLoadAllWriteback:
+    """Writeback can arrive in any per-site file — and, right after the upgrade,
+    still in the legacy combined next-roles.jsonl an agent hasn't finished.
+    load_all_writeback unions them all so no status is lost."""
+
+    def test_unions_per_site_and_legacy_files(self, tmp_path):
+        handoff.work_order_paths(tmp_path, "linkedin")[0].write_text(json.dumps({
+            "company": "Acme", "role": "SWE",
+            "url": "https://www.linkedin.com/jobs/view/1", "status": "applied"}) + "\n",
+            encoding="utf-8")
+        handoff.work_order_paths(tmp_path, "indeed")[0].write_text(json.dumps({
+            "company": "Globex", "role": "Dev",
+            "url": "https://www.indeed.com/viewjob?jk=b", "status": "skip:onsite"}) + "\n",
+            encoding="utf-8")
+        # A pre-upgrade combined file an agent is still working.
+        (tmp_path / handoff.WORK_ORDER_JSONL).write_text(json.dumps({
+            "company": "Initech", "role": "Engineer",
+            "url": "https://www.linkedin.com/jobs/view/3", "status": "handoff"}) + "\n",
+            encoding="utf-8")
+        wb = {t.key: t for t in handoff.load_all_writeback(tmp_path)}
+        assert set(wb) == {
+            handoff.role_key("Acme", "SWE"),
+            handoff.role_key("Globex", "Dev"),
+            handoff.role_key("Initech", "Engineer"),
+        }
+        assert wb[handoff.role_key("Globex", "Dev")].status == "skipped"  # skip:<reason> parsed
+
+    def test_empty_dir_is_empty(self, tmp_path):
+        assert handoff.load_all_writeback(tmp_path) == []
+
 
 class TestQueueFromTracker:
     """Review gap: nothing in the repo produces evaluated-roles-by-score.jsonl,
@@ -607,7 +774,9 @@ class TestQueueFromTracker:
         out = tmp_path / "handoff"
         rc = handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co)
         assert rc == 0
-        lines = (out / handoff.WORK_ORDER_JSONL).read_text(encoding="utf-8").strip().splitlines()
+        # Acme's posting is a LinkedIn URL → it lands in the LinkedIn session.
+        lines = handoff.work_order_paths(out, "linkedin")[0].read_text(
+            encoding="utf-8").strip().splitlines()
         assert [json.loads(l)["company"] for l in lines] == ["Acme"]
 
     def test_run_errors_when_neither_source_exists(self, tmp_path):
@@ -670,7 +839,7 @@ class TestOutDirEnv:
         rc = handoff.run(queue_path=tmp_path / "missing.jsonl",
                          career_ops=self._career_ops(tmp_path))
         assert rc == 0
-        assert (agent_home / handoff.WORK_ORDER_JSONL).exists()
+        assert handoff.work_order_paths(agent_home, "linkedin")[0].exists()  # Acme → LinkedIn
         assert (agent_home / handoff.DEFAULT_TRACKER_NAME).exists()
 
     def test_explicit_out_dir_beats_env(self, tmp_path, monkeypatch):
@@ -680,7 +849,7 @@ class TestOutDirEnv:
                          career_ops=self._career_ops(tmp_path),
                          out_dir=explicit)
         assert rc == 0
-        assert (explicit / handoff.WORK_ORDER_JSONL).exists()
+        assert handoff.work_order_paths(explicit, "linkedin")[0].exists()  # Acme → LinkedIn
         assert not (tmp_path / "env-dir").exists()
 
     def test_default_out_dir_helper_exposed(self, tmp_path, monkeypatch):
@@ -689,6 +858,149 @@ class TestOutDirEnv:
         assert handoff.default_out_dir() == tmp_path / "agent-home"
         monkeypatch.delenv("HANDOFF_OUT_DIR")
         assert handoff.default_out_dir() == handoff.ROOT / "output" / "handoff"
+
+
+class TestRunPerSiteSessions:
+    """Integration: run() writes one next-roles-<site>.{jsonl,md} per site, a
+    single shared role-status.jsonl, and folds agent writeback from the per-site
+    files back into the tracker on the next run."""
+
+    def _queue_file(self, tmp_path, rows):
+        p = tmp_path / "evaluated-roles-by-score.jsonl"
+        p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        return p
+
+    def _rows(self):
+        return [
+            {"num": "1", "score": 4.7, "company": "Curri", "role": "Software Engineer",
+             "status": "Evaluated", "url": "https://www.linkedin.com/jobs/view/1"},
+            {"num": "2", "score": 4.4, "company": "Oddball", "role": "Backend Engineer",
+             "status": "Evaluated", "url": "https://www.indeed.com/viewjob?jk=a1"},
+            {"num": "3", "score": 4.5, "company": "Glasso", "role": "Platform Engineer",
+             "status": "Evaluated", "url": "https://www.glassdoor.com/job-listing/x"},
+        ]
+
+    def _companies(self, out, board):
+        p = handoff.work_order_paths(out, board)[0]
+        return [json.loads(l)["company"]
+                for l in p.read_text(encoding="utf-8").strip().splitlines()]
+
+    def test_writes_one_file_per_site_and_shared_tracker(self, tmp_path):
+        out = tmp_path / "handoff"
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, self._rows()),
+                         out_dir=out, career_ops=tmp_path / "no-career-ops")
+        assert rc == 0
+        assert self._companies(out, "linkedin") == ["Curri"]
+        assert self._companies(out, "indeed") == ["Oddball"]
+        assert self._companies(out, "glassdoor") == ["Glasso"]
+        # Each site also gets its human-readable .md.
+        assert handoff.work_order_paths(out, "linkedin")[1].exists()
+        # One shared tracker; NO legacy combined next-roles.jsonl is produced.
+        assert (out / handoff.DEFAULT_TRACKER_NAME).exists()
+        assert not (out / handoff.WORK_ORDER_JSONL).exists()
+
+    def test_empties_stale_site_file(self, tmp_path):
+        out = tmp_path / "handoff"
+        out.mkdir()
+        # A leftover Indeed session from a previous run whose role is no longer
+        # in the queue. This run's queue has only a LinkedIn role.
+        stale = handoff.work_order_paths(out, "indeed")[0]
+        stale.write_text(json.dumps({
+            "rank": 1, "company": "GoneCorp", "role": "Old Role",
+            "url": "https://www.indeed.com/viewjob?jk=old", "status": ""}) + "\n",
+            encoding="utf-8")
+        rows = [{"num": "1", "score": 4.7, "company": "Curri", "role": "Software Engineer",
+                 "status": "Evaluated", "url": "https://www.linkedin.com/jobs/view/1"}]
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, rows),
+                         out_dir=out, career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "linkedin") == ["Curri"]
+        # The stale Indeed session is emptied so the agent won't re-work it.
+        assert stale.read_text(encoding="utf-8").strip() == ""
+
+    def test_narrow_board_writes_only_that_site(self, tmp_path):
+        out = tmp_path / "handoff"
+        out.mkdir()
+        # A LinkedIn session the user built separately must survive a narrowed
+        # Indeed-only build.
+        li = handoff.work_order_paths(out, "linkedin")[0]
+        li.write_text(json.dumps({"rank": 1, "company": "Keep", "role": "Me",
+                                  "url": "https://www.linkedin.com/jobs/view/9",
+                                  "status": ""}) + "\n", encoding="utf-8")
+        rows = [{"num": "1", "score": 4.4, "company": "Oddball", "role": "Backend Engineer",
+                 "status": "Evaluated", "url": "https://www.indeed.com/viewjob?jk=a1"}]
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, rows),
+                         out_dir=out, board="indeed", career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "indeed") == ["Oddball"]
+        assert "Keep" in li.read_text(encoding="utf-8")   # LinkedIn file untouched
+
+    def test_session_summaries_lists_nonempty_sessions(self, tmp_path):
+        out = tmp_path / "handoff"
+        assert handoff.run(queue_path=self._queue_file(tmp_path, self._rows()),
+                           out_dir=out, career_ops=tmp_path / "none") == 0
+        summ = {s["board"]: s for s in handoff.session_summaries(out)}
+        assert set(summ) == {"linkedin", "indeed", "glassdoor"}
+        assert summ["linkedin"]["label"] == "LinkedIn"
+        assert summ["linkedin"]["fresh"] == 1
+        assert summ["linkedin"]["work_order"].endswith("next-roles-linkedin.jsonl")
+        assert "next-roles-linkedin.jsonl" in summ["linkedin"]["kickoff"]
+        # Only non-empty per-site sessions — never the legacy combined file (its
+        # board tag "both" is absent from the set above), never an emptied site.
+        assert all(s["fresh"] > 0 for s in summ.values())
+
+    def test_agent_writeback_from_site_file_folds_into_tracker(self, tmp_path):
+        out = tmp_path / "handoff"
+        qf = self._queue_file(tmp_path, self._rows())
+        assert handoff.run(queue_path=qf, out_dir=out, career_ops=tmp_path / "none") == 0
+        # Agent applies to Curri and records it in the LinkedIn session file.
+        li = handoff.work_order_paths(out, "linkedin")[0]
+        obj = json.loads(li.read_text(encoding="utf-8").strip())
+        obj["status"] = "applied"
+        li.write_text(json.dumps(obj) + "\n", encoding="utf-8")
+        # Next run folds that status into the shared tracker and drops the role.
+        assert handoff.run(queue_path=qf, out_dir=out, career_ops=tmp_path / "none") == 0
+        assert li.read_text(encoding="utf-8").strip() == ""   # Curri no longer fresh
+        tracker = handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)
+        curri = [t for t in tracker if t.key == handoff.role_key("Curri", "Software Engineer")]
+        assert curri and curri[0].status == "applied"
+
+    def test_narrow_build_empties_legacy_combined_file(self, tmp_path):
+        out = tmp_path / "handoff"
+        out.mkdir()
+        # A pre-upgrade combined next-roles.jsonl on disk, plus a separate
+        # LinkedIn session the user built earlier.
+        legacy = out / handoff.WORK_ORDER_JSONL
+        legacy.write_text(json.dumps({"rank": 1, "company": "OldCo", "role": "Old Role",
+                                      "url": "https://www.indeed.com/viewjob?jk=old",
+                                      "status": ""}) + "\n", encoding="utf-8")
+        li = handoff.work_order_paths(out, "linkedin")[0]
+        li.write_text(json.dumps({"rank": 1, "company": "Keep", "role": "Me",
+                                  "url": "https://www.linkedin.com/jobs/view/9",
+                                  "status": ""}) + "\n", encoding="utf-8")
+        rows = [{"num": "1", "score": 4.4, "company": "Oddball", "role": "Backend Engineer",
+                 "status": "Evaluated", "url": "https://www.indeed.com/viewjob?jk=a1"}]
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, rows),
+                         out_dir=out, board="indeed", career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "indeed") == ["Oddball"]
+        # The legacy combined file is never a valid session — emptied even on a
+        # narrowed build (else a pre-upgrade file lingers and gets re-worked)...
+        assert legacy.read_text(encoding="utf-8").strip() == ""
+        # ...but the OTHER site's session the user built separately survives.
+        assert "Keep" in li.read_text(encoding="utf-8")
+
+    def test_empty_board_builds_all_sessions(self, tmp_path):
+        # board="" is the same "all sites" sentinel as "both" (via _is_combined),
+        # not a narrowed session literally named "".
+        out = tmp_path / "handoff"
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, self._rows()),
+                         out_dir=out, board="", career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "linkedin") == ["Curri"]
+        assert self._companies(out, "indeed") == ["Oddball"]
+        assert self._companies(out, "glassdoor") == ["Glasso"]
+        assert not (out / handoff.WORK_ORDER_JSONL).exists()   # no stray "" session file
 
 
 # ── 8. Code-review fixes (2026-07-04, PR #86 high-recall round) ────────────────
