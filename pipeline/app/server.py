@@ -1417,10 +1417,11 @@ def handoff_role_prompt(num: str) -> JSONResponse:
     # Number-based lookup (not the link target) — tolerant of report renames,
     # same convention as the skills launchpad.
     report = data.find_report_file(career_ops / "reports", row.get("report_num", ""))
+    # profile defaults to the handoff dir's living PROFILE.md (the fact bank +
+    # standing answers the agent tailors from) — not the raw onboarding YAML.
     prompt = handoff.role_prompt(
         company, row.get("role", ""), url,
         report=report,
-        profile=career_ops / "config" / "profile.yml",
         resume=find_existing(career_ops, company),
     )
     return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})

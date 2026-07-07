@@ -1002,6 +1002,13 @@ class TestHandoffReadme:
             assert token in md                  # the full writeback legend
         assert "cowork" not in md.lower()       # agent-agnostic
 
+    def test_points_agent_at_the_living_profile(self):
+        # The README must send the agent to the living master (PROFILE.md) and
+        # say it's a document to grow — the whole point of Commit 2.
+        md = handoff.render_handoff_readme()
+        assert handoff.HANDOFF_PROFILE in md
+        assert "grow" in md.lower() or "living" in md.lower()
+
 
 class TestBootstrapHandoffDir:
     """Create + seed the handoff directory. Non-clobbering (the folder accumulates
@@ -1026,6 +1033,233 @@ class TestBootstrapHandoffDir:
         handoff.bootstrap_handoff_dir(out)
         handoff.bootstrap_handoff_dir(out)      # no error, still seeded
         assert (out / handoff.HANDOFF_README).exists()
+
+
+# ── Living PROFILE.md — the browser agent's master, seeded from career-ops ─────
+# A representative cv.md + profile.yml subset. The metrics are load-bearing: the
+# entire point of the seeded fact bank is that quantitative results survive into
+# the profile VERBATIM — dropping them was the #1 complaint about the old resume
+# tailor, so the seed must never trim them.
+_FIXTURE_CV = """# Jane Doe
+
+## Professional Summary
+Engineer who shipped an 840-star observability platform via an agentic workflow.
+
+## Skills
+Languages: Python · Go · SQL
+Cloud & CI/CD: AWS · Docker · GitHub Actions
+
+PROFESSIONAL EXPERIENCE
+Capital One  Aug 2022 – Sep 2023
+Software Engineer  Chicago, IL
+• Built Java/Spring APIs powering two launches — BJ's opt-out (1M+ cardholders) and Kohl's (millions); shipped to AWS ECS via CI/CD.
+Bank of America  Apr 2025 – Present
+Production Support Engineer  Plano, TX
+• Kept mission-critical financial systems at 99.999% uptime on a 24/7 on-call rotation.
+"""
+
+# Distinctive, quantified strings that MUST reach the profile untouched.
+_FIXTURE_CV_METRICS = ["840-star", "1M+ cardholders", "99.999% uptime", "24/7"]
+
+_FIXTURE_PROFILE = {
+    "candidate": {
+        "full_name": "Jane Doe", "email": "jane@example.com",
+        "phone": "+1 (555) 010-2030", "location": "Dallas, TX",
+        "linkedin": "linkedin.com/in/jane-doe", "github": "github.com/janedoe",
+    },
+    "narrative": {
+        "headline": "Software engineer building impactful products",
+        "exit_story": "Passionate about shipping quality software.",
+        "superpowers": ["Full-stack development", "Problem-solving"],
+    },
+    "target_roles": {"primary": ["AI Engineer", "Applied AI Engineer"]},
+    "compensation": {"target_range": "$75K-$500K", "minimum": "$75K",
+                     "location_flexibility": "Remote preferred"},
+    "location": {"country": "United States", "city": "Dallas", "state": "Texas",
+                 "timezone": "CST", "visa_status": "No sponsorship needed"},
+    "work_authorization": {"citizenship": "US", "requires_sponsorship": False,
+                           "work_permit_type": "Citizen"},
+    "voluntary_disclosures": {
+        "gender": "Male", "race_ethnicity": "Hispanic",
+        "veteran_status": "I am not a protected veteran",
+        "disability_status": "Yes, I have a disability (or previously had one)",
+    },
+}
+
+# The sections the living master must always carry (case-insensitive substrings).
+_PROFILE_SECTIONS = ["Identity", "Positioning", "fact bank", "Skills",
+                     "Standing answers", "Tailoring", "grow"]
+
+
+class TestRenderProfileMd:
+    """render_profile_md assembles the seed for the browser agent's living master
+    from career-ops data (cv.md + profile.yml). Contract: every required section
+    is present; metrics survive verbatim (the anti-regression core); the standing
+    form-answers are filled from profile.yml; it degrades to a usable scaffold
+    when a source is missing."""
+
+    def _md(self, **kw):
+        return handoff.render_profile_md(**kw)
+
+    def test_has_all_master_sections(self):
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE).lower()
+        for section in _PROFILE_SECTIONS:
+            assert section.lower() in md, f"missing section: {section}"
+
+    @pytest.mark.parametrize("metric", _FIXTURE_CV_METRICS)
+    def test_metrics_survive_verbatim(self, metric):
+        # The user's #1 quality requirement: quantitative results are copied in
+        # verbatim and never trimmed.
+        assert metric in self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+
+    def test_skills_seeded_from_cv(self):
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        assert "Python" in md and "AWS" in md
+
+    def test_identity_from_profile(self):
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        assert "Jane Doe" in md and "jane@example.com" in md
+
+    def test_standing_answers_from_profile(self):
+        # The form-fill answers the agent needs on every application — work auth,
+        # comp, location, and the EEO/voluntary disclosures — sourced from
+        # profile.yml so the agent never has to re-ask the user.
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        assert "$75K-$500K" in md                                    # comp target
+        assert "CST" in md                                           # location/tz
+        assert "Citizen" in md or "no sponsorship" in md.lower()     # work auth
+        assert "I am not a protected veteran" in md                  # EEO verbatim
+        assert "Yes, I have a disability (or previously had one)" in md
+
+    def test_scaffold_without_sources(self):
+        # A fresh install with no cv.md / profile.yml still gets every heading +
+        # the growth protocol, so the agent has a frame to fill in.
+        md = self._md().lower()
+        for section in _PROFILE_SECTIONS:
+            assert section.lower() in md
+
+    def test_partial_profile_does_not_crash(self):
+        # A profile.yml missing most keys must still render (defensive .get).
+        md = self._md(cv_md=_FIXTURE_CV, profile={"candidate": {"full_name": "Jane Doe"}})
+        assert "Jane Doe" in md
+
+    def test_growth_protocol_present(self):
+        # The living-document instruction: the agent appends the facts/answers it
+        # learns so the next run is smarter (the user's explicit ask).
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE).lower()
+        assert "grow" in md or "update this" in md or "living" in md
+
+
+class TestProfileFactBankNeverDrops:
+    """Regression: the fact bank must carry experience + metrics VERBATIM for any
+    résumé layout — order of sections, heading style, all-caps skill labels. A
+    structural-divider parser once dropped the whole experience block for these
+    (metric loss is the exact failure the fact bank exists to prevent)."""
+
+    def _md(self, cv):
+        return handoff.render_profile_md(cv_md=cv, profile=_FIXTURE_PROFILE)
+
+    def test_experience_first_then_trailing_section(self):
+        # Experience above Skills, with a section (Certifications) AFTER Skills.
+        cv = ("# Jane\n\n## Summary\nDid things.\n\n## Experience\n### Acme\n"
+              "- Cut latency 40% and saved $2M\n\n## Skills\nPython · Go\n\n"
+              "## Certifications\nAWS Certified\n")
+        assert "Cut latency 40% and saved $2M" in self._md(cv)
+
+    def test_skills_last_layout(self):
+        cv = ("# Jane\n\n## Experience\n### Acme\n- Shipped X to 5M users\n\n"
+              "## Skills\nPython · Go · AWS\n")
+        md = self._md(cv)
+        assert "Shipped X to 5M users" in md and "AWS" in md
+
+    def test_allcaps_skill_labels_preserved(self):
+        # Category labels ('BACKEND') / lone tokens are common in Skills blocks;
+        # they must not be mistaken for a section boundary that eats the skills.
+        cv = ("# Jane\n\n## Skills\nBACKEND\nPython · Go\nFRONTEND\nReact\n\n"
+              "PROFESSIONAL EXPERIENCE\nAcme\n- Shipped X to 5M users\n")
+        md = self._md(cv)
+        assert "Python · Go" in md and "React" in md       # skills survive
+        assert "Shipped X to 5M users" in md               # experience survives
+
+
+class TestProfileRobustToMalformedYaml:
+    """render_profile_md must not crash or emit garbage on a hand-edited /
+    alternate-schema profile.yml (the docstring promises graceful degradation)."""
+
+    def test_non_dict_section_does_not_crash(self):
+        # target_roles authored as a bare list (not the {primary: [...]} dict).
+        p = {"candidate": {"full_name": "Jane Doe"},
+             "target_roles": ["AI Engineer", "Backend Engineer"]}
+        md = handoff.render_profile_md(cv_md=_FIXTURE_CV, profile=p)
+        assert "Jane Doe" in md
+
+    def test_scalar_superpowers_not_split_per_character(self):
+        p = {"candidate": {"full_name": "Jane Doe"},
+             "narrative": {"superpowers": "Full-stack development"}}
+        md = handoff.render_profile_md(cv_md=_FIXTURE_CV, profile=p)
+        assert "Full-stack development" in md
+        assert "F; u; l; l" not in md                       # not char-joined
+
+    def test_string_requires_sponsorship_not_inverted(self):
+        # A quoted "false" (vs the bool false) must NOT flip the legal work-auth
+        # answer to "requires sponsorship".
+        p = {**_FIXTURE_PROFILE,
+             "work_authorization": {"citizenship": "US", "work_permit_type": "Citizen",
+                                    "requires_sponsorship": "false"}}
+        md = handoff.render_profile_md(cv_md=_FIXTURE_CV, profile=p)
+        assert "US Citizen — no sponsorship required" in md
+
+
+class TestBootstrapSeedsProfile:
+    """bootstrap_handoff_dir also seeds the living PROFILE.md next to the README —
+    non-clobber (the agent grows it) and sourced from career-ops."""
+
+    def _career_ops(self, tmp_path):
+        import yaml
+        co = tmp_path / "career-ops"
+        (co / "config").mkdir(parents=True)
+        (co / "cv.md").write_text(_FIXTURE_CV, encoding="utf-8")
+        (co / "config" / "profile.yml").write_text(
+            yaml.safe_dump(_FIXTURE_PROFILE), encoding="utf-8")
+        return co
+
+    def test_seeds_profile_from_career_ops(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out, career_ops=co)
+        text = (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8")
+        assert "Jane Doe" in text
+        assert "99.999% uptime" in text                    # metric survived the seed
+        assert "I am not a protected veteran" in text      # standing answer
+
+    def test_does_not_clobber_existing_profile(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        out = tmp_path / "agent-home"
+        out.mkdir()
+        (out / handoff.HANDOFF_PROFILE).write_text(
+            "# my grown profile\nlearned facts", encoding="utf-8")
+        handoff.bootstrap_handoff_dir(out, career_ops=co)
+        assert (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8") == \
+            "# my grown profile\nlearned facts"
+
+    def test_seeds_scaffold_when_career_ops_absent(self, tmp_path):
+        # No cv.md / profile.yml anywhere → still seed a scaffold PROFILE.md.
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out, career_ops=tmp_path / "nope")
+        assert (out / handoff.HANDOFF_PROFILE).exists()
+
+
+class TestProfileReferencedInPrompts:
+    """The kickoff (batch) and per-role prompts must both point the browser agent
+    at the living PROFILE.md so it qualifies + tailors against it."""
+
+    def test_kickoff_prompt_names_the_profile(self, tmp_path):
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        assert handoff.HANDOFF_PROFILE in handoff.kickoff_prompt(wo, board="linkedin")
+
+    def test_role_prompt_names_the_profile(self):
+        p = handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1")
+        assert handoff.HANDOFF_PROFILE in p
 
 
 class TestRunPerSiteSessions:

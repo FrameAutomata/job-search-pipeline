@@ -178,7 +178,8 @@ class TestRolePrompt:
         assert "Acme" in prompt and "AI Engineer" in prompt
         assert "https://www.linkedin.com/jobs/view/101" in prompt
         assert "001-acme.md" in prompt          # evaluation report path
-        assert "profile.yml" in prompt          # candidate facts pointer
+        assert "PROFILE.md" in prompt           # the living master (not the raw profile.yml)
+        assert "profile.yml" not in prompt
         assert "next-roles-linkedin.jsonl" in prompt   # writeback target (the role's site file)
         assert "applied" in prompt and "skip:" in prompt
         assert "cowork" not in prompt.lower()   # agent-agnostic (public template)

@@ -37,7 +37,11 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text, env_float, env_int, normalize_company as _squeeze
+import yaml
+
+from pipeline._batch_common import (
+    atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
+)
 from pipeline.app import data as _data
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -52,6 +56,8 @@ WORK_ORDER_JSONL = "next-roles.jsonl"
 _WORK_ORDER_GLOB = "next-roles*.jsonl"   # matches per-site files AND the legacy one
 HANDOFF_README = "HANDOFF-README.md"     # seeded agent-instructions file — a distinct name so it
                                          # never collides with a README the user's folder already has
+HANDOFF_PROFILE = "PROFILE.md"           # the living master the agent qualifies + tailors against and
+                                         # GROWS as it learns (seeded once from career-ops; never clobbered)
 
 
 def _is_combined(board: str) -> bool:
@@ -1037,7 +1043,242 @@ def render_handoff_readme() -> str:
         "",
         _WRITEBACK_FOLD_NOTE,
         "",
+        "## Your profile — the living master",
+        f"`{HANDOFF_PROFILE}` is the candidate's living master: identity, a",
+        "metric-carrying fact bank, an honesty-rated skills inventory, and the",
+        "standing answers to the questions applications keep asking (work",
+        "authorization, compensation, location, voluntary disclosures). Qualify and",
+        f"tailor every role against it. **Grow it:** when you learn a new fact or",
+        "answer a new application question, write it back into the matching section",
+        f"of `{HANDOFF_PROFILE}` so the next run is smarter — that's the whole point.",
+        "",
     ])
+
+
+# ── The living PROFILE.md ───────────────────────────────────────────────────────
+# The browser agent's single source of truth, seeded once from what the user
+# already told career-ops (cv.md + config/profile.yml) and grown by the agent from
+# there. Structure mirrors a hand-built master profile: identity, a metric-carrying
+# fact bank, an honesty-rated skills inventory, the standing form-answers, and the
+# tailoring rules — so a role can be qualified and a résumé built without re-asking
+# the user anything.
+
+# The section titles that open a résumé's experience/projects body — matched as a
+# whole line (bare or as a `## …` heading), case-insensitively. This is a
+# best-effort list of COMMON section names, not one résumé's layout; when none
+# matches, the fact bank falls back to the whole body, so experience/metrics are
+# NEVER dropped — the list only makes the common case section more cleanly.
+_EXPERIENCE_MARKERS = re.compile(
+    r"^\s*#{0,6}\s*(AI ENGINEERING|ENGINEERING|PROFESSIONAL EXPERIENCE|WORK EXPERIENCE|"
+    r"EXPERIENCE|EMPLOYMENT( HISTORY)?|WORK HISTORY|CAREER( HISTORY)?|"
+    r"SELECTED PROJECTS|PROJECTS|OPEN SOURCE)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _cv_section_body(cv_md: str, name: str) -> str:
+    """The lines under a `## <name>` (or bare `<NAME>`) heading, up to the next
+    markdown heading or experience marker. Best-effort — an unrecognized layout
+    returns "" (the content is still carried whole by _cv_experience_body)."""
+    head = re.compile(rf"^\s*#{{0,6}}\s*{re.escape(name)}\b", re.IGNORECASE)
+    stop = re.compile(r"^\s*#{1,6}\s+\S")
+    out, capturing = [], False
+    for ln in cv_md.splitlines():
+        if not capturing:
+            capturing = bool(head.match(ln))
+            continue
+        if stop.match(ln) or _EXPERIENCE_MARKERS.match(ln):
+            break
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+def _cv_experience_body(cv_md: str) -> str:
+    """Everything from the first experience/projects marker to the end of the
+    cv.md, verbatim (metrics live in these bullets — they must never be trimmed).
+    No marker → the whole body, so nothing is ever silently dropped."""
+    m = _EXPERIENCE_MARKERS.search(cv_md)
+    return (cv_md[m.start():] if m else cv_md).strip()
+
+
+# profile.yml is user-editable, so a section can be mis-authored (a list/scalar
+# where a mapping is expected) — these coercions keep render_profile_md rendering
+# instead of crashing (its OSError-only callers wouldn't catch a TypeError).
+def _dsect(profile: dict, key: str) -> dict:
+    """A profile.yml sub-section as a dict — a missing or non-dict value → {}."""
+    v = profile.get(key)
+    return v if isinstance(v, dict) else {}
+
+
+def _slist(v) -> list[str]:
+    """A YAML value as a list of non-empty strings: a list stays; a scalar becomes
+    a one-item list (so `superpowers: Full-stack` doesn't render per-character)."""
+    items = v if isinstance(v, list) else [v]
+    return [str(x).strip() for x in items if x is not None and str(x).strip()]
+
+
+def _as_bool(v):
+    """A YAML bool-ish value as True/False, or None when it's genuinely unknown.
+    Tolerates a quoted "false"/"no" (which YAML leaves a truthy string) so a
+    hand-edit can't invert a yes/no answer."""
+    if isinstance(v, bool) or v is None:
+        return v
+    s = str(v).strip().lower()
+    return False if s in ("false", "no", "none", "n", "0", "") else \
+        True if s in ("true", "yes", "y", "1") else None
+
+
+def _profile_standing_answers(profile: dict) -> list[str]:
+    """The application form-answers, drawn from profile.yml. Each is a markdown
+    bullet; a missing value degrades to a fill-in prompt rather than vanishing, so
+    the agent always sees the full question set."""
+    wa = _dsect(profile, "work_authorization")
+    comp = _dsect(profile, "compensation")
+    loc = _dsect(profile, "location")
+    vd = _dsect(profile, "voluntary_disclosures")
+
+    def _ask(v, prompt="(add this)"):
+        v = "" if v is None else str(v).strip()
+        return v or prompt
+
+    citizenship = _ask(wa.get("citizenship"), "")
+    permit = _ask(wa.get("work_permit_type"), "")
+    needs_sponsor = _as_bool(wa.get("requires_sponsorship"))
+    sponsor = ("no sponsorship required" if needs_sponsor is False
+               else "requires sponsorship" if needs_sponsor is True
+               else _ask(loc.get("visa_status"), "(confirm sponsorship needs)"))
+    work_auth = " ".join(p for p in (citizenship, permit) if p)
+    work_auth = f"{work_auth} — {sponsor}" if work_auth else sponsor
+
+    where = ", ".join(p for p in (_ask(loc.get("city"), ""), _ask(loc.get("state"), "")) if p)
+    tz = _ask(loc.get("timezone"), "")
+    flex = _ask(comp.get("location_flexibility") or loc.get("location_flexibility"), "")
+    place = where + (f" ({tz})" if tz else "") + (f" — {flex}" if flex else "")
+
+    comp_line = _ask(comp.get("target_range"), "(add a target range)")
+    if comp.get("minimum"):
+        comp_line += f" (minimum {comp['minimum']})"
+
+    return [
+        f"- **Work authorization:** {work_auth}",
+        f"- **Compensation target:** {comp_line}",
+        f"- **Location:** {place or '(add this)'}",
+        f"- **Gender:** {_ask(vd.get('gender'))}",
+        f"- **Race / ethnicity:** {_ask(vd.get('race_ethnicity'))}",
+        f"- **Veteran status:** {_ask(vd.get('veteran_status'))}",
+        f"- **Disability status:** {_ask(vd.get('disability_status'))}",
+    ]
+
+
+def render_profile_md(*, cv_md: str = "", profile: dict | None = None) -> str:
+    """Assemble the seed for the living PROFILE.md from career-ops data. Pure and
+    defensive: any missing source degrades to a labelled scaffold so the agent
+    always gets every section (and can fill the gaps as it learns). The fact bank
+    embeds the résumé's experience VERBATIM — the seed never trims a metric."""
+    profile = profile or {}
+    cand = _dsect(profile, "candidate")
+    narr = _dsect(profile, "narrative")
+    targets = _slist(_dsect(profile, "target_roles").get("primary"))
+
+    contact = " · ".join(str(v).strip() for v in (
+        cand.get("email"), cand.get("phone"), cand.get("location"),
+        cand.get("linkedin"), cand.get("github")) if v)
+    superpowers = _slist(narr.get("superpowers"))
+    summary = _cv_section_body(cv_md, "Professional Summary") or _cv_section_body(cv_md, "Summary")
+    skills = _cv_section_body(cv_md, "Skills")
+    experience = _cv_experience_body(cv_md)
+
+    lines = [
+        f"# {cand.get('full_name') or '(your name)'} — candidate profile",
+        "",
+        "This is your **living master**: the single source of truth the browser",
+        "agent qualifies roles and tailors résumés against. It was seeded from your",
+        "résumé and onboarding answers; grow it as you go (see the last section).",
+        "",
+        "## Identity & contact",
+        f"- **Name:** {cand.get('full_name') or '(add your name)'}",
+        f"- **Contact:** {contact or '(add email · phone · location · links)'}",
+        "",
+        "## Positioning",
+        f"- **Headline:** {narr.get('headline') or '(one line: who you are, what you build)'}",
+        f"- **Exit story / motivation:** {narr.get('exit_story') or '(why you are looking)'}",
+        f"- **Target roles:** {', '.join(targets) if targets else '(your primary role families)'}",
+        "- **Superpowers:** " + ("; ".join(superpowers) if superpowers
+                                  else "(what you do better than other candidates)"),
+        *(["", "**From your résumé:**", "", summary] if summary else []),
+        "",
+        "## Role fact bank",
+        "Your experience and projects, with the numbers that carry them. **Metrics",
+        "are load-bearing — copy them into every résumé verbatim and never trim",
+        "them.** Add framing variants (the same win, phrased for different job",
+        "families) here as you learn what lands.",
+        "",
+        experience or "_(seed this from your résumé: one block per role/project, "
+                      "each bullet keeping its concrete, quantified result.)_",
+        "",
+        "## Skills inventory",
+        "Rate each skill by honesty tier — **Strong** (current, lead with it) · "
+        "**Solid** · **Lighter / older** (don't over-claim) · **Coursework only** · "
+        "**Gated** (surface only for the roles that ask). Only add a skill to a "
+        "résumé that is Solid+ here; the tier is the add/remove rule.",
+        "",
+        skills or "_(seed this from your résumé's Skills section, then tier each one.)_",
+        "",
+        "## Standing answers",
+        "What applications keep asking — answer once here, reuse everywhere:",
+        "",
+        *_profile_standing_answers(profile),
+        "",
+        "## Tailoring rules",
+        "- Pick the résumé base that matches the role family; lead with what the JD asks for.",
+        "- Add or remove skills to mirror the JD — but only ones grounded in the inventory above.",
+        "- Keep every quantified result. A specific number beats a vaguer 'tailored' line.",
+        "- Fill the page: aim for a full one-pager, not a short one (details in the résumé kit).",
+        "",
+        "## How this profile grows",
+        "Treat this file as append-only memory. When you learn a new fact, get a",
+        "new metric, or answer an application question that isn't here yet, write it",
+        "back into the matching section above — so every future run starts smarter.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _career_ops_dir(career_ops=None) -> Path:
+    """The career-ops tree: an explicit path, else CAREER_OPS_PATH, else the
+    bundled ./career-ops. One resolver shared by run(), main(), and the profile
+    seed so they can never read from different trees."""
+    if career_ops:
+        return Path(career_ops)
+    return Path(os.environ.get("CAREER_OPS_PATH") or ROOT / "career-ops")
+
+
+def _read_or_empty(path) -> str:
+    """read_text, but also swallow a non-FileNotFound OSError (an unreadable or
+    directory path) so best-effort seeding degrades to a scaffold, never a crash."""
+    try:
+        return read_text(path)
+    except OSError:
+        return ""
+
+
+def _load_yaml_or_empty(path) -> dict:
+    """Parse a YAML file to a dict, tolerating a missing/unreadable file or
+    malformed YAML (all of which just mean "no profile data yet")."""
+    try:
+        data = yaml.safe_load(_read_or_empty(path))
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_profile_sources(career_ops=None) -> dict:
+    """Read the seed inputs for render_profile_md from a career-ops tree
+    (cv.md + config/profile.yml). Best-effort — missing/unreadable files yield
+    empty inputs and render_profile_md falls back to its scaffold."""
+    co = _career_ops_dir(career_ops)
+    return {"cv_md": _read_or_empty(co / "cv.md"),
+            "profile": _load_yaml_or_empty(co / "config" / "profile.yml")}
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1051,17 +1292,22 @@ def default_out_dir() -> Path:
     return Path(env) if env else ROOT / "output" / "handoff"
 
 
-def bootstrap_handoff_dir(out_dir) -> Path:
-    """Ensure the handoff directory exists and carries the standing
-    agent-instructions README (README.md). Non-clobbering — an existing README is
-    left untouched (the folder accumulates the user's own files) — and idempotent,
-    so it's safe to call on every run / at setup / when the UI sets the path.
-    Returns the README path."""
+def bootstrap_handoff_dir(out_dir, *, career_ops=None) -> Path:
+    """Ensure the handoff directory exists and carries the two standing files the
+    browser agent needs: the instructions README (HANDOFF-README.md) and the
+    living master (PROFILE.md, seeded from career-ops). Non-clobbering — an
+    existing file is left untouched (the folder accumulates the user's own work,
+    and the agent grows PROFILE.md) — and idempotent, so it's safe to call on
+    every run / at setup / when the UI sets the path. career-ops is read only when
+    PROFILE.md actually needs seeding. Returns the README path."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     readme = out_dir / HANDOFF_README
     if not readme.exists():
         atomic_write_text(readme, render_handoff_readme())
+    profile = out_dir / HANDOFF_PROFILE
+    if not profile.exists():
+        atomic_write_text(profile, render_profile_md(**_load_profile_sources(career_ops)))
     return readme
 
 
@@ -1084,10 +1330,12 @@ def kickoff_prompt(work_order: Path, board: str = "") -> str:
     ships to users of any of them)."""
     work_order = Path(work_order)
     site = _site_prefix(board)
+    profile = work_order.parent / HANDOFF_PROFILE
     return (
         f"Work the {site}job-application work-order at:\n"
         f"  {work_order}\n"
         f"  (human-readable copy: {work_order.with_suffix('.md')})\n\n"
+        f"Qualify and tailor every role against the candidate profile at {profile}.\n\n"
         "Go top to bottom. For each row: open its url, judge fit from the live "
         "posting (the score only sets reading order), tailor the resume "
         "(resume_base names a base; a non-empty resume_pdf is pre-tailored), "
@@ -1125,8 +1373,11 @@ def role_prompt(company: str, role: str, url: str, *,
     caller (the UI route) gathers the facts/paths; this module renders them so
     the writeback contract and the appended-row schema — which must mirror the
     keys load_writeback() reads — live beside their parser."""
-    # The role's writeback target is its own site's session file.
-    work_order = work_order_paths(default_out_dir(), board_of(url))[0]
+    # The role's writeback target — and its living profile — live in the same
+    # handoff dir as its own site's session file.
+    out_dir = default_out_dir()
+    work_order = work_order_paths(out_dir, board_of(url))[0]
+    profile = profile or out_dir / HANDOFF_PROFILE
     lines = [
         "Apply to this role through the browser, then record the outcome.",
         "",
@@ -1136,8 +1387,7 @@ def role_prompt(company: str, role: str, url: str, *,
     ]
     if report:
         lines.append(f"Evaluation report: {report}")
-    if profile:
-        lines.append(f"Candidate profile: {profile}")
+    lines.append(f"Candidate profile (qualify + tailor against it): {profile}")
     if resume:
         lines.append(f"Tailored resume: {resume}")
     else:
@@ -1173,12 +1423,14 @@ def run(
     queue_path = Path(queue_path) if queue_path else ROOT / "output" / "evaluated-roles-by-score.jsonl"
     out_dir = Path(out_dir) if out_dir else default_out_dir()
     try:
-        bootstrap_handoff_dir(out_dir)   # seed the agent README, even on a no-queue run
+        # Seed the agent README + PROFILE.md (from the SAME career-ops tree the
+        # rest of run() reads), even on a no-queue run.
+        bootstrap_handoff_dir(out_dir, career_ops=career_ops)
     except OSError as e:
         # Best-effort: a misconfigured/unwritable HANDOFF_OUT_DIR must not crash a
         # no-queue run (a real work-order write below surfaces the failure loudly).
         print(f"[handoff] could not prepare {out_dir} ({e})")
-    co = Path(career_ops) if career_ops else Path(os.environ.get("CAREER_OPS_PATH") or ROOT / "career-ops")
+    co = _career_ops_dir(career_ops)
     if job_log is None:
         env_log = (os.environ.get("HANDOFF_JOB_LOG") or "").strip()
         job_log = Path(env_log) if env_log else None
@@ -1321,7 +1573,8 @@ def main(argv: list[str] | None = None) -> int:
                          "(default: CAREER_OPS_PATH env, else ./career-ops)")
     args = ap.parse_args(argv)
     if args.bootstrap_dir:
-        readme = bootstrap_handoff_dir(args.out_dir or default_out_dir())
+        readme = bootstrap_handoff_dir(args.out_dir or default_out_dir(),
+                                       career_ops=args.career_ops)
         print(f"[handoff] seeded {readme}")
         return 0
     return run(
