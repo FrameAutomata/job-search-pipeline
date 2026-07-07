@@ -811,6 +811,7 @@ def get_providers() -> JSONResponse:
             # Tailoring model/provider (blank = inherit the eval model/provider).
             "tailor_provider": os.environ.get("TAILOR_PROVIDER", ""),
             "tailor_model": os.environ.get("TAILOR_MODEL", ""),
+            "handoff_out_dir": os.environ.get("HANDOFF_OUT_DIR", ""),
         },
         "provider_defaults": dict(PROVIDER_DEFAULTS),
     })
@@ -828,6 +829,9 @@ class LocalConfigRequest(BaseModel):
     tailor_provider: str = ""
     tailor_model: str = ""
     tailor_api_key: str = ""
+    # Where the browser-agent work-orders land (blank = output/handoff default).
+    # Point it at a folder your agent can reach; setting it creates + seeds the dir.
+    handoff_out_dir: str = ""
 
 
 def _validate_provider(name: str, label: str) -> str:
@@ -910,7 +914,20 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     if tailor_key and tailor_provider and tailor_provider in onboard.PROVIDER_SECRETS:
         _set(onboard.PROVIDER_SECRETS[tailor_provider], tailor_key)
 
-    return JSONResponse({"ok": True, "updated": updated})
+    # Where the browser-agent work-orders land. Setting it creates + seeds the dir
+    # (the agent README); blank clears it so run() falls back to output/handoff.
+    handoff_dir = req.handoff_out_dir.strip()
+    _set("HANDOFF_OUT_DIR", handoff_dir)
+    seed_warning = ""
+    if handoff_dir:
+        try:
+            handoff.bootstrap_handoff_dir(handoff_dir)
+        except OSError as e:
+            # Best-effort: the .env write (the primary action) succeeded, so don't
+            # 500 — just report that the folder couldn't be prepared.
+            seed_warning = f"saved, but couldn't create/seed {handoff_dir}: {e}"
+
+    return JSONResponse({"ok": True, "updated": updated, "warning": seed_warning})
 
 
 def _maybe_generate_article_digest(payload: dict, resume_text: str,

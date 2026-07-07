@@ -5,6 +5,7 @@ import importlib
 import os
 
 import pytest
+from dotenv import dotenv_values
 from fastapi.testclient import TestClient
 
 
@@ -90,3 +91,45 @@ class TestTailorConfig:
         cur = client.get("/api/onboard/providers").json()["current"]
         assert cur["tailor_provider"] == "anthropic"
         assert cur["tailor_model"] == "claude-x"
+
+
+class TestHandoffOutDir:
+    """The browser-agent handoff directory is configured from the wizard (not a
+    hand-edited .env): the endpoint writes HANDOFF_OUT_DIR and bootstraps the dir
+    (creates it + seeds the agent README)."""
+
+    def test_writes_handoff_out_dir_and_seeds_readme(self, env):
+        client, root, server = env
+        target = root / "AutoApply Home Folder"      # a path WITH a space (the real case)
+        r = _post(client, handoff_out_dir=str(target))
+        assert r.status_code == 200
+        # Round-trips through .env intact (space and all).
+        assert dotenv_values(root / ".env")["HANDOFF_OUT_DIR"] == str(target)
+        assert os.environ["HANDOFF_OUT_DIR"] == str(target)   # live, no restart
+        # The directory is created + seeded with the agent instructions README.
+        from pipeline import handoff
+        assert (target / handoff.HANDOFF_README).exists()
+
+    def test_blank_clears_handoff_out_dir(self, env):
+        client, root, server = env
+        _post(client, handoff_out_dir=str(root / "agent"))
+        _post(client, handoff_out_dir="")                     # clear it
+        assert "HANDOFF_OUT_DIR" not in dotenv_values(root / ".env")
+        assert "HANDOFF_OUT_DIR" not in os.environ
+
+    def test_get_reports_handoff_out_dir(self, env, monkeypatch):
+        client, root, server = env
+        monkeypatch.setenv("HANDOFF_OUT_DIR", r"C:\agent\home")
+        cur = client.get("/api/onboard/providers").json()["current"]
+        assert cur["handoff_out_dir"] == r"C:\agent\home"
+
+    def test_uncreatable_handoff_dir_does_not_500(self, env):
+        # A path that can't be created (here: a file, not a dir) must not 500 and
+        # must still persist to .env — the seed is best-effort.
+        client, root, server = env
+        badfile = root / "not-a-dir"
+        badfile.write_text("x", encoding="utf-8")
+        r = _post(client, handoff_out_dir=str(badfile))
+        assert r.status_code == 200
+        assert r.json().get("warning")                                # reported, not swallowed
+        assert dotenv_values(root / ".env")["HANDOFF_OUT_DIR"] == str(badfile)

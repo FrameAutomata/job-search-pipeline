@@ -55,6 +55,10 @@ echo "==> Copying example configs"
 [ -f "$root/config/search.yml" ] || cp "$root/config/search.example.yml" "$root/config/search.yml"
 mkdir -p "$root/resumes" "$root/output"
 
+echo "==> Preparing the browser-agent handoff folder (creates it + seeds a README)"
+( cd "$root" && "$root/.venv/bin/python" -m pipeline.handoff --bootstrap-dir ) \
+  || echo "    handoff bootstrap skipped" >&2
+
 echo ""
 echo "==> Setup complete."
 echo ""

@@ -50,6 +50,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TRACKER_NAME = "role-status.jsonl"
 WORK_ORDER_JSONL = "next-roles.jsonl"
 _WORK_ORDER_GLOB = "next-roles*.jsonl"   # matches per-site files AND the legacy one
+HANDOFF_README = "HANDOFF-README.md"     # seeded agent-instructions file — a distinct name so it
+                                         # never collides with a README the user's folder already has
 
 
 def _is_combined(board: str) -> bool:
@@ -963,6 +965,20 @@ WRITEBACK_STATUSES = (
 )
 
 
+def _status_legend_md() -> list[str]:
+    """The writeback vocabulary as markdown bullets — shared by the work-order
+    header and the folder README so their legends can't diverge."""
+    return [f"- `{token}` — {gloss}" for token, gloss in WRITEBACK_STATUSES]
+
+
+# The closing promise the work-order header and the README both make — stated once
+# so the load-bearing "we fold your statuses back" guarantee can't drift. Kept
+# general (role-status.jsonl dedups ALL statuses); the applications.md reflection
+# is a partial, separate mechanism (applied/skip only) and isn't claimed here.
+_WRITEBACK_FOLD_NOTE = ("The next pipeline run folds these statuses into the tracker, "
+                        "so recorded roles never reappear.")
+
+
 def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
                          total_queue: int, touched: int) -> str:
     """Human/agent-readable work-order for one site's session, with a short
@@ -980,9 +996,9 @@ def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
         f"(suggested base in the `resume base` column), apply, then record the outcome in `{jsonl_name}`",
         "by setting that row's `status` field:",
         "",
-        *(f"- `{token}` — {gloss}" for token, gloss in WRITEBACK_STATUSES),
+        *_status_legend_md(),
         "",
-        "The next pipeline run folds these statuses into the tracker, so recorded roles never reappear.",
+        _WRITEBACK_FOLD_NOTE,
         "",
         "| # | Score | Company | Role | Board | Resume base | URL |",
         "|---|-------|---------|------|-------|-------------|-----|",
@@ -995,6 +1011,35 @@ def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
     return "\n".join(lines)
 
 
+def render_handoff_readme() -> str:
+    """The standing agent-instructions file seeded into the handoff dir. Explains
+    the work-order files + the writeback loop, generated from WRITEBACK_STATUSES so
+    the status legend can't drift. Agent-agnostic — ships to every user."""
+    return "\n".join([
+        "# Browser-agent work-orders",
+        "",
+        "This folder is where the job-search pipeline drops **work-orders** for a",
+        "browser agent to apply from. Work them; the pipeline reads your outcomes",
+        "back on the next run.",
+        "",
+        "## Files",
+        "- `next-roles-<site>.jsonl` / `.md` — one ranked work-order per job site",
+        "  (linkedin, indeed, glassdoor, …). The `.jsonl` is what the agent edits;",
+        "  the `.md` is a human-readable copy. Work one site at a time, top-down.",
+        "- `role-status.jsonl` — the pipeline's dedup tracker. Don't hand-edit it.",
+        "",
+        "## Working a session",
+        "For each row in a site's `next-roles-<site>.jsonl`: open its `url`, judge fit",
+        "from the live posting (the score only sets reading order), tailor the resume,",
+        "apply through the browser, then record the outcome in that row's `status`:",
+        "",
+        *_status_legend_md(),
+        "",
+        _WRITEBACK_FOLD_NOTE,
+        "",
+    ])
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def default_out_dir() -> Path:
     """Where the work-order lands when no out_dir is given: HANDOFF_OUT_DIR,
@@ -1004,6 +1049,20 @@ def default_out_dir() -> Path:
     the UI endpoints, so they can never write/read different places."""
     env = (os.environ.get("HANDOFF_OUT_DIR") or "").strip()
     return Path(env) if env else ROOT / "output" / "handoff"
+
+
+def bootstrap_handoff_dir(out_dir) -> Path:
+    """Ensure the handoff directory exists and carries the standing
+    agent-instructions README (README.md). Non-clobbering — an existing README is
+    left untouched (the folder accumulates the user's own files) — and idempotent,
+    so it's safe to call on every run / at setup / when the UI sets the path.
+    Returns the README path."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    readme = out_dir / HANDOFF_README
+    if not readme.exists():
+        atomic_write_text(readme, render_handoff_readme())
+    return readme
 
 
 def _writeback_contract(work_order: Path) -> str:
@@ -1113,6 +1172,12 @@ def run(
     is its argparse wrapper."""
     queue_path = Path(queue_path) if queue_path else ROOT / "output" / "evaluated-roles-by-score.jsonl"
     out_dir = Path(out_dir) if out_dir else default_out_dir()
+    try:
+        bootstrap_handoff_dir(out_dir)   # seed the agent README, even on a no-queue run
+    except OSError as e:
+        # Best-effort: a misconfigured/unwritable HANDOFF_OUT_DIR must not crash a
+        # no-queue run (a real work-order write below surfaces the failure loudly).
+        print(f"[handoff] could not prepare {out_dir} ({e})")
     co = Path(career_ops) if career_ops else Path(os.environ.get("CAREER_OPS_PATH") or ROOT / "career-ops")
     if job_log is None:
         env_log = (os.environ.get("HANDOFF_JOB_LOG") or "").strip()
@@ -1236,6 +1301,9 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"Status tracker path (default: <out-dir>/{DEFAULT_TRACKER_NAME})")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="Directory for the work-order files (default: output/handoff)")
+    ap.add_argument("--bootstrap-dir", action="store_true",
+                    help="Just create + seed the handoff directory (README) and exit — "
+                         "no queue/build. Used by setup to prepare the folder up front.")
     ap.add_argument("--board", choices=["both", *sorted(KNOWN_BOARDS)], default="both",
                     help="Restrict the build to one site's session (default: both = "
                          "a session per site the scraper searches from)")
@@ -1252,6 +1320,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="career-ops install for --tailor caching "
                          "(default: CAREER_OPS_PATH env, else ./career-ops)")
     args = ap.parse_args(argv)
+    if args.bootstrap_dir:
+        readme = bootstrap_handoff_dir(args.out_dir or default_out_dir())
+        print(f"[handoff] seeded {readme}")
+        return 0
     return run(
         queue_path=args.queue, job_log=args.job_log, tracker=args.tracker,
         out_dir=args.out_dir, board=args.board, limit=args.limit,

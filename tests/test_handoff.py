@@ -566,6 +566,16 @@ class TestMain:
         assert handoff.main(args) == 0
         assert li.read_text(encoding="utf-8") == first
 
+    def test_main_bootstrap_dir_seeds_without_a_queue(self, tmp_path):
+        # The setup-script entrypoint: create + seed the handoff dir with no queue,
+        # no career-ops, no work-order build.
+        out = tmp_path / "handoff"
+        rc = handoff.main(["--bootstrap-dir", "--out-dir", str(out)])
+        assert rc == 0
+        assert (out / handoff.HANDOFF_README).exists()
+        # It bootstraps only — no work-order files written.
+        assert not handoff.work_order_paths(out, "linkedin")[0].exists()
+
 
 # ── 7. Code-review regressions (2026-07-03 review round) ──────────────────────
 class TestQualifierPreservedFromProse:
@@ -980,10 +990,66 @@ class TestTrackerStatusSync:
             [self._wb("Acme", "AI Engineer", "applied")], tmp_path / "nope.md") == 0
 
 
+class TestHandoffReadme:
+    """The seeded agent-instructions README — generated from WRITEBACK_STATUSES so
+    its status legend can't drift, and agent-agnostic (ships to every user)."""
+
+    def test_covers_work_order_format_and_writeback_vocab(self):
+        md = handoff.render_handoff_readme()
+        assert "next-roles-" in md              # the per-site work-order files
+        assert "role-status.jsonl" in md        # the tracker (don't hand-edit)
+        for token, _ in handoff.WRITEBACK_STATUSES:
+            assert token in md                  # the full writeback legend
+        assert "cowork" not in md.lower()       # agent-agnostic
+
+
+class TestBootstrapHandoffDir:
+    """Create + seed the handoff directory. Non-clobbering (the folder accumulates
+    the user's own files) and idempotent (safe to call every run)."""
+
+    def test_creates_dir_and_seeds_readme(self, tmp_path):
+        out = tmp_path / "agent-home"
+        readme = handoff.bootstrap_handoff_dir(out)
+        assert out.is_dir()
+        assert readme == out / handoff.HANDOFF_README
+        assert readme.read_text(encoding="utf-8") == handoff.render_handoff_readme()
+
+    def test_does_not_clobber_existing_readme(self, tmp_path):
+        out = tmp_path / "agent-home"
+        out.mkdir()
+        (out / handoff.HANDOFF_README).write_text("my own notes", encoding="utf-8")
+        handoff.bootstrap_handoff_dir(out)
+        assert (out / handoff.HANDOFF_README).read_text(encoding="utf-8") == "my own notes"
+
+    def test_idempotent(self, tmp_path):
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out)
+        handoff.bootstrap_handoff_dir(out)      # no error, still seeded
+        assert (out / handoff.HANDOFF_README).exists()
+
+
 class TestRunPerSiteSessions:
     """Integration: run() writes one next-roles-<site>.{jsonl,md} per site, a
     single shared role-status.jsonl, and folds agent writeback from the per-site
     files back into the tracker on the next run."""
+
+    def test_run_seeds_readme_even_with_no_queue(self, tmp_path):
+        # The dir is bootstrapped before the queue check, so a browser agent gets
+        # the instructions even on the very first (empty) run.
+        out = tmp_path / "handoff"
+        rc = handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out,
+                         career_ops=tmp_path / "none")
+        assert rc == 1                          # no queue
+        assert (out / handoff.HANDOFF_README).exists()
+
+    def test_run_survives_unbootstrappable_out_dir(self, tmp_path):
+        # A misconfigured out_dir (a file, not a dir) must not crash a no-queue run —
+        # the bootstrap is best-effort; run() still returns 1 cleanly.
+        bad = tmp_path / "handoff"
+        bad.write_text("i am a file, not a dir", encoding="utf-8")
+        rc = handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=bad,
+                         career_ops=tmp_path / "none")
+        assert rc == 1
 
     def _queue_file(self, tmp_path, rows):
         p = tmp_path / "evaluated-roles-by-score.jsonl"
