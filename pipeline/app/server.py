@@ -930,6 +930,23 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     return JSONResponse({"ok": True, "updated": updated, "warning": seed_warning})
 
 
+@app.post("/api/onboard/pick-folder")
+def pick_folder() -> JSONResponse:
+    """Open a native OS folder dialog on this machine (the UI is local) and return
+    the chosen path — the "Browse…" button beside the handoff-folder field. Returns
+    {"path": ""} when the user cancels; 503 when no picker is available (headless /
+    no tkinter), so the field stays a plain typed path."""
+    from pipeline.app.folder_picker import pick_directory
+
+    path = pick_directory("Select the browser-agent handoff folder")
+    if path is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No folder picker available on this machine — type the path instead.",
+        )
+    return JSONResponse({"path": path})
+
+
 def _maybe_generate_article_digest(payload: dict, resume_text: str,
                                    provider: str, api_key: str) -> None:
     """Best-effort: draft career-ops/article-digest.md (the proof-points corpus

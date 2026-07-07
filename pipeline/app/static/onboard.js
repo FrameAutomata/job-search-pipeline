@@ -441,6 +441,29 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   btn.disabled = false;
 });
 
+// "Browse…" beside the handoff-folder field: the server pops a native OS folder
+// dialog (this UI is local) and returns the chosen path — browsers can't hand a
+// page a folder's real path. Falls back to typing if no picker is available.
+document.getElementById("local-handoff-browse")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const input = document.getElementById("local-handoff-dir");
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Opening…";
+  try {
+    const resp = await fetch("/api/onboard/pick-folder", { method: "POST" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || "picker unavailable");
+    if (body.path) input.value = body.path;   // "" = cancelled → leave the field as-is
+  } catch {
+    input.placeholder = "couldn't open a folder dialog — type the path here";
+    input.focus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+});
+
 // Danger zone: start over. Double-gated (a typed "RESET") since it's destructive
 // and the cloud-cache deletion is irreversible.
 const resetBtn = document.getElementById("reset-btn");

@@ -296,7 +296,10 @@
         </div>
 
         <label style="margin-top:10px">Browser-agent handoff folder <span class="muted">(optional)</span>
-          <input id="local-handoff-dir" placeholder="a folder your browser agent can reach; blank = output/handoff" />
+          <span style="display:flex; gap:6px; align-items:stretch">
+            <input id="local-handoff-dir" placeholder="a folder your browser agent can reach; blank = output/handoff" style="flex:1" />
+            <button type="button" id="local-handoff-browse">Browse…</button>
+          </span>
         </label>
         <p class="hint">Where <strong>🤝 Hand off</strong> writes the per-site work-orders
           (<code>next-roles-&lt;site&gt;.jsonl</code>) for your browser agent. Point it at a folder the agent
