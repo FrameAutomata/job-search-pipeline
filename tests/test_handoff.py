@@ -1693,3 +1693,59 @@ class TestLimitGuard:
 
     def test_positive_limit_applies(self):
         assert len(handoff.build_work_order(self._queue(3), [], limit=2)) == 2
+
+
+class TestResolveProfileMd:
+    """resolve_profile_md() — Commit 4: locate the living PROFILE.md that drives
+    evaluation. Prefers the handoff dir (where the browser agent grows PROFILE.md
+    and the résumé builder already reads it), then career-ops/PROFILE.md (the
+    target a later commit decodes the cloud PROFILE secret into), else "" so eval
+    falls back to the cv.md / profile.yml / _profile.md / article-digest.md seeds."""
+
+    def _co(self, tmp_path):
+        co = tmp_path / "career-ops"
+        co.mkdir()
+        return co
+
+    def test_prefers_handoff_dir(self, tmp_path, monkeypatch):
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()
+        (handoff_dir / "PROFILE.md").write_text("HANDOFF MASTER", encoding="utf-8")
+        co = self._co(tmp_path)
+        (co / "PROFILE.md").write_text("CAREER-OPS COPY", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        assert handoff.resolve_profile_md(co) == "HANDOFF MASTER"
+
+    def test_falls_back_to_career_ops(self, tmp_path, monkeypatch):
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()                    # exists, but has no PROFILE.md
+        co = self._co(tmp_path)
+        (co / "PROFILE.md").write_text("CAREER-OPS COPY", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        assert handoff.resolve_profile_md(co) == "CAREER-OPS COPY"
+
+    def test_empty_when_neither_exists(self, tmp_path, monkeypatch):
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        assert handoff.resolve_profile_md(self._co(tmp_path)) == ""
+
+    def test_whitespace_only_master_skipped(self, tmp_path, monkeypatch):
+        # a blank handoff PROFILE.md is ignored → fall through to career-ops
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()
+        (handoff_dir / "PROFILE.md").write_text("  \n\t\n", encoding="utf-8")
+        co = self._co(tmp_path)
+        (co / "PROFILE.md").write_text("REAL", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        assert handoff.resolve_profile_md(co) == "REAL"
+
+    def test_out_dir_arg_overrides_env(self, tmp_path, monkeypatch):
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
+        (env_dir / "PROFILE.md").write_text("ENV", encoding="utf-8")
+        arg_dir = tmp_path / "arg"
+        arg_dir.mkdir()
+        (arg_dir / "PROFILE.md").write_text("ARG", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(env_dir))
+        assert handoff.resolve_profile_md(tmp_path / "co", out_dir=arg_dir) == "ARG"

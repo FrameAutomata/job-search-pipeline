@@ -162,6 +162,25 @@ def test_refresh_offline_keeps_local_intact(client, mocker):
     assert local_apps.read_text(encoding="utf-8") == before
 
 
+def test_load_eval_system_prompt_uses_profile_master(tmp_path, monkeypatch):
+    # The UI add-job eval must resolve the living PROFILE.md exactly like
+    # --evaluate-batch (add_job's parity contract), not the stale seeds.
+    career_ops = tmp_path / "career-ops"
+    (career_ops / "config").mkdir(parents=True)
+    (career_ops / "cv.md").write_text("MYCV_XYZ", encoding="utf-8")
+    (career_ops / "config" / "profile.yml").write_text("PROFILEYAML_XYZ", encoding="utf-8")
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "PROFILE.md").write_text("LIVING MASTER PROFILE", encoding="utf-8")
+    monkeypatch.setenv("CAREER_OPS_PATH", str(career_ops))
+    monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+
+    from pipeline.app import server
+    prompt = server._load_eval_system_prompt()
+    assert "LIVING MASTER PROFILE" in prompt
+    assert "MYCV_XYZ" not in prompt          # master supersedes the seeds on the UI path too
+
+
 def test_template_status_reports_available(client, mocker):
     from pipeline.app import server
     mocker.patch.object(server.self_update, "update_available",

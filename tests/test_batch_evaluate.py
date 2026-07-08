@@ -882,3 +882,37 @@ class TestFreeTierPacing:
                                model="gemini-2.5-flash,gemini-3.5-flash", dry_run=True)
         assert n == 40
         assert "10 deferred" in capsys.readouterr().err
+
+
+class TestEvalUsesSharedPromptBuilder:
+    """_run_eval builds its system prompt via the shared eval_system_prompt helper
+    — the single candidate-profile resolution point, so the batch path and the UI
+    add-job path can't diverge. The spy stops the run right at that call, so no
+    provider is hit; PROFILE.md-vs-seeds resolution is covered by
+    test_batch_common.TestEvalSystemPrompt."""
+
+    class _Stop(Exception):
+        pass
+
+    def _career_ops(self, tmp_path):
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "batch").mkdir(parents=True)   # the spy stops before tracker-additions is touched
+        with open(career_ops / "batch" / "batch-input.tsv", "w", newline="", encoding="utf-8") as f:
+            f.write("id\turl\tsource\tnotes\n1\thttps://a.com\tAcme\tEng\n")
+        (career_ops / "cv.md").write_text("# CV", encoding="utf-8")
+        return career_ops
+
+    def test_run_eval_delegates_to_eval_system_prompt(self, tmp_path, monkeypatch):
+        career_ops = self._career_ops(tmp_path)
+        monkeypatch.setattr(eval_mod, "_check_provider", lambda p: None)
+        captured = {}
+
+        def spy(co):
+            captured["career_ops"] = co
+            raise self._Stop()
+
+        monkeypatch.setattr(eval_mod, "eval_system_prompt", spy)
+        with pytest.raises(self._Stop):
+            eval_mod._run_eval(career_ops, provider="anthropic")
+        # subscript, not .get: a dropped eval_system_prompt call → KeyError → fail
+        assert captured["career_ops"] == career_ops

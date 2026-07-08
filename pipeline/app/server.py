@@ -29,10 +29,11 @@ from pipeline.app import data, gh, local_run, onboard, reset, self_update, skill
 from pipeline import article_digest
 from pipeline import gemini_limits
 from pipeline._batch_common import (
-    build_system_prompt,
     build_user_message,
+    eval_system_prompt,
     max_report_num,
     max_tracker_num,
+    read_text,
     write_job_result,
     run_merge_tracker,
 )
@@ -1109,15 +1110,14 @@ def _fetch_jd(url: str, timeout: int = 20) -> str:
 
 
 def _load_eval_system_prompt() -> str:
-    """Load the evaluation system prompt from the local career-ops install."""
+    """Load the evaluation system prompt from the local career-ops install.
+
+    Delegates to the shared eval_system_prompt builder so the UI add-job eval
+    resolves the candidate profile identically to `--evaluate-batch` — the living
+    PROFILE.md when present, else the seed files (see add_job's parity contract).
+    The 409 guard keeps the pre-Setup error message."""
     co = _career_ops_local()
-
-    def _opt(p: Path) -> str:
-        return p.read_text(encoding="utf-8") if p.exists() else ""
-
-    cv = _opt(co / "cv.md")
-    profile_yml = _opt(co / "config" / "profile.yml")
-    if not cv and not profile_yml:
+    if not read_text(co / "cv.md") and not read_text(co / "config" / "profile.yml"):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -1125,12 +1125,7 @@ def _load_eval_system_prompt() -> str:
                 "Complete the Setup wizard first."
             ),
         )
-    return build_system_prompt(
-        cv=cv,
-        profile_yml=profile_yml,
-        profile_md=_opt(co / "modes" / "_profile.md"),
-        article_digest=_opt(co / "article-digest.md"),
-    )
+    return eval_system_prompt(co)
 
 
 class AddJobRequest(BaseModel):

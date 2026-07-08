@@ -9,6 +9,7 @@ import pytest
 from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
+    eval_system_prompt,
     extract_tag,
     load_pending,
     load_state,
@@ -435,3 +436,79 @@ class TestBuildSystemPrompt:
     def test_article_digest_omitted_when_empty(self):
         result = build_system_prompt("cv", "profile", article_digest="")
         assert "Proof Points" not in result
+
+    # --- Commit 4: PROFILE.md as the authoritative candidate profile ----------
+    # When a living PROFILE.md is resolved, it supersedes the 4 seed fragments
+    # (cv.md / profile.yml / _profile.md / article-digest.md) as the candidate
+    # profile — one master drives evaluation. Only the profile *content* swaps;
+    # the evaluation framework is unchanged.
+
+    def test_profile_master_supersedes_seed_fragments(self):
+        result = build_system_prompt(
+            "MYCV_XYZ", "PROFILEYAML_XYZ",
+            profile_md="CUSTOM_XYZ", article_digest="PROOF_XYZ",
+            profile_master="LIVING MASTER PROFILE",
+        )
+        assert "LIVING MASTER PROFILE" in result
+        # the raw seed fragments are NOT separately dumped when a master is present
+        for frag in ("MYCV_XYZ", "PROFILEYAML_XYZ", "CUSTOM_XYZ", "PROOF_XYZ"):
+            assert frag not in result
+
+    def test_profile_master_keeps_evaluation_framework(self):
+        result = build_system_prompt("cv", "profile", profile_master="MASTER")
+        assert "EVALUATION FRAMEWORK" in result
+        assert "Machine Summary" in result
+
+    def test_empty_profile_master_is_current_behavior(self):
+        # regression: no master → the 4 seed fragments render exactly as before
+        result = build_system_prompt(
+            "MYCV_XYZ", "PROFILEYAML_XYZ",
+            profile_md="CUSTOM_XYZ", article_digest="PROOF_XYZ",
+        )
+        for frag in ("MYCV_XYZ", "PROFILEYAML_XYZ", "CUSTOM_XYZ", "PROOF_XYZ"):
+            assert frag in result
+        assert "EVALUATION FRAMEWORK" in result
+
+    def test_whitespace_profile_master_falls_back_to_fragments(self):
+        # a blank/whitespace master must not blank out the candidate profile
+        result = build_system_prompt("MYCV_XYZ", "profile", profile_master="   \n  ")
+        assert "MYCV_XYZ" in result
+
+    def test_none_profile_master_falls_back_to_fragments(self):
+        # defensive: a None master degrades like the sibling params, never crashes
+        result = build_system_prompt("MYCV_XYZ", "profile", profile_master=None)
+        assert "MYCV_XYZ" in result
+
+
+class TestEvalSystemPrompt:
+    """eval_system_prompt(career_ops) — the single candidate-profile resolution
+    point shared by the batch (`--evaluate-batch`) and UI add-job eval paths, so
+    they can never disagree: PROFILE.md wins when present, else the seed files."""
+
+    def _career_ops(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "config").mkdir(parents=True)
+        (co / "cv.md").write_text("MYCV_XYZ", encoding="utf-8")
+        (co / "config" / "profile.yml").write_text("PROFILEYAML_XYZ", encoding="utf-8")
+        return co
+
+    def test_uses_profile_master_when_present(self, tmp_path, monkeypatch):
+        co = self._career_ops(tmp_path)
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()
+        (handoff_dir / "PROFILE.md").write_text("LIVING MASTER PROFILE", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        result = eval_system_prompt(co)
+        assert "LIVING MASTER PROFILE" in result
+        assert "MYCV_XYZ" not in result            # master supersedes the seeds
+        assert "PROFILEYAML_XYZ" not in result
+
+    def test_falls_back_to_seeds_when_absent(self, tmp_path, monkeypatch):
+        co = self._career_ops(tmp_path)
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()                          # no PROFILE.md anywhere
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        result = eval_system_prompt(co)
+        assert "MYCV_XYZ" in result
+        assert "PROFILEYAML_XYZ" in result
+        assert "EVALUATION FRAMEWORK" in result
