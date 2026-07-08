@@ -58,6 +58,8 @@ HANDOFF_README = "HANDOFF-README.md"     # seeded agent-instructions file — a 
                                          # never collides with a README the user's folder already has
 HANDOFF_PROFILE = "PROFILE.md"           # the living master the agent qualifies + tailors against and
                                          # GROWS as it learns (seeded once from career-ops; never clobbered)
+HANDOFF_RESUME_RUNBOOK = "RESUME-RUNBOOK.md"   # the recipe (schema + fill target + rules) a capable
+                                               # agent follows to rebuild/override a résumé from PROFILE.md
 
 
 def _is_combined(board: str) -> bool:
@@ -1057,6 +1059,76 @@ def render_handoff_readme() -> str:
         "answer a new application question, write it back into the matching section",
         f"of `{HANDOFF_PROFILE}` so the next run is smarter — that's the whole point.",
         "",
+        f"To rebuild or override a role's résumé, follow `{HANDOFF_RESUME_RUNBOOK}` (the",
+        "content-JSON schema, the one-page fill target, and the tailoring rules).",
+        "",
+    ])
+
+
+# The content-JSON schema shown in the seeded RESUME-RUNBOOK.md. Kept literal (not
+# imported from resume_content._SCHEMA) so seeding never pulls in python-docx or the
+# handoff↔resume_content import cycle — keep the two in sync if the schema changes.
+_RESUME_SCHEMA_BLOCK = '''```json
+{
+  "name": "Full Name",
+  "contact": "email · phone · City, ST · linkedin.com/in/… · github.com/…",
+  "summary": "2-3 lines of prose",
+  "skills": [{"label": "Languages", "items": "Python · Go · SQL"}],
+  "experience": [{"org": "Employer", "dates": "2022 – Present", "role": "Title",
+                  "loc": "City, ST", "bullets": ["a quantified achievement", "…"]}],
+  "projects_heading": "Selected Projects",
+  "projects": [{"org": "Project", "role": "stack / subtitle", "bullets": ["…"]}],
+  "projects_first": false,
+  "education": ["B.S. Field — School", "Certification"]
+}
+```'''
+
+
+def render_resume_runbook() -> str:
+    """The seeded résumé RUN_BOOK: how the pipeline builds each role's résumé from
+    PROFILE.md, and how a capable agent can rebuild or override one. Docs only,
+    agent-agnostic — the pipeline is the runnable builder; this is the recipe."""
+    from pipeline.resume_fit import TARGET_HI, TARGET_LO
+    band = f"{int(TARGET_LO * 100)}–{int(TARGET_HI * 100)}%"   # the aim band, single-sourced
+    return "\n".join([
+        "# Résumé build — how it works, and how to rebuild",
+        "",
+        "A role in a `next-roles-<site>.jsonl` work-order may carry a `resume_pdf`: a",
+        f"one-page PDF the pipeline already tailored for that role from `{HANDOFF_PROFILE}`.",
+        "Upload it as-is. This file explains how those are built so you can rebuild or",
+        "override one when you want to.",
+        "",
+        "## The model",
+        "A résumé is a **content-JSON** rendered to a **one page** PDF. The pipeline reads",
+        f"`{HANDOFF_PROFILE}`, has an LLM produce a content-JSON tailored to the posting",
+        "(using ONLY facts in the profile, keeping every metric verbatim, adding/removing",
+        f"skills to match the JD), then renders it and auto-fits the layout so it fills",
+        f"**{band} of one page**.",
+        "",
+        "## Content-JSON schema",
+        _RESUME_SCHEMA_BLOCK,
+        "- `skills[].items` is a `·`-separated string; `experience`/`projects` are ordered",
+        "  best/most-relevant first; `projects_first: true` hoists projects above experience",
+        "  (use it for AI or projects-forward roles).",
+        "",
+        "## Rules (the same ones the pipeline follows)",
+        f"- Ground everything in `{HANDOFF_PROFILE}`. Never invent an employer, date, title,",
+        "  or metric. Keep every quantified result verbatim.",
+        "- Tailor emphasis to the JD: add the skills it asks for that the profile supports,",
+        "  drop the irrelevant ones (honesty tiers — only Strong/Solid skills).",
+        f"- Honor any candidate-specific tailoring rules in `{HANDOFF_PROFILE}` (which role to",
+        "  lead with, phrasing preferences, and so on).",
+        f"- One page, filled {band}. Prefer real substance over padding.",
+        "",
+        "## Rebuilding",
+        "- **Re-run the pipeline** (rebuilds every role's résumé from the current profile and",
+        "  refreshes the cached PDFs; a role is rebuilt when its role or the profile changes):",
+        "  `./run.ps1 --skip-scrape --skip-filter --handoff --handoff-tailor`",
+        "- **Build one yourself:** produce a content-JSON per the schema above from the",
+        "  profile + the posting, render it to a one-page PDF with any docx/PDF tooling, and",
+        f"  check it fills ~{band} of one page. Cached résumés live at",
+        "  `career-ops/output/<Company> - resume.pdf`.",
+        "",
     ])
 
 
@@ -1368,6 +1440,9 @@ def bootstrap_handoff_dir(out_dir, *, career_ops=None) -> Path:
     readme = out_dir / HANDOFF_README
     if not readme.exists():
         atomic_write_text(readme, render_handoff_readme())
+    runbook = out_dir / HANDOFF_RESUME_RUNBOOK
+    if not runbook.exists():
+        atomic_write_text(runbook, render_resume_runbook())
     profile = out_dir / HANDOFF_PROFILE
     if not profile.exists():
         atomic_write_text(profile, render_profile_md(**_load_profile_sources(career_ops)))

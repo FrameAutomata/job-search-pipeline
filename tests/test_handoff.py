@@ -1026,6 +1026,22 @@ class TestHandoffReadme:
         assert "grow" in md.lower() or "living" in md.lower()
 
 
+class TestResumeRunbook:
+    """The seeded résumé RUN_BOOK — the recipe (schema + fill target + rules + how
+    to rebuild) a capable agent needs to rebuild/override a résumé. Docs only, no
+    shipped code; agent-agnostic."""
+
+    def test_documents_schema_fill_target_and_rebuild(self):
+        rb = handoff.render_resume_runbook()
+        for key in ("name", "summary", "skills", "experience", "projects", "education"):
+            assert key in rb                       # the content-JSON schema
+        assert handoff.HANDOFF_PROFILE in rb        # built from PROFILE.md
+        assert "92" in rb and "96" in rb            # the fill target band
+        assert "one page" in rb.lower()
+        assert "--handoff-tailor" in rb             # how to rebuild via the pipeline
+        assert "cowork" not in rb.lower()           # agent-agnostic
+
+
 class TestBootstrapHandoffDir:
     """Create + seed the handoff directory. Non-clobbering (the folder accumulates
     the user's own files) and idempotent (safe to call every run)."""
@@ -1043,6 +1059,19 @@ class TestBootstrapHandoffDir:
         (out / handoff.HANDOFF_README).write_text("my own notes", encoding="utf-8")
         handoff.bootstrap_handoff_dir(out)
         assert (out / handoff.HANDOFF_README).read_text(encoding="utf-8") == "my own notes"
+
+    def test_seeds_the_resume_runbook(self, tmp_path):
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out)
+        assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == \
+            handoff.render_resume_runbook()
+
+    def test_does_not_clobber_existing_runbook(self, tmp_path):
+        out = tmp_path / "agent-home"
+        out.mkdir()
+        (out / handoff.HANDOFF_RESUME_RUNBOOK).write_text("mine", encoding="utf-8")
+        handoff.bootstrap_handoff_dir(out)
+        assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == "mine"
 
     def test_idempotent(self, tmp_path):
         out = tmp_path / "agent-home"

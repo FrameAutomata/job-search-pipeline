@@ -87,13 +87,16 @@ class TestBuildForJob:
         return lambda system, user: raw
 
     def test_builds_grounded_content_and_fits(self, tmp_path, monkeypatch):
+        from pipeline import resume_build, resume_fit
         captured = {}
-        sentinel = object()
+        built = resume_build.BuildResult(
+            pdf=tmp_path / "r.pdf", scale=1.0,
+            fit=resume_fit.FitResult(ok=True, code=0, verdict="OK", fill=0.95, pages=1, notes=[]))
         monkeypatch.setattr("pipeline.resume_build.fit_to_page",
-                            lambda content, out_dir, **kw: captured.update(content=content) or sentinel)
+                            lambda content, out_dir, **kw: captured.update(content=content) or built)
         out = resume_content.build_for_job(_PROFILE, _JD, tmp_path,
                                            caller=self._caller(json.dumps(_CONTENT)))
-        assert out is sentinel
+        assert out is built
         assert captured["content"]["experience"][0]["org"] == "Acme Corp"
 
     def test_returns_none_on_unparseable_output(self, tmp_path, monkeypatch):
@@ -110,6 +113,58 @@ class TestBuildForJob:
         # max_attempts=1 / base_delay=0 so the failure path doesn't sleep/retry.
         assert resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=boom,
                                             max_attempts=1, base_delay=0.0) is None
+
+
+class TestCorrectiveTrim:
+    """On overflow (content spills one page even at the smallest layout scale),
+    build_for_job retries the LLM with 'trim' feedback instead of giving up — so a
+    too-long tailoring is trimmed to fit rather than dropped for the default."""
+
+    def _fit_by_name(self, name_to_pages, pdf):
+        # fit_to_page stub keyed on content['name'] so a test can make the first
+        # render overflow and the corrected one fit.
+        from pipeline import resume_build, resume_fit
+
+        def fake(content, out_dir, **kw):
+            pages = name_to_pages.get(content.get("name"), 1)
+            fit = resume_fit.FitResult(ok=(pages == 1), code=(0 if pages == 1 else 3),
+                                       verdict=("OK" if pages == 1 else "OVERFULL"),
+                                       fill=0.95, pages=pages, notes=[])
+            return resume_build.BuildResult(pdf=pdf, scale=0.9, fit=fit)
+        return fake
+
+    def _caller(self, names):
+        seen = []
+
+        def caller(system, user):
+            seen.append(user)
+            return json.dumps({"name": names[min(len(seen) - 1, len(names) - 1)], "experience": []})
+        caller.seen = seen
+        return caller
+
+    def test_trim_round_recovers_from_overflow(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("pipeline.resume_build.fit_to_page",
+                            self._fit_by_name({"Big": 2, "Trimmed": 1}, tmp_path / "r.pdf"))
+        caller = self._caller(["Big", "Trimmed"])
+        r = resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=caller, trim_rounds=1)
+        assert r.fit.pages == 1 and len(caller.seen) == 2            # one corrective round fixed it
+        assert resume_content._TRIM_FEEDBACK in caller.seen[1]      # the trim feedback was appended
+
+    def test_no_trim_when_first_render_fits(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("pipeline.resume_build.fit_to_page",
+                            self._fit_by_name({"Fits": 1}, tmp_path / "r.pdf"))
+        caller = self._caller(["Fits"])
+        r = resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=caller)
+        assert r.fit.pages == 1 and len(caller.seen) == 1           # no wasted corrective call
+
+    def test_returns_last_result_after_exhausting_trim_rounds(self, tmp_path, monkeypatch):
+        # Still overflowing after the budget → return the last result; generate_for_job's
+        # overflow guard then falls back to the default résumé.
+        monkeypatch.setattr("pipeline.resume_build.fit_to_page",
+                            self._fit_by_name({"Big": 2}, tmp_path / "r.pdf"))
+        caller = self._caller(["Big"])
+        r = resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=caller, trim_rounds=1)
+        assert r.fit.pages == 2 and len(caller.seen) == 2           # 1 initial + 1 trim
 
 
 class TestGenerateForJob:

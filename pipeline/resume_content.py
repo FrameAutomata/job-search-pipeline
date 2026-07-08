@@ -87,29 +87,46 @@ def parse_content_json(raw: str) -> dict:
     return obj
 
 
+_TRIM_FEEDBACK = (
+    "\n\nThe previous version still spilled onto a second page at the smallest "
+    "layout scale. Remove the weakest bullet(s) and tighten the summary so it fits "
+    "ONE page, keeping every metric. Return the corrected JSON object."
+)
+
+
 def build_for_job(profile_md: str, jd: str, out_dir, *, report: str = "",
                   caller=None, provider: str | None = None, model: str | None = None,
-                  max_attempts: int = 6, base_delay: float = 1.0):
+                  max_attempts: int = 6, base_delay: float = 1.0, trim_rounds: int = 1):
     """Build + fit a tailored résumé for one job: LLM → grounded content-JSON →
-    resume_build.fit_to_page. Returns a BuildResult, or None on any failure (bad
-    provider call or unusable output) so the caller falls back to the default
-    résumé — the same contract as resume_tailor.generate_for_job."""
+    resume_build.fit_to_page. If the content overflows one page even at the
+    smallest scale, retry (up to trim_rounds) asking the LLM to trim — a too-long
+    tailoring is trimmed to fit, not dropped. Returns a BuildResult (possibly still
+    overflowing after the budget, which generate_for_job's guard then rejects), or
+    None on any failure so the caller falls back to the default résumé."""
     system, user = build_prompt(profile_md, jd, report)
     if caller is None:
         from pipeline.resume_tailor import _resolve_caller
         caller = _resolve_caller(provider, model)
     from pipeline.batch_evaluate import _call_with_retry
-    try:
-        raw = _call_with_retry(caller, system, user, max_attempts=max_attempts, base_delay=base_delay)
-    except Exception as e:
-        print(f"[build] résumé generation call failed ({type(e).__name__}: {e}) — using default")
-        return None
-    try:
-        content = parse_content_json(raw)
-    except ValueError as e:
-        print(f"[build] model output wasn't usable JSON ({e}) — using default")
-        return None
-    return resume_build.fit_to_page(content, out_dir)
+
+    feedback, result = "", None
+    for _ in range(trim_rounds + 1):
+        try:
+            raw = _call_with_retry(caller, system, user + feedback,
+                                   max_attempts=max_attempts, base_delay=base_delay)
+        except Exception as e:
+            print(f"[build] résumé generation call failed ({type(e).__name__}: {e}) — using default")
+            return None
+        try:
+            content = parse_content_json(raw)
+        except ValueError as e:
+            print(f"[build] model output wasn't usable JSON ({e}) — using default")
+            return None
+        result = resume_build.fit_to_page(content, out_dir)
+        if result.fit.pages == 1:
+            return result                     # fits one page (the scale handled the fill)
+        feedback = _TRIM_FEEDBACK             # overflowed even at min scale → trim and retry
+    return result                             # still overflowing; the caller's guard falls back
 
 
 def generate_for_job(career_ops, job, *, profile_dir, caller=None,
