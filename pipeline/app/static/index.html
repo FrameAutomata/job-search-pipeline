@@ -34,21 +34,15 @@
     <div id="action-msg" class="action-msg" hidden></div>
     <div id="handoff-panel" class="local-run-panel" hidden>
       <div class="local-run-options">
-        <label>Board
-          <select id="handoff-board">
-            <option value="both">Both boards</option>
-            <option value="linkedin">LinkedIn only</option>
-            <option value="indeed">Indeed only</option>
-          </select>
-        </label>
-        <label>Limit <input id="handoff-limit" type="number" min="1" placeholder="all" style="width:5em" /></label>
+        <label>Limit / site <input id="handoff-limit" type="number" min="1" placeholder="all" style="width:5em" /></label>
         <label class="check"><input type="checkbox" id="handoff-tailor" /> Pre-tailor resumes</label>
-        <button id="handoff-start" class="primary">Build work-order</button>
+        <button id="handoff-start" class="primary">Build work-orders</button>
       </div>
-      <p class="hint">Builds <b>next-roles.jsonl</b> / <b>.md</b> — every evaluated, not-yet-handled role,
-        ranked best-first — for your browser agent to apply from through your own logged-in browser.
-        When it finishes, copy the kickoff prompt into your agent. The agent records each outcome back
-        into the file; the next build folds those in so handled roles never reappear.
+      <p class="hint">Builds one <b>next-roles-&lt;site&gt;.jsonl</b> / <b>.md</b> per job site — every evaluated,
+        not-yet-handled role, ranked best-first within each site — so your browser agent can work one site
+        session at a time through your own logged-in browser. When it finishes, copy each site's kickoff
+        prompt into your agent. The agent records each outcome back into the file; the next build folds
+        those in so handled roles never reappear. <b>Limit / site</b> caps each site's session.
         <b>Pre-tailor</b> generates a tailored resume per company (needs <code>resumes/resume.docx</code>;
         spends LLM calls, can take minutes).</p>
       <div id="handoff-result"></div>

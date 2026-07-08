@@ -4,7 +4,7 @@
 // multipart to /api/onboard, which generates the profile artifacts and writes
 // them as GitHub secrets.
 
-const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local eval", "Review"];
+const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local settings", "Review"];
 
 const form = document.getElementById("wizard");
 const steps = [...document.querySelectorAll(".step")];
@@ -301,7 +301,7 @@ async function loadSavedConfig() {
   }
 }
 
-// ── Local evaluation provider (step 6) ──────────────────────────────────────
+// ── Local settings — .env (step 6): eval provider, tailoring, handoff folder ──
 
 async function loadLocalProviders() {
   const detection = document.getElementById("local-provider-detection");
@@ -358,6 +358,9 @@ async function loadLocalProviders() {
     }
     if (tailorModel) tailorModel.value = d.current.tailor_model || "";
 
+    const handoffDirInput = document.getElementById("local-handoff-dir");
+    if (handoffDirInput) handoffDirInput.value = d.current.handoff_out_dir || "";
+
     // Current Gemini free-tier opt-in.
     const freeTierCb = document.getElementById("gemini-free-tier");
     const freeTierRow = document.getElementById("gemini-free-tier-row");
@@ -412,6 +415,7 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   const tailorProvider = document.getElementById("local-tailor-provider")?.value || "";
   const tailorModel    = document.getElementById("local-tailor-model")?.value.trim() || "";
   const tailorKey      = document.getElementById("local-tailor-key")?.value || "";
+  const handoffDir     = document.getElementById("local-handoff-dir")?.value.trim() || "";
   btn.disabled = true;
   msgEl.hidden = true;
   try {
@@ -422,7 +426,8 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
                              api_key: apiKey,
                              gemini_free_tier: geminiFreeTier,
                              tailor_provider: tailorProvider, tailor_model: tailorModel,
-                             tailor_api_key: tailorKey }),
+                             tailor_api_key: tailorKey,
+                             handoff_out_dir: handoffDir }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || "save failed");
@@ -434,6 +439,29 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   }
   msgEl.hidden = false;
   btn.disabled = false;
+});
+
+// "Browse…" beside the handoff-folder field: the server pops a native OS folder
+// dialog (this UI is local) and returns the chosen path — browsers can't hand a
+// page a folder's real path. Falls back to typing if no picker is available.
+document.getElementById("local-handoff-browse")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const input = document.getElementById("local-handoff-dir");
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Opening…";
+  try {
+    const resp = await fetch("/api/onboard/pick-folder", { method: "POST" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || "picker unavailable");
+    if (body.path) input.value = body.path;   // "" = cancelled → leave the field as-is
+  } catch {
+    input.placeholder = "couldn't open a folder dialog — type the path here";
+    input.focus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 });
 
 // Danger zone: start over. Double-gated (a typed "RESET") since it's destructive

@@ -1,9 +1,10 @@
 """Chain scrape -> filter -> screen -> bridge -> batch_prep. Each step can be skipped with a flag.
 
 Applying is NOT a pipeline stage: the pipeline finds and evaluates roles, then
---handoff emits a work-order (output/handoff/next-roles.jsonl + .md) for
-whatever browser agent the user prefers (Claude Cowork, OpenClaw, a local
-Agent-SDK runner, ...) to work through with the user's own logged-in browser.
+--handoff emits a work-order per site the scraper searches from
+(output/handoff/next-roles-<site>.jsonl + .md) for whatever browser agent the
+user prefers (Claude Cowork, OpenClaw, a local Agent-SDK runner, ...) to work
+through — one site session at a time — with the user's own logged-in browser.
 """
 
 import argparse
@@ -18,6 +19,10 @@ load_dotenv(ROOT / ".env")
 
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
 from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_evaluate's timeout/budget knobs)
+# Only the board vocabulary is needed at arg-parse time; handoff.run itself is
+# still lazy-imported below to keep the hot pipeline path free of its tailoring
+# deps. This module-level import is cheap (handoff pulls only _batch_common + app.data).
+from pipeline.handoff import KNOWN_BOARDS  # noqa: E402
 
 
 def main() -> int:
@@ -42,14 +47,15 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="Print what would be submitted/evaluated without doing it")
     ap.add_argument("--handoff", action="store_true",
-                    help="After evaluation, build the browser-agent work-order "
-                         "(output/handoff/next-roles.jsonl + .md): every evaluated, "
-                         "not-yet-handled role, ranked best-first, for your browser "
-                         "agent to apply through your own logged-in browser.")
-    ap.add_argument("--handoff-board", choices=["linkedin", "indeed", "both"], default="both",
-                    help="Restrict the work-order to one board (default: both)")
+                    help="After evaluation, build one browser-agent work-order per site "
+                         "(output/handoff/next-roles-<site>.jsonl + .md): every evaluated, "
+                         "not-yet-handled role, ranked best-first within each site, for your "
+                         "browser agent to apply through your own logged-in browser.")
+    ap.add_argument("--handoff-board", choices=["both", *sorted(KNOWN_BOARDS)], default="both",
+                    help="Restrict the hand-off to one site's session (default: both = "
+                         "a session per site the scraper searches from)")
     ap.add_argument("--handoff-limit", type=int, default=None,
-                    help="Cap the work-order at the top N roles")
+                    help="Cap EACH site's session at the top N roles (per-site, not a global total)")
     ap.add_argument("--handoff-tailor", action="store_true",
                     help="With --handoff: pre-tailor a candidate-named resume per "
                          "work-order row (needs resumes/resume.docx) so the agent "

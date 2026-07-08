@@ -233,13 +233,13 @@
         </label>
       </section>
 
-      <!-- 7. Local evaluation -->
+      <!-- 7. Local settings (.env) -->
       <section class="step" data-step="6" hidden>
-        <h2>Local evaluation provider</h2>
-        <p class="hint">Configures which provider the UI uses for <strong>+ Add Job</strong>
-          evaluations and the API path for career skills. Saved to your local
-          <code>.env</code> — separate from the GitHub secrets above. You can skip this
-          step and configure it later.</p>
+        <h2>Local settings (.env)</h2>
+        <p class="hint">Local settings saved to your <code>.env</code> — separate from the
+          GitHub secrets above: the provider the UI uses for <strong>+ Add Job</strong>
+          evaluations and career skills, résumé-tailoring overrides, and your
+          <strong>browser-agent handoff folder</strong>. You can skip this step and configure it later.</p>
 
         <div id="local-provider-detection" class="provider-detection">
           <span class="muted">Detecting…</span>
@@ -294,6 +294,17 @@
             (e.g. ~20 jobs/day on <code>gemini-2.5-flash</code>; the rest defer to the next run).
             Use <code>gemma-4-26b-a4b-it</code> for ~1,500/day.</p>
         </div>
+
+        <label style="margin-top:10px">Browser-agent handoff folder <span class="muted">(optional)</span>
+          <span style="display:flex; gap:6px; align-items:stretch">
+            <input id="local-handoff-dir" placeholder="a folder your browser agent can reach; blank = output/handoff" style="flex:1" />
+            <button type="button" id="local-handoff-browse">Browse…</button>
+          </span>
+        </label>
+        <p class="hint">Where <strong>🤝 Hand off</strong> writes the per-site work-orders
+          (<code>next-roles-&lt;site&gt;.jsonl</code>) for your browser agent. Point it at a folder the agent
+          can read — saving creates the folder and seeds a <code>HANDOFF-README.md</code> it follows.
+          Blank uses <code>output/handoff</code>.</p>
 
         <button type="button" id="save-local-btn" style="margin-top:8px">Save to .env</button>
         <div id="local-save-msg" class="action-msg" hidden></div>

@@ -641,19 +641,20 @@ handoffUi.btn.addEventListener("click", () => {
 });
 
 handoffUi.start.addEventListener("click", async () => {
-  const board = document.getElementById("handoff-board").value;
   // Only a positive integer counts as a limit — "0", "e", or garbage would
-  // otherwise coerce to NaN/falsy and silently mean "no limit".
+  // otherwise coerce to NaN/falsy and silently mean "no limit". This caps each
+  // site's session (the server builds one session per site).
   const parsedLimit = parseInt(document.getElementById("handoff-limit").value, 10);
   const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
   const tailor = document.getElementById("handoff-tailor").checked;
   handoffUi.start.disabled = true;
-  handoffUi.result.innerHTML = `<p class="hint">Building the work-order${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
+  handoffUi.result.innerHTML = `<p class="hint">Building the work-orders${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
   try {
+    // board omitted → server default "both" = a session per site.
     const resp = await fetch("/api/handoff/build", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ board, limit, tailor }),
+      body: JSON.stringify({ limit, tailor }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || `build failed (${resp.status})`);
@@ -688,12 +689,25 @@ async function pollHandoffBuild(jobId) {
     return;
   }
   const r = t.result;
+  const sessions = r.sessions || [];
+  if (!sessions.length) {
+    handoffUi.result.innerHTML =
+      `<p class="hint">No fresh roles to hand off — every evaluated role is already handled.</p>`;
+    return;
+  }
+  // One paste-ready kickoff per site session — the agent works one site at a time.
   handoffUi.result.innerHTML =
-    `<p><b>${r.fresh}</b> fresh role${r.fresh === 1 ? "" : "s"} written to
-      <code>${escapeHtml(r.work_order)}</code></p>
-     <div class="skill-choice"><button id="handoff-copy-kickoff">Copy agent kickoff prompt</button></div>`;
-  wireCopy("handoff-copy-kickoff", r.kickoff,
-           (btn) => { btn.textContent = "Copied — paste it into your browser agent"; });
+    `<p><b>${r.total_fresh}</b> fresh role${r.total_fresh === 1 ? "" : "s"} across
+      <b>${sessions.length}</b> site session${sessions.length === 1 ? "" : "s"} —
+      copy each into your browser agent:</p>` +
+    sessions.map((s, i) =>
+      `<div class="skill-choice">
+         <button id="handoff-copy-kickoff-${i}">Copy ${escapeHtml(s.label)} kickoff</button>
+         <span class="hint"> ${s.fresh} role${s.fresh === 1 ? "" : "s"} → <code>${escapeHtml(s.work_order)}</code></span>
+       </div>`).join("");
+  sessions.forEach((s, i) =>
+    wireCopy(`handoff-copy-kickoff-${i}`, s.kickoff,
+             (btn) => { btn.textContent = `Copied ${s.label} — paste it into your browser agent`; }));
 }
 
 // ── career-ops skills ──────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import json
 import pytest
 
 from pipeline import handoff
+from pipeline.app import data as app_data
 
 
 # A compact but representative JOB_LOG.md. Exercises every parseable shape:
@@ -178,11 +179,35 @@ class TestBoardOf:
     @pytest.mark.parametrize("url,expected", [
         ("https://www.linkedin.com/jobs/view/123", "linkedin"),
         ("https://www.indeed.com/viewjob?jk=abc", "indeed"),
+        # Every other JobSpy site is now its own board (was "other").
+        ("https://www.glassdoor.com/job-listing/abc", "glassdoor"),
+        ("https://www.glassdoor.co.uk/job-listing/abc", "glassdoor"),  # any TLD
+        ("https://www.ziprecruiter.com/jobs/abc", "zip_recruiter"),    # JobSpy enum spelling
+        ("https://www.bayt.com/en/job/abc", "bayt"),
+        ("https://www.naukri.com/job-listings-abc", "naukri"),
+        ("https://bdjobs.com/jobdetails?id=abc", "bdjobs"),
         ("https://www.workatastartup.com/jobs/94300", "waas"),
+        # Unrecognized domains (incl. Google-sourced employer/ATS URLs) → catch-all.
+        ("https://boards.greenhouse.io/acme/jobs/1", "other"),
         ("https://example.com/careers/1", "other"),
     ])
     def test_board_of(self, url, expected):
         assert handoff.board_of(url) == expected
+
+    def test_known_boards_covers_jobspy_sites(self):
+        # KNOWN_BOARDS is the vocabulary the CLI/UI expose and every value
+        # board_of() can emit; it must cover the JobSpy sites we tag by URL.
+        assert {"linkedin", "indeed", "glassdoor", "zip_recruiter",
+                "bayt", "naukri", "bdjobs"} <= handoff.KNOWN_BOARDS
+        assert "other" in handoff.KNOWN_BOARDS          # the catch-all session
+        assert "both" not in handoff.KNOWN_BOARDS       # "both" is a selector, not a board
+
+    def test_board_labels_cover_known_boards(self):
+        # Every board board_of() can emit needs a human label — else the raw tag
+        # (e.g. "zip_recruiter") leaks into work-order headers and kickoff prompts.
+        # Guards the label table from drifting when a new site is added.
+        missing = [b for b in handoff.KNOWN_BOARDS if b not in handoff._BOARD_LABELS]
+        assert not missing, f"KNOWN_BOARDS with no _BOARD_LABELS entry: {missing}"
 
 
 # ── 2. Parsing JOB_LOG.md ──────────────────────────────────────────────────────
@@ -343,6 +368,75 @@ class TestBuildWorkOrder:
         assert [i.company for i in items] == ["Curri", "Crogl"]
 
 
+def _multi_site_queue():
+    """A fresh (untouched) queue spanning several sites: 2 linkedin, 2 indeed,
+    1 glassdoor, 1 zip_recruiter, and 1 unrecognized domain (→ other)."""
+    rows = [
+        ("Curri", "Software Engineer", 4.7, "https://www.linkedin.com/jobs/view/1"),
+        ("Crogl", "AI Engineer", 4.6, "https://www.linkedin.com/jobs/view/2"),
+        ("Oddball", "Backend Engineer", 4.4, "https://www.indeed.com/viewjob?jk=a1"),
+        ("Solugenix", "Full Stack Engineer", 3.8, "https://www.indeed.com/viewjob?jk=a2"),
+        ("Glasso", "Platform Engineer", 4.5, "https://www.glassdoor.com/job-listing/x"),
+        ("Zippy", "Software Engineer", 4.1, "https://www.ziprecruiter.com/jobs/z"),
+        ("Mystery", "AI Engineer", 4.0, "https://boards.greenhouse.io/mystery/jobs/9"),
+    ]
+    return [handoff.QueueRole(num=str(i + 1), score=s, company=c, role=r,
+                              url=u, status="Evaluated")
+            for i, (c, r, s, u) in enumerate(rows)]
+
+
+class TestBuildSessions:
+    """The generalization: instead of one board-filtered work-order, partition
+    the fresh queue into one session per site the scraper searches from."""
+
+    def test_partitions_by_site(self):
+        sessions = handoff.build_sessions(_multi_site_queue(), [])
+        assert set(sessions) == {"linkedin", "indeed", "glassdoor",
+                                 "zip_recruiter", "other"}
+        for board, items in sessions.items():
+            assert all(i.board == board for i in items)
+
+    def test_unknown_domain_lands_in_other(self):
+        sessions = handoff.build_sessions(_multi_site_queue(), [])
+        assert {i.company for i in sessions["other"]} == {"Mystery"}
+
+    def test_ranks_renumbered_per_session(self):
+        sessions = handoff.build_sessions(_multi_site_queue(), [])
+        # Each session is independently ranked 1..N, best score first.
+        assert [i.rank for i in sessions["linkedin"]] == [1, 2]
+        assert [i.company for i in sessions["linkedin"]] == ["Curri", "Crogl"]
+        assert [i.rank for i in sessions["indeed"]] == [1, 2]
+        assert [i.company for i in sessions["indeed"]] == ["Oddball", "Solugenix"]
+
+    def test_every_fresh_role_in_exactly_one_session(self):
+        queue = _multi_site_queue()
+        sessions = handoff.build_sessions(queue, [])
+        keys = [handoff.role_key(i.company, i.role)
+                for items in sessions.values() for i in items]
+        assert len(keys) == len(queue)          # nothing dropped
+        assert len(set(keys)) == len(keys)      # nothing duplicated across sessions
+
+    def test_limit_is_per_session(self):
+        # limit=1 caps EACH session at its single best role, not 1 role total.
+        sessions = handoff.build_sessions(_multi_site_queue(), [], limit=1)
+        assert all(len(items) == 1 for items in sessions.values())
+        assert sessions["linkedin"][0].company == "Curri"   # the site's top score
+        assert sessions["indeed"][0].company == "Oddball"
+
+    @pytest.mark.parametrize("limit", [0, -3, None])
+    def test_non_positive_limit_means_no_limit(self, limit):
+        sessions = handoff.build_sessions(_multi_site_queue(), [], limit=limit)
+        assert len(sessions["linkedin"]) == 2
+
+    def test_touched_roles_excluded_from_sessions(self):
+        # A role already in the tracker (any site) never appears in a session.
+        tracker = [handoff.TrackedRole(
+            key=handoff.role_key("Curri", "Software Engineer"),
+            company="Curri", role="Software Engineer", status="applied")]
+        sessions = handoff.build_sessions(_multi_site_queue(), tracker)
+        assert "Curri" not in {i.company for items in sessions.values() for i in items}
+
+
 class TestRender:
     def test_jsonl_lines_parse_with_expected_keys(self, queue_file):
         queue = handoff.load_queue(queue_file)
@@ -362,6 +456,23 @@ class TestRender:
         assert "Curri" in md and "Solugenix" in md
         # Must not hard-code a specific browser agent (template ships to everyone).
         assert "cowork" not in md.lower()
+
+    def test_md_for_a_site_names_that_sites_file(self):
+        items = handoff.build_sessions(_multi_site_queue(), [])["linkedin"]
+        md = handoff.render_work_order_md(items, board="linkedin",
+                                          total_queue=7, touched=0)
+        # The writeback legend must point at THIS site's file, not the generic one.
+        assert "next-roles-linkedin.jsonl" in md
+        assert "linkedin" in md.lower()
+        assert "cowork" not in md.lower()          # still agent-agnostic
+
+    def test_kickoff_prompt_names_site_files(self, tmp_path):
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        assert wo.name == "next-roles-linkedin.jsonl"
+        prompt = handoff.kickoff_prompt(wo, board="linkedin")
+        assert "next-roles-linkedin.jsonl" in prompt
+        assert "next-roles-linkedin.md" in prompt   # human-readable sibling
+        assert "cowork" not in prompt.lower()
 
 
 # ── 5. Tailoring enrichment ────────────────────────────────────────────────────
@@ -412,7 +523,7 @@ class TestEnrichment:
 
 # ── 6. CLI ─────────────────────────────────────────────────────────────────────
 class TestMain:
-    def test_main_writes_tracker_and_work_order(self, tmp_path, queue_file):
+    def test_main_writes_tracker_and_per_site_work_orders(self, tmp_path, queue_file):
         job_log = tmp_path / "JOB_LOG.md"
         job_log.write_text(SAMPLE_JOB_LOG, encoding="utf-8")
         out_dir = tmp_path / "handoff"
@@ -427,15 +538,20 @@ class TestMain:
         assert rc == 0
         assert tracker.exists()
 
-        wo_jsonl = out_dir / handoff.WORK_ORDER_JSONL
-        wo_md = out_dir / handoff.WORK_ORDER_MD
-        assert wo_jsonl.exists() and wo_md.exists()
+        def companies(board):
+            jsonl, md = handoff.work_order_paths(out_dir, board)
+            assert jsonl.exists() and md.exists()
+            return [json.loads(l)["company"]
+                    for l in jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
 
-        companies = [json.loads(l)["company"] for l in wo_jsonl.read_text(encoding="utf-8").splitlines() if l.strip()]
-        assert companies == ["Curri", "Crogl", "Oddball", "Solugenix"]
-        # Applied/handoff/skipped roles must be absent from the hand-off.
+        # One session per site, each ranked best-first (queue_file: Curri/Crogl
+        # are LinkedIn, Oddball/Solugenix are Indeed).
+        assert companies("linkedin") == ["Curri", "Crogl"]
+        assert companies("indeed") == ["Oddball", "Solugenix"]
+        # Applied/handoff/skipped roles must be absent from every session.
+        allc = companies("linkedin") + companies("indeed")
         for gone in ("Ryan", "Temu", "JPMorganChase", "micro1", "Falconer"):
-            assert gone not in companies
+            assert gone not in allc
 
     def test_main_is_rerunnable_and_idempotent(self, tmp_path, queue_file):
         job_log = tmp_path / "JOB_LOG.md"
@@ -444,10 +560,21 @@ class TestMain:
         tracker = tmp_path / handoff.DEFAULT_TRACKER_NAME
         args = ["--queue", str(queue_file), "--job-log", str(job_log),
                 "--tracker", str(tracker), "--out-dir", str(out_dir)]
+        li = handoff.work_order_paths(out_dir, "linkedin")[0]
         assert handoff.main(args) == 0
-        first = (out_dir / handoff.WORK_ORDER_JSONL).read_text(encoding="utf-8")
+        first = li.read_text(encoding="utf-8")
         assert handoff.main(args) == 0
-        assert (out_dir / handoff.WORK_ORDER_JSONL).read_text(encoding="utf-8") == first
+        assert li.read_text(encoding="utf-8") == first
+
+    def test_main_bootstrap_dir_seeds_without_a_queue(self, tmp_path):
+        # The setup-script entrypoint: create + seed the handoff dir with no queue,
+        # no career-ops, no work-order build.
+        out = tmp_path / "handoff"
+        rc = handoff.main(["--bootstrap-dir", "--out-dir", str(out)])
+        assert rc == 0
+        assert (out / handoff.HANDOFF_README).exists()
+        # It bootstraps only — no work-order files written.
+        assert not handoff.work_order_paths(out, "linkedin")[0].exists()
 
 
 # ── 7. Code-review regressions (2026-07-03 review round) ──────────────────────
@@ -574,6 +701,57 @@ class TestLateWritebackFold:
         kept, late = handoff.drop_late_writeback(items, tmp_path)
         assert kept == items and late == []
 
+    def test_late_status_in_per_site_file_is_caught(self, tmp_path):
+        # The status now lands in a per-site file (next-roles-<board>.jsonl), not
+        # the legacy combined file — drop_late_writeback must read them all.
+        handoff.work_order_paths(tmp_path, "linkedin")[0].write_text(json.dumps({
+            "company": "Acme", "role": "SWE",
+            "url": "https://www.linkedin.com/jobs/view/1", "status": "applied",
+        }) + "\n", encoding="utf-8")
+        items = [
+            handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="SWE",
+                                  board="linkedin", url="https://www.linkedin.com/jobs/view/1",
+                                  resume_base="content_adhoc"),
+            handoff.WorkOrderItem(rank=2, num="2", score=4.0, company="Globex", role="Dev",
+                                  board="indeed", url="https://www.indeed.com/viewjob?jk=b",
+                                  resume_base="content_adhoc"),
+        ]
+        kept, late = handoff.drop_late_writeback(items, tmp_path)
+        assert [i.company for i in kept] == ["Globex"]
+        assert [i.rank for i in kept] == [1]      # ranks renumbered
+        assert {t.key for t in late} == {handoff.role_key("Acme", "SWE")}
+
+
+class TestLoadAllWriteback:
+    """Writeback can arrive in any per-site file — and, right after the upgrade,
+    still in the legacy combined next-roles.jsonl an agent hasn't finished.
+    load_all_writeback unions them all so no status is lost."""
+
+    def test_unions_per_site_and_legacy_files(self, tmp_path):
+        handoff.work_order_paths(tmp_path, "linkedin")[0].write_text(json.dumps({
+            "company": "Acme", "role": "SWE",
+            "url": "https://www.linkedin.com/jobs/view/1", "status": "applied"}) + "\n",
+            encoding="utf-8")
+        handoff.work_order_paths(tmp_path, "indeed")[0].write_text(json.dumps({
+            "company": "Globex", "role": "Dev",
+            "url": "https://www.indeed.com/viewjob?jk=b", "status": "skip:onsite"}) + "\n",
+            encoding="utf-8")
+        # A pre-upgrade combined file an agent is still working.
+        (tmp_path / handoff.WORK_ORDER_JSONL).write_text(json.dumps({
+            "company": "Initech", "role": "Engineer",
+            "url": "https://www.linkedin.com/jobs/view/3", "status": "handoff"}) + "\n",
+            encoding="utf-8")
+        wb = {t.key: t for t in handoff.load_all_writeback(tmp_path)}
+        assert set(wb) == {
+            handoff.role_key("Acme", "SWE"),
+            handoff.role_key("Globex", "Dev"),
+            handoff.role_key("Initech", "Engineer"),
+        }
+        assert wb[handoff.role_key("Globex", "Dev")].status == "skipped"  # skip:<reason> parsed
+
+    def test_empty_dir_is_empty(self, tmp_path):
+        assert handoff.load_all_writeback(tmp_path) == []
+
 
 class TestQueueFromTracker:
     """Review gap: nothing in the repo produces evaluated-roles-by-score.jsonl,
@@ -607,7 +785,9 @@ class TestQueueFromTracker:
         out = tmp_path / "handoff"
         rc = handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co)
         assert rc == 0
-        lines = (out / handoff.WORK_ORDER_JSONL).read_text(encoding="utf-8").strip().splitlines()
+        # Acme's posting is a LinkedIn URL → it lands in the LinkedIn session.
+        lines = handoff.work_order_paths(out, "linkedin")[0].read_text(
+            encoding="utf-8").strip().splitlines()
         assert [json.loads(l)["company"] for l in lines] == ["Acme"]
 
     def test_run_errors_when_neither_source_exists(self, tmp_path):
@@ -623,11 +803,12 @@ class TestSharedTailorCaller:
 
     def test_caller_resolved_once_and_shared(self, monkeypatch, tmp_path):
         import pipeline.resume_tailor as rt
+        from pipeline import resume_content
         resolved = []
         captured = []
         monkeypatch.setattr(rt, "_resolve_caller",
                             lambda p, m: resolved.append(1) or (lambda s, u: "{}"))
-        monkeypatch.setattr(rt, "generate_for_job",
+        monkeypatch.setattr(resume_content, "generate_for_job",
                             lambda co, job, caller=None, **kw: captured.append(caller) or None)
         fn = handoff._make_tailor_fn(tmp_path)
         item = handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="A", role="R",
@@ -643,6 +824,21 @@ class TestSharedTailorCaller:
         assert captured[0]("sys", "user") == "{}"
         # …and exactly once across invocations (one shared rate limiter).
         assert resolved == [1]
+
+    def test_builds_from_the_handoff_profile_dir(self, monkeypatch, tmp_path):
+        # The tailor now builds from PROFILE.md in the handoff dir (resume_content),
+        # not the slot-edit tailor — so _make_tailor_fn threads out_dir through.
+        from pipeline import resume_content
+        calls = {}
+        monkeypatch.setattr(resume_content, "generate_for_job",
+                            lambda co, job, **kw: calls.update(career_ops=co, **kw) or "Acme.pdf")
+        handoff_dir = tmp_path / "handoff"
+        fn = handoff._make_tailor_fn(tmp_path / "career-ops", handoff_dir)
+        item = handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="SWE",
+                                     board="linkedin", url="u", resume_base="content_adhoc")
+        assert fn(item) == "Acme.pdf"
+        assert calls["profile_dir"] == handoff_dir
+        assert calls["career_ops"] == tmp_path / "career-ops"
 
 
 class TestOutDirEnv:
@@ -670,7 +866,7 @@ class TestOutDirEnv:
         rc = handoff.run(queue_path=tmp_path / "missing.jsonl",
                          career_ops=self._career_ops(tmp_path))
         assert rc == 0
-        assert (agent_home / handoff.WORK_ORDER_JSONL).exists()
+        assert handoff.work_order_paths(agent_home, "linkedin")[0].exists()  # Acme → LinkedIn
         assert (agent_home / handoff.DEFAULT_TRACKER_NAME).exists()
 
     def test_explicit_out_dir_beats_env(self, tmp_path, monkeypatch):
@@ -680,7 +876,7 @@ class TestOutDirEnv:
                          career_ops=self._career_ops(tmp_path),
                          out_dir=explicit)
         assert rc == 0
-        assert (explicit / handoff.WORK_ORDER_JSONL).exists()
+        assert handoff.work_order_paths(explicit, "linkedin")[0].exists()  # Acme → LinkedIn
         assert not (tmp_path / "env-dir").exists()
 
     def test_default_out_dir_helper_exposed(self, tmp_path, monkeypatch):
@@ -689,6 +885,732 @@ class TestOutDirEnv:
         assert handoff.default_out_dir() == tmp_path / "agent-home"
         monkeypatch.delenv("HANDOFF_OUT_DIR")
         assert handoff.default_out_dir() == handoff.ROOT / "output" / "handoff"
+
+
+class TestTrackerStatusSync:
+    """Bridge: agent writeback surfaces in career-ops' applications.md — the
+    tracker the UI renders and the cloud maintains. applied->Applied, skip->SKIP;
+    handoff/claimed stay dedup-only. Anchored by company/role identity (cloud
+    row-numbers are minted independently), reusing the UI's record_status_changes
+    so a pending cloud override is queued for the edit-tracker push. The autouse
+    conftest fixture isolates the override file to tmp."""
+
+    APPS = (
+        "# Applications Tracker\n\n"
+        "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+        "| 7 | 2026-07-01 | Acme | AI Engineer | 4.5/5 | Evaluated | X | [007](reports/007.md) | https://www.linkedin.com/jobs/view/7 |\n"
+        "| 8 | 2026-07-01 | Globex | Backend Engineer | 4.2/5 | Evaluated | X | [008](reports/008.md) | https://www.indeed.com/viewjob?jk=8 |\n"
+    )
+
+    def _apps(self, tmp_path, text=None):
+        p = tmp_path / "applications.md"
+        p.write_text(text or self.APPS, encoding="utf-8")
+        return p
+
+    def _wb(self, company, role, status):
+        return handoff.TrackedRole(key=handoff.role_key(company, role),
+                                   company=company, role=role, status=status)
+
+    def _status(self, apps_md, company, role):
+        want = handoff.role_key(company, role)
+        for row in app_data.parse_applications(apps_md):
+            if handoff.role_key(row["company"], row["role"]) == want:
+                return row.get("status_canonical")
+        return None
+
+    def _apps_status(self, tmp_path, status):
+        # The APPS fixture with Acme's row set to `status`.
+        return self._apps(tmp_path, self.APPS.replace(
+            "| Acme | AI Engineer | 4.5/5 | Evaluated",
+            f"| Acme | AI Engineer | 4.5/5 | {status}"))
+
+    def test_applied_marks_applied_and_queues_cloud_override(self, tmp_path):
+        apps = self._apps(tmp_path)
+        n = handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "applied")], apps)
+        assert n == 1
+        assert self._status(apps, "Acme", "AI Engineer") == "Applied"
+        # A pending, identity-anchored cloud override is queued for edit-tracker.
+        vals = [v for v in app_data.load_status_overrides().values()
+                if app_data.override_identity(v) == ("Acme", "AI Engineer")]
+        assert vals and app_data.override_status(vals[0]) == "Applied"
+
+    def test_skip_marks_skip(self, tmp_path):
+        apps = self._apps(tmp_path)
+        handoff.sync_tracker_statuses([self._wb("Globex", "Backend Engineer", "skipped")], apps)
+        assert self._status(apps, "Globex", "Backend Engineer") == "SKIP"
+
+    def test_handoff_and_claimed_not_synced(self, tmp_path):
+        apps = self._apps(tmp_path)
+        n = handoff.sync_tracker_statuses(
+            [self._wb("Acme", "AI Engineer", "handoff"),
+             self._wb("Globex", "Backend Engineer", "claimed")], apps)
+        assert n == 0
+        assert self._status(apps, "Acme", "AI Engineer") == "Evaluated"
+        assert self._status(apps, "Globex", "Backend Engineer") == "Evaluated"
+
+    def test_already_applied_row_is_idempotent(self, tmp_path):
+        # A row already reflected (not Evaluated) is left untouched — no re-write,
+        # no re-queued cloud override.
+        apps = self._apps_status(tmp_path, "Applied")
+        assert handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "applied")], apps) == 0
+        assert app_data.load_status_overrides() == {}
+
+    def test_does_not_downgrade_a_further_along_status(self, tmp_path):
+        # M1: a stale `applied` writeback must not revert a manually-advanced row.
+        apps = self._apps_status(tmp_path, "Responded")
+        assert handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "applied")], apps) == 0
+        assert self._status(apps, "Acme", "AI Engineer") == "Responded"
+
+    def test_skip_does_not_clobber_applied(self, tmp_path):
+        # M1: `skip:already-applied` on an already-Applied row must not downgrade it.
+        apps = self._apps_status(tmp_path, "Applied")
+        assert handoff.sync_tracker_statuses([self._wb("Acme", "AI Engineer", "skipped")], apps) == 0
+        assert self._status(apps, "Acme", "AI Engineer") == "Applied"
+
+    def test_resolves_across_legal_suffix_and_decoration_variance(self, tmp_path):
+        # M2: the writeback identity differs from the tracker's by a legal suffix
+        # AND a "- Remote" decoration, but role_key normalizes both, so the row
+        # still resolves (and the override anchors on the tracker's clean identity).
+        apps = self._apps(tmp_path,
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 4 | 2026-07-01 | Ryan | Backend Engineer | 4.3/5 | Evaluated | X | [004](reports/004.md) | https://www.indeed.com/viewjob?jk=4 |\n")
+        n = handoff.sync_tracker_statuses(
+            [self._wb("Ryan, LLC", "Backend Engineer - Remote", "applied")], apps)
+        assert n == 1
+        assert self._status(apps, "Ryan", "Backend Engineer") == "Applied"
+        vals = list(app_data.load_status_overrides().values())
+        assert vals and app_data.override_identity(vals[0]) == ("Ryan", "Backend Engineer")
+
+    def test_queued_override_reanchors_on_a_renumbered_tracker(self, tmp_path):
+        # The point of identity anchoring: the queued override carries
+        # company/role, so a push re-resolves it onto the correct row even when
+        # the cloud tracker numbers that role differently (8 locally -> 42 cloud).
+        apps = self._apps(tmp_path)
+        handoff.sync_tracker_statuses([self._wb("Globex", "Backend Engineer", "applied")], apps)
+        cloud = self.APPS.replace("| 8 |", "| 42 |")
+        _, payload, unresolved = app_data.resolve_overrides_for_push(
+            cloud, app_data.load_status_overrides())
+        assert not unresolved
+        assert payload.get("42") == "Applied"      # re-anchored onto the cloud's num
+
+    def test_role_absent_from_tracker_is_skipped(self, tmp_path):
+        apps = self._apps(tmp_path)
+        assert handoff.sync_tracker_statuses(
+            [self._wb("Nowhere", "Ghost Engineer", "applied")], apps) == 0
+
+    def test_missing_applications_md_is_noop(self, tmp_path):
+        assert handoff.sync_tracker_statuses(
+            [self._wb("Acme", "AI Engineer", "applied")], tmp_path / "nope.md") == 0
+
+
+class TestHandoffReadme:
+    """The seeded agent-instructions README — generated from WRITEBACK_STATUSES so
+    its status legend can't drift, and agent-agnostic (ships to every user)."""
+
+    def test_covers_work_order_format_and_writeback_vocab(self):
+        md = handoff.render_handoff_readme()
+        assert "next-roles-" in md              # the per-site work-order files
+        assert "role-status.jsonl" in md        # the tracker (don't hand-edit)
+        for token, _ in handoff.WRITEBACK_STATUSES:
+            assert token in md                  # the full writeback legend
+        assert "cowork" not in md.lower()       # agent-agnostic
+
+    def test_points_agent_at_the_living_profile(self):
+        # The README must send the agent to the living master (PROFILE.md) and
+        # say it's a document to grow — the whole point of Commit 2.
+        md = handoff.render_handoff_readme()
+        assert handoff.HANDOFF_PROFILE in md
+        assert "grow" in md.lower() or "living" in md.lower()
+
+
+class TestResumeRunbook:
+    """The seeded résumé RUN_BOOK — the recipe (schema + fill target + rules + how
+    to rebuild) a capable agent needs to rebuild/override a résumé. Docs only, no
+    shipped code; agent-agnostic."""
+
+    def test_documents_schema_fill_target_and_rebuild(self):
+        rb = handoff.render_resume_runbook()
+        for key in ("name", "summary", "skills", "experience", "projects", "education"):
+            assert key in rb                       # the content-JSON schema
+        assert handoff.HANDOFF_PROFILE in rb        # built from PROFILE.md
+        assert "92" in rb and "96" in rb            # the fill target band
+        assert "one page" in rb.lower()
+        assert "--handoff-tailor" in rb             # how to rebuild via the pipeline
+        assert "cowork" not in rb.lower()           # agent-agnostic
+
+
+class TestBootstrapHandoffDir:
+    """Create + seed the handoff directory. Non-clobbering (the folder accumulates
+    the user's own files) and idempotent (safe to call every run)."""
+
+    def test_creates_dir_and_seeds_readme(self, tmp_path):
+        out = tmp_path / "agent-home"
+        readme = handoff.bootstrap_handoff_dir(out)
+        assert out.is_dir()
+        assert readme == out / handoff.HANDOFF_README
+        assert readme.read_text(encoding="utf-8") == handoff.render_handoff_readme()
+
+    def test_does_not_clobber_existing_readme(self, tmp_path):
+        out = tmp_path / "agent-home"
+        out.mkdir()
+        (out / handoff.HANDOFF_README).write_text("my own notes", encoding="utf-8")
+        handoff.bootstrap_handoff_dir(out)
+        assert (out / handoff.HANDOFF_README).read_text(encoding="utf-8") == "my own notes"
+
+    def test_seeds_the_resume_runbook(self, tmp_path):
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out)
+        assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == \
+            handoff.render_resume_runbook()
+
+    def test_does_not_clobber_existing_runbook(self, tmp_path):
+        out = tmp_path / "agent-home"
+        out.mkdir()
+        (out / handoff.HANDOFF_RESUME_RUNBOOK).write_text("mine", encoding="utf-8")
+        handoff.bootstrap_handoff_dir(out)
+        assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == "mine"
+
+    def test_idempotent(self, tmp_path):
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out)
+        handoff.bootstrap_handoff_dir(out)      # no error, still seeded
+        assert (out / handoff.HANDOFF_README).exists()
+
+
+# ── Living PROFILE.md — the browser agent's master, seeded from career-ops ─────
+# A representative cv.md + profile.yml subset. The metrics are load-bearing: the
+# entire point of the seeded fact bank is that quantitative results survive into
+# the profile VERBATIM — dropping them was the #1 complaint about the old resume
+# tailor, so the seed must never trim them.
+_FIXTURE_CV = """# Jane Doe
+
+## Professional Summary
+Engineer who shipped an 840-star observability platform via an agentic workflow.
+
+## Skills
+Languages: Python · Go · SQL
+Cloud & CI/CD: AWS · Docker · GitHub Actions
+
+PROFESSIONAL EXPERIENCE
+Capital One  Aug 2022 – Sep 2023
+Software Engineer  Chicago, IL
+• Built Java/Spring APIs powering two launches — BJ's opt-out (1M+ cardholders) and Kohl's (millions); shipped to AWS ECS via CI/CD.
+Bank of America  Apr 2025 – Present
+Production Support Engineer  Plano, TX
+• Kept mission-critical financial systems at 99.999% uptime on a 24/7 on-call rotation.
+"""
+
+# Distinctive, quantified strings that MUST reach the profile untouched.
+_FIXTURE_CV_METRICS = ["840-star", "1M+ cardholders", "99.999% uptime", "24/7"]
+
+_FIXTURE_PROFILE = {
+    "candidate": {
+        "full_name": "Jane Doe", "email": "jane@example.com",
+        "phone": "+1 (555) 010-2030", "location": "Dallas, TX",
+        "linkedin": "linkedin.com/in/jane-doe", "github": "github.com/janedoe",
+    },
+    "narrative": {
+        "headline": "Software engineer building impactful products",
+        "exit_story": "Passionate about shipping quality software.",
+        "superpowers": ["Full-stack development", "Problem-solving"],
+    },
+    "target_roles": {"primary": ["AI Engineer", "Applied AI Engineer"]},
+    "compensation": {"target_range": "$75K-$500K", "minimum": "$75K",
+                     "location_flexibility": "Remote preferred"},
+    "location": {"country": "United States", "city": "Dallas", "state": "Texas",
+                 "timezone": "CST", "visa_status": "No sponsorship needed"},
+    "work_authorization": {"citizenship": "US", "requires_sponsorship": False,
+                           "work_permit_type": "Citizen"},
+    "voluntary_disclosures": {
+        "gender": "Male", "race_ethnicity": "Hispanic",
+        "veteran_status": "I am not a protected veteran",
+        "disability_status": "Yes, I have a disability (or previously had one)",
+    },
+}
+
+# The sections the living master must always carry (case-insensitive substrings).
+_PROFILE_SECTIONS = ["Identity", "Positioning", "fact bank", "Skills",
+                     "Standing answers", "Tailoring", "grow"]
+
+# The two grounded sources 3a folds in for comprehensiveness. article-digest.md
+# carries per-project hero metrics + proof points with [TODO: confirm] flags on
+# time-sensitive figures; _profile.md carries targeting/positioning context.
+_FIXTURE_ARTICLE_DIGEST = """# Article Digest -- Proof Points
+
+> **`[TODO: confirm]`** markers flag figures that are real but time-sensitive.
+
+## Traceway -- Observability Platform
+**Hero metrics:** Shipped a profiling subsystem across 3 merged PRs in ~3 days
+with full Go test coverage. `[TODO: confirm]` 840-star repo.
+**Proof points:**
+- Three production PRs merged into a real OSS platform in roughly three days.
+"""
+
+# "Your Target Roles" duplicates profile.yml (dropped by section-select); "Your
+# Adaptive Framing" is unique positioning content (kept).
+_FIXTURE_PROFILE_MD = """# User Profile Context -- career-ops
+
+## Your Target Roles
+| Archetype | What they buy |
+|-----------|---------------|
+| AI Engineer | ARCHETYPE-BOILERPLATE that duplicates profile.yml |
+
+## Your Adaptive Framing
+Lead with agentic / AI-first framing; production backend depth as the foundation.
+
+## Negotiation Scripts
+- Anchor high; NEGOTIATION-SENTINEL not résumé material.
+"""
+
+
+class TestRenderProfileMd:
+    """render_profile_md assembles the seed for the browser agent's living master
+    from career-ops data (cv.md + profile.yml). Contract: every required section
+    is present; metrics survive verbatim (the anti-regression core); the standing
+    form-answers are filled from profile.yml; it degrades to a usable scaffold
+    when a source is missing."""
+
+    def _md(self, **kw):
+        return handoff.render_profile_md(**kw)
+
+    def test_has_all_master_sections(self):
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE).lower()
+        for section in _PROFILE_SECTIONS:
+            assert section.lower() in md, f"missing section: {section}"
+
+    @pytest.mark.parametrize("metric", _FIXTURE_CV_METRICS)
+    def test_metrics_survive_verbatim(self, metric):
+        # The user's #1 quality requirement: quantitative results are copied in
+        # verbatim and never trimmed.
+        assert metric in self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+
+    def test_skills_seeded_from_cv(self):
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        assert "Python" in md and "AWS" in md
+
+    def test_identity_from_profile(self):
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        assert "Jane Doe" in md and "jane@example.com" in md
+
+    def test_standing_answers_from_profile(self):
+        # The form-fill answers the agent needs on every application — work auth,
+        # comp, location, and the EEO/voluntary disclosures — sourced from
+        # profile.yml so the agent never has to re-ask the user.
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        assert "$75K-$500K" in md                                    # comp target
+        assert "CST" in md                                           # location/tz
+        assert "Citizen" in md or "no sponsorship" in md.lower()     # work auth
+        assert "I am not a protected veteran" in md                  # EEO verbatim
+        assert "Yes, I have a disability (or previously had one)" in md
+
+    def test_scaffold_without_sources(self):
+        # A fresh install with no cv.md / profile.yml still gets every heading +
+        # the growth protocol, so the agent has a frame to fill in.
+        md = self._md().lower()
+        for section in _PROFILE_SECTIONS:
+            assert section.lower() in md
+
+    def test_partial_profile_does_not_crash(self):
+        # A profile.yml missing most keys must still render (defensive .get).
+        md = self._md(cv_md=_FIXTURE_CV, profile={"candidate": {"full_name": "Jane Doe"}})
+        assert "Jane Doe" in md
+
+    def test_growth_protocol_present(self):
+        # The living-document instruction: the agent appends the facts/answers it
+        # learns so the next run is smarter (the user's explicit ask).
+        md = self._md(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE).lower()
+        assert "grow" in md or "update this" in md or "living" in md
+
+
+class TestProfileFactBankNeverDrops:
+    """Regression: the fact bank must carry experience + metrics VERBATIM for any
+    résumé layout — order of sections, heading style, all-caps skill labels. A
+    structural-divider parser once dropped the whole experience block for these
+    (metric loss is the exact failure the fact bank exists to prevent)."""
+
+    def _md(self, cv):
+        return handoff.render_profile_md(cv_md=cv, profile=_FIXTURE_PROFILE)
+
+    def test_experience_first_then_trailing_section(self):
+        # Experience above Skills, with a section (Certifications) AFTER Skills.
+        cv = ("# Jane\n\n## Summary\nDid things.\n\n## Experience\n### Acme\n"
+              "- Cut latency 40% and saved $2M\n\n## Skills\nPython · Go\n\n"
+              "## Certifications\nAWS Certified\n")
+        assert "Cut latency 40% and saved $2M" in self._md(cv)
+
+    def test_skills_last_layout(self):
+        cv = ("# Jane\n\n## Experience\n### Acme\n- Shipped X to 5M users\n\n"
+              "## Skills\nPython · Go · AWS\n")
+        md = self._md(cv)
+        assert "Shipped X to 5M users" in md and "AWS" in md
+
+    def test_allcaps_skill_labels_preserved(self):
+        # Category labels ('BACKEND') / lone tokens are common in Skills blocks;
+        # they must not be mistaken for a section boundary that eats the skills.
+        cv = ("# Jane\n\n## Skills\nBACKEND\nPython · Go\nFRONTEND\nReact\n\n"
+              "PROFESSIONAL EXPERIENCE\nAcme\n- Shipped X to 5M users\n")
+        md = self._md(cv)
+        assert "Python · Go" in md and "React" in md       # skills survive
+        assert "Shipped X to 5M users" in md               # experience survives
+
+
+class TestProfileRobustToMalformedYaml:
+    """render_profile_md must not crash or emit garbage on a hand-edited /
+    alternate-schema profile.yml (the docstring promises graceful degradation)."""
+
+    def test_non_dict_section_does_not_crash(self):
+        # target_roles authored as a bare list (not the {primary: [...]} dict).
+        p = {"candidate": {"full_name": "Jane Doe"},
+             "target_roles": ["AI Engineer", "Backend Engineer"]}
+        md = handoff.render_profile_md(cv_md=_FIXTURE_CV, profile=p)
+        assert "Jane Doe" in md
+
+    def test_scalar_superpowers_not_split_per_character(self):
+        p = {"candidate": {"full_name": "Jane Doe"},
+             "narrative": {"superpowers": "Full-stack development"}}
+        md = handoff.render_profile_md(cv_md=_FIXTURE_CV, profile=p)
+        assert "Full-stack development" in md
+        assert "F; u; l; l" not in md                       # not char-joined
+
+    def test_string_requires_sponsorship_not_inverted(self):
+        # A quoted "false" (vs the bool false) must NOT flip the legal work-auth
+        # answer to "requires sponsorship".
+        p = {**_FIXTURE_PROFILE,
+             "work_authorization": {"citizenship": "US", "work_permit_type": "Citizen",
+                                    "requires_sponsorship": "false"}}
+        md = handoff.render_profile_md(cv_md=_FIXTURE_CV, profile=p)
+        assert "US Citizen — no sponsorship required" in md
+
+
+class TestProfileRicherSources:
+    """3a: the seed is comprehensive AND accurate because it folds in ALL grounded
+    career-ops sources — not just cv.md + profile.yml, but article-digest.md (hero
+    metrics / proof points) and _profile.md (positioning) — verbatim."""
+
+    def _md(self, **kw):
+        base = dict(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        base.update(kw)
+        return handoff.render_profile_md(**base)
+
+    def test_article_digest_metrics_and_proof_points_in_fact_bank(self):
+        md = self._md(article_digest=_FIXTURE_ARTICLE_DIGEST)
+        assert "3 merged PRs in ~3 days" in md              # hero metric, verbatim
+        assert "Three production PRs merged" in md           # proof point, verbatim
+
+    def test_confirm_markers_preserved(self):
+        # The flag must survive in the FOLDED CONTENT — not just in our static
+        # instruction header. Anchor on the flagged figure + require ≥2 markers
+        # (header + content), so stripping the content marker fails the test.
+        md = self._md(article_digest=_FIXTURE_ARTICLE_DIGEST)
+        assert "840-star" in md
+        assert md.count("[TODO: confirm]") >= 2
+
+    def test_profile_md_unique_positioning_kept(self):
+        md = self._md(profile_md=_FIXTURE_PROFILE_MD)
+        assert "agentic / AI-first framing" in md            # Adaptive Framing kept
+
+    def test_profile_md_drops_duplicative_and_offtopic_sections(self):
+        # Section-select: the archetype table (dups profile.yml) and negotiation
+        # scripts (not résumé material) are dropped; unique content stays.
+        md = self._md(profile_md=_FIXTURE_PROFILE_MD)
+        assert "ARCHETYPE-BOILERPLATE" not in md             # Your Target Roles dropped
+        assert "NEGOTIATION-SENTINEL" not in md              # Negotiation Scripts dropped
+
+    def test_embedded_source_headings_are_demoted(self):
+        # A source's own H2s must nest UNDER our subsection, not collide with
+        # PROFILE.md's top-level headings (no second "## Positioning", no stray
+        # "## Traceway" / "## Your Adaptive Framing" at section level).
+        md = self._md(article_digest=_FIXTURE_ARTICLE_DIGEST, profile_md=_FIXTURE_PROFILE_MD)
+        assert "\n## Traceway" not in md and "Traceway" in md
+        assert "\n## Your Adaptive Framing" not in md
+        assert md.count("\n## Positioning") == 1             # only PROFILE.md's own
+
+    def test_degrades_without_extra_sources(self):
+        # article-digest / _profile.md absent (a bare install) → still renders every
+        # section from cv.md + profile.yml, no crash, no empty enrichment headers.
+        md = self._md().lower()
+        for section in _PROFILE_SECTIONS:
+            assert section.lower() in md
+        assert "99.999% uptime" in self._md()               # cv fact bank intact
+
+    def test_missing_extras_do_not_leave_dangling_headers(self):
+        # Neither enrichment sub-section header may appear when its source is empty.
+        md = self._md(article_digest="", profile_md="").lower()
+        assert "article-digest" not in md                    # proof-points header gone
+        assert "positioning context" not in md               # _profile.md header gone
+
+
+class TestBootstrapSeedsProfile:
+    """bootstrap_handoff_dir also seeds the living PROFILE.md next to the README —
+    non-clobber (the agent grows it) and sourced from career-ops."""
+
+    def _career_ops(self, tmp_path):
+        import yaml
+        co = tmp_path / "career-ops"
+        (co / "config").mkdir(parents=True)
+        (co / "modes").mkdir(parents=True)
+        (co / "cv.md").write_text(_FIXTURE_CV, encoding="utf-8")
+        (co / "config" / "profile.yml").write_text(
+            yaml.safe_dump(_FIXTURE_PROFILE), encoding="utf-8")
+        (co / "article-digest.md").write_text(_FIXTURE_ARTICLE_DIGEST, encoding="utf-8")
+        (co / "modes" / "_profile.md").write_text(_FIXTURE_PROFILE_MD, encoding="utf-8")
+        return co
+
+    def test_seeds_profile_from_career_ops(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out, career_ops=co)
+        text = (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8")
+        assert "Jane Doe" in text
+        assert "99.999% uptime" in text                    # cv.md metric
+        assert "I am not a protected veteran" in text      # profile.yml standing answer
+        assert "Three production PRs merged" in text       # article-digest.md proof point
+        assert "agentic / AI-first framing" in text        # _profile.md positioning
+        # _load_profile_sources surfaces all four grounded sources end-to-end.
+
+    def test_does_not_clobber_existing_profile(self, tmp_path):
+        co = self._career_ops(tmp_path)
+        out = tmp_path / "agent-home"
+        out.mkdir()
+        (out / handoff.HANDOFF_PROFILE).write_text(
+            "# my grown profile\nlearned facts", encoding="utf-8")
+        handoff.bootstrap_handoff_dir(out, career_ops=co)
+        assert (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8") == \
+            "# my grown profile\nlearned facts"
+
+    def test_seeds_scaffold_when_career_ops_absent(self, tmp_path):
+        # No cv.md / profile.yml anywhere → still seed a scaffold PROFILE.md.
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out, career_ops=tmp_path / "nope")
+        assert (out / handoff.HANDOFF_PROFILE).exists()
+
+
+class TestProfileReferencedInPrompts:
+    """The kickoff (batch) and per-role prompts must both point the browser agent
+    at the living PROFILE.md so it qualifies + tailors against it."""
+
+    def test_kickoff_prompt_names_the_profile(self, tmp_path):
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        assert handoff.HANDOFF_PROFILE in handoff.kickoff_prompt(wo, board="linkedin")
+
+    def test_role_prompt_names_the_profile(self):
+        p = handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1")
+        assert handoff.HANDOFF_PROFILE in p
+
+
+class TestRunPerSiteSessions:
+    """Integration: run() writes one next-roles-<site>.{jsonl,md} per site, a
+    single shared role-status.jsonl, and folds agent writeback from the per-site
+    files back into the tracker on the next run."""
+
+    def test_run_seeds_readme_even_with_no_queue(self, tmp_path):
+        # The dir is bootstrapped before the queue check, so a browser agent gets
+        # the instructions even on the very first (empty) run.
+        out = tmp_path / "handoff"
+        rc = handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out,
+                         career_ops=tmp_path / "none")
+        assert rc == 1                          # no queue
+        assert (out / handoff.HANDOFF_README).exists()
+
+    def test_run_survives_unbootstrappable_out_dir(self, tmp_path):
+        # A misconfigured out_dir (a file, not a dir) must not crash a no-queue run —
+        # the bootstrap is best-effort; run() still returns 1 cleanly.
+        bad = tmp_path / "handoff"
+        bad.write_text("i am a file, not a dir", encoding="utf-8")
+        rc = handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=bad,
+                         career_ops=tmp_path / "none")
+        assert rc == 1
+
+    def _queue_file(self, tmp_path, rows):
+        p = tmp_path / "evaluated-roles-by-score.jsonl"
+        p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        return p
+
+    def _rows(self):
+        return [
+            {"num": "1", "score": 4.7, "company": "Curri", "role": "Software Engineer",
+             "status": "Evaluated", "url": "https://www.linkedin.com/jobs/view/1"},
+            {"num": "2", "score": 4.4, "company": "Oddball", "role": "Backend Engineer",
+             "status": "Evaluated", "url": "https://www.indeed.com/viewjob?jk=a1"},
+            {"num": "3", "score": 4.5, "company": "Glasso", "role": "Platform Engineer",
+             "status": "Evaluated", "url": "https://www.glassdoor.com/job-listing/x"},
+        ]
+
+    def _companies(self, out, board):
+        p = handoff.work_order_paths(out, board)[0]
+        return [json.loads(l)["company"]
+                for l in p.read_text(encoding="utf-8").strip().splitlines()]
+
+    def test_writes_one_file_per_site_and_shared_tracker(self, tmp_path):
+        out = tmp_path / "handoff"
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, self._rows()),
+                         out_dir=out, career_ops=tmp_path / "no-career-ops")
+        assert rc == 0
+        assert self._companies(out, "linkedin") == ["Curri"]
+        assert self._companies(out, "indeed") == ["Oddball"]
+        assert self._companies(out, "glassdoor") == ["Glasso"]
+        # Each site also gets its human-readable .md.
+        assert handoff.work_order_paths(out, "linkedin")[1].exists()
+        # One shared tracker; NO legacy combined next-roles.jsonl is produced.
+        assert (out / handoff.DEFAULT_TRACKER_NAME).exists()
+        assert not (out / handoff.WORK_ORDER_JSONL).exists()
+
+    def test_empties_stale_site_file(self, tmp_path):
+        out = tmp_path / "handoff"
+        out.mkdir()
+        # A leftover Indeed session from a previous run whose role is no longer
+        # in the queue. This run's queue has only a LinkedIn role.
+        stale = handoff.work_order_paths(out, "indeed")[0]
+        stale.write_text(json.dumps({
+            "rank": 1, "company": "GoneCorp", "role": "Old Role",
+            "url": "https://www.indeed.com/viewjob?jk=old", "status": ""}) + "\n",
+            encoding="utf-8")
+        rows = [{"num": "1", "score": 4.7, "company": "Curri", "role": "Software Engineer",
+                 "status": "Evaluated", "url": "https://www.linkedin.com/jobs/view/1"}]
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, rows),
+                         out_dir=out, career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "linkedin") == ["Curri"]
+        # The stale Indeed session is emptied so the agent won't re-work it.
+        assert stale.read_text(encoding="utf-8").strip() == ""
+
+    def test_narrow_board_writes_only_that_site(self, tmp_path):
+        out = tmp_path / "handoff"
+        out.mkdir()
+        # A LinkedIn session the user built separately must survive a narrowed
+        # Indeed-only build.
+        li = handoff.work_order_paths(out, "linkedin")[0]
+        li.write_text(json.dumps({"rank": 1, "company": "Keep", "role": "Me",
+                                  "url": "https://www.linkedin.com/jobs/view/9",
+                                  "status": ""}) + "\n", encoding="utf-8")
+        rows = [{"num": "1", "score": 4.4, "company": "Oddball", "role": "Backend Engineer",
+                 "status": "Evaluated", "url": "https://www.indeed.com/viewjob?jk=a1"}]
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, rows),
+                         out_dir=out, board="indeed", career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "indeed") == ["Oddball"]
+        assert "Keep" in li.read_text(encoding="utf-8")   # LinkedIn file untouched
+
+    def test_session_summaries_lists_nonempty_sessions(self, tmp_path):
+        out = tmp_path / "handoff"
+        assert handoff.run(queue_path=self._queue_file(tmp_path, self._rows()),
+                           out_dir=out, career_ops=tmp_path / "none") == 0
+        summ = {s["board"]: s for s in handoff.session_summaries(out)}
+        assert set(summ) == {"linkedin", "indeed", "glassdoor"}
+        assert summ["linkedin"]["label"] == "LinkedIn"
+        assert summ["linkedin"]["fresh"] == 1
+        assert summ["linkedin"]["work_order"].endswith("next-roles-linkedin.jsonl")
+        assert "next-roles-linkedin.jsonl" in summ["linkedin"]["kickoff"]
+        # Only non-empty per-site sessions — never the legacy combined file (its
+        # board tag "both" is absent from the set above), never an emptied site.
+        assert all(s["fresh"] > 0 for s in summ.values())
+
+    def test_agent_writeback_from_site_file_folds_into_tracker(self, tmp_path):
+        out = tmp_path / "handoff"
+        qf = self._queue_file(tmp_path, self._rows())
+        assert handoff.run(queue_path=qf, out_dir=out, career_ops=tmp_path / "none") == 0
+        # Agent applies to Curri and records it in the LinkedIn session file.
+        li = handoff.work_order_paths(out, "linkedin")[0]
+        obj = json.loads(li.read_text(encoding="utf-8").strip())
+        obj["status"] = "applied"
+        li.write_text(json.dumps(obj) + "\n", encoding="utf-8")
+        # Next run folds that status into the shared tracker and drops the role.
+        assert handoff.run(queue_path=qf, out_dir=out, career_ops=tmp_path / "none") == 0
+        assert li.read_text(encoding="utf-8").strip() == ""   # Curri no longer fresh
+        tracker = handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)
+        curri = [t for t in tracker if t.key == handoff.role_key("Curri", "Software Engineer")]
+        assert curri and curri[0].status == "applied"
+
+    def test_narrow_build_empties_legacy_combined_file(self, tmp_path):
+        out = tmp_path / "handoff"
+        out.mkdir()
+        # A pre-upgrade combined next-roles.jsonl on disk, plus a separate
+        # LinkedIn session the user built earlier.
+        legacy = out / handoff.WORK_ORDER_JSONL
+        legacy.write_text(json.dumps({"rank": 1, "company": "OldCo", "role": "Old Role",
+                                      "url": "https://www.indeed.com/viewjob?jk=old",
+                                      "status": ""}) + "\n", encoding="utf-8")
+        li = handoff.work_order_paths(out, "linkedin")[0]
+        li.write_text(json.dumps({"rank": 1, "company": "Keep", "role": "Me",
+                                  "url": "https://www.linkedin.com/jobs/view/9",
+                                  "status": ""}) + "\n", encoding="utf-8")
+        rows = [{"num": "1", "score": 4.4, "company": "Oddball", "role": "Backend Engineer",
+                 "status": "Evaluated", "url": "https://www.indeed.com/viewjob?jk=a1"}]
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, rows),
+                         out_dir=out, board="indeed", career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "indeed") == ["Oddball"]
+        # The legacy combined file is never a valid session — emptied even on a
+        # narrowed build (else a pre-upgrade file lingers and gets re-worked)...
+        assert legacy.read_text(encoding="utf-8").strip() == ""
+        # ...but the OTHER site's session the user built separately survives.
+        assert "Keep" in li.read_text(encoding="utf-8")
+
+    def test_empty_board_builds_all_sessions(self, tmp_path):
+        # board="" is the same "all sites" sentinel as "both" (via _is_combined),
+        # not a narrowed session literally named "".
+        out = tmp_path / "handoff"
+        rc = handoff.run(queue_path=self._queue_file(tmp_path, self._rows()),
+                         out_dir=out, board="", career_ops=tmp_path / "none")
+        assert rc == 0
+        assert self._companies(out, "linkedin") == ["Curri"]
+        assert self._companies(out, "indeed") == ["Oddball"]
+        assert self._companies(out, "glassdoor") == ["Glasso"]
+        assert not (out / handoff.WORK_ORDER_JSONL).exists()   # no stray "" session file
+
+    def _career_ops_with_row(self, tmp_path, status="Evaluated"):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            f"| 3 | 2026-07-01 | Acme | AI Engineer | 4.6/5 | {status} | X | [003](reports/003.md) "
+            "| https://www.linkedin.com/jobs/view/3 |\n", encoding="utf-8")
+        return co
+
+    def _seed_applied_writeback(self, out):
+        out.mkdir(exist_ok=True)
+        handoff.work_order_paths(out, "linkedin")[0].write_text(json.dumps({
+            "rank": 1, "company": "Acme", "role": "AI Engineer",
+            "url": "https://www.linkedin.com/jobs/view/3", "status": "applied"}) + "\n",
+            encoding="utf-8")
+
+    def test_run_reflects_applied_writeback_into_applications_md(self, tmp_path):
+        # The agent applied to a tracker role (status in a per-site work-order).
+        # run() folds it into role-status.jsonl AND marks the tracker Applied +
+        # queues a cloud override.
+        co = self._career_ops_with_row(tmp_path)
+        out = tmp_path / "handoff"
+        self._seed_applied_writeback(out)
+        assert handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co) == 0
+        rows = {r["company"]: r for r in app_data.parse_applications(co / "data" / "applications.md")}
+        assert rows["Acme"]["status_canonical"] == "Applied"                    # UI Kanban
+        tracker = handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)
+        assert any(t.key == handoff.role_key("Acme", "AI Engineer") and t.status == "applied"
+                   for t in tracker)                                             # dedup ledger
+        assert any(app_data.override_identity(v) == ("Acme", "AI Engineer")
+                   for v in app_data.load_status_overrides().values())          # cloud push queue
+
+    def test_run_tracker_sync_is_idempotent(self, tmp_path):
+        co = self._career_ops_with_row(tmp_path)
+        out = tmp_path / "handoff"
+        self._seed_applied_writeback(out)
+        # A scored-export queue so the re-run still has a queue after the tracker's
+        # only row flips to Applied (the tracker-sourced queue would then be empty).
+        q = tmp_path / "q.jsonl"
+        q.write_text(json.dumps({"num": "3", "score": 4.6, "company": "Acme", "role": "AI Engineer",
+                                 "url": "https://www.linkedin.com/jobs/view/3", "status": "Evaluated"}) + "\n",
+                     encoding="utf-8")
+        assert handoff.run(queue_path=q, out_dir=out, career_ops=co) == 0
+        # Simulate a push clearing the override queue, then re-run: the role is
+        # already Applied in role-status.jsonl, so nothing is re-queued.
+        app_data.save_status_overrides({})
+        assert handoff.run(queue_path=q, out_dir=out, career_ops=co) == 0
+        assert app_data.load_status_overrides() == {}
 
 
 # ── 8. Code-review fixes (2026-07-04, PR #86 high-recall round) ────────────────
@@ -744,10 +1666,9 @@ class TestReportPathThreaded:
         assert handoff.build_work_order([q], [])[0].report == "reports/001-acme.md"
 
     def test_tailor_passes_report_path_to_generate(self, monkeypatch, tmp_path):
-        import pipeline.resume_tailor as rt
+        from pipeline import resume_content
         seen = {}
-        monkeypatch.setattr(rt, "_resolve_caller", lambda p, m: (lambda s, u: "{}"))
-        monkeypatch.setattr(rt, "generate_for_job",
+        monkeypatch.setattr(resume_content, "generate_for_job",
                             lambda co, job, **kw: seen.update(report_path=job.report_path) or None)
         fn = handoff._make_tailor_fn(tmp_path)
         fn(handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="AI Engineer",

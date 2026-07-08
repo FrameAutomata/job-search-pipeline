@@ -68,6 +68,12 @@ if (-not (Test-Path "$root\config\search.yml")) { Copy-Item "$root\config\search
 if (-not (Test-Path "$root\resumes")) { New-Item -ItemType Directory "$root\resumes" | Out-Null }
 if (-not (Test-Path "$root\output")) { New-Item -ItemType Directory "$root\output" | Out-Null }
 
+Write-Host "==> Preparing the browser-agent handoff folder (creates it + seeds a README)"
+Push-Location $root
+try { & "$root\.venv\Scripts\python.exe" -m pipeline.handoff --bootstrap-dir }
+catch { Write-Host "    handoff bootstrap skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
+Pop-Location
+
 Write-Host ""
 Write-Host "==> Setup complete."
 Write-Host ""
