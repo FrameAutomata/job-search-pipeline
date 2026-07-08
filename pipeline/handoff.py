@@ -1170,11 +1170,57 @@ def _profile_standing_answers(profile: dict) -> list[str]:
     ]
 
 
-def render_profile_md(*, cv_md: str = "", profile: dict | None = None) -> str:
-    """Assemble the seed for the living PROFILE.md from career-ops data. Pure and
-    defensive: any missing source degrades to a labelled scaffold so the agent
-    always gets every section (and can fill the gaps as it learns). The fact bank
-    embeds the résumé's experience VERBATIM — the seed never trims a metric."""
+def _strip_h1(text: str) -> str:
+    """Drop a single leading `# …` title line from an embedded source, so folding
+    it into PROFILE.md doesn't plant a competing top-level heading."""
+    lines = text.strip().splitlines()
+    if lines and lines[0].startswith("# "):   # text.strip() already dropped any indent
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+_HEADING_RE = re.compile(r"(?m)^(#{1,6})(\s)")
+
+
+def _demote_headings(text: str, by: int = 2) -> str:
+    """Push every markdown heading in an embedded block `by` levels deeper (capped
+    at H6), so the source's `##` sections nest UNDER the PROFILE.md subsection
+    they're folded into instead of colliding with PROFILE.md's own headings."""
+    return _HEADING_RE.sub(lambda m: "#" * min(6, len(m.group(1)) + by) + m.group(2), text)
+
+
+# _profile.md sections that duplicate what profile.yml already renders (targets /
+# exit story / location / comp) or aren't résumé material (negotiation). Matched
+# by lowercased H2 title; ANY other section — including a user's custom one — is
+# kept, so section-selecting never silently drops customization.
+_PROFILE_MD_DROP = frozenset((
+    "your target roles", "your exit narrative", "your location policy",
+    "your comp targets", "negotiation scripts",
+))
+
+
+def _select_profile_md(profile_md: str) -> str:
+    """The positioning-relevant slice of _profile.md — every `##` section except
+    the ones in _PROFILE_MD_DROP (and their subsections). Keeps the unique bits
+    (adaptive framing, deal-breakers, portfolio) without the boilerplate."""
+    out, dropping = [], False
+    for ln in _strip_h1(profile_md).splitlines():
+        m = re.match(r"^\s*##\s+(.*\S)", ln)
+        if m:
+            dropping = m.group(1).strip().lower() in _PROFILE_MD_DROP
+        if not dropping:
+            out.append(ln)
+    return "\n".join(out).strip()
+
+
+def render_profile_md(*, cv_md: str = "", profile: dict | None = None,
+                      article_digest: str = "", profile_md: str = "") -> str:
+    """Assemble the seed for the living PROFILE.md from the grounded career-ops
+    sources — cv.md (experience/skills), profile.yml (identity/standing answers),
+    article-digest.md (hero metrics/proof points), _profile.md (positioning).
+    Pure and defensive: any missing source degrades to a labelled scaffold so the
+    agent always gets every section. All source text is embedded VERBATIM — the
+    seed never trims a metric or a [TODO: confirm] flag."""
     profile = profile or {}
     cand = _dsect(profile, "candidate")
     narr = _dsect(profile, "narrative")
@@ -1187,6 +1233,10 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None) -> str:
     summary = _cv_section_body(cv_md, "Professional Summary") or _cv_section_body(cv_md, "Summary")
     skills = _cv_section_body(cv_md, "Skills")
     experience = _cv_experience_body(cv_md)
+    # Fold the two extra sources verbatim, but nest their headings (demote) and
+    # drop _profile.md's sections that just duplicate profile.yml (section-select).
+    positioning_ctx = _demote_headings(_select_profile_md(profile_md))
+    proof_points = _demote_headings(_strip_h1(article_digest))
 
     lines = [
         f"# {cand.get('full_name') or '(your name)'} — candidate profile",
@@ -1206,6 +1256,8 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None) -> str:
         "- **Superpowers:** " + ("; ".join(superpowers) if superpowers
                                   else "(what you do better than other candidates)"),
         *(["", "**From your résumé:**", "", summary] if summary else []),
+        *(["", "**Targeting & positioning context (from _profile.md):**", "", positioning_ctx]
+          if positioning_ctx else []),
         "",
         "## Role fact bank",
         "Your experience and projects, with the numbers that carry them. **Metrics",
@@ -1215,6 +1267,9 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None) -> str:
         "",
         experience or "_(seed this from your résumé: one block per role/project, "
                       "each bullet keeping its concrete, quantified result.)_",
+        *(["", "### Proof points & hero metrics (from article-digest.md)",
+           "Keep any `[TODO: confirm]` figures flagged until you re-verify them.",
+           "", proof_points] if proof_points else []),
         "",
         "## Skills inventory",
         "Rate each skill by honesty tier — **Strong** (current, lead with it) · "
@@ -1273,12 +1328,15 @@ def _load_yaml_or_empty(path) -> dict:
 
 
 def _load_profile_sources(career_ops=None) -> dict:
-    """Read the seed inputs for render_profile_md from a career-ops tree
-    (cv.md + config/profile.yml). Best-effort — missing/unreadable files yield
-    empty inputs and render_profile_md falls back to its scaffold."""
+    """Read the seed inputs for render_profile_md from a career-ops tree — the four
+    grounded sources: cv.md, config/profile.yml, article-digest.md (hero metrics /
+    proof points), modes/_profile.md (positioning). Best-effort — missing/unreadable
+    files yield empty inputs and render_profile_md falls back to its scaffold."""
     co = _career_ops_dir(career_ops)
     return {"cv_md": _read_or_empty(co / "cv.md"),
-            "profile": _load_yaml_or_empty(co / "config" / "profile.yml")}
+            "profile": _load_yaml_or_empty(co / "config" / "profile.yml"),
+            "article_digest": _read_or_empty(co / "article-digest.md"),
+            "profile_md": _read_or_empty(co / "modes" / "_profile.md")}
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

@@ -1090,6 +1090,36 @@ _FIXTURE_PROFILE = {
 _PROFILE_SECTIONS = ["Identity", "Positioning", "fact bank", "Skills",
                      "Standing answers", "Tailoring", "grow"]
 
+# The two grounded sources 3a folds in for comprehensiveness. article-digest.md
+# carries per-project hero metrics + proof points with [TODO: confirm] flags on
+# time-sensitive figures; _profile.md carries targeting/positioning context.
+_FIXTURE_ARTICLE_DIGEST = """# Article Digest -- Proof Points
+
+> **`[TODO: confirm]`** markers flag figures that are real but time-sensitive.
+
+## Traceway -- Observability Platform
+**Hero metrics:** Shipped a profiling subsystem across 3 merged PRs in ~3 days
+with full Go test coverage. `[TODO: confirm]` 840-star repo.
+**Proof points:**
+- Three production PRs merged into a real OSS platform in roughly three days.
+"""
+
+# "Your Target Roles" duplicates profile.yml (dropped by section-select); "Your
+# Adaptive Framing" is unique positioning content (kept).
+_FIXTURE_PROFILE_MD = """# User Profile Context -- career-ops
+
+## Your Target Roles
+| Archetype | What they buy |
+|-----------|---------------|
+| AI Engineer | ARCHETYPE-BOILERPLATE that duplicates profile.yml |
+
+## Your Adaptive Framing
+Lead with agentic / AI-first framing; production backend depth as the foundation.
+
+## Negotiation Scripts
+- Anchor high; NEGOTIATION-SENTINEL not résumé material.
+"""
+
 
 class TestRenderProfileMd:
     """render_profile_md assembles the seed for the browser agent's living master
@@ -1210,6 +1240,64 @@ class TestProfileRobustToMalformedYaml:
         assert "US Citizen — no sponsorship required" in md
 
 
+class TestProfileRicherSources:
+    """3a: the seed is comprehensive AND accurate because it folds in ALL grounded
+    career-ops sources — not just cv.md + profile.yml, but article-digest.md (hero
+    metrics / proof points) and _profile.md (positioning) — verbatim."""
+
+    def _md(self, **kw):
+        base = dict(cv_md=_FIXTURE_CV, profile=_FIXTURE_PROFILE)
+        base.update(kw)
+        return handoff.render_profile_md(**base)
+
+    def test_article_digest_metrics_and_proof_points_in_fact_bank(self):
+        md = self._md(article_digest=_FIXTURE_ARTICLE_DIGEST)
+        assert "3 merged PRs in ~3 days" in md              # hero metric, verbatim
+        assert "Three production PRs merged" in md           # proof point, verbatim
+
+    def test_confirm_markers_preserved(self):
+        # The flag must survive in the FOLDED CONTENT — not just in our static
+        # instruction header. Anchor on the flagged figure + require ≥2 markers
+        # (header + content), so stripping the content marker fails the test.
+        md = self._md(article_digest=_FIXTURE_ARTICLE_DIGEST)
+        assert "840-star" in md
+        assert md.count("[TODO: confirm]") >= 2
+
+    def test_profile_md_unique_positioning_kept(self):
+        md = self._md(profile_md=_FIXTURE_PROFILE_MD)
+        assert "agentic / AI-first framing" in md            # Adaptive Framing kept
+
+    def test_profile_md_drops_duplicative_and_offtopic_sections(self):
+        # Section-select: the archetype table (dups profile.yml) and negotiation
+        # scripts (not résumé material) are dropped; unique content stays.
+        md = self._md(profile_md=_FIXTURE_PROFILE_MD)
+        assert "ARCHETYPE-BOILERPLATE" not in md             # Your Target Roles dropped
+        assert "NEGOTIATION-SENTINEL" not in md              # Negotiation Scripts dropped
+
+    def test_embedded_source_headings_are_demoted(self):
+        # A source's own H2s must nest UNDER our subsection, not collide with
+        # PROFILE.md's top-level headings (no second "## Positioning", no stray
+        # "## Traceway" / "## Your Adaptive Framing" at section level).
+        md = self._md(article_digest=_FIXTURE_ARTICLE_DIGEST, profile_md=_FIXTURE_PROFILE_MD)
+        assert "\n## Traceway" not in md and "Traceway" in md
+        assert "\n## Your Adaptive Framing" not in md
+        assert md.count("\n## Positioning") == 1             # only PROFILE.md's own
+
+    def test_degrades_without_extra_sources(self):
+        # article-digest / _profile.md absent (a bare install) → still renders every
+        # section from cv.md + profile.yml, no crash, no empty enrichment headers.
+        md = self._md().lower()
+        for section in _PROFILE_SECTIONS:
+            assert section.lower() in md
+        assert "99.999% uptime" in self._md()               # cv fact bank intact
+
+    def test_missing_extras_do_not_leave_dangling_headers(self):
+        # Neither enrichment sub-section header may appear when its source is empty.
+        md = self._md(article_digest="", profile_md="").lower()
+        assert "article-digest" not in md                    # proof-points header gone
+        assert "positioning context" not in md               # _profile.md header gone
+
+
 class TestBootstrapSeedsProfile:
     """bootstrap_handoff_dir also seeds the living PROFILE.md next to the README —
     non-clobber (the agent grows it) and sourced from career-ops."""
@@ -1218,9 +1306,12 @@ class TestBootstrapSeedsProfile:
         import yaml
         co = tmp_path / "career-ops"
         (co / "config").mkdir(parents=True)
+        (co / "modes").mkdir(parents=True)
         (co / "cv.md").write_text(_FIXTURE_CV, encoding="utf-8")
         (co / "config" / "profile.yml").write_text(
             yaml.safe_dump(_FIXTURE_PROFILE), encoding="utf-8")
+        (co / "article-digest.md").write_text(_FIXTURE_ARTICLE_DIGEST, encoding="utf-8")
+        (co / "modes" / "_profile.md").write_text(_FIXTURE_PROFILE_MD, encoding="utf-8")
         return co
 
     def test_seeds_profile_from_career_ops(self, tmp_path):
@@ -1229,8 +1320,11 @@ class TestBootstrapSeedsProfile:
         handoff.bootstrap_handoff_dir(out, career_ops=co)
         text = (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8")
         assert "Jane Doe" in text
-        assert "99.999% uptime" in text                    # metric survived the seed
-        assert "I am not a protected veteran" in text      # standing answer
+        assert "99.999% uptime" in text                    # cv.md metric
+        assert "I am not a protected veteran" in text      # profile.yml standing answer
+        assert "Three production PRs merged" in text       # article-digest.md proof point
+        assert "agentic / AI-first framing" in text        # _profile.md positioning
+        # _load_profile_sources surfaces all four grounded sources end-to-end.
 
     def test_does_not_clobber_existing_profile(self, tmp_path):
         co = self._career_ops(tmp_path)
