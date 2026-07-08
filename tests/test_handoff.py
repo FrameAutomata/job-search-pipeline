@@ -803,11 +803,12 @@ class TestSharedTailorCaller:
 
     def test_caller_resolved_once_and_shared(self, monkeypatch, tmp_path):
         import pipeline.resume_tailor as rt
+        from pipeline import resume_content
         resolved = []
         captured = []
         monkeypatch.setattr(rt, "_resolve_caller",
                             lambda p, m: resolved.append(1) or (lambda s, u: "{}"))
-        monkeypatch.setattr(rt, "generate_for_job",
+        monkeypatch.setattr(resume_content, "generate_for_job",
                             lambda co, job, caller=None, **kw: captured.append(caller) or None)
         fn = handoff._make_tailor_fn(tmp_path)
         item = handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="A", role="R",
@@ -823,6 +824,21 @@ class TestSharedTailorCaller:
         assert captured[0]("sys", "user") == "{}"
         # …and exactly once across invocations (one shared rate limiter).
         assert resolved == [1]
+
+    def test_builds_from_the_handoff_profile_dir(self, monkeypatch, tmp_path):
+        # The tailor now builds from PROFILE.md in the handoff dir (resume_content),
+        # not the slot-edit tailor — so _make_tailor_fn threads out_dir through.
+        from pipeline import resume_content
+        calls = {}
+        monkeypatch.setattr(resume_content, "generate_for_job",
+                            lambda co, job, **kw: calls.update(career_ops=co, **kw) or "Acme.pdf")
+        handoff_dir = tmp_path / "handoff"
+        fn = handoff._make_tailor_fn(tmp_path / "career-ops", handoff_dir)
+        item = handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="SWE",
+                                     board="linkedin", url="u", resume_base="content_adhoc")
+        assert fn(item) == "Acme.pdf"
+        assert calls["profile_dir"] == handoff_dir
+        assert calls["career_ops"] == tmp_path / "career-ops"
 
 
 class TestOutDirEnv:
@@ -1621,10 +1637,9 @@ class TestReportPathThreaded:
         assert handoff.build_work_order([q], [])[0].report == "reports/001-acme.md"
 
     def test_tailor_passes_report_path_to_generate(self, monkeypatch, tmp_path):
-        import pipeline.resume_tailor as rt
+        from pipeline import resume_content
         seen = {}
-        monkeypatch.setattr(rt, "_resolve_caller", lambda p, m: (lambda s, u: "{}"))
-        monkeypatch.setattr(rt, "generate_for_job",
+        monkeypatch.setattr(resume_content, "generate_for_job",
                             lambda co, job, **kw: seen.update(report_path=job.report_path) or None)
         fn = handoff._make_tailor_fn(tmp_path)
         fn(handoff.WorkOrderItem(rank=1, num="1", score=4.5, company="Acme", role="AI Engineer",

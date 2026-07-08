@@ -919,10 +919,12 @@ def enrich_with_resumes(items: list[WorkOrderItem], tailor_fn, *, min_score: flo
     return items
 
 
-def _make_tailor_fn(career_ops: Path):
-    """The real tailor adapter: wraps pipeline.resume_tailor.generate_for_job
-    (cached per company, one-page verified, hand-edits win). Lazy imports so the
-    handoff stage itself never needs python-docx unless --tailor is used.
+def _make_tailor_fn(career_ops: Path, out_dir=None):
+    """The real tailor adapter: builds each row's résumé from the handoff
+    PROFILE.md via resume_content.generate_for_job (LLM → grounded content-JSON →
+    one-page fit → cached PDF). out_dir is where PROFILE.md lives (defaults to the
+    handoff dir). Lazy imports so the handoff stage itself never needs python-docx
+    unless --tailor is used.
 
     All rows share ONE caller: gemini_limits' free-tier pacer lives inside the
     caller instance, so per-row resolution would give every pool worker its own
@@ -930,9 +932,11 @@ def _make_tailor_fn(career_ops: Path):
     actual LLM invocation, so a fully cached run still works with no provider
     key configured."""
     import threading
+    from pipeline import resume_content
     from pipeline import resume_tailor as rt
     from pipeline.role_select import ApplyJob
 
+    out_dir = Path(out_dir) if out_dir else default_out_dir()
     lock = threading.Lock()
     cell: list = []
 
@@ -944,11 +948,12 @@ def _make_tailor_fn(career_ops: Path):
 
     def tailor(item: WorkOrderItem):
         # report_path feeds generate_for_job's proof-point branch (report_base
-        # defaults to career_ops, where the path is rooted) so tailoring uses
-        # the evaluation report, not JD text alone (review M1).
+        # defaults to career_ops, where the path is rooted) so tailoring uses the
+        # evaluation report, not JD text alone.
         job = ApplyJob(num=item.num, company=item.company, role=item.role,
                        url=item.url, score=item.score, report_path=item.report)
-        return rt.generate_for_job(career_ops, job, caller=shared_caller)
+        return resume_content.generate_for_job(career_ops, job, profile_dir=out_dir,
+                                               caller=shared_caller)
 
     return tailor
 
@@ -1528,7 +1533,7 @@ def run(
     if tailor:
         min_score = tailor_min_score if tailor_min_score is not None else env_float("APPLY_TAILOR_MIN_SCORE", 4.0)
         try:
-            tailor_fn = _make_tailor_fn(co.resolve())
+            tailor_fn = _make_tailor_fn(co.resolve(), out_dir)
         except ImportError as e:
             print(f"[handoff] --tailor unavailable ({e}) — emitting the work-order without resume files")
         else:
