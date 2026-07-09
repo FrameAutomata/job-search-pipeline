@@ -514,6 +514,86 @@ fetch("/api/run-local/status").then((r) => r.json()).then((s) => {
   }
 }).catch(() => {});
 
+// ── local search-config override ───────────────────────────────────────────
+// A full standalone search config for local runs that diverges from the
+// cloud-shared config. orchestrate auto-prefers config/search.local.yml when it
+// exists, so this only affects THIS machine's runs — cloud stays on search.yml.
+
+const localSearch = {
+  status: document.getElementById("local-search-status"),
+  edit: document.getElementById("local-search-edit"),
+  editor: document.getElementById("local-search-editor"),
+  text: document.getElementById("local-search-text"),
+  save: document.getElementById("local-search-save"),
+  clear: document.getElementById("local-search-clear"),
+  msg: document.getElementById("local-search-msg"),
+  active: false,
+};
+
+function renderLocalSearchStatus() {
+  localSearch.status.textContent = localSearch.active
+    ? "Local runs use: search.local.yml (override active)"
+    : "Local runs use: search.yml (same as cloud)";
+  // Nothing to revert to when no override exists.
+  localSearch.clear.hidden = !localSearch.active;
+}
+
+async function loadLocalSearch() {
+  try {
+    const resp = await fetch("/api/local-search");
+    const body = await resp.json();
+    localSearch.active = !!body.active;
+    localSearch.text.value = body.content || "";
+    renderLocalSearchStatus();
+  } catch (_) {
+    localSearch.status.textContent = "Search config: unavailable";
+  }
+}
+
+localSearch.edit.addEventListener("click", () => {
+  localSearch.editor.hidden = !localSearch.editor.hidden;
+  localSearch.msg.textContent = "";
+});
+
+localSearch.save.addEventListener("click", async () => {
+  localSearch.save.disabled = true;
+  localSearch.msg.textContent = "Saving…";
+  try {
+    const resp = await fetch("/api/local-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: localSearch.text.value }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `save failed (${resp.status})`);
+    localSearch.active = true;
+    renderLocalSearchStatus();
+    localSearch.msg.textContent = "Saved — local runs now use this override.";
+  } catch (e) {
+    localSearch.msg.textContent = String(e.message || e);
+  } finally {
+    localSearch.save.disabled = false;
+  }
+});
+
+localSearch.clear.addEventListener("click", async () => {
+  if (!confirm("Delete the local override so local runs use your cloud search config?")) return;
+  localSearch.clear.disabled = true;
+  try {
+    const resp = await fetch("/api/local-search", { method: "DELETE" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `delete failed (${resp.status})`);
+    await loadLocalSearch();   // re-seed the editor from the cloud config; sets active=false
+    localSearch.msg.textContent = "Reverted to cloud config.";
+  } catch (e) {
+    localSearch.msg.textContent = String(e.message || e);
+  } finally {
+    localSearch.clear.disabled = false;
+  }
+});
+
+loadLocalSearch();
+
 // ── tracker liveness re-check ──────────────────────────────────────────────
 
 const recheckUi = {

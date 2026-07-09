@@ -17,6 +17,45 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+# The cloud-shared search config (populated from the SEARCH_CONFIG_B64 secret in
+# the daily workflow) and the optional LOCAL override. A local run auto-prefers
+# the override so a user can search different terms locally than the cloud daily,
+# without touching the secret. The cloud checkout never has search.local.yml —
+# it's gitignored and the daily only ever decodes the secret into search.yml.
+SHARED_SEARCH_CONFIG = Path("config/search.yml")
+LOCAL_SEARCH_CONFIG = Path("config/search.local.yml")
+
+
+def resolve_search_config(explicit: str | Path | None, root: Path = ROOT) -> Path:
+    """Pick the search config, resolved against `root`.
+
+    Precedence: explicit --config > a *custom* SEARCH_CONFIG env >
+    config/search.local.yml (if present) > config/search.yml.
+
+    Note the "custom" qualifier: .env.example ships `SEARCH_CONFIG=./config/search.yml`,
+    so nearly every local .env has the var set to the shared default. Honoring that
+    literally would defeat the local override for everyone, so a SEARCH_CONFIG that
+    resolves to the shared config/search.yml is treated as boilerplate (equivalent to
+    unset) and the override still wins. A SEARCH_CONFIG pointing anywhere else is a
+    deliberate choice and takes precedence. The cloud daily sets no SEARCH_CONFIG env
+    (it relies on the default path), so it always uses the decoded search.yml.
+    """
+    def _resolve(p: str | Path) -> Path:
+        p = Path(p)
+        return p if p.is_absolute() else (root / p).resolve()
+
+    if explicit:
+        return _resolve(explicit)
+    shared = _resolve(SHARED_SEARCH_CONFIG)
+    env = os.environ.get("SEARCH_CONFIG")
+    if env and (env_path := _resolve(env)) != shared:
+        return env_path
+    local = _resolve(LOCAL_SEARCH_CONFIG)
+    if local.exists():
+        return local
+    return shared
+
+
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
 from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_evaluate's timeout/budget knobs)
 # Only the board vocabulary is needed at arg-parse time; handoff.run itself is
@@ -99,7 +138,9 @@ def main() -> int:
     # unset and empty-string both as "use the default".
     career_ops = resolve(os.environ.get("CAREER_OPS_PATH") or "career-ops")
 
-    config_path = args.config or resolve(os.environ.get("SEARCH_CONFIG") or "config/search.yml")
+    config_path = resolve_search_config(args.config)
+    if config_path == resolve(LOCAL_SEARCH_CONFIG):
+        print(f"[config] using local search override ({LOCAL_SEARCH_CONFIG.name})")
     if not config_path.exists():
         print(f"error: config not found at {config_path}", file=sys.stderr)
         print("hint: copy config/search.example.yml -> config/search.yml and edit", file=sys.stderr)

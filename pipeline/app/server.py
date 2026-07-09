@@ -498,6 +498,68 @@ def run_local_cancel() -> JSONResponse:
     return JSONResponse(local_run.cancel())
 
 
+# ── local search-config override ────────────────────────────────────────────
+# A full standalone search config for LOCAL runs (config/search.local.yml) that
+# diverges from the cloud-shared config/search.yml. orchestrate.py auto-prefers
+# it when present (resolve_search_config), so both the UI "Run" button and CLI
+# runs use it; the cloud is untouched (the daily decodes SEARCH_CONFIG_B64 into
+# search.yml and never sees this gitignored file). The UI seeds the editor from
+# search.yml so "full replacement" starts from the current cloud config.
+# These filenames mirror orchestrate.{LOCAL,SHARED}_SEARCH_CONFIG — not imported
+# from there because orchestrate pulls jobspy transitively and this UI process
+# shouldn't. Keep the two in sync if either is ever renamed.
+def _local_search_path() -> Path:
+    return ROOT / "config" / "search.local.yml"
+
+
+class LocalSearchConfig(BaseModel):
+    content: str
+
+
+@app.get("/api/local-search")
+def local_search_get() -> JSONResponse:
+    """Return the local override if present, else seed the editor with the
+    cloud-shared search.yml so the user edits a full copy. `active` is whether an
+    override file exists (i.e. what local runs will actually use)."""
+    local = _local_search_path()
+    if local.exists():
+        return JSONResponse({"active": True, "content": local.read_text(encoding="utf-8"),
+                             "path": "config/search.local.yml"})
+    shared = ROOT / "config" / "search.yml"
+    content = shared.read_text(encoding="utf-8") if shared.exists() else ""
+    return JSONResponse({"active": False, "content": content, "path": "config/search.local.yml"})
+
+
+@app.post("/api/local-search")
+def local_search_set(req: LocalSearchConfig) -> JSONResponse:
+    """Validate and write the local override. Rejects anything that wouldn't load
+    as a search config so the next run can't choke on a broken file. Accepts the
+    same two shapes as pipeline.scrape.load_searches (the runtime authority): a
+    `searches:` list, or the legacy single `search:` mapping."""
+    import yaml
+    try:
+        parsed = yaml.safe_load(req.content)
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Not valid YAML: {e}")
+    ok = isinstance(parsed, dict) and (isinstance(parsed.get("searches"), list) or "search" in parsed)
+    if not ok:
+        raise HTTPException(status_code=400,
+                            detail="Config must be a mapping with a `searches:` list "
+                                   "(or a legacy `search:` entry).")
+    local = _local_search_path()
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(req.content, encoding="utf-8")
+    return JSONResponse({"ok": True, "active": True})
+
+
+@app.delete("/api/local-search")
+def local_search_delete() -> JSONResponse:
+    """Remove the override so local runs fall back to the cloud-shared config.
+    Idempotent — a no-op when no override exists."""
+    _local_search_path().unlink(missing_ok=True)
+    return JSONResponse({"ok": True, "active": False})
+
+
 # ── tracker liveness re-check ───────────────────────────────────────────────
 # A background sweep that re-checks every Evaluated tracker role's liveness and
 # marks closed ones Discarded — the UI counterpart of orchestrate's
