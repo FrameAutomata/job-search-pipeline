@@ -76,6 +76,38 @@ def test_post_accepts_legacy_search_form(client):
     assert _local_file(root).exists()
 
 
+def test_post_rejects_scalar_search_entry(client):
+    # `search: python` loads, but the pipeline reads dict fields off it and would
+    # crash — the validator must reject it, not "accept then choke on next run".
+    c, root = client
+    r = c.post("/api/local-search", json={"content": "search: python\n"})
+    assert r.status_code == 400
+    assert not _local_file(root).exists()
+
+
+def test_post_rejects_scalar_in_searches_list(client):
+    c, root = client
+    r = c.post("/api/local-search", json={"content": "searches: [python, rust]\n"})
+    assert r.status_code == 400
+    assert not _local_file(root).exists()
+
+
+def test_post_rejects_null_search(client):
+    c, root = client
+    r = c.post("/api/local-search", json={"content": "search:\n"})
+    assert r.status_code == 400
+    assert not _local_file(root).exists()
+
+
+def test_post_rejects_empty_searches_list(client):
+    # An empty override silently scrapes nothing every run — reject so the user
+    # gets a clear error instead of a mystery zero-result pipeline.
+    c, root = client
+    r = c.post("/api/local-search", json={"content": "searches: []\n"})
+    assert r.status_code == 400
+    assert not _local_file(root).exists()
+
+
 def test_post_rejects_unparseable_yaml(client):
     c, root = client
     r = c.post("/api/local-search", json={"content": "searches: [unterminated\n"})

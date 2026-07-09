@@ -546,7 +546,11 @@ async function loadLocalSearch() {
     localSearch.text.value = body.content || "";
     renderLocalSearchStatus();
   } catch (_) {
+    // State unknown — don't offer a delete against it, and don't leave the
+    // clear button in whatever state the last render left it.
+    localSearch.active = false;
     localSearch.status.textContent = "Search config: unavailable";
+    localSearch.clear.hidden = true;
   }
 }
 

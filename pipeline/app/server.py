@@ -516,6 +516,27 @@ class LocalSearchConfig(BaseModel):
     content: str
 
 
+def _search_entries(parsed) -> list | None:
+    """The per-search mappings pipeline.scrape.load_searches would yield, or None
+    if the shape is invalid. Mirrors load_searches (a `searches:` list, or the
+    legacy single `search:`) but additionally requires at least one entry and
+    every entry to be a mapping — the pipeline reads dict fields off each, so a
+    scalar/null entry or an empty list would crash the next run, not no-op."""
+    if not isinstance(parsed, dict):
+        return None
+    if "searches" in parsed:
+        entries = parsed["searches"]
+    elif "search" in parsed:
+        entries = [parsed["search"]]
+    else:
+        return None
+    if not isinstance(entries, list) or not entries:
+        return None
+    if not all(isinstance(e, dict) for e in entries):
+        return None
+    return entries
+
+
 @app.get("/api/local-search")
 def local_search_get() -> JSONResponse:
     """Return the local override if present, else seed the editor with the
@@ -533,19 +554,17 @@ def local_search_get() -> JSONResponse:
 @app.post("/api/local-search")
 def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     """Validate and write the local override. Rejects anything that wouldn't load
-    as a search config so the next run can't choke on a broken file. Accepts the
-    same two shapes as pipeline.scrape.load_searches (the runtime authority): a
-    `searches:` list, or the legacy single `search:` mapping."""
+    as a search config so the next run can't choke on a broken file — including a
+    non-mapping or empty search entry, which would crash scrape, not no-op."""
     import yaml
     try:
         parsed = yaml.safe_load(req.content)
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Not valid YAML: {e}")
-    ok = isinstance(parsed, dict) and (isinstance(parsed.get("searches"), list) or "search" in parsed)
-    if not ok:
+    if _search_entries(parsed) is None:
         raise HTTPException(status_code=400,
-                            detail="Config must be a mapping with a `searches:` list "
-                                   "(or a legacy `search:` entry).")
+                            detail="Config must have a non-empty `searches:` list of search "
+                                   "mappings (or a single legacy `search:` mapping).")
     local = _local_search_path()
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(req.content, encoding="utf-8")
