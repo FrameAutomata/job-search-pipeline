@@ -28,6 +28,8 @@ name: Daily Job Pipeline
 #   RESUME_TXT_B64     — resumes/resume.txt
 #   (optional) PROFILE_MD_B64     — your modes/_profile.md customizations
 #   (optional) ARTICLE_DIGEST_B64 — your article-digest.md
+#   (optional) PROFILE_MASTER_B64 — your living PROFILE.md (the browser agent's master;
+#                                   when set, the cloud evaluator scores against it)
 #   At least one LLM key: GEMINI_API_KEY / GROQ_API_KEY / DEEPINFRA_API_KEY /
 #     OPENROUTER_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
 
@@ -119,6 +121,7 @@ jobs:
           PROFILE_YML_B64:    ${{ secrets.PROFILE_YML_B64 }}
           PROFILE_MD_B64:     ${{ secrets.PROFILE_MD_B64 }}
           ARTICLE_DIGEST_B64: ${{ secrets.ARTICLE_DIGEST_B64 }}
+          PROFILE_MASTER_B64: ${{ secrets.PROFILE_MASTER_B64 }}
         run: |
           mkdir -p config resumes career-ops/config career-ops/modes career-ops/data \
                    career-ops/batch/jds career-ops/batch/tracker-additions career-ops/reports
@@ -158,6 +161,7 @@ jobs:
           decode_secret PROFILE_YML_B64    "$PROFILE_YML_B64"   career-ops/config/profile.yml  yes
           decode_secret PROFILE_MD_B64     "$PROFILE_MD_B64"    career-ops/modes/_profile.md   no
           decode_secret ARTICLE_DIGEST_B64 "$ARTICLE_DIGEST_B64" career-ops/article-digest.md  no
+          decode_secret PROFILE_MASTER_B64 "$PROFILE_MASTER_B64" career-ops/PROFILE.md          no
 
           if [ "$fail" = 1 ]; then
             echo "::error::One or more setup secrets failed to decode (see above). Fix them and re-run."

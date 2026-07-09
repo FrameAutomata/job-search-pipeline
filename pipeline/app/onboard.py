@@ -52,6 +52,12 @@ SECRET_FILES = {
 }
 REQUIRED_SECRETS = ["SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64"]
 
+# GitHub caps a repository secret at 48 KB. PROFILE.md is the one append-only,
+# agent-grown secret source, so we bound the base64 blob and skip it (the cloud
+# degrades to the seed profile) rather than fail the whole onboard when it
+# outgrows the cap — which would also strand the provider-key write that follows.
+PROFILE_MASTER_MAX_B64 = 45_000
+
 # Sidecar of the last submitted onboarding payload (minus the API key), so a
 # second visit to the wizard prefills every field instead of forcing the user
 # to re-fill the whole form just to tweak one knob like `results_wanted`.
@@ -362,4 +368,19 @@ def collect_secret_blobs(root: Path) -> dict[str, str]:
             blobs[secret] = base64.b64encode(p.read_bytes()).decode("ascii")
         elif secret in REQUIRED_SECRETS:
             raise OnboardError(f"expected generated file {rel} was not produced")
+
+    # PROFILE_MASTER_B64: the browser agent's living PROFILE.md, so the cloud
+    # evaluator scores against the same master as local eval. Optional and
+    # special-cased — it lives at HANDOFF_OUT_DIR (resolve_profile_md), not a
+    # repo-relative path, and a user who hasn't grown one yet just ships the seeds.
+    from pipeline.handoff import resolve_profile_md
+    master = resolve_profile_md()
+    if master:
+        blob = base64.b64encode(master.encode("utf-8")).decode("ascii")
+        if len(blob) <= PROFILE_MASTER_MAX_B64:
+            blobs["PROFILE_MASTER_B64"] = blob
+        else:
+            print(f"[onboard] PROFILE.md too large to sync as a secret "
+                  f"({len(blob) // 1024} KB base64 > {PROFILE_MASTER_MAX_B64 // 1024} KB cap) — "
+                  f"cloud eval will use the seed profile; trim PROFILE.md to sync it.")
     return blobs

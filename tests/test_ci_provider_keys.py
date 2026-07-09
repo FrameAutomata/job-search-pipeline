@@ -42,3 +42,18 @@ def test_daily_pipeline_forwards_every_provider_api_key():
         "batch_evaluate._PROVIDER_KEYS, but these are not wired into the "
         "workflow env: " + ", ".join(f"{p} ({k})" for p, k in missing)
     )
+
+
+def test_daily_pipeline_syncs_profile_master_to_career_ops():
+    """The living PROFILE.md rides to the cloud as PROFILE_MASTER_B64 and is
+    decoded to the exact path resolve_profile_md() falls back to
+    (career-ops/PROFILE.md), so the cloud evaluator scores against the same
+    master as local eval. Optional (`no`) — absent secret → cloud uses the seeds."""
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert "PROFILE_MASTER_B64" in _all_env_pairs(workflow), \
+        "daily-pipeline.yml must forward PROFILE_MASTER_B64 into the workflow env"
+    text = WORKFLOW.read_text(encoding="utf-8")
+    decode = [ln for ln in text.splitlines() if "decode_secret PROFILE_MASTER_B64" in ln]
+    assert decode, "workflow must decode PROFILE_MASTER_B64"
+    assert "career-ops/PROFILE.md" in decode[0], "must decode to resolve_profile_md's fallback path"
+    assert decode[0].split()[-1] == "no", "PROFILE_MASTER_B64 is an optional secret"
