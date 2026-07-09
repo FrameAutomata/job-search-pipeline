@@ -498,6 +498,87 @@ def run_local_cancel() -> JSONResponse:
     return JSONResponse(local_run.cancel())
 
 
+# ── local search-config override ────────────────────────────────────────────
+# A full standalone search config for LOCAL runs (config/search.local.yml) that
+# diverges from the cloud-shared config/search.yml. orchestrate.py auto-prefers
+# it when present (resolve_search_config), so both the UI "Run" button and CLI
+# runs use it; the cloud is untouched (the daily decodes SEARCH_CONFIG_B64 into
+# search.yml and never sees this gitignored file). The UI seeds the editor from
+# search.yml so "full replacement" starts from the current cloud config.
+# These filenames mirror orchestrate.{LOCAL,SHARED}_SEARCH_CONFIG — not imported
+# from there because orchestrate pulls jobspy transitively and this UI process
+# shouldn't. Keep the two in sync if either is ever renamed.
+def _local_search_path() -> Path:
+    return ROOT / "config" / "search.local.yml"
+
+
+class LocalSearchConfig(BaseModel):
+    content: str
+
+
+def _search_entries(parsed) -> list | None:
+    """The per-search mappings pipeline.scrape.load_searches would yield, or None
+    if the shape is invalid. Mirrors load_searches (a `searches:` list, or the
+    legacy single `search:`) but additionally requires at least one entry and
+    every entry to be a mapping — the pipeline reads dict fields off each, so a
+    scalar/null entry or an empty list would crash the next run, not no-op."""
+    if not isinstance(parsed, dict):
+        return None
+    if "searches" in parsed:
+        entries = parsed["searches"]
+    elif "search" in parsed:
+        entries = [parsed["search"]]
+    else:
+        return None
+    if not isinstance(entries, list) or not entries:
+        return None
+    if not all(isinstance(e, dict) for e in entries):
+        return None
+    return entries
+
+
+@app.get("/api/local-search")
+def local_search_get() -> JSONResponse:
+    """Return the local override if present, else seed the editor with the
+    cloud-shared search.yml so the user edits a full copy. `active` is whether an
+    override file exists (i.e. what local runs will actually use)."""
+    local = _local_search_path()
+    if local.exists():
+        return JSONResponse({"active": True, "content": local.read_text(encoding="utf-8"),
+                             "path": "config/search.local.yml"})
+    shared = ROOT / "config" / "search.yml"
+    content = shared.read_text(encoding="utf-8") if shared.exists() else ""
+    return JSONResponse({"active": False, "content": content, "path": "config/search.local.yml"})
+
+
+@app.post("/api/local-search")
+def local_search_set(req: LocalSearchConfig) -> JSONResponse:
+    """Validate and write the local override. Rejects anything that wouldn't load
+    as a search config so the next run can't choke on a broken file — including a
+    non-mapping or empty search entry, which would crash scrape, not no-op."""
+    import yaml
+    try:
+        parsed = yaml.safe_load(req.content)
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Not valid YAML: {e}")
+    if _search_entries(parsed) is None:
+        raise HTTPException(status_code=400,
+                            detail="Config must have a non-empty `searches:` list of search "
+                                   "mappings (or a single legacy `search:` mapping).")
+    local = _local_search_path()
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(req.content, encoding="utf-8")
+    return JSONResponse({"ok": True, "active": True})
+
+
+@app.delete("/api/local-search")
+def local_search_delete() -> JSONResponse:
+    """Remove the override so local runs fall back to the cloud-shared config.
+    Idempotent — a no-op when no override exists."""
+    _local_search_path().unlink(missing_ok=True)
+    return JSONResponse({"ok": True, "active": False})
+
+
 # ── tracker liveness re-check ───────────────────────────────────────────────
 # A background sweep that re-checks every Evaluated tracker role's liveness and
 # marks closed ones Discarded — the UI counterpart of orchestrate's
