@@ -318,6 +318,59 @@ class TestArticleDigestSecretWiring:
         assert "ARTICLE_DIGEST_B64" not in blobs
 
 
+class TestProfileMasterSecretWiring:
+    """The living PROFILE.md (grown by the browser agent in HANDOFF_OUT_DIR) rides
+    to the cloud as an OPTIONAL PROFILE_MASTER_B64 secret, so the cloud evaluator
+    scores against the same master as local eval. Special-cased (not in
+    SECRET_FILES) because it lives at HANDOFF_OUT_DIR, not a repo-relative path."""
+
+    def _seed_required(self, root):
+        (root / "config").mkdir()
+        (root / "resumes").mkdir()
+        (root / "career-ops" / "config").mkdir(parents=True)
+        (root / "config" / "search.yml").write_text("searches: []", encoding="utf-8")
+        (root / "resumes" / "resume.txt").write_text("resume", encoding="utf-8")
+        (root / "career-ops" / "cv.md").write_text("# CV", encoding="utf-8")
+        (root / "career-ops" / "config" / "profile.yml").write_text("candidate: {}", encoding="utf-8")
+
+    def test_profile_master_is_not_required(self):
+        assert "PROFILE_MASTER_B64" not in onboard.REQUIRED_SECRETS
+
+    def test_collect_includes_profile_master_when_present(self, tmp_path, monkeypatch):
+        self._seed_required(tmp_path)
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()
+        (handoff_dir / "PROFILE.md").write_text("LIVING MASTER PROFILE", encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "career-ops"))   # pin the fallback
+        blobs = onboard.collect_secret_blobs(tmp_path)
+        assert "PROFILE_MASTER_B64" in blobs
+        assert base64.b64decode(blobs["PROFILE_MASTER_B64"]).decode() == "LIVING MASTER PROFILE"
+
+    def test_collect_omits_profile_master_when_absent(self, tmp_path, monkeypatch):
+        self._seed_required(tmp_path)
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()                          # no PROFILE.md anywhere
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "career-ops"))   # fallback dir has none either
+        blobs = onboard.collect_secret_blobs(tmp_path)
+        assert "PROFILE_MASTER_B64" not in blobs
+
+    def test_collect_skips_oversized_profile_master(self, tmp_path, monkeypatch, capsys):
+        # An append-only PROFILE.md that outgrows GitHub's secret cap must degrade
+        # to the seeds (skip + log), not 502 the onboard / strand the provider key.
+        self._seed_required(tmp_path)
+        handoff_dir = tmp_path / "handoff"
+        handoff_dir.mkdir()
+        big = "x" * onboard.PROFILE_MASTER_MAX_B64   # base64 ~1.33x → over the cap
+        (handoff_dir / "PROFILE.md").write_text(big, encoding="utf-8")
+        monkeypatch.setenv("HANDOFF_OUT_DIR", str(handoff_dir))
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "career-ops"))
+        blobs = onboard.collect_secret_blobs(tmp_path)
+        assert "PROFILE_MASTER_B64" not in blobs      # skipped, not a crash
+        assert "too large" in capsys.readouterr().out  # and it says why
+
+
 class TestEeoDatalists:
     """The four voluntary self-ID fields offer standard answers as dropdown
     suggestions, but must stay free-text so a user can type the employer's exact

@@ -54,6 +54,7 @@ First generate the profile artifacts locally with `node setup-profile.mjs` (poin
    | `RESUME_TXT_B64` | `resumes/resume.txt` (the file you created above) |
    | `PROFILE_MD_B64` *(optional)* | `career-ops/modes/_profile.md` |
    | `ARTICLE_DIGEST_B64` *(optional)* | `career-ops/article-digest.md` |
+   | `PROFILE_MASTER_B64` *(optional)* | your living `PROFILE.md` → decoded to `career-ops/PROFILE.md` |
 
    Plus at least one LLM API key secret: `GEMINI_API_KEY` (free tier) / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`.
 
