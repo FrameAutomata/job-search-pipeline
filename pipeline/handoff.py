@@ -1427,6 +1427,25 @@ def default_out_dir() -> Path:
     return Path(env) if env else ROOT / "output" / "handoff"
 
 
+def resolve_profile_md(career_ops=None, out_dir=None) -> str:
+    """The living PROFILE.md that drives evaluation (Commit 4), or "" when none
+    exists. Resolution order:
+
+      1. the handoff dir — HANDOFF_OUT_DIR (or an explicit out_dir), where the
+         browser agent grows PROFILE.md and the résumé builder already reads it;
+      2. career-ops/PROFILE.md — the target a later commit decodes the cloud
+         PROFILE secret into, so the cloud evaluator sees the same master;
+      3. "" — the caller (build_system_prompt) then falls back to the cv.md /
+         profile.yml / _profile.md / article-digest.md seed fragments.
+
+    _read_or_empty already strips whitespace and swallows a bad path, so a blank
+    or unreadable file degrades to the next source rather than winning or crashing."""
+    master = _read_or_empty(Path(out_dir or default_out_dir()) / HANDOFF_PROFILE)
+    if master:
+        return master
+    return _read_or_empty(_career_ops_dir(career_ops) / HANDOFF_PROFILE)
+
+
 def bootstrap_handoff_dir(out_dir, *, career_ops=None) -> Path:
     """Ensure the handoff directory exists and carries the two standing files the
     browser agent needs: the instructions README (HANDOFF-README.md) and the

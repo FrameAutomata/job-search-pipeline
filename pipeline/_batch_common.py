@@ -525,12 +525,30 @@ def run_merge_tracker(career_ops: Path) -> bool:
     return False
 
 
-def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article_digest: str = "") -> str:
-    extra = ""
-    if profile_md:
-        extra += f"\n### User Customizations (_profile.md)\n{profile_md}\n"
-    if article_digest:
-        extra += f"\n### Proof Points (article-digest.md)\n{article_digest}\n"
+def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article_digest: str = "", *, profile_master: str = "") -> str:
+    # PROFILE.md (Commit 4), when present, is the candidate's living master and
+    # supersedes the 4 seed fragments: it already folds in the CV, profile,
+    # positioning, and proof points, and the browser agent grows it as it learns.
+    # Only the candidate-profile *content* swaps; the evaluation framework below is
+    # unchanged. A blank/whitespace master → the original seed-fragment assembly.
+    if (profile_master or "").strip():
+        candidate_profile = (
+            "### Candidate Profile (PROFILE.md — the living master)\n"
+            "_Folds in the CV/experience, structured profile, positioning, and "
+            'proof points. Where the framework below says "CV" or "_profile.md", '
+            "read this profile._\n\n"
+            f"{profile_master}\n"
+        )
+    else:
+        extra = ""
+        if profile_md:
+            extra += f"\n### User Customizations (_profile.md)\n{profile_md}\n"
+        if article_digest:
+            extra += f"\n### Proof Points (article-digest.md)\n{article_digest}\n"
+        candidate_profile = (
+            f"### CV (read-only)\n{cv}\n\n"
+            f"### Profile (profile.yml)\n{profile_yml}\n{extra}"
+        )
 
     return f"""You are a job evaluation expert running in headless batch mode. \
 Evaluate job postings for the candidate described below. \
@@ -538,12 +556,7 @@ You have no file system access, cannot generate PDFs, and cannot run real-time w
 
 ## CANDIDATE PROFILE
 
-### CV (read-only)
-{cv}
-
-### Profile (profile.yml)
-{profile_yml}
-{extra}
+{candidate_profile}
 ## EVALUATION FRAMEWORK
 
 Work through blocks A-G in order. Rules in _profile.md override system defaults for scoring.
@@ -669,3 +682,22 @@ Summary JSON: id and report_num must be the exact values from the user message. 
 On catastrophic failure output only:
 <evaluation><summary>{{"status": "failed", "id": "JOB_ID", "report_num": "REPORT_NUM", "company": "unknown", "role": "unknown", "score": null, "legitimacy": null, "pdf": null, "report": null, "error": "brief description"}}</summary></evaluation>
 """
+
+
+def eval_system_prompt(career_ops: Path) -> str:
+    """The evaluation system prompt for a career-ops install — the single place
+    the candidate-profile source is resolved, so `--evaluate-batch` and the UI
+    add-job eval can never disagree on it. Uses the living PROFILE.md when present
+    (authoritative), else the cv.md / profile.yml / _profile.md / article-digest.md
+    seeds."""
+    # Lazy import: handoff imports this module at load, so a top-level import of
+    # it here would cycle.
+    from pipeline.handoff import resolve_profile_md
+    career_ops = Path(career_ops)
+    return build_system_prompt(
+        read_text(career_ops / "cv.md"),
+        read_text(career_ops / "config" / "profile.yml"),
+        read_text(career_ops / "modes" / "_profile.md"),
+        read_text(career_ops / "article-digest.md"),
+        profile_master=resolve_profile_md(career_ops),
+    )

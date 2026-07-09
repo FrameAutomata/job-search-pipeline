@@ -54,9 +54,9 @@ from pipeline._batch_common import (
     acquire_process_lock,
     assign_job_numbers,
     atomic_write_text,
-    build_system_prompt,
     build_user_message,
     env_float,
+    eval_system_prompt,
     has_pending_tracker_additions,
     load_pending,
     load_state,
@@ -750,12 +750,11 @@ def _run_eval(
         print("error: career-ops/cv.md not found — cannot evaluate without a CV", file=sys.stderr)
         return 0
 
-    system_prompt = build_system_prompt(
-        cv,
-        read_text(career_ops / "config" / "profile.yml"),
-        read_text(career_ops / "modes" / "_profile.md"),
-        read_text(career_ops / "article-digest.md"),
-    )
+    # cv.md above is still the "profile configured" sentinel (a PROFILE.md-only
+    # setup is a later-commit concern). eval_system_prompt is the shared builder:
+    # it uses the living PROFILE.md when present, else the seed files — the same
+    # resolution the UI add-job path uses, so the two never diverge.
+    system_prompt = eval_system_prompt(career_ops)
 
     report_counter = max_report_num(reports_dir, state)
     tracker_counter = max_tracker_num(applications_md, state)
