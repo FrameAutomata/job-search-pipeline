@@ -224,6 +224,35 @@ class TestBuildLogStream:
             release.set()
         _wait_done(client, job_id)
 
+    def test_new_build_does_not_show_previous_builds_log(self, client, tmp_path, monkeypatch):
+        # A fresh build must not briefly surface the PRIOR build's log: the build
+        # endpoint clears the log (under the lock the status poll also takes)
+        # before publishing the task, so a poll can't win the race and read stale
+        # content before the worker thread truncates the file.
+        monkeypatch.setattr("pipeline.handoff.run",
+                            _fake_run_with_log(tmp_path / "agent-home", rows=1,
+                                               lines=("[handoff] AAA-from-build-A",)))
+        first = _wait_done(client, client.post("/api/handoff/build", json={}).json()["job_id"])
+        assert "AAA-from-build-A" in first["log_tail"]
+
+        # Build B blocks before printing anything; its first status read must be
+        # clean, not build A's tail.
+        release = threading.Event()
+
+        def slow_run(**kw):
+            release.wait(timeout=5)
+            return 0
+
+        monkeypatch.setattr("pipeline.handoff.run", slow_run)
+        job_b = client.post("/api/handoff/build", json={}).json()["job_id"]
+        try:
+            status = client.get(f"/api/handoff/build-status/{job_b}").json()
+            assert status["status"] == "running"
+            assert "AAA-from-build-A" not in status["log_tail"]
+        finally:
+            release.set()
+        _wait_done(client, job_b)
+
     def test_build_log_redirect_is_scoped(self, client, tmp_path, monkeypatch):
         # Redirecting the build's stdout must not permanently swallow the
         # server's own stdout: whatever sys.stdout was before the build, it's

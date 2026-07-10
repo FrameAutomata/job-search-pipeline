@@ -1343,13 +1343,13 @@ def _finish_handoff(job_id: str, **fields) -> None:
 def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
     try:
         # Capture the build's [handoff] progress to a file so the status poll can
-        # stream it to the UI. Line-buffered (buffering=1) so each printed line
-        # is flushed to disk immediately and the tail updates live. The redirect
-        # restores sys.stdout on exit. Builds are single-flight, so no two builds
-        # ever fight over the log; the process-global redirect does mean any OTHER
-        # request handler that prints during the build window lands in here too,
-        # but nothing on the normal request path prints, so in practice it's this
-        # build's output.
+        # stream it to the UI. Line-buffered (buffering=1) so each printed line is
+        # flushed to disk immediately and the tail updates live; sys.stdout is
+        # restored on exit. Caveat: redirect_stdout/stderr are process-global, so
+        # a concurrent background thread that prints during a long (--tailor) build
+        # — a recheck sweep, onboarding — has its output diverted here too (and
+        # away from the console). Accepted for a localhost single-user UI: at worst
+        # a stray line lands in this log; the build result itself is unaffected.
         _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(_HANDOFF_LOG, "w", encoding="utf-8", errors="replace", buffering=1) as log, \
                 contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
@@ -1391,6 +1391,13 @@ def handoff_build(req: HandoffBuildRequest) -> JSONResponse:
         if _handoff_task and _handoff_task.get("status") == "running":
             raise HTTPException(status_code=409,
                                 detail="A work-order build is already in progress.")
+        # Clear the previous build's log BEFORE publishing this task (and while
+        # holding the lock the status poll also takes) so a poll for this build
+        # can't return the prior build's tail in the window before the worker
+        # thread truncates the file. Truncate before the status flip so a failure
+        # here surfaces as an error without wedging the slot in "running".
+        _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _HANDOFF_LOG.write_text("", encoding="utf-8")
         job_id = str(uuid.uuid4())
         _handoff_task = {"id": job_id, "status": "running"}
     threading.Thread(target=_run_handoff_build,

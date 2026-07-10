@@ -53,6 +53,8 @@ def tail_text(path: Path, tail_lines: int, max_bytes: int = 16384) -> str:
     from the end rather than the whole file — cheap enough to poll a live,
     growing log. Returns "" before the file exists or if it can't be read.
     Shared by the UI's local-run and handoff-build log streams."""
+    if tail_lines <= 0:
+        return ""   # else [-0:] would slice the WHOLE window, not zero lines
     try:
         size = path.stat().st_size
         with open(path, "rb") as f:
