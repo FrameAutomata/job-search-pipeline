@@ -10,6 +10,7 @@ Run:
 or use the run-ui.sh / run-ui.ps1 launchers.
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -34,6 +35,7 @@ from pipeline._batch_common import (
     max_report_num,
     max_tracker_num,
     read_text,
+    tail_text,
     write_job_result,
     run_merge_tracker,
 )
@@ -1393,6 +1395,12 @@ def add_job_status(job_id: str) -> JSONResponse:
 # single-flight by design — a new build simply replaces the finished one.
 _handoff_task: dict | None = None
 _handoff_lock = threading.Lock()
+# The build runs in-process (so tests can monkeypatch handoff.run and the result
+# stays a plain function return), so to stream its progress to the UI the way the
+# local pipeline run does we redirect its stdout to this file and tail it on each
+# status poll. Single-flight (one build at a time), so a fixed path — truncated
+# per build — is enough; no per-job filenames needed.
+_HANDOFF_LOG = ROOT / ".ui-cache" / "handoff-build.log"
 
 
 class HandoffBuildRequest(BaseModel):
@@ -1415,11 +1423,22 @@ def _finish_handoff(job_id: str, **fields) -> None:
 
 def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
     try:
-        # Pass the server's ROOT-anchored career-ops so a RELATIVE
-        # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
-        # own default only anchors an absolute value (review L2).
-        rc = handoff.run(board=board, limit=limit, tailor=tailor,
-                         career_ops=_career_ops_local())
+        # Capture the build's [handoff] progress to a file so the status poll can
+        # stream it to the UI. Line-buffered (buffering=1) so each printed line is
+        # flushed to disk immediately and the tail updates live; sys.stdout is
+        # restored on exit. Caveat: redirect_stdout/stderr are process-global, so
+        # a concurrent background thread that prints during a long (--tailor) build
+        # — a recheck sweep, onboarding — has its output diverted here too (and
+        # away from the console). Accepted for a localhost single-user UI: at worst
+        # a stray line lands in this log; the build result itself is unaffected.
+        _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_HANDOFF_LOG, "w", encoding="utf-8", errors="replace", buffering=1) as log, \
+                contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            # Pass the server's ROOT-anchored career-ops so a RELATIVE
+            # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
+            # own default only anchors an absolute value (review L2).
+            rc = handoff.run(board=board, limit=limit, tailor=tailor,
+                             career_ops=_career_ops_local())
         if rc != 0:
             _finish_handoff(job_id, status="failed",
                             error="handoff exited non-zero — no scored roles found "
@@ -1453,6 +1472,13 @@ def handoff_build(req: HandoffBuildRequest) -> JSONResponse:
         if _handoff_task and _handoff_task.get("status") == "running":
             raise HTTPException(status_code=409,
                                 detail="A work-order build is already in progress.")
+        # Clear the previous build's log BEFORE publishing this task (and while
+        # holding the lock the status poll also takes) so a poll for this build
+        # can't return the prior build's tail in the window before the worker
+        # thread truncates the file. Truncate before the status flip so a failure
+        # here surfaces as an error without wedging the slot in "running".
+        _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _HANDOFF_LOG.write_text("", encoding="utf-8")
         job_id = str(uuid.uuid4())
         _handoff_task = {"id": job_id, "status": "running"}
     threading.Thread(target=_run_handoff_build,
@@ -1468,6 +1494,9 @@ def handoff_build_status(job_id: str) -> JSONResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="Unknown build task")
     task.pop("id", None)
+    # The captured build log — live while running, retained on the terminal state
+    # — so the 🤝 panel can stream progress like the local pipeline run does.
+    task["log_tail"] = tail_text(_HANDOFF_LOG, 40)
     return JSONResponse(task)
 
 

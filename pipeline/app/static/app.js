@@ -415,6 +415,17 @@ localRun.btn.addEventListener("click", () => {
   localRun.panel.hidden = !localRun.panel.hidden;
 });
 
+// Set a <pre>'s content to a streamed log tail, keeping the view pinned to the
+// bottom only when the user is already there (so they can scroll up to read
+// without being yanked back down). Shared by the local-run and handoff logs.
+function renderLogTail(el, tail) {
+  el.hidden = !tail;
+  if (!tail) return;
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+  el.textContent = tail;
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
 function renderLocalStatus(s) {
   const running = s.running;
   localRun.start.hidden = running;
@@ -430,12 +441,7 @@ function renderLocalStatus(s) {
       return `<span class="stage${seen ? " seen" : ""}${current ? " current" : ""}">${st}</span>`;
     }).join("<span class=\"stage-sep\">→</span>");
   }
-  localRun.log.hidden = !s.log_tail;
-  if (s.log_tail) {
-    const atBottom = localRun.log.scrollTop + localRun.log.clientHeight >= localRun.log.scrollHeight - 8;
-    localRun.log.textContent = s.log_tail;
-    if (atBottom) localRun.log.scrollTop = localRun.log.scrollHeight;
-  }
+  renderLogTail(localRun.log, s.log_tail);
 }
 
 async function pollLocalRun() {
@@ -717,6 +723,7 @@ const handoffUi = {
   panel: document.getElementById("handoff-panel"),
   start: document.getElementById("handoff-start"),
   result: document.getElementById("handoff-result"),
+  log: document.getElementById("handoff-log"),
   timer: null,
 };
 
@@ -732,6 +739,7 @@ handoffUi.start.addEventListener("click", async () => {
   const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
   const tailor = document.getElementById("handoff-tailor").checked;
   handoffUi.start.disabled = true;
+  renderLogTail(handoffUi.log, "");   // clear any prior build's log
   handoffUi.result.innerHTML = `<p class="hint">Building the work-orders${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
   try {
     // board omitted → server default "both" = a session per site.
@@ -759,6 +767,7 @@ async function pollHandoffBuild(jobId) {
     return;
   }
   const t = await resp.json().catch(() => ({}));
+  renderLogTail(handoffUi.log, t.log_tail || "");
   if (resp.ok && t.status === "running") {
     handoffUi.timer = setTimeout(() => pollHandoffBuild(jobId), 1500);
     return;
