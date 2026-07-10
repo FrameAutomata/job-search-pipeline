@@ -8,6 +8,7 @@ whichever agent they use. Skips if FastAPI isn't installed."""
 
 import importlib
 import json
+import sys
 import threading
 import time
 
@@ -60,6 +61,19 @@ def _fake_run(out_dir, rows=0, board="linkedin"):
         jsonl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         md.write_text("# Work order\n", encoding="utf-8")
         return 0
+    return run
+
+
+def _fake_run_with_log(out_dir, rows=1, board="linkedin",
+                       lines=("[handoff] scanning queue", "[handoff] wrote work-order")):
+    """A handoff.run stand-in that PRINTS progress lines (like the real run)
+    before writing its work-order — so a test can assert those lines are
+    captured and surfaced for the UI to stream."""
+    base = _fake_run(out_dir, rows=rows, board=board)
+    def run(**kw):
+        for ln in lines:
+            print(ln)
+        return base(**kw)
     return run
 
 
@@ -165,6 +179,60 @@ class TestBuildEndpoint:
 
     def test_unknown_task_404(self, client):
         assert client.get("/api/handoff/build-status/nope").status_code == 404
+
+
+# ── Build log streaming: build-status exposes the captured build log ───────────
+# Parity with the local pipeline run, which streams its log to the UI. The
+# work-order build prints [handoff] progress; the status endpoint surfaces a
+# tail of it so the 🤝 panel can show what's happening (esp. during a
+# minutes-long --tailor build) instead of a bare spinner.
+class TestBuildLogStream:
+    def test_status_surfaces_captured_build_log_when_done(self, client, tmp_path, monkeypatch):
+        monkeypatch.setattr("pipeline.handoff.run",
+                            _fake_run_with_log(tmp_path / "agent-home", rows=1))
+        r = client.post("/api/handoff/build", json={})
+        body = _wait_done(client, r.json()["job_id"])
+        assert body["status"] == "done"
+        assert "log_tail" in body
+        assert "[handoff] scanning queue" in body["log_tail"]
+        assert "[handoff] wrote work-order" in body["log_tail"]
+
+    def test_running_build_streams_partial_log(self, client, tmp_path, monkeypatch):
+        # The log must be visible WHILE running — not only after completion —
+        # so a long tailor build shows live progress.
+        release = threading.Event()
+
+        def slow_run(**kw):
+            print("[handoff] started, tailoring")
+            sys.stdout.flush()
+            release.wait(timeout=5)
+            return 0
+
+        monkeypatch.setattr("pipeline.handoff.run", slow_run)
+        job_id = client.post("/api/handoff/build", json={}).json()["job_id"]
+        try:
+            deadline = time.time() + 3
+            seen = ""
+            while time.time() < deadline:
+                b = client.get(f"/api/handoff/build-status/{job_id}").json()
+                seen = b.get("log_tail", "")
+                if b["status"] == "running" and "started, tailoring" in seen:
+                    break
+                time.sleep(0.02)
+            assert "started, tailoring" in seen
+        finally:
+            release.set()
+        _wait_done(client, job_id)
+
+    def test_build_log_redirect_is_scoped(self, client, tmp_path, monkeypatch):
+        # Redirecting the build's stdout must not permanently swallow the
+        # server's own stdout: whatever sys.stdout was before the build, it's
+        # restored after (the redirect is scoped to the build, not global).
+        before = sys.stdout
+        monkeypatch.setattr("pipeline.handoff.run",
+                            _fake_run_with_log(tmp_path / "agent-home", rows=1))
+        _wait_done(client, client.post("/api/handoff/build", json={}).json()["job_id"])
+        assert sys.stdout is before
 
 
 # ── Single role: GET /api/handoff/role-prompt/{num} ────────────────────────────

@@ -48,6 +48,21 @@ def read_text(path: Path, default: str = "") -> str:
         return default
 
 
+def tail_text(path: Path, tail_lines: int, max_bytes: int = 16384) -> str:
+    """The last `tail_lines` lines of a log file, reading at most `max_bytes`
+    from the end rather than the whole file — cheap enough to poll a live,
+    growing log. Returns "" before the file exists or if it can't be read.
+    Shared by the UI's local-run and handoff-build log streams."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            raw = f.read()
+    except OSError:
+        return ""
+    return "\n".join(raw.decode("utf-8", errors="replace").splitlines()[-tail_lines:])
+
+
 def env_float(name: str, default: float) -> float:
     """A float env override that can NEVER crash startup: a malformed or
     set-but-empty value warns and falls back rather than raising. Shared by

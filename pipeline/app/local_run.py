@@ -27,6 +27,7 @@ from pipeline._batch_common import (
     pid_alive as _pid_alive,
     process_lock_active,
     read_process_lock,
+    tail_text,
     write_process_lock,
 )
 
@@ -223,19 +224,6 @@ def _scan_log_for_stages() -> list:
     return seen
 
 
-def _read_tail(tail_lines: int, max_bytes: int = 16384) -> str:
-    """The last `tail_lines` lines, reading at most `max_bytes` from the end of
-    the log rather than the whole file."""
-    try:
-        size = LOG_PATH.stat().st_size
-        with open(LOG_PATH, "rb") as f:
-            f.seek(max(0, size - max_bytes))
-            raw = f.read()
-    except OSError:
-        return ""
-    return "\n".join(raw.decode("utf-8", errors="replace").splitlines()[-tail_lines:])
-
-
 def _idle_status() -> dict:
     """Nothing is running and nothing ran this session — don't parse a leftover
     log into a phantom finished run."""
@@ -287,5 +275,5 @@ def status(tail_lines: int = 30) -> dict:
             "stages_seen": sorted(set(seen), key=STAGES.index),
             "exit_code": exit_code,
             "ok": (exit_code == 0) if exit_code is not None else None,
-            "log_tail": _read_tail(tail_lines),
+            "log_tail": tail_text(LOG_PATH, tail_lines),
         }

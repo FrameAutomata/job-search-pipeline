@@ -10,6 +10,7 @@ Run:
 or use the run-ui.sh / run-ui.ps1 launchers.
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -34,6 +35,7 @@ from pipeline._batch_common import (
     max_report_num,
     max_tracker_num,
     read_text,
+    tail_text,
     write_job_result,
     run_merge_tracker,
 )
@@ -1312,6 +1314,12 @@ def add_job_status(job_id: str) -> JSONResponse:
 # single-flight by design — a new build simply replaces the finished one.
 _handoff_task: dict | None = None
 _handoff_lock = threading.Lock()
+# The build runs in-process (so tests can monkeypatch handoff.run and the result
+# stays a plain function return), so to stream its progress to the UI the way the
+# local pipeline run does we redirect its stdout to this file and tail it on each
+# status poll. Single-flight (one build at a time), so a fixed path — truncated
+# per build — is enough; no per-job filenames needed.
+_HANDOFF_LOG = ROOT / ".ui-cache" / "handoff-build.log"
 
 
 class HandoffBuildRequest(BaseModel):
@@ -1334,11 +1342,22 @@ def _finish_handoff(job_id: str, **fields) -> None:
 
 def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
     try:
-        # Pass the server's ROOT-anchored career-ops so a RELATIVE
-        # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
-        # own default only anchors an absolute value (review L2).
-        rc = handoff.run(board=board, limit=limit, tailor=tailor,
-                         career_ops=_career_ops_local())
+        # Capture the build's [handoff] progress to a file so the status poll can
+        # stream it to the UI. Line-buffered (buffering=1) so each printed line
+        # is flushed to disk immediately and the tail updates live. The redirect
+        # restores sys.stdout on exit. Builds are single-flight, so no two builds
+        # ever fight over the log; the process-global redirect does mean any OTHER
+        # request handler that prints during the build window lands in here too,
+        # but nothing on the normal request path prints, so in practice it's this
+        # build's output.
+        _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_HANDOFF_LOG, "w", encoding="utf-8", errors="replace", buffering=1) as log, \
+                contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            # Pass the server's ROOT-anchored career-ops so a RELATIVE
+            # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
+            # own default only anchors an absolute value (review L2).
+            rc = handoff.run(board=board, limit=limit, tailor=tailor,
+                             career_ops=_career_ops_local())
         if rc != 0:
             _finish_handoff(job_id, status="failed",
                             error="handoff exited non-zero — no scored roles found "
@@ -1387,6 +1406,9 @@ def handoff_build_status(job_id: str) -> JSONResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="Unknown build task")
     task.pop("id", None)
+    # The captured build log — live while running, retained on the terminal state
+    # — so the 🤝 panel can stream progress like the local pipeline run does.
+    task["log_tail"] = tail_text(_HANDOFF_LOG, 40)
     return JSONResponse(task)
 
 
