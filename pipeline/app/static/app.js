@@ -556,7 +556,7 @@ async function pollRecheck() {
     if (s.unconfirmed) caveats.push(`${s.unconfirmed} couldn't be reached`);
     if (s.throttled) caveats.push(`${s.throttled} rate-limited (will retry)`);
     if (s.deferred) caveats.push(`${s.deferred} deferred to a later run`);
-    if (s.unverifiable) caveats.push(`${s.unverifiable} skipped (can't verify automatically, e.g. Indeed)`);
+    if (s.unverifiable) caveats.push(`${s.unverifiable} skipped (can't verify automatically, e.g. Glassdoor)`);
     const tail = caveats.length ? ` ${caveats.join(", ")}.` : "";
     const open = s.checked - (s.unconfirmed || 0) - (s.throttled || 0);
     showAction(

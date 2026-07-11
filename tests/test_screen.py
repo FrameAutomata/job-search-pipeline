@@ -60,6 +60,51 @@ class TestLinkedInGuestUrl:
         assert linkedin_guest_jd_url(None) is None
 
 
+class TestIndeedJobKey:
+    """Extract the `jk` job key from an Indeed posting URL. The key is what the
+    jobData GraphQL liveness check queries by (see TestFetchIndeedExpiry) — the
+    page itself is Cloudflare-walled to a plain fetch, so the URL's only role is
+    carrying the key. Non-Indeed hosts must never match: a jk-shaped param on
+    another site is not an Indeed key."""
+
+    def test_viewjob_url(self):
+        assert screen_mod.indeed_job_key(
+            "https://www.indeed.com/viewjob?jk=abc123def4567890"
+        ) == "abc123def4567890"
+
+    def test_jk_among_other_params(self):
+        assert screen_mod.indeed_job_key(
+            "https://www.indeed.com/viewjob?from=serp&jk=1a2b3c4d5e6f7a8b&tk=xyz"
+        ) == "1a2b3c4d5e6f7a8b"
+
+    def test_mobile_and_country_subdomains(self):
+        assert screen_mod.indeed_job_key(
+            "https://m.indeed.com/viewjob?jk=abc123def4567890") == "abc123def4567890"
+        assert screen_mod.indeed_job_key(
+            "https://de.indeed.com/viewjob?jk=abc123def4567890") == "abc123def4567890"
+
+    def test_redirect_style_url_with_jk(self):
+        # rc/clk-style tracking URLs still carry the jk param.
+        assert screen_mod.indeed_job_key(
+            "https://www.indeed.com/rc/clk?jk=abc123def4567890&from=web"
+        ) == "abc123def4567890"
+
+    def test_indeed_url_without_jk(self):
+        assert screen_mod.indeed_job_key("https://www.indeed.com/jobs?q=engineer") is None
+
+    def test_non_indeed_host_with_jk_param(self):
+        assert screen_mod.indeed_job_key("https://evil.example/viewjob?jk=abc123") is None
+        assert screen_mod.indeed_job_key(
+            "https://www.linkedin.com/jobs/view/123?jk=abc123") is None
+
+    def test_lookalike_domain(self):
+        assert screen_mod.indeed_job_key("https://notindeed.com/viewjob?jk=abc123") is None
+
+    def test_empty_or_none_input(self):
+        assert screen_mod.indeed_job_key("") is None
+        assert screen_mod.indeed_job_key(None) is None
+
+
 class TestClassifyLiveness:
     def test_http_404_expired(self):
         result, reason = classify_liveness(404, "https://example.com", "page content")
@@ -740,18 +785,23 @@ class TestClassifyEachRetry:
 
 class TestIsLivenessVerifiable:
     """A URL is liveness-verifiable only if we have a working unauthenticated way
-    to read it. Today that's LinkedIn /jobs/view (the guest JD endpoint); Indeed
-    and Glassdoor serve JS/anti-bot pages a plain fetch can't classify, so the
-    re-check skips them (see issue: Indeed support via CAPTCHA solving)."""
+    to read it: LinkedIn /jobs/view (the guest JD endpoint) and Indeed viewjob
+    URLs (the jobData GraphQL API — the page is Cloudflare-walled but the API the
+    scraper already uses returns a definitive `expired` flag per job key).
+    Glassdoor still has no path, so the re-check skips it."""
 
     def test_linkedin_view_is_verifiable(self):
         from pipeline.screen import is_liveness_verifiable
         assert is_liveness_verifiable("https://www.linkedin.com/jobs/view/4342114687/")
         assert is_liveness_verifiable("https://linkedin.com/jobs/view/eng-at-acme-555")
 
-    def test_indeed_not_verifiable(self):
+    def test_indeed_viewjob_is_verifiable(self):
         from pipeline.screen import is_liveness_verifiable
-        assert not is_liveness_verifiable("https://www.indeed.com/viewjob?jk=abc123")
+        assert is_liveness_verifiable("https://www.indeed.com/viewjob?jk=abc123")
+
+    def test_indeed_without_job_key_not_verifiable(self):
+        from pipeline.screen import is_liveness_verifiable
+        assert not is_liveness_verifiable("https://www.indeed.com/jobs?q=engineer")
 
     def test_glassdoor_not_verifiable(self):
         from pipeline.screen import is_liveness_verifiable
@@ -761,3 +811,213 @@ class TestIsLivenessVerifiable:
         from pipeline.screen import is_liveness_verifiable
         assert not is_liveness_verifiable("")
         assert not is_liveness_verifiable(None)
+
+
+class _FakeResp:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def _jobdata_payload(*jobs):
+    """A jobData GraphQL response body: jobs are (key, expired) pairs."""
+    return {"data": {"jobData": {"results": [
+        {"job": {"key": k, "expired": e}} for k, e in jobs
+    ]}}}
+
+
+class TestFetchIndeedExpiry:
+    """fetch_indeed_expiry(keys) POSTs ONE jobData GraphQL batch to
+    apis.indeed.com (the same endpoint + mobile-app headers the JobSpy scraper
+    uses — the Cloudflare wall only guards the website, not this API) and returns
+    {jk: expired} for every job the API returned. Any transport- or query-level
+    failure RAISES — the caller maps that to `throttled` (couldn't read), so a
+    broken request can never look like a verdict."""
+
+    @pytest.fixture
+    def fake_post(self, monkeypatch):
+        import requests
+        state = {"resp": _FakeResp(payload=_jobdata_payload()), "calls": []}
+
+        def _post(url, headers=None, json=None, timeout=None, **kw):
+            state["calls"].append(
+                {"url": url, "headers": headers or {}, "json": json or {}, "timeout": timeout})
+            resp = state["resp"]
+            if isinstance(resp, Exception):
+                raise resp
+            return resp
+
+        monkeypatch.setattr(requests, "post", _post)
+        return state
+
+    def test_returns_expired_flag_per_key(self, fake_post):
+        fake_post["resp"] = _FakeResp(payload=_jobdata_payload(("aaa", False), ("bbb", True)))
+        out = screen_mod.fetch_indeed_expiry(["aaa", "bbb"])
+        assert out == {"aaa": False, "bbb": True}
+
+    def test_omitted_keys_are_absent_not_guessed(self, fake_post):
+        """The API silently omits a job key that no longer exists; the dict must
+        reflect exactly what came back — absence semantics belong to the caller."""
+        fake_post["resp"] = _FakeResp(payload=_jobdata_payload(("aaa", False)))
+        out = screen_mod.fetch_indeed_expiry(["aaa", "gone"])
+        assert out == {"aaa": False}
+
+    def test_single_batched_post_with_all_keys(self, fake_post):
+        screen_mod.fetch_indeed_expiry(["k1abc", "k2def", "k3ghi"])
+        assert len(fake_post["calls"]) == 1
+        call = fake_post["calls"][0]
+        assert call["url"] == "https://apis.indeed.com/graphql"
+        query = call["json"]["query"]
+        assert "jobData" in query
+        assert all(k in query for k in ("k1abc", "k2def", "k3ghi"))
+
+    def test_sends_mobile_api_headers(self, fake_post):
+        """The request must carry the scraper's mobile-app credentials — that's
+        what sails past the anti-bot wall a browser UA + no key would hit."""
+        screen_mod.fetch_indeed_expiry(["aaa"])
+        headers = fake_post["calls"][0]["headers"]
+        assert headers.get("indeed-api-key")
+        assert headers.get("indeed-co")
+
+    # Failure contract: every transport/shape failure surfaces as RuntimeError
+    # (json decode errors wrapped too), so the classifier has ONE thing to catch
+    # and map to `throttled`.
+
+    def test_http_error_raises(self, fake_post):
+        fake_post["resp"] = _FakeResp(status_code=500, payload={})
+        with pytest.raises(RuntimeError):
+            screen_mod.fetch_indeed_expiry(["aaa"])
+
+    def test_graphql_errors_raise(self, fake_post):
+        fake_post["resp"] = _FakeResp(payload={
+            "errors": [{"message": "field 'expired' no longer exists"}],
+            "data": None,
+        })
+        with pytest.raises(RuntimeError):
+            screen_mod.fetch_indeed_expiry(["aaa"])
+
+    def test_malformed_payload_raises(self, fake_post):
+        fake_post["resp"] = _FakeResp(payload={"data": {}})
+        with pytest.raises(RuntimeError):
+            screen_mod.fetch_indeed_expiry(["aaa"])
+
+    def test_non_json_body_raises(self, fake_post):
+        fake_post["resp"] = _FakeResp(payload=ValueError("not json"))
+        with pytest.raises(RuntimeError):
+            screen_mod.fetch_indeed_expiry(["aaa"])
+
+
+class TestClassifyIndeedEach:
+    """classify_indeed_each(items, key_of) — the Indeed counterpart of
+    classify_each, yielding the same (item, result, reason, body) shape so
+    recheck's accounting loop consumes both without site logic. Verdicts:
+
+      expired=False in the batch          -> active
+      expired=True in the batch           -> expired (definitive)
+      absent from a NON-EMPTY batch       -> expired (removed from Indeed —
+                                             the API omits unknown keys)
+      absent from an EMPTY batch          -> uncertain (can't tell 'all removed'
+                                             from a silently rejected query)
+      batch request raised                -> throttled for the whole chunk (no
+                                             read — recheck leaves state
+                                             unstamped and retries next run)
+      key_of(item) is falsy               -> uncertain (defensive)
+
+    No in-call retry (unlike the LinkedIn throttle retry): a batch failure is
+    batch-wide, and the recheck's staleness state IS the retry mechanism."""
+
+    @pytest.fixture
+    def fake_expiry(self, monkeypatch):
+        """Stub fetch_indeed_expiry with a scripted per-call behavior list (or a
+        single dict/Exception applied to every call) + a log of key batches."""
+        state = {"behavior": {}, "batches": []}
+
+        def _expiry(keys, timeout=8):
+            state["batches"].append(list(keys))
+            b = state["behavior"]
+            if isinstance(b, list):
+                b = b[len(state["batches"]) - 1]
+            if isinstance(b, Exception):
+                raise b
+            if b == "echo-live":
+                return {k: False for k in keys}
+            return b
+
+        monkeypatch.setattr(screen_mod, "fetch_indeed_expiry", _expiry, raising=False)
+        state["behavior"] = "echo-live"
+        return state
+
+    @staticmethod
+    def _classify(items, **kw):
+        rows = list(screen_mod.classify_indeed_each(
+            items, lambda it: it.get("jk"), **kw))
+        return {id(item): (item, result, reason, body) for item, result, reason, body in rows}
+
+    def test_live_key_is_active(self, fake_expiry):
+        item = {"jk": "aaa"}
+        _, result, reason, body = self._classify([item])[id(item)]
+        assert result == "active"
+        assert body == ""
+
+    def test_expired_key_is_expired(self, fake_expiry):
+        fake_expiry["behavior"] = {"aaa": True}
+        item = {"jk": "aaa"}
+        _, result, reason, _ = self._classify([item])[id(item)]
+        assert result == "expired"
+        assert "expired" in reason.lower()
+
+    def test_absent_from_nonempty_batch_is_expired(self, fake_expiry):
+        """A key the API omitted while returning others is definitively gone —
+        the bogus-key probe confirmed silent omission is the removal signal."""
+        fake_expiry["behavior"] = {"aaa": False}          # bbb omitted
+        keep, gone = {"jk": "aaa"}, {"jk": "bbb"}
+        out = self._classify([keep, gone])
+        assert out[id(keep)][1] == "active"
+        assert out[id(gone)][1] == "expired"
+        assert "removed" in out[id(gone)][2].lower()
+
+    def test_absent_from_empty_batch_is_uncertain(self, fake_expiry):
+        """An empty result set could be 'every key removed' OR a silently
+        rejected query — never discard on it."""
+        fake_expiry["behavior"] = {}
+        item = {"jk": "aaa"}
+        _, result, _, _ = self._classify([item])[id(item)]
+        assert result == "uncertain"
+
+    def test_failed_batch_throttles_whole_chunk(self, fake_expiry):
+        fake_expiry["behavior"] = RuntimeError("api down")
+        a, b = {"jk": "aaa"}, {"jk": "bbb"}
+        out = self._classify([a, b])
+        assert out[id(a)][1] == "throttled"
+        assert out[id(b)][1] == "throttled"
+
+    def test_failed_batch_does_not_abort_later_chunks(self, fake_expiry):
+        """Per-chunk containment, mirroring classify_each's per-item containment:
+        one failed batch must not strand the rest of the sweep."""
+        fake_expiry["behavior"] = [RuntimeError("blip"), "echo-live"]
+        items = [{"jk": f"k{i}"} for i in range(4)]
+        out = self._classify(items, chunk_size=2)
+        assert [out[id(it)][1] for it in items] == \
+            ["throttled", "throttled", "active", "active"]
+        assert len(fake_expiry["batches"]) == 2
+
+    def test_chunks_keys_in_input_order(self, fake_expiry):
+        items = [{"jk": f"k{i}"} for i in range(5)]
+        self._classify(items, chunk_size=2)
+        assert fake_expiry["batches"] == [["k0", "k1"], ["k2", "k3"], ["k4"]]
+
+    def test_item_without_key_is_uncertain_and_not_queried(self, fake_expiry):
+        keyless, keyed = {"nope": 1}, {"jk": "aaa"}
+        out = self._classify([keyless, keyed])
+        assert out[id(keyless)][1] == "uncertain"
+        assert out[id(keyed)][1] == "active"
+        assert all("aaa" == k for batch in fake_expiry["batches"] for k in batch)
+
+    def test_empty_items_makes_no_requests(self, fake_expiry):
+        assert list(screen_mod.classify_indeed_each([], lambda it: it.get("jk"))) == []
+        assert fake_expiry["batches"] == []

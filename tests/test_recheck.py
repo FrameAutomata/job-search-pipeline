@@ -7,8 +7,9 @@ active queue until someone tries to apply. This stage closes that gap: it
 re-fetches every Evaluated role and marks the ones that are demonstrably gone
 `Discarded`.
 
-The HTTP layer (screen.fetch_and_classify) is monkeypatched — the same
-convention test_screen.py uses; we exercise the selection + classify->mark
+The HTTP layers (screen.fetch_and_classify for page fetches, and
+screen.fetch_indeed_expiry for the Indeed jobData API) are monkeypatched — the
+same convention test_screen.py uses; we exercise the selection + classify->mark
 logic, not real network calls.
 
 Design under test:
@@ -21,6 +22,11 @@ Design under test:
   and `uncertain` are left Evaluated — an ambiguous/transient fetch must never
   discard a live role. Returns {checked, discarded, dead, skipped, errors};
   calls progress(checked, total, discarded) once per role.
+- Site routing: LinkedIn roles go through classify_each (guest-endpoint page
+  fetch); Indeed roles go through classify_indeed_each (batched jobData GraphQL
+  — the posting page is Cloudflare-walled but the scraper's API isn't). Both
+  feed the same accounting/marking loop. Glassdoor has no path and stays
+  `unverifiable`.
 """
 
 import datetime as dt
@@ -33,8 +39,9 @@ from pipeline.app import data as app_data
 
 
 # A tracker covering every selection branch. Liveness re-check is verifiable-site
-# only — LinkedIn via the guest endpoint; Indeed/Glassdoor have no liveness path
-# (anti-bot walls), so they're counted `unverifiable` and never fetched.
+# only — LinkedIn via the guest endpoint, Indeed via the jobData GraphQL API;
+# Glassdoor has no liveness path (anti-bot wall, no API), so it's counted
+# `unverifiable` and never fetched.
 #   1 Evaluated + LinkedIn /jobs/view URL   -> rechecked (via guest endpoint)
 #   2 Evaluated + LinkedIn URL              -> rechecked
 #   3 Applied  + LinkedIn URL               -> NOT rechecked (acted on)
@@ -42,7 +49,7 @@ from pipeline.app import data as app_data
 #   5 Rejected                              -> NOT rechecked
 #   6 Evaluated + LinkedIn URL, score 1.0/5 -> rechecked (score-agnostic)
 #   7 Discarded                             -> NOT rechecked
-#   8 Evaluated + Indeed URL                -> unverifiable (skipped, counted)
+#   8 Evaluated + Indeed URL (jk=888)       -> rechecked (via jobData API)
 #   9 Evaluated + Glassdoor URL             -> unverifiable (skipped, counted)
 _TRACKER = (
     "# Applications Tracker\n\n"
@@ -81,12 +88,21 @@ def tracker(tmp_path):
 
 @pytest.fixture
 def fake_fetch(monkeypatch):
-    """Stub screen.fetch_and_classify with a per-URL result map and a call log.
+    """Stub both liveness transports: screen.fetch_and_classify (page fetches)
+    with a per-URL result map + call log, and screen.fetch_indeed_expiry (the
+    jobData API) with a per-key expiry map + batch log.
 
     `results` maps a substring of the fetched URL -> (liveness, reason); the
     default is ('active', ...). `urls` records every URL actually fetched so a
-    test can assert LinkedIn went through the guest endpoint."""
-    state = {"results": {}, "urls": []}
+    test can assert LinkedIn went through the guest endpoint (and Indeed through
+    no page fetch at all).
+
+    `indeed` is the jobData behavior: {} (default) answers every queried key
+    expired=False (all live); a non-empty dict is authoritative — only its keys
+    come back, so a test expresses 'removed from Indeed' by omitting a key while
+    mapping another; an Exception is raised (API outage). `indeed_batches` logs
+    each batch's keys."""
+    state = {"results": {}, "urls": [], "indeed": {}, "indeed_batches": []}
 
     def _fetch(url, timeout=8):
         state["urls"].append(url)
@@ -98,7 +114,17 @@ def fake_fetch(monkeypatch):
                 return liveness, reason, "<html/>"
         return "active", "apply control visible", "<html/>"
 
+    def _expiry(keys, timeout=8):
+        state["indeed_batches"].append(list(keys))
+        ind = state["indeed"]
+        if isinstance(ind, Exception):
+            raise ind
+        if not ind:
+            return {k: False for k in keys}
+        return {k: ind[k] for k in keys if k in ind}
+
     monkeypatch.setattr(screen, "fetch_and_classify", _fetch)
+    monkeypatch.setattr(screen, "fetch_indeed_expiry", _expiry, raising=False)
     monkeypatch.setattr(screen.time, "sleep", lambda *_: None)  # don't sleep on throttle retries
     return state
 
@@ -122,9 +148,10 @@ class TestSelectEvaluated:
     def test_selects_only_evaluated_rows_with_urls(self, tracker):
         _, apps = tracker
         nums = {j.num for j in recheck.select_evaluated(apps)}
-        # 1, 2, 6 are Evaluated + verifiable (LinkedIn) URL. 3/5/7 wrong status;
-        # 4 has no URL; 8/9 are Evaluated but unverifiable (Indeed/Glassdoor).
-        assert nums == {"1", "2", "6"}
+        # 1, 2, 6 are Evaluated + LinkedIn URL and 8 is Evaluated + Indeed URL —
+        # all verifiable. 3/5/7 wrong status; 4 has no URL; 9 is Evaluated but
+        # unverifiable (Glassdoor).
+        assert nums == {"1", "2", "6", "8"}
 
     def test_is_not_score_gated(self, tracker):
         """Row 6 scores 1.0/5 — apply's queue would skip it, recheck must not
@@ -133,12 +160,13 @@ class TestSelectEvaluated:
         assert "6" in {j.num for j in recheck.select_evaluated(apps)}
 
     def test_excludes_unverifiable_sites(self, tracker):
-        """Indeed (8) and Glassdoor (9) have no liveness path (anti-bot walls),
-        so they're NOT selected for re-check — run() counts them `unverifiable`
-        instead of fetching a page it can't classify."""
+        """Glassdoor (9) has no liveness path (anti-bot wall, no API), so it's
+        NOT selected for re-check — run() counts it `unverifiable` instead of
+        fetching a page it can't classify. Indeed (8) IS selected: the jobData
+        API gives it a real liveness path."""
         _, apps = tracker
         nums = {j.num for j in recheck.select_evaluated(apps)}
-        assert "8" not in nums and "9" not in nums
+        assert "8" in nums and "9" not in nums
 
     def test_carries_identity(self, tracker):
         _, apps = tracker
@@ -201,7 +229,8 @@ class TestRecheckMarking:
         assert _status_cell(apps, "1") == "Discarded"
         assert _status_cell(apps, "2") == "Evaluated"
         assert _status_cell(apps, "6") == "Evaluated"
-        assert summary["checked"] == 3 and summary["discarded"] == 1
+        assert _status_cell(apps, "8") == "Evaluated"   # Indeed, live by default
+        assert summary["checked"] == 4 and summary["discarded"] == 1
         assert summary["skipped"] == 1   # row 4 (Evaluated, no URL)
 
 
@@ -217,14 +246,92 @@ class TestFetchRouting:
         assert guest in fake_fetch["urls"]
         assert "https://www.linkedin.com/jobs/view/111" not in fake_fetch["urls"]
 
-    def test_unverifiable_sites_are_not_fetched(self, tracker, fake_fetch):
-        """An unverifiable site (Indeed row 8, Glassdoor row 9) is never fetched —
-        no HTTP request is made for it (it can't be classified, so we skip it)."""
+    def test_indeed_classified_via_api_not_page_fetch(self, tracker, fake_fetch):
+        """The Indeed posting PAGE is Cloudflare-walled — row 8 must never be
+        page-fetched. Its liveness comes from the jobData API batch instead."""
         co, apps = tracker
         recheck.run(co, applications_md=apps)
-        assert not any("indeed.com" in u or "glassdoor.com" in u for u in fake_fetch["urls"])
-        assert "888" not in "".join(fake_fetch["urls"])   # row 8 not fetched
+        assert not any("indeed.com" in u for u in fake_fetch["urls"])
+        assert "888" in [k for batch in fake_fetch["indeed_batches"] for k in batch]
+
+    def test_unverifiable_sites_are_not_fetched(self, tracker, fake_fetch):
+        """An unverifiable site (Glassdoor row 9) is never fetched — no HTTP
+        request is made for it (it can't be classified, so we skip it)."""
+        co, apps = tracker
+        recheck.run(co, applications_md=apps)
+        assert not any("glassdoor.com" in u for u in fake_fetch["urls"])
         assert "999" not in "".join(fake_fetch["urls"])   # row 9 not fetched
+        assert "999" not in [k for batch in fake_fetch["indeed_batches"] for k in batch]
+
+
+# ── run: Indeed via the jobData API ──────────────────────────────────────────
+
+class TestIndeedRecheck:
+    """Indeed roles get real verdicts through the batched jobData API. Semantics
+    mirror the page-fetch path: only a definitive dead signal (the `expired`
+    flag, or absence from a batch that returned others) discards; an API failure
+    is a throttle (no read, no stamp, retried next run), never a verdict."""
+
+    def test_expired_indeed_marked_discarded(self, tracker, fake_fetch):
+        co, apps = tracker
+        fake_fetch["indeed"] = {"888": True}
+        summary = recheck.run(co, applications_md=apps)
+        assert _status_cell(apps, "8") == "Discarded"
+        assert summary["discarded"] == 1
+        assert [d["num"] for d in summary["dead"]] == ["8"]
+        # Identity-anchored override, same channel the LinkedIn path writes.
+        assert _overrides()["8"] == {
+            "status": "Discarded", "company": "Globo Gym", "role": "Trainer",
+        }
+
+    def test_removed_indeed_marked_discarded(self, tmp_path, fake_fetch):
+        """A key absent from a batch that returned others = removed from Indeed
+        entirely — as dead as an expired flag."""
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        apps = co / "data" / "applications.md"
+        apps.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-06-01 | Acme | Eng | 4.5/5 | Evaluated | ❌ | [1](reports/1.md) | "
+            "https://www.indeed.com/viewjob?jk=aaa111 — live |\n"
+            "| 2 | 2026-06-01 | Globex | Dev | 4.2/5 | Evaluated | ❌ | [2](reports/2.md) | "
+            "https://www.indeed.com/viewjob?jk=bbb222 — vanished |\n",
+            encoding="utf-8",
+        )
+        fake_fetch["indeed"] = {"aaa111": False}    # bbb222 omitted → removed
+        summary = recheck.run(co, applications_md=apps)
+        assert _status_cell(apps, "1") == "Evaluated"
+        assert _status_cell(apps, "2") == "Discarded"
+        assert [d["num"] for d in summary["dead"]] == ["2"]
+
+    def test_api_failure_throttles_and_leaves_role_stale(self, tracker, fake_fetch, tmp_path):
+        """An API outage must read as 'couldn't check' — the role stays
+        Evaluated, counts as throttled, and its state is NOT stamped so the next
+        run retries it (same contract as a LinkedIn rate-limit)."""
+        co, apps = tracker
+        state_path = tmp_path / "recheck-state.tsv"
+        fake_fetch["indeed"] = RuntimeError("api down")
+        summary = recheck.run(co, applications_md=apps, state_path=state_path)
+        assert _status_cell(apps, "8") == "Evaluated"
+        assert summary["throttled"] == 1
+        assert summary["discarded"] == 0
+        state = recheck._load_state(state_path)
+        assert "https://www.indeed.com/viewjob?jk=888" not in state   # unstamped
+        assert "https://www.linkedin.com/jobs/view/111" in state      # LinkedIn unaffected
+
+    def test_mixed_site_discards_in_one_summary(self, tracker, fake_fetch):
+        """A LinkedIn death and an Indeed death land in the same batched
+        dual-write and the same summary."""
+        co, apps = tracker
+        fake_fetch["results"] = {"111": ("expired", "HTTP 404")}
+        fake_fetch["indeed"] = {"888": True}
+        summary = recheck.run(co, applications_md=apps)
+        assert _status_cell(apps, "1") == "Discarded"
+        assert _status_cell(apps, "8") == "Discarded"
+        assert summary["checked"] == 4
+        assert summary["discarded"] == 2
+        assert {d["num"] for d in summary["dead"]} == {"1", "8"}
 
 
 # ── run: summary, progress, dry-run, resilience ──────────────────────────────
@@ -234,7 +341,7 @@ class TestRunReporting:
         co, apps = tracker
         fake_fetch["results"] = {"111": ("expired", "gone"), "666": ("expired", "gone")}
         summary = recheck.run(co, applications_md=apps)
-        assert summary["checked"] == 3      # rows 1, 2, 6
+        assert summary["checked"] == 4      # rows 1, 2, 6 (LinkedIn) + 8 (Indeed)
         assert summary["skipped"] == 1      # row 4
         assert summary["discarded"] == 2    # rows 1, 6
         assert summary["unconfirmed"] == 0
@@ -244,10 +351,12 @@ class TestRunReporting:
         co, apps = tracker
         seen = []
         recheck.run(co, applications_md=apps, progress=lambda c, t, d: seen.append((c, t, d)))
-        # One call per checked role; checked count climbs 1..N; total is constant.
-        assert len(seen) == 3
-        assert {c for c, _, _ in seen} == {1, 2, 3}
-        assert {t for _, t, _ in seen} == {3}
+        # One call per checked role — Indeed API-classified roles included, so
+        # the UI's progress bar covers the whole sweep, not just page fetches;
+        # checked count climbs 1..N; total is constant.
+        assert len(seen) == 4
+        assert {c for c, _, _ in seen} == {1, 2, 3, 4}
+        assert {t for _, t, _ in seen} == {4}
 
     def test_dry_run_detects_but_does_not_mutate(self, tracker, fake_fetch):
         co, apps = tracker
@@ -292,13 +401,13 @@ class TestRunReporting:
         assert fake_fetch["urls"] == []
 
     def test_unverifiable_sites_counted_not_fetched(self, tracker, fake_fetch):
-        """Evaluated roles on unverifiable sites (Indeed 8, Glassdoor 9) are
-        counted in `unverifiable` and never fetched; only the 3 LinkedIn roles
-        (1, 2, 6) are checked."""
+        """Evaluated roles on unverifiable sites (Glassdoor 9) are counted in
+        `unverifiable` and never fetched; the 3 LinkedIn roles (1, 2, 6) and the
+        Indeed role (8) are checked."""
         co, apps = tracker
         summary = recheck.run(co, applications_md=apps)
-        assert summary["unverifiable"] == 2
-        assert summary["checked"] == 3
+        assert summary["unverifiable"] == 1
+        assert summary["checked"] == 4
 
 
 class TestRecheckState:
@@ -321,7 +430,7 @@ class TestRecheckState:
         nums = {j.num for j in recheck.select_for_recheck(
             apps, state=state, now=now, min_age_hours=6, budget=100)}
         assert "1" not in nums                 # checked 1h ago (< 6h) → skipped
-        assert {"2", "6"} <= nums              # 10h ago + unseen → included
+        assert {"2", "6", "8"} <= nums         # 10h ago + unseen → included
 
     def test_budget_caps_and_prefers_stalest(self, tracker):
         _, apps = tracker
@@ -329,12 +438,12 @@ class TestRecheckState:
         state = {
             "https://www.linkedin.com/jobs/view/111": now - dt.timedelta(hours=20),  # row 1
             "https://www.linkedin.com/jobs/view/222": now - dt.timedelta(hours=30),   # row 2 (stalest seen)
-            # row 6 unseen → treated as oldest
+            # rows 6 and 8 unseen → treated as oldest
         }
         nums = [j.num for j in recheck.select_for_recheck(
             apps, state=state, now=now, min_age_hours=6, budget=2)]
         assert len(nums) == 2
-        assert set(nums) == {"6", "2"}         # unseen(6) + stalest(2); row 1 dropped by budget
+        assert set(nums) == {"6", "8"}         # both unseen; rows 2/1 dropped by budget
 
     def test_state_round_trip(self, tmp_path):
         now = self._now()
@@ -357,6 +466,9 @@ class TestRecheckState:
         assert "https://www.linkedin.com/jobs/view/111" in state
         assert "https://www.linkedin.com/jobs/view/666" in state
         assert "https://www.linkedin.com/jobs/view/222" not in state   # throttled → unstamped
+        # The Indeed role (live via the API, conclusive) rides the same cadence
+        # state as the page-fetched sites.
+        assert "https://www.indeed.com/viewjob?jk=888" in state
 
     def test_run_reports_throttled_count(self, tracker, fake_fetch):
         co, apps = tracker
@@ -415,10 +527,10 @@ class TestRecheckState:
         # Row 1 checked 1h ago (within the 6h window → ineligible, not "deferred").
         fresh = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
         recheck._save_state(sp, {"https://www.linkedin.com/jobs/view/111": fresh})
-        # Eligible now: rows 2 & 6 (unseen). budget 1 → check 1, defer the other 1.
+        # Eligible now: rows 2, 6 & 8 (unseen). budget 1 → check 1, defer the other 2.
         summary = recheck.run(co, applications_md=apps, state_path=sp, budget=1, min_age_hours=6)
         assert summary["checked"] == 1
-        assert summary["deferred"] == 1     # the over-budget eligible only — NOT row 1
+        assert summary["deferred"] == 2     # the over-budget eligible only — NOT row 1
 
 
 class TestRecheckDrain:
@@ -544,13 +656,15 @@ class TestRecheckDrain:
         assert len(calls) == 1                    # single sweep despite a full-budget result
 
     def test_advances_through_backlog_with_real_run(self, tracker, fake_fetch, tmp_path):
-        """Integration: with the REAL run() (only the HTTP layer faked), a budget
+        """Integration: with the REAL run() (only the HTTP layers faked), a budget
         smaller than the backlog drives drain across cycles, and the per-role
         state makes each cycle skip the prior cycle's roles — so every verifiable
-        role is fetched exactly once, none re-checked."""
+        role is checked exactly once, none re-checked."""
         co, apps = tracker
         sp = tmp_path / "recheck-state.tsv"
         agg = recheck.drain(co, applications_md=apps, state_path=sp,
                             budget=1, cooldown=0, max_cycles=10)
-        assert agg["checked"] == 3                # rows 1, 2, 6 (verifiable), one each
+        assert agg["checked"] == 4                # rows 1, 2, 6 (LinkedIn) + 8 (Indeed)
         assert len(fake_fetch["urls"]) == len(set(fake_fetch["urls"])) == 3   # no re-fetch
+        keys = [k for batch in fake_fetch["indeed_batches"] for k in batch]
+        assert keys == ["888"]                    # Indeed checked exactly once too

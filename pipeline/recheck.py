@@ -6,12 +6,15 @@ someone tries to apply. This stage closes that gap: it re-fetches every
 Evaluated role and Discards the ones that are demonstrably gone.
 
 Only a definitive `expired` result (HTTP 404/410, an expired-body marker, an
-error redirect) discards a role. An `active` OR `uncertain` result leaves it
-Evaluated — so a transient network blip, a login wall, or an ambiguous page
-never drops a live role from the queue; those land in the `unconfirmed` count so
-an outage (everything uncertain) is visible rather than silently reported as
-"all still open". The parallel fetch + LinkedIn guest-endpoint mapping is the
-shared `screen.classify_each`; the Discards are one batched dual-write.
+error redirect, an Indeed jobData expired/removed verdict) discards a role. An
+`active` OR `uncertain` result leaves it Evaluated — so a transient network
+blip, a login wall, or an ambiguous page never drops a live role from the
+queue; those land in the `unconfirmed` count so an outage (everything
+uncertain) is visible rather than silently reported as "all still open".
+Site routing is `screen.classify_liveness_each`: LinkedIn roles ride the
+parallel page fetch (guest-endpoint mapping), Indeed roles the batched jobData
+API (the posting page is Cloudflare-walled but the scraper's API isn't); the
+Discards are one batched dual-write.
 
 Wired into orchestrate via the opt-in `--recheck-liveness` flag (off by default)
 and exposed in the UI as a background sweep. Both go through `run()`.
@@ -56,8 +59,8 @@ def _select(applications_md: Path) -> tuple[list[RecheckJob], int, int]:
     """(jobs, skipped, unverifiable): the Evaluated roles we can actually
     liveness-check, plus counts of Evaluated rows with no URL (`skipped`) and
     with a URL on a site we have no liveness path for (`unverifiable` — e.g.
-    Indeed/Glassdoor anti-bot walls, which a plain fetch can't classify). The
-    unverifiable ones are never fetched; restoring them is a tracked follow-up."""
+    Glassdoor's anti-bot wall, which a plain fetch can't classify and which has
+    no API fallback). The unverifiable ones are never fetched."""
     jobs: list[RecheckJob] = []
     skipped = unverifiable = 0
     for row in data.parse_applications(applications_md):
@@ -81,7 +84,7 @@ def select_evaluated(applications_md: Path) -> list[RecheckJob]:
     """Every Evaluated tracker role we can liveness-check (has a posting URL on a
     verifiable site). Not score-gated — liveness applies at every score — but it
     IS site-gated: only sites with a working unauthenticated liveness path
-    (currently LinkedIn via the guest endpoint) are returned."""
+    (LinkedIn via the guest endpoint, Indeed via the jobData API) are returned."""
     jobs, _, _ = _select(Path(applications_md))
     return jobs
 
@@ -180,7 +183,7 @@ def run(
 
     Returns {checked, discarded, dead, skipped, unconfirmed, throttled,
     deferred, unverifiable}: `unverifiable` counts Evaluated roles on sites with
-    no liveness path (Indeed/Glassdoor anti-bot walls) — never fetched, just
+    no liveness path (Glassdoor's anti-bot wall) — never fetched, just
     reported; `dead` is a list of {num, company, role, url, reason};
     `unconfirmed` counts roles we read but couldn't call live-or-dead (ambiguous
     page / fetch error); `throttled` counts roles LinkedIn rate-limited (no real
@@ -216,7 +219,9 @@ def run(
     checked = unconfirmed = throttled = 0
     dead: list[dict] = []
     new_state = dict(state)
-    for job, result, reason, _body in screen.classify_each(
+    # classify_liveness_each routes each role by site (Indeed → batched jobData
+    # API, everything else → per-URL page fetch) and yields one uniform shape.
+    for job, result, reason, _body in screen.classify_liveness_each(
         jobs, lambda j: j.url, timeout=timeout, max_workers=max(1, concurrency)
     ):
         checked += 1
