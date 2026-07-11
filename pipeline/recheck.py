@@ -186,8 +186,9 @@ def run(
     no liveness path (Glassdoor's anti-bot wall) — never fetched, just
     reported; `dead` is a list of {num, company, role, url, reason};
     `unconfirmed` counts roles we read but couldn't call live-or-dead (ambiguous
-    page / fetch error); `throttled` counts roles LinkedIn rate-limited (no real
-    read — retried next run, NEVER discarded); `deferred` counts roles DUE a
+    page / fetch error); `throttled` counts roles with no real read — LinkedIn
+    rate-limiting or an Indeed jobData batch failure (retried next run, NEVER
+    discarded); `deferred` counts roles DUE a
     re-check but cut by the per-run budget (the backlog remainder for a later
     run — not roles merely inside the min-age window). `progress(checked, total,
     dead_so_far)` fires once per checked role. `dry_run` reports without writing.

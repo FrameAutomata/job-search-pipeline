@@ -440,10 +440,13 @@ class TestRecheckState:
             "https://www.linkedin.com/jobs/view/222": now - dt.timedelta(hours=30),   # row 2 (stalest seen)
             # rows 6 and 8 unseen → treated as oldest
         }
+        # budget=3 exercises BOTH orderings: unseen (6, 8) outrank every seen
+        # row, and among seen rows the stalest (2 @30h) beats the fresher
+        # (1 @20h), which the budget cuts.
         nums = [j.num for j in recheck.select_for_recheck(
-            apps, state=state, now=now, min_age_hours=6, budget=2)]
-        assert len(nums) == 2
-        assert set(nums) == {"6", "8"}         # both unseen; rows 2/1 dropped by budget
+            apps, state=state, now=now, min_age_hours=6, budget=3)]
+        assert set(nums[:2]) == {"6", "8"}     # unseen first
+        assert nums[2] == "2"                  # then stalest seen; row 1 dropped
 
     def test_state_round_trip(self, tmp_path):
         now = self._now()

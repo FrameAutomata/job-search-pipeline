@@ -132,7 +132,7 @@ class TestRecheckTrigger:
     def test_status_surfaces_throttled_deferred_unverifiable(self, client, monkeypatch):
         """A sweep must not look like a clean 'all open' run: throttled (no real
         read), deferred (budget-skipped) and unverifiable (site can't be checked,
-        e.g. Indeed) all reach the UI status."""
+        e.g. Glassdoor) all reach the UI status."""
         def fake_run(career_ops, *, progress=None, **kw):
             if progress:
                 progress(2, 2, 0)

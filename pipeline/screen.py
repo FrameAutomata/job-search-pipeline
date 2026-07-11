@@ -26,7 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -149,25 +149,37 @@ def linkedin_guest_jd_url(url: str) -> str | None:
     return f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}"
 
 
-# Matches the `jk` job key on any *.indeed.com URL (viewjob, m./country
-# subdomains, rc/clk tracking redirects). Host-anchored so a jk-shaped param on
-# another site (or a lookalike domain) never reads as an Indeed key.
-_INDEED_JK_RE = re.compile(
-    r"^https?://(?:[a-z0-9-]+\.)*indeed\.com/[^#]*[?&]jk=([0-9A-Za-z]+)",
-    re.IGNORECASE,
-)
+# Every job key is interpolated into the jobData GraphQL query string, so this
+# charset gate doubles as the injection guard.
+_INDEED_JK_CHARSET = re.compile(r"[0-9A-Za-z]+")
 
 
 def indeed_job_key(url: str | None) -> str | None:
-    """The Indeed job key (`jk`) from a posting URL, or None if this isn't an
-    Indeed posting URL.
+    """The Indeed job key — the first top-level `jk` query param — from a URL
+    on any *.indeed.com host (viewjob, m./country subdomains, rc/clk tracking
+    redirects), or None if this isn't an Indeed posting URL.
+
+    Parsed with urllib rather than a regex scan: a scan can be hijacked by a
+    jk= embedded in another param's VALUE (e.g. a redirect target), and a wrong
+    key comes back absent from jobData — which reads as "removed" and would
+    discard a live role. Host-checked so a jk-shaped param on another site (or
+    a lookalike domain) never counts.
 
     The key — not the page — is Indeed's liveness handle: the posting page is
-    Cloudflare-walled to a plain fetch, but the jobData GraphQL API (the same
-    one the JobSpy scraper uses) answers by job key with a definitive `expired`
-    flag. See fetch_indeed_expiry."""
-    m = _INDEED_JK_RE.match(url or "")
-    return m.group(1) if m else None
+    Cloudflare-walled to a plain fetch, but the jobData GraphQL API answers by
+    job key with a definitive `expired` flag. See fetch_indeed_expiry."""
+    try:
+        parts = urlparse(url or "")
+        host = parts.hostname or ""
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https"):
+        return None
+    if host != "indeed.com" and not host.endswith(".indeed.com"):
+        return None
+    vals = parse_qs(parts.query).get("jk")
+    key = vals[0] if vals else None
+    return key if key and _INDEED_JK_CHARSET.fullmatch(key) else None
 
 
 def is_liveness_verifiable(url: str | None) -> bool:
@@ -328,12 +340,15 @@ def _jobdata_query(keys) -> str:
 def fetch_indeed_expiry(keys, *, timeout: int = 8) -> dict[str, bool]:
     """One batched jobData lookup on Indeed's GraphQL API → {jk: expired}.
 
-    Same endpoint + embedded mobile-app credentials the JobSpy scraper uses
-    (imported from jobspy so the two can't drift): Indeed's Cloudflare wall
-    guards the website, not this API, so it works where a page fetch can't —
-    including datacenter IPs. A job key the API no longer knows is silently
-    OMITTED from the results; absence semantics belong to the caller
-    (classify_indeed_each treats absence-from-a-non-empty-batch as removed).
+    Same endpoint + embedded mobile-app credentials the JobSpy scraper uses.
+    The headers come from jobspy so the credentials can't drift; the endpoint
+    URL and the jobData query are OURS (jobspy only ships a jobSearch query),
+    so a jobspy upgrade won't fix them if Indeed ever moves the API. Indeed's
+    Cloudflare wall guards the website, not this API, so it works where a page
+    fetch can't — including datacenter IPs. A job key the API no longer knows
+    is silently OMITTED from the results; absence semantics belong to the
+    caller (classify_indeed_each treats absence-from-a-non-empty-batch as
+    removed).
 
     Raises RuntimeError on ANY transport- or shape-level failure (HTTP error,
     GraphQL errors, malformed/non-JSON payload) so the classifier has exactly
@@ -389,6 +404,8 @@ def classify_indeed_each(items, key_of, *, timeout: int = 8,
     rejected query, and uncertain never discards). A failed batch yields
     `throttled` for that chunk only — no read happened, so the re-check leaves
     those roles unstamped and retries them next run; later chunks still run.
+    ImportError is the exception: a missing dependency is permanent for this
+    process, so it propagates instead of posing as a retryable throttle.
     There's no in-call retry (unlike the LinkedIn throttle backoff): a batch
     failure is batch-wide, and the re-check's staleness state IS the retry
     mechanism. Items whose key_of() is falsy yield `uncertain` unqueried."""
@@ -404,6 +421,11 @@ def classify_indeed_each(items, key_of, *, timeout: int = 8,
         chunk = keyed[i:i + step]
         try:
             expiry = fetch_indeed_expiry([key for _, key in chunk], timeout=timeout)
+        except ImportError:
+            # jobspy/requests absent (e.g. a UI-only venv): permanent, so a
+            # `throttled` verdict would re-queue the backlog forever behind a
+            # "will retry" that never can. Surface the real failure.
+            raise
         except Exception as exc:
             for item, _ in chunk:
                 yield item, "throttled", f"jobData request failed: {exc}", ""
@@ -424,13 +446,17 @@ def classify_liveness_each(items, url_of, *, timeout: int = 8, max_workers: int 
     """Site-routed liveness classification, yielding (item, result, reason,
     body) for every item: Indeed postings (a jk-bearing URL) go through the
     batched jobData API (their pages are Cloudflare-walled to a plain fetch),
-    everything else through the per-URL page fetch. The routing lives here,
-    next to is_liveness_verifiable, so the gate that admits a site and the
-    dispatch that classifies it can't drift apart — callers never partition by
-    site themselves. `max_workers` paces only the page-fetch pool; the Indeed
+    everything else through the per-URL page fetch. Callers never partition by
+    site themselves; the routing lives here, beside is_liveness_verifiable, and
+    the two must agree — a new verifiable site means extending BOTH the gate
+    and this dispatch. `max_workers` paces only the page-fetch pool; the Indeed
     batches are already few (~items/25 requests)."""
-    indeed = [it for it in items if indeed_job_key(url_of(it))]
-    fetched = [it for it in items if not indeed_job_key(url_of(it))]
+    # One materializing pass: url_of/indeed_job_key run once per item, and a
+    # one-shot iterable (generator) is safe — a second scan of `items` would
+    # find it exhausted and silently drop whichever partition is built second.
+    tagged = [(it, indeed_job_key(url_of(it))) for it in items]
+    fetched = [it for it, key in tagged if not key]
+    indeed = [it for it, key in tagged if key]
     yield from classify_each(fetched, url_of, timeout=timeout, max_workers=max_workers)
     yield from classify_indeed_each(
         indeed, lambda it: indeed_job_key(url_of(it)), timeout=timeout)

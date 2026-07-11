@@ -89,6 +89,24 @@ class TestIndeedJobKey:
             "https://www.indeed.com/rc/clk?jk=abc123def4567890&from=web"
         ) == "abc123def4567890"
 
+    def test_first_top_level_jk_wins_over_nested_jk(self):
+        """Regression: a greedy scan used to capture the LAST jk= in the string,
+        so an un-encoded jk inside a redirect param's VALUE hijacked the key —
+        the wrong key comes back absent from jobData and the LIVE role gets
+        discarded. The genuine posting key is the top-level jk param."""
+        assert screen_mod.indeed_job_key(
+            "https://www.indeed.com/rc/clk?jk=abc123def4567890&url=http://o/a?jk=aaaaaaaaaaaaaaaa"
+        ) == "abc123def4567890"
+        assert screen_mod.indeed_job_key(
+            "https://www.indeed.com/viewjob?jk=abc123def4567890&next=https://x.com/v?jk=bbbbbbbbbbbbbbbb"
+        ) == "abc123def4567890"
+
+    def test_jk_only_inside_a_param_value_does_not_count(self):
+        # ?url=...?jk=... carries no top-level jk — there is no posting key here.
+        assert screen_mod.indeed_job_key(
+            "https://www.indeed.com/rc/clk?url=http://o/a?jk=zzzzzzzzzzzzzzzz"
+        ) is None
+
     def test_indeed_url_without_jk(self):
         assert screen_mod.indeed_job_key("https://www.indeed.com/jobs?q=engineer") is None
 
@@ -1021,3 +1039,33 @@ class TestClassifyIndeedEach:
     def test_empty_items_makes_no_requests(self, fake_expiry):
         assert list(screen_mod.classify_indeed_each([], lambda it: it.get("jk"))) == []
         assert fake_expiry["batches"] == []
+
+    def test_import_error_propagates_not_throttled(self, fake_expiry):
+        """A missing dependency (jobspy/requests not installed — e.g. a UI-only
+        venv) is permanent for this process: masking it as a retryable
+        `throttled` would re-queue the whole backlog forever behind a 'will
+        retry' that never can. It must surface as the real error instead."""
+        fake_expiry["behavior"] = ImportError("No module named 'jobspy'")
+        with pytest.raises(ImportError):
+            list(screen_mod.classify_indeed_each([{"jk": "aaa"}], lambda it: it.get("jk")))
+
+
+class TestClassifyLivenessEach:
+    """The site router must be safe for any iterable input: it materializes
+    `items` once, so a one-shot iterator (generator) classifies every item
+    instead of silently losing whichever partition is built second."""
+
+    def test_generator_input_classifies_every_item(self, monkeypatch):
+        monkeypatch.setattr(screen_mod, "fetch_and_classify",
+                            lambda url, timeout=8: ("active", "ok", "<html/>"))
+        monkeypatch.setattr(screen_mod, "fetch_indeed_expiry",
+                            lambda keys, timeout=8: {k: False for k in keys})
+        items = iter([
+            {"url": "https://www.linkedin.com/jobs/view/111"},
+            {"url": "https://www.indeed.com/viewjob?jk=abc123def4567890"},
+            {"url": "https://www.linkedin.com/jobs/view/222"},
+        ])
+        rows = list(screen_mod.classify_liveness_each(
+            items, lambda it: it["url"], timeout=8, max_workers=1))
+        assert len(rows) == 3
+        assert all(result == "active" for _, result, _, _ in rows)
