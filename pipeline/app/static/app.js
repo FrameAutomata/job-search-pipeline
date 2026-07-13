@@ -415,6 +415,17 @@ localRun.btn.addEventListener("click", () => {
   localRun.panel.hidden = !localRun.panel.hidden;
 });
 
+// Set a <pre>'s content to a streamed log tail, keeping the view pinned to the
+// bottom only when the user is already there (so they can scroll up to read
+// without being yanked back down). Shared by the local-run and handoff logs.
+function renderLogTail(el, tail) {
+  el.hidden = !tail;
+  if (!tail) return;
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+  el.textContent = tail;
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
 function renderLocalStatus(s) {
   const running = s.running;
   localRun.start.hidden = running;
@@ -430,12 +441,7 @@ function renderLocalStatus(s) {
       return `<span class="stage${seen ? " seen" : ""}${current ? " current" : ""}">${st}</span>`;
     }).join("<span class=\"stage-sep\">→</span>");
   }
-  localRun.log.hidden = !s.log_tail;
-  if (s.log_tail) {
-    const atBottom = localRun.log.scrollTop + localRun.log.clientHeight >= localRun.log.scrollHeight - 8;
-    localRun.log.textContent = s.log_tail;
-    if (atBottom) localRun.log.scrollTop = localRun.log.scrollHeight;
-  }
+  renderLogTail(localRun.log, s.log_tail);
 }
 
 async function pollLocalRun() {
@@ -513,6 +519,90 @@ fetch("/api/run-local/status").then((r) => r.json()).then((s) => {
     localRun.timer = setTimeout(pollLocalRun, 2500);
   }
 }).catch(() => {});
+
+// ── local search-config override ───────────────────────────────────────────
+// A full standalone search config for local runs that diverges from the
+// cloud-shared config. orchestrate auto-prefers config/search.local.yml when it
+// exists, so this only affects THIS machine's runs — cloud stays on search.yml.
+
+const localSearch = {
+  status: document.getElementById("local-search-status"),
+  edit: document.getElementById("local-search-edit"),
+  editor: document.getElementById("local-search-editor"),
+  text: document.getElementById("local-search-text"),
+  save: document.getElementById("local-search-save"),
+  clear: document.getElementById("local-search-clear"),
+  msg: document.getElementById("local-search-msg"),
+  active: false,
+};
+
+function renderLocalSearchStatus() {
+  localSearch.status.textContent = localSearch.active
+    ? "Local runs use: search.local.yml (override active)"
+    : "Local runs use: search.yml (same as cloud)";
+  // Nothing to revert to when no override exists.
+  localSearch.clear.hidden = !localSearch.active;
+}
+
+async function loadLocalSearch() {
+  try {
+    const resp = await fetch("/api/local-search");
+    const body = await resp.json();
+    localSearch.active = !!body.active;
+    localSearch.text.value = body.content || "";
+    renderLocalSearchStatus();
+  } catch (_) {
+    // State unknown — don't offer a delete against it, and don't leave the
+    // clear button in whatever state the last render left it.
+    localSearch.active = false;
+    localSearch.status.textContent = "Search config: unavailable";
+    localSearch.clear.hidden = true;
+  }
+}
+
+localSearch.edit.addEventListener("click", () => {
+  localSearch.editor.hidden = !localSearch.editor.hidden;
+  localSearch.msg.textContent = "";
+});
+
+localSearch.save.addEventListener("click", async () => {
+  localSearch.save.disabled = true;
+  localSearch.msg.textContent = "Saving…";
+  try {
+    const resp = await fetch("/api/local-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: localSearch.text.value }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `save failed (${resp.status})`);
+    localSearch.active = true;
+    renderLocalSearchStatus();
+    localSearch.msg.textContent = "Saved — local runs now use this override.";
+  } catch (e) {
+    localSearch.msg.textContent = String(e.message || e);
+  } finally {
+    localSearch.save.disabled = false;
+  }
+});
+
+localSearch.clear.addEventListener("click", async () => {
+  if (!confirm("Delete the local override so local runs use your cloud search config?")) return;
+  localSearch.clear.disabled = true;
+  try {
+    const resp = await fetch("/api/local-search", { method: "DELETE" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `delete failed (${resp.status})`);
+    await loadLocalSearch();   // re-seed the editor from the cloud config; sets active=false
+    localSearch.msg.textContent = "Reverted to cloud config.";
+  } catch (e) {
+    localSearch.msg.textContent = String(e.message || e);
+  } finally {
+    localSearch.clear.disabled = false;
+  }
+});
+
+loadLocalSearch();
 
 // ── tracker liveness re-check ──────────────────────────────────────────────
 
@@ -633,6 +723,7 @@ const handoffUi = {
   panel: document.getElementById("handoff-panel"),
   start: document.getElementById("handoff-start"),
   result: document.getElementById("handoff-result"),
+  log: document.getElementById("handoff-log"),
   timer: null,
 };
 
@@ -648,6 +739,7 @@ handoffUi.start.addEventListener("click", async () => {
   const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
   const tailor = document.getElementById("handoff-tailor").checked;
   handoffUi.start.disabled = true;
+  renderLogTail(handoffUi.log, "");   // clear any prior build's log
   handoffUi.result.innerHTML = `<p class="hint">Building the work-orders${tailor ? " + tailoring resumes (this can take minutes)" : ""}…</p>`;
   try {
     // board omitted → server default "both" = a session per site.
@@ -675,6 +767,7 @@ async function pollHandoffBuild(jobId) {
     return;
   }
   const t = await resp.json().catch(() => ({}));
+  renderLogTail(handoffUi.log, t.log_tail || "");
   if (resp.ok && t.status === "running") {
     handoffUi.timer = setTimeout(() => pollHandoffBuild(jobId), 1500);
     return;

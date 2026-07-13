@@ -18,8 +18,34 @@ from pipeline._batch_common import (
     parse_json_loose,
     read_text,
     run_merge_tracker,
+    tail_text,
     write_job_result,
 )
+
+
+class TestTailText:
+    def test_returns_last_n_lines(self, tmp_path):
+        f = tmp_path / "log.txt"
+        f.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
+        assert tail_text(f, 3) == "line 7\nline 8\nline 9"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert tail_text(tmp_path / "nope.txt", 5) == ""
+
+    def test_zero_lines_returns_empty_not_whole_window(self, tmp_path):
+        # [-0:] would slice the WHOLE file; the guard must return "" for 0.
+        f = tmp_path / "log.txt"
+        f.write_text("a\nb\nc", encoding="utf-8")
+        assert tail_text(f, 0) == ""
+
+    def test_reads_only_tail_bytes(self, tmp_path):
+        # A line beyond the byte window is excluded even if the line count allows
+        # it — the read is bounded to the last max_bytes of the file.
+        f = tmp_path / "log.txt"
+        f.write_text("OLD-LINE\n" + "x" * 100 + "\nNEW-LINE", encoding="utf-8")
+        out = tail_text(f, 100, max_bytes=16)
+        assert "OLD-LINE" not in out
+        assert "NEW-LINE" in out
 
 
 class TestReadText:

@@ -45,6 +45,7 @@
         those in so handled roles never reappear. <b>Limit / site</b> caps each site's session.
         <b>Pre-tailor</b> generates a tailored resume per company (needs <code>resumes/resume.docx</code>;
         spends LLM calls, can take minutes).</p>
+      <pre id="handoff-log" class="local-log" hidden></pre>
       <div id="handoff-result"></div>
     </div>
     <div id="local-run-panel" class="local-run-panel" hidden>
@@ -60,6 +61,23 @@
         <button id="local-start">▶ Start</button>
         <button id="local-cancel" hidden>✕ Cancel run</button>
         <span class="hint">Runs scrape → filter → screen → bridge → evaluate on this machine; results load here when done.</span>
+      </div>
+      <div class="local-search-override">
+        <div class="local-run-options">
+          <span id="local-search-status" class="hint">Search config: loading…</span>
+          <button id="local-search-edit" type="button">✎ Edit local search config</button>
+        </div>
+        <div id="local-search-editor" hidden>
+          <p class="hint">A <b>full standalone</b> search config used only for local runs on this machine.
+            Cloud <b>▶ Run now</b> and the daily always use your cloud config — this never leaves your
+            machine (it's gitignored). Seeded from your current cloud config; edit and save to diverge.</p>
+          <textarea id="local-search-text" class="local-search-text" spellcheck="false" rows="18"></textarea>
+          <div class="local-run-options">
+            <button id="local-search-save" class="primary">Save local override</button>
+            <button id="local-search-clear">Use cloud config</button>
+            <span id="local-search-msg" class="hint"></span>
+          </div>
+        </div>
       </div>
       <div id="local-stages" class="local-stages" hidden></div>
       <pre id="local-log" class="local-log" hidden></pre>

@@ -454,6 +454,22 @@ tbody tr.selected { background: #233047; }
 }
 .local-run-options button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .local-run-options .hint { color: var(--muted); font-size: 12px; }
+.local-search-override {
+  border-top: 1px solid var(--border); padding-top: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.local-search-override button {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer;
+}
+.local-search-override button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.local-search-text {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.5;
+}
 .local-stages { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .local-stages .stage {
   padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted);

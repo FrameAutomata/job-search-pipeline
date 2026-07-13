@@ -10,6 +10,7 @@ Run:
 or use the run-ui.sh / run-ui.ps1 launchers.
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -34,6 +35,7 @@ from pipeline._batch_common import (
     max_report_num,
     max_tracker_num,
     read_text,
+    tail_text,
     write_job_result,
     run_merge_tracker,
 )
@@ -496,6 +498,87 @@ def run_local_status() -> JSONResponse:
 @app.post("/api/run-local/cancel")
 def run_local_cancel() -> JSONResponse:
     return JSONResponse(local_run.cancel())
+
+
+# ── local search-config override ────────────────────────────────────────────
+# A full standalone search config for LOCAL runs (config/search.local.yml) that
+# diverges from the cloud-shared config/search.yml. orchestrate.py auto-prefers
+# it when present (resolve_search_config), so both the UI "Run" button and CLI
+# runs use it; the cloud is untouched (the daily decodes SEARCH_CONFIG_B64 into
+# search.yml and never sees this gitignored file). The UI seeds the editor from
+# search.yml so "full replacement" starts from the current cloud config.
+# These filenames mirror orchestrate.{LOCAL,SHARED}_SEARCH_CONFIG — not imported
+# from there because orchestrate pulls jobspy transitively and this UI process
+# shouldn't. Keep the two in sync if either is ever renamed.
+def _local_search_path() -> Path:
+    return ROOT / "config" / "search.local.yml"
+
+
+class LocalSearchConfig(BaseModel):
+    content: str
+
+
+def _search_entries(parsed) -> list | None:
+    """The per-search mappings pipeline.scrape.load_searches would yield, or None
+    if the shape is invalid. Mirrors load_searches (a `searches:` list, or the
+    legacy single `search:`) but additionally requires at least one entry and
+    every entry to be a mapping — the pipeline reads dict fields off each, so a
+    scalar/null entry or an empty list would crash the next run, not no-op."""
+    if not isinstance(parsed, dict):
+        return None
+    if "searches" in parsed:
+        entries = parsed["searches"]
+    elif "search" in parsed:
+        entries = [parsed["search"]]
+    else:
+        return None
+    if not isinstance(entries, list) or not entries:
+        return None
+    if not all(isinstance(e, dict) for e in entries):
+        return None
+    return entries
+
+
+@app.get("/api/local-search")
+def local_search_get() -> JSONResponse:
+    """Return the local override if present, else seed the editor with the
+    cloud-shared search.yml so the user edits a full copy. `active` is whether an
+    override file exists (i.e. what local runs will actually use)."""
+    local = _local_search_path()
+    if local.exists():
+        return JSONResponse({"active": True, "content": local.read_text(encoding="utf-8"),
+                             "path": "config/search.local.yml"})
+    shared = ROOT / "config" / "search.yml"
+    content = shared.read_text(encoding="utf-8") if shared.exists() else ""
+    return JSONResponse({"active": False, "content": content, "path": "config/search.local.yml"})
+
+
+@app.post("/api/local-search")
+def local_search_set(req: LocalSearchConfig) -> JSONResponse:
+    """Validate and write the local override. Rejects anything that wouldn't load
+    as a search config so the next run can't choke on a broken file — including a
+    non-mapping or empty search entry, which would crash scrape, not no-op."""
+    import yaml
+    try:
+        parsed = yaml.safe_load(req.content)
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Not valid YAML: {e}")
+    if _search_entries(parsed) is None:
+        raise HTTPException(status_code=400,
+                            detail="Config must have a non-empty `searches:` list of search "
+                                   "mappings (or a single legacy `search:` mapping).")
+    local = _local_search_path()
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text(req.content, encoding="utf-8")
+    return JSONResponse({"ok": True, "active": True})
+
+
+@app.delete("/api/local-search")
+def local_search_delete() -> JSONResponse:
+    """Remove the override so local runs fall back to the cloud-shared config.
+    Idempotent — a no-op when no override exists."""
+    _local_search_path().unlink(missing_ok=True)
+    return JSONResponse({"ok": True, "active": False})
 
 
 # ── tracker liveness re-check ───────────────────────────────────────────────
@@ -1312,6 +1395,12 @@ def add_job_status(job_id: str) -> JSONResponse:
 # single-flight by design — a new build simply replaces the finished one.
 _handoff_task: dict | None = None
 _handoff_lock = threading.Lock()
+# The build runs in-process (so tests can monkeypatch handoff.run and the result
+# stays a plain function return), so to stream its progress to the UI the way the
+# local pipeline run does we redirect its stdout to this file and tail it on each
+# status poll. Single-flight (one build at a time), so a fixed path — truncated
+# per build — is enough; no per-job filenames needed.
+_HANDOFF_LOG = ROOT / ".ui-cache" / "handoff-build.log"
 
 
 class HandoffBuildRequest(BaseModel):
@@ -1334,11 +1423,22 @@ def _finish_handoff(job_id: str, **fields) -> None:
 
 def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool) -> None:
     try:
-        # Pass the server's ROOT-anchored career-ops so a RELATIVE
-        # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
-        # own default only anchors an absolute value (review L2).
-        rc = handoff.run(board=board, limit=limit, tailor=tailor,
-                         career_ops=_career_ops_local())
+        # Capture the build's [handoff] progress to a file so the status poll can
+        # stream it to the UI. Line-buffered (buffering=1) so each printed line is
+        # flushed to disk immediately and the tail updates live; sys.stdout is
+        # restored on exit. Caveat: redirect_stdout/stderr are process-global, so
+        # a concurrent background thread that prints during a long (--tailor) build
+        # — a recheck sweep, onboarding — has its output diverted here too (and
+        # away from the console). Accepted for a localhost single-user UI: at worst
+        # a stray line lands in this log; the build result itself is unaffected.
+        _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_HANDOFF_LOG, "w", encoding="utf-8", errors="replace", buffering=1) as log, \
+                contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            # Pass the server's ROOT-anchored career-ops so a RELATIVE
+            # CAREER_OPS_PATH resolves the same tree the UI reads from — handoff's
+            # own default only anchors an absolute value (review L2).
+            rc = handoff.run(board=board, limit=limit, tailor=tailor,
+                             career_ops=_career_ops_local())
         if rc != 0:
             _finish_handoff(job_id, status="failed",
                             error="handoff exited non-zero — no scored roles found "
@@ -1372,6 +1472,13 @@ def handoff_build(req: HandoffBuildRequest) -> JSONResponse:
         if _handoff_task and _handoff_task.get("status") == "running":
             raise HTTPException(status_code=409,
                                 detail="A work-order build is already in progress.")
+        # Clear the previous build's log BEFORE publishing this task (and while
+        # holding the lock the status poll also takes) so a poll for this build
+        # can't return the prior build's tail in the window before the worker
+        # thread truncates the file. Truncate before the status flip so a failure
+        # here surfaces as an error without wedging the slot in "running".
+        _HANDOFF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _HANDOFF_LOG.write_text("", encoding="utf-8")
         job_id = str(uuid.uuid4())
         _handoff_task = {"id": job_id, "status": "running"}
     threading.Thread(target=_run_handoff_build,
@@ -1387,6 +1494,9 @@ def handoff_build_status(job_id: str) -> JSONResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="Unknown build task")
     task.pop("id", None)
+    # The captured build log — live while running, retained on the terminal state
+    # — so the 🤝 panel can stream progress like the local pipeline run does.
+    task["log_tail"] = tail_text(_HANDOFF_LOG, 40)
     return JSONResponse(task)
 
 

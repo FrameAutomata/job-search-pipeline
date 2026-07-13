@@ -14,6 +14,8 @@ node_modules/
 
 # User-specific config (the .example.yml is committed)
 config/search.yml
+# Local-only search override — diverges local runs from the cloud-shared config
+config/search.local.yml
 
 # Pipeline outputs
 output/
