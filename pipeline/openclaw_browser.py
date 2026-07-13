@@ -4,7 +4,8 @@ The OpenClaw browser CLI's `snapshot` verb emits an indented aria tree of the
 live page. The deterministic apply tier navigates forms by LABEL — labels are
 stable across page loads while [ref=eN] handles are minted per snapshot — so
 this module parses the tree once and answers label-based queries; refs are
-resolved only at act time.
+resolved fresh from each snapshot at plan time and are only valid for the
+capture they came from (see snapshot_id).
 
 Grammar (one element per line)::
 
@@ -15,8 +16,8 @@ Nesting is by relative indentation (a deeper line is a child of the nearest
 shallower open element), so a uniform leading offset — e.g. a snapshot captured
 with a wrapper prefix — parses the same as one flush to column 0. `[ref=eN]`
 becomes the element's `ref`; other `[k=v]` / `[flag]` groups and `/prop:` lines
-land in `attrs` (`url` gets a convenience property — the one prop the apply tier
-reads); quotes and brackets inside quoted spans are respected, and `\\"`-escaped
+land in `attrs` (`url` gets a convenience property — the one prop with a planned
+consumer); quotes and brackets inside quoted spans are respected, and `\\"`-escaped
 quotes in labels are honored. Parsing is deliberately tolerant: ANSI color codes
 are stripped, and lines that do not match the grammar — blank lines, truncation
 artifacts, a line cut off mid-label — are skipped rather than raising, because

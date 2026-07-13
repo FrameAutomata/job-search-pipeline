@@ -1,4 +1,4 @@
-"""Escalation state machine for the apply ladder (Phase 3 stub).
+"""Escalation state machine for the apply ladder (Phase 3).
 
 Drives one job application through the three tiers over an abstract browser:
 
@@ -15,9 +15,6 @@ Drives one job application through the three tiers over an abstract browser:
 The Browser/agent/wall collaborators are injected so this module is pure control
 flow, exercised in tests with a fake browser. The real OpenClaw client and the
 PROFILE.md -> answers compiler arrive in Phase 4.
-
-Interface only; behavior is specified by tests/test_ats_apply.py and implemented
-after the test spec is signed off (TDD).
 """
 
 from __future__ import annotations
@@ -60,17 +57,18 @@ def _stuck(action: FillAction) -> Unmapped:
     return Unmapped(action.label, "unresolved")
 
 
-def _outstanding(plan) -> list[Unmapped]:
-    # what the deterministic tier couldn't finish: fields it couldn't handle,
-    # plus fills still pending after the retry budget (never took effect).
-    return list(plan.unmapped) + [_stuck(a) for a in plan.actions]
+def _unfinished(snap: SnapshotIndex, plan) -> list[Unmapped]:
+    """What still needs a tier above: unmapped fields that are genuinely
+    unsatisfied on the live form (a no-rule field pre-filled by autofill or a
+    part-completed session counts as done), plus fills that never converged."""
+    return _still_unresolved(snap, plan.unmapped) + [_stuck(a) for a in plan.actions]
 
 
 def _still_unresolved(index: SnapshotIndex, items: list[Unmapped]) -> list[Unmapped]:
-    """After the agent runs, an item is resolved if its field is gone or now
-    holds a value and is no longer flagged invalid (re-plan can't see this for
-    no-rule fields, which never had a rule to drop out of). Labels can repeat,
-    so an item survives while ANY field bearing its label is still unsatisfied —
+    """An unmapped item is resolved if its field is gone or now holds a value
+    and is no longer flagged invalid (a re-plan can't see this for no-rule
+    fields, which never had a rule to drop out of). Labels can repeat, so an
+    item survives while ANY field bearing its label is still unsatisfied —
     never mask an empty duplicate behind a filled one."""
     invalid_ids = {id(el) for el in index.invalid_fields()}
     by_label: dict[str, list] = {}
@@ -138,12 +136,12 @@ def run_apply(
     snap, plan, rounds, blocker = _drive(browser, field_map, answers, snap, filled, detect_wall, max_rounds)
     if blocker:
         return escalated_at_wall()
-    remaining = _outstanding(plan)
+    remaining = _unfinished(snap, plan)
 
     # Agent tier: hand it whatever the deterministic tier couldn't finish, then
     # re-run the deterministic tier on anything the agent revealed, and re-check
-    # what's left by field satisfaction (fresh unmapped included, so a field the
-    # agent surfaces can't be silently dropped).
+    # what's left the same way (fresh unmapped included, so a field the agent
+    # surfaces can't be silently dropped).
     if remaining and agent is not None:
         try:
             agent(browser, remaining)
@@ -158,7 +156,7 @@ def run_apply(
         rounds += agent_rounds
         if blocker:
             return escalated_at_wall()
-        remaining = _still_unresolved(snap, plan.unmapped) + [_stuck(a) for a in plan.actions]
+        remaining = _unfinished(snap, plan)
 
     if remaining:
         return ApplyOutcome(ESCALATED_HUMAN, plan.submit_ref, filled, remaining, rounds=rounds)

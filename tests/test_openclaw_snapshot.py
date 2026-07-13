@@ -3,7 +3,8 @@
 Phase 1 of the deterministic/agent/human apply ladder: parse the OpenClaw
 browser CLI's `snapshot` output into a label-queryable index. Labels are the
 stable API of a form (refs are minted per snapshot), so the deterministic
-tier plans actions by label and resolves refs at act time.
+tier plans actions by label and resolves each ref fresh from the snapshot the
+plan is built against.
 
 Fixture lines are verbatim shapes from live captures (2026-07-13 spike):
 the Clover Health Greenhouse form and the Relevant Search LinkedIn Easy

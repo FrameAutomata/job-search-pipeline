@@ -296,6 +296,19 @@ def test_duplicate_label_empty_field_not_masked():
     assert out.status == ESCALATED_HUMAN
 
 
+def test_prefilled_unmapped_required_satisfied_without_agent():
+    # a required no-rule field already holding a value (autofill / a resumed
+    # session) is satisfied; the outcome must not depend on whether an agent
+    # callable was injected — form state decides, symmetrically on both paths
+    def prefilled():
+        return FakeBrowser([FF("e9", "textbox", "Why do you want to work here?",
+                               value="Because I love the mission.", required=True)])
+
+    no_agent = run(prefilled())
+    noop_agent = run(prefilled(), agent=lambda b, u: None)
+    assert no_agent.status == noop_agent.status == READY_TO_SUBMIT
+
+
 def test_escalation_payload_not_double_counted():
     # a sticky field the agent can't fix appears once in escalated, not twice (fix #5)
     b = FakeBrowser([FF("e3", "combobox", "Do you have a legal right to work in the US?",

@@ -3,8 +3,9 @@
 The apply ladder's fast tier: given a parsed live form (Phase 1 SnapshotIndex)
 and the candidate's canonical answers, emit a batched FILL PLAN — which ref
 gets which value via which widget recipe — without a single model call. Fields
-the map can't resolve (no rule, or a rule with no answer) are reported for the
-agent tier; the submit control is located but never actioned (human gate).
+the map can't finish (no rule, no usable answer, or a widget that won't resolve
+to an actionable ref) are reported for the agent tier; the submit control is
+located but never actioned (human gate).
 
 Pure functions only: no browser, no I/O. A later phase adds the OpenClaw client
 that executes the plan and the PROFILE.md -> answers compiler.
@@ -62,7 +63,11 @@ class FillAction:
 @dataclass
 class Unmapped:
     label: str
-    reason: str  # "no-rule" (required field the map doesn't cover) | "no-answer"
+    # "no-rule": required field the map doesn't cover; "no-answer": rule matched
+    # but no usable answer; "unresolved": matched with an answer, but the widget
+    # couldn't be resolved to an actionable ref (also used by the state machine
+    # for fills that never converged).
+    reason: str
 
 
 @dataclass
