@@ -320,6 +320,25 @@ class TestScoreJob:
         assert score == 0
         assert matches == []
 
+    def test_score_none_target_title_no_crash(self):
+        """A null/empty entry in target_titles (a bare `-` in YAML parses to
+        None) must not crash scoring. `_compile_alternation` already drops
+        falsy entries; the target_lookup build must be equally None-tolerant."""
+        row = {"title": "research assistant", "description": "", "skills": ""}
+        keywords = {}
+        score, matches = filter_mod.score_job(
+            row, keywords, ["research", None, "", "assistant"], []
+        )
+        assert score == 10  # two target-title hits × SCORE_TITLE_MATCH (5)
+        assert "title:research" in matches
+        assert "title:assistant" in matches
+
+    def test_score_none_negative_title_no_crash(self):
+        """A null/empty entry in negative_titles must not crash either."""
+        row = {"title": "senior engineer", "description": "", "skills": ""}
+        result = filter_mod.score_job(row, {}, [], ["senior", None, ""])
+        assert result is None
+
 
 class TestRun:
     """Test filter.run function with mocked pdfplumber."""

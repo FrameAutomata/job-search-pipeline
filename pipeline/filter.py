@@ -203,6 +203,13 @@ def _compile_alternation(terms: list[str]) -> re.Pattern | None:
     return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
 
 
+def _target_lookup(target_titles: list[str | None]) -> dict[str, str]:
+    """Map a matched (lowercased) title term back to its configured casing.
+    Drops falsy entries — a bare `-` in the YAML list parses to None — mirroring
+    _compile_alternation's `if t` guard so both stay null-tolerant."""
+    return {t.lower(): t for t in target_titles if t}
+
+
 def _is_remote(row: dict) -> bool:
     """JobSpy writes is_remote as a stringified bool ("True"/"False"/"") or empty."""
     return str(row.get("is_remote") or "").strip().lower() in ("true", "1", "yes", "t")
@@ -257,7 +264,7 @@ def score_job(
         _compile_alternation(list(keywords.keys())),
         _compile_alternation(target_titles),
         _compile_alternation(negative_titles),
-        target_titles,
+        _target_lookup(target_titles),
     )
 
 
@@ -267,7 +274,7 @@ def _score_job(
     keyword_pattern: re.Pattern | None,
     target_pattern: re.Pattern | None,
     negative_pattern: re.Pattern | None,
-    target_titles: list[str],
+    target_lookup: dict[str, str],
 ) -> tuple[int, list[str]] | None:
     """Score one job row using precompiled patterns. Each keyword contributes
     its weight at most once even if it appears multiple times in the text."""
@@ -290,7 +297,6 @@ def _score_job(
             matched.append(hit)
 
     if target_pattern is not None:
-        target_lookup = {t.lower(): t for t in target_titles}
         for hit in set(target_pattern.findall(title)):
             score += SCORE_TITLE_MATCH
             matched.append(f"title:{target_lookup.get(hit, hit)}")
@@ -355,6 +361,7 @@ def run(config_path: Path) -> Path:
     keyword_pattern = _compile_alternation(list(keywords.keys()))
     target_pattern = _compile_alternation(target_titles)
     negative_pattern = _compile_alternation(negative_titles)
+    target_lookup = _target_lookup(target_titles)
 
     jobs = []
     excluded = 0
@@ -371,7 +378,7 @@ def run(config_path: Path) -> Path:
                 ineligible += 1
                 continue
             result = _score_job(
-                row, keywords, keyword_pattern, target_pattern, negative_pattern, target_titles,
+                row, keywords, keyword_pattern, target_pattern, negative_pattern, target_lookup,
             )
             if result is None:
                 excluded += 1
