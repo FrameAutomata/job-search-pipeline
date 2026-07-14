@@ -190,16 +190,13 @@ def compile_answers(
     if loc := standing.get("location"):
         if m := _CITY_STATE.match(loc):
             answers["location_city"] = m.group(1).strip()
-    if pron := standing.get("pronouns"):
-        answers["pronouns"] = pron
-    if gender := standing.get("gender"):
-        answers["gender"] = gender
     if race := standing.get("race / ethnicity") or standing.get("race"):
         answers["race"] = race
-    if vet := standing.get("veteran status"):
-        answers["veteran_status"] = vet
-    if dis := standing.get("disability status"):
-        answers["disability_status"] = dis
+    for std_key, ans_key in (("pronouns", "pronouns"), ("gender", "gender"),
+                             ("veteran status", "veteran_status"),
+                             ("disability status", "disability_status")):
+        if v := standing.get(std_key):
+            answers[ans_key] = v
 
     answers["referral_source"] = referral
     if resume_path:

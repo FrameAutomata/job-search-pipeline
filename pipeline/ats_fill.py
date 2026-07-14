@@ -186,10 +186,10 @@ def _option_matches(committed: str, answer: str) -> bool:
 def _is_satisfied(index: SnapshotIndex, el, rule, answer: str) -> bool:
     """Widget-aware 'already holds the right value' check ([invalid] is the
     caller's concern)."""
+    committed = committed_value(index, el)
     if rule.widget in (SELECT, TYPEAHEAD):
-        committed = _committed_option(index, el)
         return committed is not None and _option_matches(committed, answer)
-    return el.value == answer
+    return committed == answer
 
 
 def _plan_upload(index, group, answer, rule, actions, unmapped) -> None:

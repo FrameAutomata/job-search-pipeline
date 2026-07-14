@@ -52,11 +52,6 @@ class ApplyOutcome:
     rounds: int = 0
 
 
-def _stuck(action: FillAction) -> Unmapped:
-    """A deterministic fill that never converged → hand it to the next tier."""
-    return Unmapped(action.label, "unresolved")
-
-
 def _blocking(items: list[Unmapped]) -> list[Unmapped]:
     """The items that actually block a ready-to-submit / need the agent —
     everything except purely-informational optional-unfilled fields."""
@@ -66,8 +61,10 @@ def _blocking(items: list[Unmapped]) -> list[Unmapped]:
 def _unfinished(snap: SnapshotIndex, plan) -> list[Unmapped]:
     """What still needs a tier above: unmapped fields that are genuinely
     unsatisfied on the live form (a no-rule field pre-filled by autofill or a
-    part-completed session counts as done), plus fills that never converged."""
-    return _still_unresolved(snap, plan.unmapped) + [_stuck(a) for a in plan.actions]
+    part-completed session counts as done), plus fills that never converged
+    ("unresolved")."""
+    return _still_unresolved(snap, plan.unmapped) + [
+        Unmapped(a.label, "unresolved") for a in plan.actions]
 
 
 def _still_unresolved(index: SnapshotIndex, items: list[Unmapped]) -> list[Unmapped]:
@@ -121,12 +118,16 @@ def run_apply(
     agent: AgentFn | None = None,
     wall: WallFn | None = None,
     max_rounds: int = 3,
+    snap: SnapshotIndex | None = None,
 ) -> ApplyOutcome:
-    """Drive one application through the ladder; never actions the submit."""
+    """Drive one application through the ladder; never actions the submit. A
+    caller that already snapshotted the settled page can pass `snap` to avoid a
+    redundant capture."""
     filled: list[FillAction] = []
     detect_wall = wall or (lambda _snap: None)
 
-    snap = browser.snapshot()
+    if snap is None:
+        snap = browser.snapshot()
     blocker = detect_wall(snap)
     if blocker:
         return ApplyOutcome(ESCALATED_HUMAN, blocker=blocker)

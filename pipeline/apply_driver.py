@@ -118,11 +118,13 @@ def run_apply_ladder(
 
     # Country-aware work authorization: resolve the live form's work-auth
     # questions before filling, and skip the role entirely if it's a deal-breaker.
-    skip = _resolve_work_auth(browser.snapshot(), profile_md, answers)
+    # The snapshot is reused by run_apply (nothing mutated the page between).
+    snap = browser.snapshot()
+    skip = _resolve_work_auth(snap, profile_md, answers)
     if skip:
         return ApplyReport(url, "skipped", message=skip)
 
-    outcome = run_apply(browser, field_map, answers, wall=_wall)
+    outcome = run_apply(browser, field_map, answers, wall=_wall, snap=snap)
 
     filled = _dedup(a.label for a in outcome.filled)
     needs_you = [f"{u.label} ({u.reason})" for u in outcome.escalated if u.reason != "optional"]
