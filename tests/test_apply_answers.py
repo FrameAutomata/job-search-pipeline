@@ -7,7 +7,19 @@ fill tier consumes. The fixture is the real shape of Thomas's PROFILE.md: an
 
 import pytest
 
-from pipeline.apply_answers import below_comp_floor, compile_answers, salary_answer
+from pipeline.apply_answers import (
+    below_comp_floor,
+    compile_answers,
+    country_of,
+    parse_work_auth,
+    resolve_work_auth,
+    salary_answer,
+)
+
+SEEKER = """\
+## Standing answers
+- **Work authorization:** On F-1 OPT in the US; will require H-1B sponsorship
+"""
 
 PROFILE = """\
 # Thomas Thirlwall — candidate profile
@@ -55,13 +67,62 @@ def test_email_and_phone_from_contact_line(answers):
 
 # ── standing answers ─────────────────────────────────────────────────────────
 
-def test_work_authorization_yes(answers):
-    # "US Citizen — no sponsorship required" → has the legal right to work
-    assert answers["work_authorization"] == "Yes"
+def test_work_auth_is_not_a_static_answer(answers):
+    # work-auth is country-dependent, resolved per question by the driver — the
+    # static answers dict must NOT carry a blanket work_authorization/sponsorship
+    assert "work_authorization" not in answers
+    assert "sponsorship" not in answers
 
 
-def test_sponsorship_no(answers):
-    assert answers["sponsorship"] == "No"
+# ── work-authorization policy (country-aware, non-US-centric) ────────────────
+
+def test_parse_us_citizen_no_sponsorship():
+    p = parse_work_auth(PROFILE)
+    assert "US" in p.authorized
+    assert p.open_to_sponsorship is False
+
+
+def test_parse_sponsorship_seeker():
+    p = parse_work_auth(SEEKER)
+    assert p.open_to_sponsorship is True
+
+
+def test_country_of_work_auth_question():
+    assert country_of("Do you have a legal right to work in the US?") == "US"
+    assert country_of("Do you have a legal right to work in the United States?") == "US"
+    assert country_of("Are you authorized to work in Canada?") == "Canada"
+    assert country_of("What is your favourite colour?") is None
+
+
+def test_country_of_ignores_mid_sentence_in_clauses():
+    # the live-acceptance bug: two "in" clauses; a lowercase "in the future" must
+    # not be read as the country — only the trailing "in the United States" is
+    label = "Will you now or in the future require immigration sponsorship in the United States?"
+    assert country_of(label) == "US"
+
+
+def test_resolve_authorized_country_is_yes_no_sponsorship():
+    a = resolve_work_auth("Do you have a legal right to work in the US?", parse_work_auth(PROFILE))
+    assert (a.legal_right, a.sponsorship, a.dealbreaker) == ("Yes", "No", False)
+
+
+def test_resolve_unauthorized_country_no_sponsorship_is_a_dealbreaker():
+    # US-only candidate, Canada question → cannot work there, won't seek it → skip
+    a = resolve_work_auth("Legal right to work in Canada?", parse_work_auth(PROFILE))
+    assert a.dealbreaker is True
+
+
+def test_resolve_unauthorized_country_for_a_seeker_answers_truthfully():
+    # sponsorship-seeker, a country they aren't yet authorized in → honest No/Yes,
+    # NOT a deal-breaker (they want the role)
+    a = resolve_work_auth("Legal right to work in Canada?", parse_work_auth(SEEKER))
+    assert (a.legal_right, a.sponsorship, a.dealbreaker) == ("No", "Yes", False)
+
+
+def test_resolve_seeker_in_authorized_country():
+    # OPT seeker asked about the US: has current authorization, still needs sponsorship
+    a = resolve_work_auth("legal right to work in the US?", parse_work_auth(SEEKER))
+    assert (a.legal_right, a.sponsorship, a.dealbreaker) == ("Yes", "Yes", False)
 
 
 def test_location_city_is_city_state(answers):

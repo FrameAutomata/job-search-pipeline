@@ -19,6 +19,7 @@ never a crash.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -27,6 +28,8 @@ from typing import Callable
 
 from pipeline.ats_fill import SELECT, TEXT, TYPEAHEAD, UPLOAD, FillAction, _option_matches
 from pipeline.openclaw_browser import SnapshotIndex, parse_snapshot
+
+_SUBMIT = re.compile(r"submit application", re.I)
 
 OPENCLAW = str(Path.home() / "AppData" / "Roaming" / "npm" / "openclaw.cmd")
 INBOUND = Path.home() / ".openclaw" / "media" / "inbound"
@@ -54,6 +57,8 @@ class OpenClawBrowser:
         sleep: Callable[[float], None] = time.sleep,
         typeahead_wait: float = 2.0,
         typeahead_tries: int = 3,
+        settle_wait: float = 1.0,
+        settle_tries: int = 8,
     ):
         self.profile = profile
         self.runner = runner
@@ -61,12 +66,29 @@ class OpenClawBrowser:
         self.sleep = sleep
         self.typeahead_wait = typeahead_wait
         self.typeahead_tries = typeahead_tries
+        self.settle_wait = settle_wait
+        self.settle_tries = settle_tries
 
     def _run(self, *args: str) -> str:
         return self.runner([*args, "--browser-profile", self.profile])
 
     def open(self, url: str) -> None:
         self._run("open", url)
+        self._settle()
+
+    def _settle(self) -> None:
+        """Greenhouse re-mints refs while the form loads, so acting too early
+        hits dead refs. Wait until the submit button's ref is stable across two
+        reads (the form has stopped re-rendering) before anyone plans against
+        it. Falls through after settle_tries so a formless page can't hang."""
+        prev = object()
+        for _ in range(self.settle_tries):
+            self.sleep(self.settle_wait)
+            submit = self.snapshot().find("button", _SUBMIT)
+            ref = submit.ref if submit else None
+            if ref is not None and ref == prev:
+                return
+            prev = ref
 
     def snapshot(self) -> SnapshotIndex:
         return parse_snapshot(self._run("snapshot", "--timeout", "45000"))

@@ -18,7 +18,12 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pipeline.apply_answers import compile_answers
+from pipeline.apply_answers import (
+    compile_answers,
+    country_of,
+    parse_work_auth,
+    resolve_work_auth,
+)
 from pipeline.ats_apply import (
     ESCALATED_HUMAN,
     NO_FORM,
@@ -68,6 +73,28 @@ def _dedup(labels) -> list[str]:
     return out
 
 
+def _resolve_work_auth(index, profile_md, answers) -> str | None:
+    """Set country-correct work_authorization / sponsorship answers for the live
+    form's work-auth questions. Returns a skip reason if the role requires
+    authorization the candidate lacks and won't seek (a deal-breaker), else None.
+    Country-aware so a US answer never lands on a foreign question."""
+    policy = parse_work_auth(profile_md)
+    for el in index.elements:
+        if el.role != "combobox" or not el.label:
+            continue
+        ans = resolve_work_auth(el.label, policy)
+        if ans is None:
+            continue
+        if ans.dealbreaker:
+            return (f"Skipped: this role needs work authorization in {country_of(el.label)}, "
+                    "which you don't have and aren't seeking sponsorship for.")
+        if re.search(r"sponsor", el.label, re.I):
+            answers["sponsorship"] = ans.sponsorship
+        else:
+            answers["work_authorization"] = ans.legal_right
+    return None
+
+
 def run_apply_ladder(
     url: str,
     profile_md: str,
@@ -87,6 +114,13 @@ def run_apply_ladder(
     answers = compile_answers(profile_md, resume_path=resume_path)
     if open_url:
         browser.open(url)
+
+    # Country-aware work authorization: resolve the live form's work-auth
+    # questions before filling, and skip the role entirely if it's a deal-breaker.
+    skip = _resolve_work_auth(browser.snapshot(), profile_md, answers)
+    if skip:
+        return ApplyReport(url, "skipped", message=skip)
+
     outcome = run_apply(browser, field_map, answers, wall=_wall)
 
     filled = _dedup(a.label for a in outcome.filled)

@@ -62,10 +62,25 @@ def test_snapshot_parses_cli_output():
     assert idx.find("textbox", "First Name").ref == "e1"
 
 
-def test_open_navigates():
-    r = FakeRunner()
+def _form_with_submit(ref):
+    return f'- form [ref=e0]:\n  - button "Submit application" [ref={ref}]\n'
+
+
+def test_open_navigates_then_settles_until_refs_stable():
+    # the form re-mints refs while loading (e1→e2), then stabilizes (e2==e2);
+    # open() must not return until it stops moving, so nobody plans stale refs
+    # first output is consumed by the `open` call; then the settle snapshots
+    r = FakeRunner(["", _form_with_submit("e1"), _form_with_submit("e2"), _form_with_submit("e2")])
     browser(r).open("https://job-boards.greenhouse.io/x/jobs/1")
     assert r.calls[0][:2] == ["open", "https://job-boards.greenhouse.io/x/jobs/1"]
+    assert r.verbs() == ["open", "snapshot", "snapshot", "snapshot"]  # settled on the 3rd
+
+
+def test_settle_gives_up_after_its_budget_on_a_formless_page():
+    # no submit button ever appears → don't hang; fall through after the budget
+    r = FakeRunner(["", *([SNAP_BASIC] * 10)])
+    browser(r, settle_tries=3).open("https://x/jobs/1")
+    assert r.verbs() == ["open", "snapshot", "snapshot", "snapshot"]
 
 
 # ── TEXT ─────────────────────────────────────────────────────────────────────

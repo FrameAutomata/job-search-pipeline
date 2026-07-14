@@ -23,7 +23,24 @@ PROFILE = """\
 - **Location:** Dallas, Texas (CST) — Remote (US)
 """
 
+SEEKER_PROFILE = """\
+## Identity & contact
+- **Name:** Priya Kumar
+- **Contact:** priya@x.io · +1 (555) 222-3333
+
+## Standing answers
+- **Work authorization:** On F-1 OPT in the US; will require H-1B sponsorship
+"""
+
 GH = "https://job-boards.greenhouse.io/acme/jobs/1"
+
+
+def legal_right_form(country):
+    return FakeBrowser([
+        FF("e1", "textbox", "First Name"),
+        FF("e3", "combobox", f"Do you have a legal right to work in {country}?",
+           invalid=True, required=True),
+    ])
 
 
 @dataclass
@@ -154,3 +171,33 @@ def test_driver_never_actions_submit():
     b.act = watch
     run_apply_ladder(GH, PROFILE, browser=b)
     assert submitted["hit"] is False
+
+
+# ── country-aware work authorization ─────────────────────────────────────────
+
+def test_us_work_auth_fills_yes_for_us_citizen():
+    b = legal_right_form("the US")
+    rep = run_apply_ladder(GH, PROFILE, browser=b)
+    legal = next(f for f in b.fields if f.label.startswith("Do you"))
+    assert legal.value == "Yes"
+    assert rep.status == "ready-to-submit"
+
+
+def test_foreign_work_auth_role_is_skipped_for_us_only_candidate():
+    # the acceptance-run bug: a Canada work-auth question must NOT be answered
+    # "Yes"; for a US-only, no-sponsorship candidate the whole role is skipped
+    b = legal_right_form("Canada")
+    rep = run_apply_ladder(GH, PROFILE, browser=b)
+    assert rep.status == "skipped"
+    assert "Canada" in rep.message
+    legal = next(f for f in b.fields if f.label.startswith("Do you"))
+    assert legal.value == ""  # never filled a false answer
+    assert not rep.ok
+
+
+def test_sponsorship_seeker_applies_to_foreign_role_and_answers_truthfully():
+    b = legal_right_form("Canada")
+    rep = run_apply_ladder(GH, SEEKER_PROFILE, browser=b)
+    assert rep.status != "skipped"  # a seeker WANTS this role
+    legal = next(f for f in b.fields if f.label.startswith("Do you"))
+    assert legal.value == "No"  # honest: not yet authorized in Canada
