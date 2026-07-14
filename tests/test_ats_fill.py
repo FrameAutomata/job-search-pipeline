@@ -16,10 +16,15 @@ escalation and idempotence edges the ladder depends on:
   - sponsorship  empty select                                   -> SELECT
   - base salary  textbox                                        -> TEXT
   - Resume/CV*   group wrapping an Attach button                -> UPLOAD (button ref)
-  - Country      select with a rule but NO answer               -> unmapped(no-answer)
+  - How heard    textbox with a rule but NO answer              -> unmapped(no-answer)
   - Why us?*     required free-text the map doesn't cover        -> unmapped(no-rule)
   - Preferred    optional, unmapped, not required               -> ignored
   - Submit       located, never actioned
+
+The react-select section below pins the committed/uncommitted widget shapes
+captured live on Clover's Greenhouse board (2026-07-13): a committed select
+renders its value in a SIBLING node while the combobox's own value holds only
+the typed filter text — satisfaction must read the sibling, never the combobox.
 """
 
 import re
@@ -49,7 +54,7 @@ GREENHOUSE_FORM = """\
   - group "Resume/CV*" [ref=e8]:
     - paragraph [ref=e80]: Attach a file
     - button "Attach" [ref=e9]
-  - combobox "Country" [ref=e10]
+  - textbox "How did you hear about this job?" [ref=e10]
   - textbox "Why do you want to work here?*" [ref=e11]
   - textbox "Preferred Name" [ref=e12]
   - button "Submit application" [ref=e13]
@@ -64,7 +69,7 @@ ANSWERS = {
     "sponsorship": "No",
     "salary_expectation": "150000",
     "resume": r"C:\Users\Corbi\resume.pdf",
-    # deliberately no "country" answer
+    # deliberately no "referral_source" answer
 }
 
 
@@ -131,8 +136,8 @@ def test_invalid_field_refilled_even_when_value_matches(plan):
 # ── escalation ───────────────────────────────────────────────────────────────
 
 def test_mapped_field_without_answer_escalates(plan):
-    country = [u for u in plan.unmapped if "Country" in u.label]
-    assert country and country[0].reason == "no-answer"
+    heard = [u for u in plan.unmapped if "How did you hear" in u.label]
+    assert heard and heard[0].reason == "no-answer"
     assert "e10" not in _by_ref(plan)  # not actioned with an empty value
 
 
@@ -260,3 +265,145 @@ def test_salary_pattern_matches_common_phrasings():
 
 def test_detect_greenhouse_without_scheme():
     assert detect_ats("job-boards.greenhouse.io/cloverhealth/jobs/8031845") == "greenhouse"
+
+
+# ── react-select satisfaction (live-capture shapes, 2026-07-13) ──────────────
+#
+# Greenhouse selects are react-select: the combobox's own value is only the
+# typed FILTER text; the committed value renders as a sibling generic under the
+# combobox's parent. Verbatim committed shape from the live capture:
+#
+#   - generic:                                ← question container
+#     - generic: Do you have a legal right...*   ← label node
+#     - generic:
+#       - log: option Yes, selected.          ← transient aria-live
+#       - generic:
+#         - generic: "Yes"                    ← THE COMMITTED VALUE
+#         - combobox "Do you have a legal..." ← value: empty
+#       - button "Clear selections" ...
+
+def select_widget(label, *, committed=None, filter_text=None, invalid=False, ref="e5"):
+    # verbatim react-select nesting: the aria-live `log` sits a level up (sibling
+    # of the value container), the committed singleValue `generic` sits inside it
+    # right before the combobox. Both are rendered so the fixture pins that the
+    # committed lookup reads the singleValue, not the log's "option X, selected."
+    inv = " [invalid]" if invalid else ""
+    val = f': "{filter_text}"' if filter_text else ""
+    log_line = f'      - log [ref=e30]: option {committed}, selected.\n' if committed else ""
+    committed_line = f'        - generic [ref=e900]: "{committed}"\n' if committed else ""
+    return (
+        "- form [ref=e0]:\n"
+        "  - generic [ref=e1]:\n"
+        f"    - generic [ref=e2]: {label}\n"
+        "    - generic [ref=e3]:\n"
+        f"{log_line}"
+        "      - generic [ref=e4]:\n"
+        f"{committed_line}"
+        f'        - combobox "{label}"{inv} [ref={ref}]{val}\n'
+    )
+
+
+SPONSOR = "Will you now or in the future require immigration sponsorship in the United States?"
+LEGAL = "Do you have a legal right to work in the US?"
+
+
+def _plan(snapshot_text, answers=ANSWERS):
+    return plan_fill(parse_snapshot(snapshot_text), greenhouse_map(), answers)
+
+
+def test_committed_select_matching_answer_is_skipped():
+    p = _plan(select_widget(SPONSOR, committed="No"))
+    assert p.actions == []
+
+
+def test_committed_select_match_is_case_insensitive():
+    p = _plan(select_widget(SPONSOR, committed="no"))
+    assert p.actions == []
+
+
+def test_committed_select_wrong_value_is_reactioned():
+    p = _plan(select_widget(SPONSOR, committed="Yes"))  # answer is "No"
+    assert [a.ref for a in p.actions] == ["e5"]
+
+
+def test_filter_text_in_combobox_is_not_commitment():
+    # the overnight bug: "Yes" typed into the combobox (filter text) without
+    # selecting an option — looks like value==answer but nothing is committed
+    p = _plan(select_widget(LEGAL, filter_text="Yes"))
+    assert [a.ref for a in p.actions] == ["e5"]
+
+
+def test_committed_but_invalid_is_reactioned():
+    p = _plan(select_widget(SPONSOR, committed="No", invalid=True))
+    assert [a.ref for a in p.actions] == ["e5"]
+
+
+def test_typeahead_committed_prefix_before_comma_satisfies():
+    # answer "Dallas, Texas" vs committed "Dallas, Texas, United States"
+    p = _plan(select_widget("Location (City)", committed="Dallas, Texas, United States"))
+    assert p.actions == []
+
+
+def test_typeahead_committed_different_city_is_reactioned():
+    p = _plan(select_widget("Location (City)", committed="Dallas, Oregon, United States"))
+    assert [a.ref for a in p.actions] == ["e5"]
+
+
+def test_typeahead_prefix_must_break_at_comma():
+    # "Dallas, Texas" must NOT satisfy a committed "Dallas, Texasville, USA"
+    p = _plan(select_widget("Location (City)", committed="Dallas, Texasville, USA"))
+    assert [a.ref for a in p.actions] == ["e5"]
+
+
+def test_bare_city_answer_requires_exact_not_prefix():
+    # answer "Dallas" (no comma) must NOT be satisfied by a wrong "Dallas, Oregon"
+    p = _plan(select_widget("Location (City)", committed="Dallas, Oregon, United States"),
+              {**ANSWERS, "location_city": "Dallas"})
+    assert [a.ref for a in p.actions] == ["e5"]
+
+
+def test_committed_lookup_ignores_the_aria_live_log():
+    # the log node ("option No, selected.") must not be read as the value
+    p = _plan(select_widget(SPONSOR, committed="No"))
+    assert p.actions == []  # reads the singleValue "No", not the log text
+
+
+def test_committed_match_tolerates_whitespace():
+    p = _plan(select_widget(SPONSOR, committed="No"), {**ANSWERS, "sponsorship": " No "})
+    assert p.actions == []
+
+
+def test_unrelated_sibling_value_does_not_satisfy_select():
+    # a flat form: the legal-right select is empty, but a filled First Name
+    # textbox sits in the same container — it must NOT count as the committed value
+    snap = (
+        "- form [ref=e0]:\n"
+        '  - textbox "First Name" [ref=e1]: Yes\n'
+        f'  - combobox "{LEGAL}" [ref=e5]\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(), {"work_authorization": "Yes"})
+    assert [a.ref for a in p.actions] == ["e5"]  # select re-actioned, not falsely satisfied
+
+
+# ── country rule removed (live finding: it claimed the phone country-code) ───
+
+def test_no_country_rule_in_map():
+    assert not any(r.answer_key == "country" for r in greenhouse_map().rules)
+
+
+def test_phone_country_code_widget_untouched():
+    # verbatim shape: the phone row nests a combobox labeled "Country" showing
+    # "+1" — it must be neither actioned nor escalated (it's not required)
+    snap = (
+        "- form [ref=e0]:\n"
+        "  - generic [ref=e143]:\n"
+        "    - generic [ref=e144]: Phone*\n"
+        "    - generic [ref=e133]:\n"
+        "      - generic [ref=e134]:\n"
+        '        - generic [ref=e467]: "+1"\n'
+        '        - combobox "Country" [ref=e136]\n'
+        '      - textbox "Phone" [ref=e146]\n'
+    )
+    p = _plan(snap, {"phone": "(956) 525-3015"})
+    assert [a.ref for a in p.actions] == ["e146"]
+    assert p.unmapped == []

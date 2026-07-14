@@ -91,12 +91,13 @@ def greenhouse_map() -> FieldMap:
             _rule(r"last name", "last_name", TEXT, "textbox"),
             _rule(r"^email", "email", TEXT, "textbox"),
             _rule(r"phone", "phone", TEXT, "textbox"),
+            # no "country" rule: live testing showed it claims the phone
+            # country-code widget; a real country question escalates instead.
             _rule(r"\blocation\b", "location_city", TYPEAHEAD, "combobox"),
             _rule(r"how did you hear", "referral_source", TEXT, "textbox"),
             _rule(r"legal right to work", "work_authorization", SELECT, "combobox"),
             _rule(r"immigration sponsorship", "sponsorship", SELECT, "combobox"),
             _rule(r"salary|compensation", "salary_expectation", TEXT, "textbox"),
-            _rule(r"country", "country", SELECT, "combobox"),
             _rule(r"resume/cv", "resume", UPLOAD, "group"),
         ],
         submit_label=re.compile(r"submit application", re.I),
@@ -117,6 +118,50 @@ def _is_required(el) -> bool:
     # Greenhouse marks required fields with a trailing "*" in the label. This
     # convention is ATS-specific; when a second map lands, lift it onto FieldMap.
     return bool(el.label and el.label.rstrip().endswith("*"))
+
+
+def _committed_option(index: SnapshotIndex, el) -> str | None:
+    """A react-select combobox's committed value, or None.
+
+    Live-captured shape: a committed value renders as a value-bearing `generic`
+    node that is a DIRECT sibling of the combobox (react-select's singleValue);
+    the combobox's OWN value is only the typed filter text and never proves
+    commitment. Anchoring to a direct `generic` sibling (not any descendant)
+    keeps an unrelated field's value, or the aria-live `log` node ("option Yes,
+    selected."), from being read as the selection."""
+    if el.parent is None:
+        return None
+    for sib in index.elements:
+        if sib.parent is el.parent and sib is not el and sib.role == "generic" and sib.value:
+            return sib.value
+    return None
+
+
+def committed_value(index: SnapshotIndex, el) -> str | None:
+    """The value a field currently holds for satisfaction checks: a combobox's
+    committed react-select sibling (filter text ignored), otherwise its own
+    value. Shared by the planner and the state machine so both judge a field the
+    same way."""
+    return _committed_option(index, el) if el.role == "combobox" else el.value
+
+
+def _option_matches(committed: str, answer: str) -> bool:
+    """Case-insensitive equality, or — when the answer is itself multi-part — a
+    comma-bounded prefix, so answer "Dallas, Texas" is satisfied by "Dallas,
+    Texas, United States" but bare "Dallas" is NOT satisfied by "Dallas, Oregon"
+    (a wrong city), and "Dallas, Texas" is not satisfied by "Dallas, Texasville".
+    """
+    c, a = committed.strip().casefold(), answer.strip().casefold()
+    return c == a or ("," in a and c.startswith(a + ","))
+
+
+def _is_satisfied(index: SnapshotIndex, el, rule, answer: str) -> bool:
+    """Widget-aware 'already holds the right value' check ([invalid] is the
+    caller's concern)."""
+    if rule.widget in (SELECT, TYPEAHEAD):
+        committed = _committed_option(index, el)
+        return committed is not None and _option_matches(committed, answer)
+    return el.value == answer
 
 
 def _plan_upload(index, group, answer, rule, actions, unmapped) -> None:
@@ -166,7 +211,7 @@ def plan_fill(index: SnapshotIndex, field_map: FieldMap, answers: dict[str, str]
             _plan_upload(index, el, answer, rule, actions, unmapped)
         elif el.ref is None:  # matched but the parser lost the ref → unexecutable
             unmapped.append(Unmapped(el.label, "unresolved"))
-        elif el.value != answer or id(el) in invalid:
+        elif not _is_satisfied(index, el, rule, answer) or id(el) in invalid:
             actions.append(FillAction(el.ref, rule.widget, answer, el.label, rule.answer_key))
 
     submit_ref = None

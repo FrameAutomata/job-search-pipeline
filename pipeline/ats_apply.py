@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
-from pipeline.ats_fill import FieldMap, FillAction, Unmapped, plan_fill
+from pipeline.ats_fill import FieldMap, FillAction, Unmapped, committed_value, plan_fill
 from pipeline.openclaw_browser import SnapshotIndex
 
 READY_TO_SUBMIT = "ready-to-submit"
@@ -76,7 +76,9 @@ def _still_unresolved(index: SnapshotIndex, items: list[Unmapped]) -> list[Unmap
         by_label.setdefault(el.label, []).append(el)
 
     def unsatisfied(el):
-        return not el.value or id(el) in invalid_ids
+        # widget-aware: a combobox is satisfied by its committed react-select
+        # value, never by leftover filter text on the combobox itself
+        return id(el) in invalid_ids or not committed_value(index, el)
 
     return [u for u in items if any(unsatisfied(el) for el in by_label.get(u.label, ()))]
 

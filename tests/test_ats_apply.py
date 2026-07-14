@@ -36,6 +36,7 @@ class FF:
     value: str = ""
     invalid: bool = False
     required: bool = False
+    filter_only: bool = False  # combobox: value is uncommitted filter text
 
 
 class FakeBrowser:
@@ -76,8 +77,18 @@ class FakeBrowser:
         for f in self.fields:
             attrs = " [invalid]" if f.invalid else ""
             star = "*" if f.required else ""
-            val = f": {f.value}" if f.value else ""
-            lines.append(f'  - {f.role} "{f.label}{star}"{attrs} [ref={f.ref}]{val}')
+            if f.role == "combobox":
+                # react-select shape (live-capture): a committed value renders as
+                # a SIBLING node; uncommitted filter text sits on the combobox
+                # itself and must NOT count as satisfaction.
+                lines.append(f"  - generic [ref=w{f.ref}]:")
+                if f.value and not f.filter_only:
+                    lines.append(f'    - generic [ref=v{f.ref}]: "{f.value}"')
+                ft = f': "{f.value}"' if f.value and f.filter_only else ""
+                lines.append(f'    - {f.role} "{f.label}{star}"{attrs} [ref={f.ref}]{ft}')
+            else:
+                val = f": {f.value}" if f.value else ""
+                lines.append(f'  - {f.role} "{f.label}{star}"{attrs} [ref={f.ref}]{val}')
         if self.submit:
             lines.append(f'  - button "Submit application" [ref={self.submit}]')
         return "\n".join(lines) + "\n"
@@ -188,6 +199,28 @@ def test_agent_resolves_required_unmapped_field():
     b = FakeBrowser([FF("e9", "textbox", "Why do you want to work here?", required=True)])
     out = run(b, agent=agent_fills("Why do you want to work here?"))
     assert out.status == READY_TO_SUBMIT
+
+
+def test_agent_resolves_required_unmapped_combobox():
+    # a required no-rule react-select: the agent commits it (value on the sibling
+    # node, combobox's own value empty). _still_unresolved must judge it satisfied
+    # by the committed value, not by the empty combobox — else false escalation.
+    b = FakeBrowser([FF("e1", "combobox", "Gender", required=True)])
+    out = run(b, agent=agent_fills("Gender"))
+    assert out.status == READY_TO_SUBMIT
+
+
+def test_uncommitted_combobox_filter_text_still_escalates():
+    # the agent leaves only filter text (no committed option) → not satisfied
+    def type_filter_only(browser, unresolved):
+        for f in browser.fields:
+            if f.label.rstrip("*") == "Gender":
+                f.filter_only = True
+                f.value = "Ma"  # filter text, not a commitment
+
+    b = FakeBrowser([FF("e1", "combobox", "Gender", required=True)])
+    out = run(b, agent=type_filter_only)
+    assert out.status == ESCALATED_HUMAN
 
 
 def test_unmapped_without_agent_escalates_to_human():
