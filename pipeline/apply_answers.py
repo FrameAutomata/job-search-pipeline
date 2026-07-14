@@ -25,7 +25,9 @@ _PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
 _LINKEDIN = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/[^\s·]+", re.I)
 _GITHUB = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[^\s·]+", re.I)
 _CITY_STATE = re.compile(r"^([A-Za-z .'-]+,\s*[A-Za-z .'-]+?)(?=\s*[(—–-]|$)")
-_MONEY = re.compile(r"\$\s*([\d,]+)\s*([kK]?)")
+# the floor amount is the "$" figure that FOLLOWS the floor/minimum keyword, so a
+# range stated earlier on the line ("$130K-$170K, minimum $80K") can't win.
+_FLOOR = re.compile(r"(?:compensation floor|minimum)\b.*?\$\s*([\d,]+)\s*([kK]?)", re.I)
 
 
 def _section(md: str, heading: str) -> str:
@@ -48,11 +50,9 @@ def _floor(md: str) -> int:
     """The compensation floor in dollars, from any '$NNK'/'$NN,NNN' mention on a
     floor/minimum line; 0 when the profile doesn't state one."""
     for line in md.splitlines():
-        if re.search(r"compensation floor|minimum", line, re.I):
-            m = _MONEY.search(line)
-            if m:
-                n = int(m.group(1).replace(",", ""))
-                return n * 1000 if m.group(2) else n
+        if m := _FLOOR.search(line):
+            n = int(m.group(1).replace(",", ""))
+            return n * 1000 if m.group(2) else n
     return 0
 
 
@@ -70,7 +70,8 @@ def below_comp_floor(target_min: int, jd_range: tuple[int, int] | None) -> bool:
 # depends on the country asked about and the candidate. So work-auth is NOT a
 # static answer; the driver resolves it per question against this policy.
 
-_US = {"us", "u.s.", "u.s.a.", "usa", "united states", "america", "the us"}
+_US = {"us", "u.s.", "u.s.a.", "usa", "united states", "united states of america",
+       "america", "the us"}
 
 
 def _norm_country(name: str) -> str:
@@ -111,11 +112,13 @@ def country_of(label: str) -> str | None:
                      label, re.I):
         return None
     # The country is a capitalized proper noun in the LAST "in <country>" clause
-    # at the end (a trailing "?"/"*" is tolerated). Requiring a capital keeps a
-    # mid-sentence "in the future" from being read as a country — the bug that
-    # made a US sponsorship question ("...in the future require...in the United
-    # States?") look like a foreign-work-auth deal-breaker.
-    m = re.search(r"\bin (?:the )?([A-Z][A-Za-z.]*(?: [A-Z][A-Za-z.]*)*)\s*[?*]*\s*$", label)
+    # at the end (a trailing "?"/"*" is tolerated); lowercase connectors ("of",
+    # "and") inside the name are allowed so "United States of America" is caught.
+    # Requiring a leading capital keeps a mid-sentence "in the future" from being
+    # read as a country (the bug that made a US sponsorship question, "...in the
+    # future require...in the United States?", look like a foreign deal-breaker).
+    m = re.search(
+        r"\bin (?:the )?([A-Z][A-Za-z.]*(?: (?:of |and )?[A-Z][A-Za-z.]*)*)\s*[?*]*\s*$", label)
     return _norm_country(m.group(1)) if m else None
 
 

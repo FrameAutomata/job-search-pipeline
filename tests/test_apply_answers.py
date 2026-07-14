@@ -132,6 +132,11 @@ def test_country_of_ignores_mid_sentence_in_clauses():
     assert country_of(label) == "US"
 
 
+def test_country_of_handles_united_states_of_america():
+    # lowercase "of" inside the country name must not break the match
+    assert country_of("Are you authorized to work in the United States of America?") == "US"
+
+
 def test_resolve_authorized_country_is_yes_no_sponsorship():
     a = resolve_work_auth("Do you have a legal right to work in the US?", parse_work_auth(PROFILE))
     assert (a.legal_right, a.sponsorship, a.dealbreaker) == ("Yes", "No", False)
@@ -199,6 +204,15 @@ def test_salary_rule_edges():
     assert salary_answer(80000, (150000, 200000)) == "175000"  # midpoint
     assert salary_answer(80000, (70000, 100000)) == "85000"    # midpoint ≥ floor
     assert salary_answer(80000, (75000, 84000)) == "80000"     # clamp up to floor
+
+
+def test_floor_reads_the_minimum_not_an_earlier_range():
+    # a range stated before the minimum on the same line must not be read as the
+    # floor (the salary clamp/skip decisions depend on the true floor)
+    profile = "## Deal-breakers\n- **Compensation:** $130K-$170K target, minimum $80K\n"
+    # midpoint of a $150k-$160k posting stays above the true $80k floor, unclamped
+    a = compile_answers(profile, jd_salary_range=(150000, 160000))
+    assert a["salary_expectation"] == "155000"  # not clamped up to a false 130k floor
 
 
 def test_below_floor_band_is_a_role_skip_not_an_answer():

@@ -126,17 +126,26 @@ def detect_ats(url: str) -> str | None:
     return None
 
 
-def _is_required(el, index: SnapshotIndex) -> bool:
-    """Greenhouse marks required fields with a trailing "*", but on the adjacent
-    LABEL node ("LinkedIn Profile*"), not the control's own aria label. So a
-    field is required if its own label ends with "*" OR a sibling/label node
-    carrying "<its label>*" exists on the page."""
-    if not el.label:
-        return False
-    if el.label.rstrip().endswith("*"):
-        return True
-    marked = el.label.strip() + "*"
-    return any(e.value and e.value.strip() == marked for e in index.elements)
+def _required_checker(index: SnapshotIndex):
+    """A fast `is_required(el)` for one snapshot. Greenhouse marks required fields
+    with a "*", but on the adjacent LABEL node — either combined ("LinkedIn
+    Profile*") or as a standalone "*" node beside the field — not the control's
+    own aria label. Precomputes both signals once (O(n)), so the per-field check
+    is O(1) instead of re-scanning every element per field."""
+    starred = {e.value.strip() for e in index.elements
+               if e.value and e.value.rstrip().endswith("*")}
+    star_parents = {id(e.parent) for e in index.elements
+                    if e.parent is not None and e.value
+                    and e.value.strip() in ("*", "(required)")}
+
+    def is_required(el) -> bool:
+        if not el.label:
+            return False
+        return (el.label.rstrip().endswith("*")
+                or (el.label.strip() + "*") in starred
+                or id(el.parent) in star_parents)
+
+    return is_required
 
 
 def _committed_option(index: SnapshotIndex, el) -> str | None:
@@ -206,6 +215,7 @@ def plan_fill(index: SnapshotIndex, field_map: FieldMap, answers: dict[str, str]
     in order; the submit control is located but never actioned.
     """
     invalid = {id(el) for el in index.invalid_fields()}
+    is_required = _required_checker(index)
     # Claim EVERY field a rule matches (not just the first), so duplicates like
     # "First Name" AND "Legal First Name" both get filled; a field a
     # higher-priority rule already claimed is not re-claimed by a later one.
@@ -223,7 +233,7 @@ def plan_fill(index: SnapshotIndex, field_map: FieldMap, answers: dict[str, str]
             # dropped: a required one escalates ("no-rule"); an empty optional
             # one is reported ("optional") for the human to fill if they want.
             if el.role in CONTROL_ROLES and el.label:
-                if _is_required(el, index):
+                if is_required(el):
                     unmapped.append(Unmapped(el.label, "no-rule"))
                 elif not committed_value(index, el):
                     unmapped.append(Unmapped(el.label, "optional"))
@@ -232,7 +242,7 @@ def plan_fill(index: SnapshotIndex, field_map: FieldMap, answers: dict[str, str]
         if not answer:  # None or "" — no usable value; hand off rather than clobber
             # a required field we can't answer blocks (no-answer); an optional
             # one is only reported (optional), never blocks a ready-to-submit
-            unmapped.append(Unmapped(el.label, "no-answer" if _is_required(el, index) else "optional"))
+            unmapped.append(Unmapped(el.label, "no-answer" if is_required(el) else "optional"))
         elif rule.widget == UPLOAD:
             _plan_upload(index, el, answer, rule, actions, unmapped)
         elif el.ref is None:  # matched but the parser lost the ref → unexecutable

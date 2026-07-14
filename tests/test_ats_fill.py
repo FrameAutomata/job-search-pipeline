@@ -232,6 +232,20 @@ def test_wrapper_group_does_not_escalate():
     assert not any(u.reason == "no-rule" for u in p.unmapped)
 
 
+def test_required_marker_as_standalone_asterisk_node_escalates():
+    # some forms render the label and the "*" as SEPARATE sibling nodes; the
+    # required field must still be detected (not treated as optional)
+    snap = (
+        "- form [ref=e0]:\n"
+        "  - generic [ref=e1]:\n"
+        "    - generic [ref=e2]: Describe a hard bug\n"
+        "    - generic [ref=e3]: *\n"
+        '    - textbox "Describe a hard bug" [ref=e4]\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(), {})
+    assert any(u.reason == "no-rule" and "Describe a hard bug" in u.label for u in p.unmapped)
+
+
 def test_required_marker_on_adjacent_label_node_escalates():
     # real Greenhouse: the required "*" rides the label node, not the control's
     # own aria label — an unmapped required field must STILL escalate, not vanish
