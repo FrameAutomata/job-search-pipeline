@@ -41,8 +41,9 @@ _WALL = re.compile(r"just a moment|verify you are human|checking your browser", 
 class ApplyReport:
     url: str
     status: str            # run_apply status, or "unsupported-ats" / "no-profile"
-    filled: list[str] = field(default_factory=list)   # field labels filled
-    needs_you: list[str] = field(default_factory=list)  # "label (reason)" lines
+    filled: list[str] = field(default_factory=list)     # field labels filled
+    needs_you: list[str] = field(default_factory=list)  # required, unfillable
+    optional: list[str] = field(default_factory=list)   # optional, left blank
     blocker: str | None = None
     submit_ref: str | None = None
     message: str = ""      # one-line human summary
@@ -124,20 +125,22 @@ def run_apply_ladder(
     outcome = run_apply(browser, field_map, answers, wall=_wall)
 
     filled = _dedup(a.label for a in outcome.filled)
-    needs_you = [f"{u.label} ({u.reason})" for u in outcome.escalated]
+    needs_you = [f"{u.label} ({u.reason})" for u in outcome.escalated if u.reason != "optional"]
+    optional = _dedup(u.label for u in outcome.escalated if u.reason == "optional")
 
+    tail = f" {len(optional)} optional field(s) left blank." if optional else ""
     if outcome.status == READY_TO_SUBMIT:
-        message = f"Filled {len(filled)} field(s). Review the form and submit."
+        message = f"Filled {len(filled)} field(s). Review the form and submit.{tail}"
     elif outcome.status == NO_FORM:
         message = "Filled nothing — no application form found on the page."
     elif outcome.blocker:
         message = (f"Filled {len(filled)} field(s), then hit a wall: {outcome.blocker}. "
                    "Take over in your browser.")
     else:
-        message = (f"Filled {len(filled)} field(s); {len(needs_you)} need you. "
+        message = (f"Filled {len(filled)} field(s); {len(needs_you)} need you.{tail} "
                    "Complete them in your browser, then submit.")
 
-    return ApplyReport(url, outcome.status, filled, needs_you,
+    return ApplyReport(url, outcome.status, filled, needs_you, optional,
                        blocker=outcome.blocker, submit_ref=outcome.submit_ref, message=message)
 
 

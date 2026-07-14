@@ -27,10 +27,13 @@ UPLOAD = "upload"      # arm an upload with value (a file path), click Attach
 
 # aria roles that carry a fillable control. Used to decide whether an unmapped
 # required field must escalate to the agent tier (rather than silently vanish);
-# broad on purpose so a required radio/checkbox/upload the map misses is caught.
+# broad on purpose so a required radio/checkbox the map misses is caught.
+# "group" is deliberately excluded: Greenhouse wraps fields (Phone, Name) in a
+# required-labeled group, but the group is a container, not a field — its inner
+# control is handled on its own, so escalating the group is a false positive.
 CONTROL_ROLES = frozenset({
     "textbox", "combobox", "checkbox", "radio", "radiogroup",
-    "listbox", "group", "slider", "spinbutton", "switch",
+    "listbox", "slider", "spinbutton", "switch",
 })
 
 
@@ -87,6 +90,10 @@ def greenhouse_map() -> FieldMap:
     return FieldMap(
         name="greenhouse",
         rules=[
+            # legal-name rules come FIRST so "Legal First Name" is claimed for
+            # the legal name, not swept up by the generic "first name" rule.
+            _rule(r"legal first name", "legal_first_name", TEXT, "textbox"),
+            _rule(r"legal last name", "legal_last_name", TEXT, "textbox"),
             _rule(r"first name", "first_name", TEXT, "textbox"),
             _rule(r"last name", "last_name", TEXT, "textbox"),
             _rule(r"^email", "email", TEXT, "textbox"),
@@ -95,6 +102,11 @@ def greenhouse_map() -> FieldMap:
             # country-code widget; a real country question escalates instead.
             _rule(r"\blocation\b", "location_city", TYPEAHEAD, "combobox"),
             _rule(r"how did you hear", "referral_source", TEXT, "textbox"),
+            _rule(r"linkedin", "linkedin", TEXT, "textbox"),
+            _rule(r"github", "github", TEXT, "textbox"),
+            _rule(r"^website|personal website|portfolio", "website", TEXT, "textbox"),
+            _rule(r"pronouns", "pronouns", TEXT, "textbox"),
+            _rule(r"preferred name", "first_name", TEXT, "textbox"),
             _rule(r"legal right to work", "work_authorization", SELECT, "combobox"),
             _rule(r"immigration sponsorship", "sponsorship", SELECT, "combobox"),
             _rule(r"salary|compensation", "salary_expectation", TEXT, "textbox"),
@@ -114,10 +126,17 @@ def detect_ats(url: str) -> str | None:
     return None
 
 
-def _is_required(el) -> bool:
-    # Greenhouse marks required fields with a trailing "*" in the label. This
-    # convention is ATS-specific; when a second map lands, lift it onto FieldMap.
-    return bool(el.label and el.label.rstrip().endswith("*"))
+def _is_required(el, index: SnapshotIndex) -> bool:
+    """Greenhouse marks required fields with a trailing "*", but on the adjacent
+    LABEL node ("LinkedIn Profile*"), not the control's own aria label. So a
+    field is required if its own label ends with "*" OR a sibling/label node
+    carrying "<its label>*" exists on the page."""
+    if not el.label:
+        return False
+    if el.label.rstrip().endswith("*"):
+        return True
+    marked = el.label.strip() + "*"
+    return any(e.value and e.value.strip() == marked for e in index.elements)
 
 
 def _committed_option(index: SnapshotIndex, el) -> str | None:
@@ -187,12 +206,12 @@ def plan_fill(index: SnapshotIndex, field_map: FieldMap, answers: dict[str, str]
     in order; the submit control is located but never actioned.
     """
     invalid = {id(el) for el in index.invalid_fields()}
-    # Resolve each rule to its first matching field (rule priority); a field a
+    # Claim EVERY field a rule matches (not just the first), so duplicates like
+    # "First Name" AND "Legal First Name" both get filled; a field a
     # higher-priority rule already claimed is not re-claimed by a later one.
     claimed: dict[int, FieldRule] = {}
     for rule in field_map.rules:
-        el = index.find(rule.role, rule.label)
-        if el is not None:
+        for el in index.find_all(rule.role, rule.label):
             claimed.setdefault(id(el), rule)
 
     actions: list[FillAction] = []
@@ -200,13 +219,20 @@ def plan_fill(index: SnapshotIndex, field_map: FieldMap, answers: dict[str, str]
     for el in index.elements:  # document order
         rule = claimed.get(id(el))
         if rule is None:
-            # A required control no rule covers must escalate, not vanish.
-            if el.role in CONTROL_ROLES and _is_required(el):
-                unmapped.append(Unmapped(el.label, "no-rule"))
+            # A control no rule covers is surfaced so nothing is silently
+            # dropped: a required one escalates ("no-rule"); an empty optional
+            # one is reported ("optional") for the human to fill if they want.
+            if el.role in CONTROL_ROLES and el.label:
+                if _is_required(el, index):
+                    unmapped.append(Unmapped(el.label, "no-rule"))
+                elif not committed_value(index, el):
+                    unmapped.append(Unmapped(el.label, "optional"))
             continue
         answer = answers.get(rule.answer_key)
         if not answer:  # None or "" — no usable value; hand off rather than clobber
-            unmapped.append(Unmapped(el.label, "no-answer"))
+            # a required field we can't answer blocks (no-answer); an optional
+            # one is only reported (optional), never blocks a ready-to-submit
+            unmapped.append(Unmapped(el.label, "no-answer" if _is_required(el, index) else "optional"))
         elif rule.widget == UPLOAD:
             _plan_upload(index, el, answer, rule, actions, unmapped)
         elif el.ref is None:  # matched but the parser lost the ref → unexecutable

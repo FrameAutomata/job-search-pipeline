@@ -56,7 +56,7 @@ GREENHOUSE_FORM = """\
     - button "Attach" [ref=e9]
   - textbox "How did you hear about this job?" [ref=e10]
   - textbox "Why do you want to work here?*" [ref=e11]
-  - textbox "Preferred Name" [ref=e12]
+  - textbox "Anything else you would like us to know?" [ref=e12]
   - button "Submit application" [ref=e13]
 """
 
@@ -135,9 +135,11 @@ def test_invalid_field_refilled_even_when_value_matches(plan):
 
 # ── escalation ───────────────────────────────────────────────────────────────
 
-def test_mapped_field_without_answer_escalates(plan):
+def test_mapped_field_without_answer_is_reported(plan):
+    # "How did you hear" is mapped (referral_source) but ANSWERS omits it, and
+    # the field is optional → reported "optional", never filled with an empty
     heard = [u for u in plan.unmapped if "How did you hear" in u.label]
-    assert heard and heard[0].reason == "no-answer"
+    assert heard and heard[0].reason == "optional"
     assert "e10" not in _by_ref(plan)  # not actioned with an empty value
 
 
@@ -146,11 +148,12 @@ def test_required_unmapped_field_escalates(plan):
     assert why and why[0].reason == "no-rule"
 
 
-def test_optional_unmapped_field_is_ignored(plan):
-    # "Preferred Name" has no rule and no required (*) marker -> neither actioned
-    # nor escalated
+def test_optional_unmapped_field_is_reported_not_actioned(plan):
+    # an unmapped, empty, non-required field is not filled, but IS reported as
+    # "optional" so the human can choose to fill it (nothing silently dropped)
     assert "e12" not in _by_ref(plan)
-    assert not any("Preferred Name" in u.label for u in plan.unmapped)
+    optional = [u for u in plan.unmapped if "Anything else" in u.label]
+    assert optional and optional[0].reason == "optional"
 
 
 # ── submit gate ──────────────────────────────────────────────────────────────
@@ -189,6 +192,77 @@ def test_map_labels_match_real_greenhouse_noise():
     gm = greenhouse_map()
     assert any(r.label.search("Resume/CV*") for r in gm.rules)
     assert any(r.label.search("Do you have a legal right to work in the US?") for r in gm.rules)
+
+
+def test_legal_and_preferred_first_name_route_separately():
+    # "First Name" gets the preferred name, "Legal First Name" the legal one —
+    # they are distinct fields and must not be conflated
+    snap = (
+        "- form [ref=e0]:\n"
+        '  - textbox "First Name" [ref=e1]\n'
+        '  - textbox "Legal First Name" [ref=e2]\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(),
+                  {"first_name": "Bob", "legal_first_name": "Robert"})
+    by_ref = {a.ref: a.value for a in p.actions}
+    assert by_ref == {"e1": "Bob", "e2": "Robert"}
+
+
+def test_duplicate_first_name_fields_both_fill():
+    # two plain "First Name" fields both match one rule → both filled
+    snap = (
+        "- form [ref=e0]:\n"
+        '  - textbox "First Name" [ref=e1]\n'
+        '  - textbox "Preferred First Name" [ref=e2]\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(), {"first_name": "Bob"})
+    assert {a.ref for a in p.actions} == {"e1", "e2"}
+
+
+def test_wrapper_group_does_not_escalate():
+    # Greenhouse wraps the phone field in a required-labeled "Phone" GROUP; the
+    # group is a container, not a field — it must not escalate as no-rule
+    snap = (
+        "- form [ref=e0]:\n"
+        '  - group "Phone" [ref=e1]:\n'
+        "    - generic [ref=e2]: Phone*\n"
+        '    - textbox "Phone" [ref=e3]: +1 (555) 000-1111\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(), {"phone": "+1 (555) 000-1111"})
+    assert not any(u.reason == "no-rule" for u in p.unmapped)
+
+
+def test_required_marker_on_adjacent_label_node_escalates():
+    # real Greenhouse: the required "*" rides the label node, not the control's
+    # own aria label — an unmapped required field must STILL escalate, not vanish
+    snap = (
+        "- form [ref=e0]:\n"
+        "  - generic [ref=e1]:\n"
+        "    - generic [ref=e2]: Describe a hard bug*\n"
+        '    - textbox "Describe a hard bug" [ref=e3]\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(), {})
+    assert any(u.reason == "no-rule" and "Describe a hard bug" in u.label for u in p.unmapped)
+
+
+def test_optional_field_with_no_marker_is_reported_not_required():
+    snap = (
+        "- form [ref=e0]:\n"
+        "  - generic [ref=e1]:\n"
+        "    - generic [ref=e2]: Anything else?\n"
+        '    - textbox "Anything else?" [ref=e3]\n'
+    )
+    p = plan_fill(parse_snapshot(snap), greenhouse_map(), {})
+    # no "*" marker → optional (reported), NOT required (no-rule)
+    assert [(u.label, u.reason) for u in p.unmapped] == [("Anything else?", "optional")]
+
+
+def test_map_covers_linkedin_and_website_fields():
+    gm = greenhouse_map()
+    linkedin = next((r for r in gm.rules if r.label.search("LinkedIn Profile")), None)
+    website = next((r for r in gm.rules if r.label.search("Website")), None)
+    assert linkedin and linkedin.answer_key == "linkedin"
+    assert website and website.answer_key == "website"
 
 
 # ── review fixes: never silently drop a needed field ─────────────────────────
@@ -234,9 +308,11 @@ def test_required_non_text_control_escalates():
 
 
 def test_empty_string_answer_escalates_not_clobbers():
-    idx = parse_snapshot('- form:\n  - textbox "Last Name" [ref=e1]: existing\n')
+    # a REQUIRED field (marker on the label node) with an empty answer must
+    # block (no-answer) and never overwrite an existing value with ""
+    idx = parse_snapshot('- form:\n  - generic [ref=e2]: Last Name*\n  - textbox "Last Name" [ref=e1]: existing\n')
     p = plan_fill(idx, greenhouse_map(), {"last_name": ""})
-    assert p.actions == []  # must NOT overwrite "existing" with ""
+    assert p.actions == []
     assert [(u.label, u.reason) for u in p.unmapped] == [("Last Name", "no-answer")]
 
 

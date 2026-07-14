@@ -57,6 +57,12 @@ def _stuck(action: FillAction) -> Unmapped:
     return Unmapped(action.label, "unresolved")
 
 
+def _blocking(items: list[Unmapped]) -> list[Unmapped]:
+    """The items that actually block a ready-to-submit / need the agent —
+    everything except purely-informational optional-unfilled fields."""
+    return [u for u in items if u.reason != "optional"]
+
+
 def _unfinished(snap: SnapshotIndex, plan) -> list[Unmapped]:
     """What still needs a tier above: unmapped fields that are genuinely
     unsatisfied on the live form (a no-rule field pre-filled by autofill or a
@@ -140,13 +146,13 @@ def run_apply(
         return escalated_at_wall()
     remaining = _unfinished(snap, plan)
 
-    # Agent tier: hand it whatever the deterministic tier couldn't finish, then
-    # re-run the deterministic tier on anything the agent revealed, and re-check
-    # what's left the same way (fresh unmapped included, so a field the agent
-    # surfaces can't be silently dropped).
-    if remaining and agent is not None:
+    # Agent tier: hand it whatever the deterministic tier couldn't FINISH (the
+    # blocking items — optional-unfilled fields never block or invoke the agent),
+    # then re-run the deterministic tier on anything the agent revealed.
+    blocking = _blocking(remaining)
+    if blocking and agent is not None:
         try:
-            agent(browser, remaining)
+            agent(browser, blocking)
         except Exception:
             pass  # agent couldn't help → fall through to human with progress so far
         snap = browser.snapshot()
@@ -160,6 +166,7 @@ def run_apply(
             return escalated_at_wall()
         remaining = _unfinished(snap, plan)
 
-    if remaining:
-        return ApplyOutcome(ESCALATED_HUMAN, plan.submit_ref, filled, remaining, rounds=rounds)
-    return ApplyOutcome(READY_TO_SUBMIT, plan.submit_ref, filled, rounds=rounds)
+    # Optional-unfilled fields are reported (in `escalated`) but don't block a
+    # ready-to-submit — only unresolved required/mapped fields do.
+    status = ESCALATED_HUMAN if _blocking(remaining) else READY_TO_SUBMIT
+    return ApplyOutcome(status, plan.submit_ref, filled, remaining, rounds=rounds)

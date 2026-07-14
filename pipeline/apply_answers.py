@@ -22,6 +22,8 @@ from dataclasses import dataclass
 _BULLET = re.compile(r"^\s*-\s+\*\*(?P<key>[^:*]+):\*\*\s*(?P<value>.+?)\s*$")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _PHONE = re.compile(r"\+?\d[\d\s().-]{7,}\d")
+_LINKEDIN = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/[^\s·]+", re.I)
+_GITHUB = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[^\s·]+", re.I)
 _CITY_STATE = re.compile(r"^([A-Za-z .'-]+,\s*[A-Za-z .'-]+?)(?=\s*[(—–-]|$)")
 _MONEY = re.compile(r"\$\s*([\d,]+)\s*([kK]?)")
 
@@ -157,15 +159,26 @@ def compile_answers(
     identity = _bullets(_section(profile_md, "Identity & contact"))
     name = identity.get("name")
     if name:
-        first, _, last = name.partition(" ")
-        answers["first_name"] = first
-        if last:
-            answers["last_name"] = last.strip()
+        # "Name" is the LEGAL name; "First Name" fields on applications want the
+        # preferred/go-by name, which defaults to the legal first name unless a
+        # "Preferred first name" is set (Robert vs Bob).
+        legal_first, _, legal_last = name.partition(" ")
+        preferred = identity.get("preferred first name") or legal_first
+        answers["legal_first_name"] = legal_first
+        answers["first_name"] = preferred
+        if legal_last:
+            answers["legal_last_name"] = legal_last.strip()
+            answers["last_name"] = legal_last.strip()
     contact = identity.get("contact", "")
     if m := _EMAIL.search(contact):
         answers["email"] = m.group(0)
     if m := _PHONE.search(contact):
         answers["phone"] = m.group(0).strip()
+    if m := _LINKEDIN.search(contact):
+        answers["linkedin"] = m.group(0)
+    if m := _GITHUB.search(contact):
+        answers["github"] = m.group(0)
+        answers["website"] = m.group(0)  # portfolio fallback for a "Website" field
 
     standing = _bullets(_section(profile_md, "Standing answers"))
     # work_authorization / sponsorship are NOT emitted here — they are
@@ -174,6 +187,8 @@ def compile_answers(
     if loc := standing.get("location"):
         if m := _CITY_STATE.match(loc):
             answers["location_city"] = m.group(1).strip()
+    if pron := standing.get("pronouns"):
+        answers["pronouns"] = pron
     if gender := standing.get("gender"):
         answers["gender"] = gender
     if race := standing.get("race / ethnicity") or standing.get("race"):

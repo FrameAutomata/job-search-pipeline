@@ -28,6 +28,7 @@ PROFILE = """\
 - **Name:** Thomas Thirlwall
 - **Contact:** thomas.thirlwall.dev@gmail.com · +1 (956) 525-3015 · Dallas, TX · linkedin.com/in/thomas-thirlwall · github.com/FrameAutomata
 
+
 ## Positioning
 #### Deal-breakers
 - **Compensation floor:** $80,000.
@@ -60,9 +61,39 @@ def test_name_splits_first_and_last(answers):
     assert answers["last_name"] == "Thirlwall"
 
 
+def test_legal_name_defaults_to_the_name_when_no_preferred(answers):
+    assert answers["legal_first_name"] == "Thomas"
+    assert answers["legal_last_name"] == "Thirlwall"
+
+
+def test_preferred_first_name_overrides_first_name_only():
+    profile = (
+        "## Identity & contact\n"
+        "- **Name:** Robert Smith\n"
+        "- **Preferred first name:** Bob\n"
+        "- **Contact:** bob@x.io · +1 (555) 000-1111\n"
+    )
+    a = compile_answers(profile)
+    assert a["first_name"] == "Bob"          # what he goes by → "First Name" fields
+    assert a["legal_first_name"] == "Robert"  # official → "Legal First Name" fields
+    assert a["last_name"] == "Smith"
+
+
 def test_email_and_phone_from_contact_line(answers):
     assert answers["email"] == "thomas.thirlwall.dev@gmail.com"
     assert answers["phone"] == "+1 (956) 525-3015"
+
+
+def test_linkedin_and_website_from_contact_line(answers):
+    assert answers["linkedin"] == "linkedin.com/in/thomas-thirlwall"
+    assert answers["github"] == "github.com/FrameAutomata"
+    assert answers["website"] == "github.com/FrameAutomata"  # portfolio fallback
+
+
+def test_contact_urls_optional():
+    minimal = "## Identity & contact\n- **Name:** Ada L\n- **Contact:** ada@x.io · +1 (555) 000-1111\n"
+    a = compile_answers(minimal)
+    assert "linkedin" not in a and "website" not in a
 
 
 # ── standing answers ─────────────────────────────────────────────────────────

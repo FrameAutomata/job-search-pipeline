@@ -83,6 +83,8 @@ def _run_apply_ladder(url: str, resume: Path | None) -> int:
         print(f"  filled: {label}")
     for line in report.needs_you:
         print(f"  NEEDS YOU: {line}")
+    for label in report.optional:
+        print(f"  optional (blank): {label}")
     if report.ok:
         print("[apply] Review the form in your browser and submit.")
     return 0 if report.ok else 2
