@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from pipeline.apply_driver import ApplyReport, map_for, run_apply_ladder
+from pipeline.apply_driver import ApplyReport, _wall, map_for, run_apply_ladder
+from pipeline.openclaw_browser import parse_snapshot
 
 PROFILE = """\
 ## Identity & contact
@@ -57,16 +58,21 @@ class FakeBrowser:
     """Stateful form over the driver's Browser calls. Comboboxes render the
     react-select committed-sibling shape (matches production)."""
 
-    def __init__(self, fields, submit="e_sub"):
+    def __init__(self, fields, submit="e_sub", wall=None):
         self.fields = list(fields)
         self.submit = submit
+        self.wall = wall  # None | "cloudflare" | "login" — renders a wall instead
         self.opened = None
 
     def open(self, url):
         self.opened = url
 
     def snapshot(self):
-        from pipeline.openclaw_browser import parse_snapshot
+        if self.wall == "cloudflare":
+            return parse_snapshot('- heading "Just a moment..." [level=1] [ref=eb]\n')
+        if self.wall == "login":
+            return parse_snapshot(
+                '- form [ref=e0]:\n  - textbox "Email" [ref=e1]\n  - textbox "Password" [ref=e2]\n')
 
         lines = ["- form [ref=e0]:"]
         for f in self.fields:
@@ -157,6 +163,65 @@ def test_report_message_is_human_readable():
 
 
 # ── never submits ────────────────────────────────────────────────────────────
+
+# ── walls: detect + notify (don't silently move on) ──────────────────────────
+
+def test_wall_detects_cloudflare():
+    snap = parse_snapshot('- heading "Just a moment..." [level=1] [ref=eb]\n')
+    assert _wall(snap) is not None
+
+
+def test_wall_detects_login_password_field():
+    snap = parse_snapshot('- form:\n  - textbox "Password" [ref=e2]\n')
+    reason = _wall(snap)
+    assert reason and "sign" in reason.lower()
+
+
+def test_wall_absent_on_a_normal_form():
+    assert _wall(full_form().snapshot()) is None
+
+
+class Notifier:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, title, message):
+        self.calls.append((title, message))
+
+
+def test_cloudflare_wall_fires_a_notification():
+    n = Notifier()
+    b = full_form()
+    b.wall = "cloudflare"
+    rep = run_apply_ladder(GH, PROFILE, browser=b, notifier=n)
+    assert rep.status == "escalated-human" and rep.blocker
+    assert len(n.calls) == 1
+    title, message = n.calls[0]
+    assert "wall" in (title + message).lower() or "captcha" in (title + message).lower()
+
+
+def test_login_wall_fires_a_notification():
+    n = Notifier()
+    b = full_form()
+    b.wall = "login"
+    rep = run_apply_ladder(GH, PROFILE, browser=b, notifier=n)
+    assert rep.blocker and "sign" in rep.blocker.lower()
+    assert n.calls  # the user is told to take over, not silently skipped
+
+
+def test_clean_run_does_not_notify():
+    n = Notifier()
+    run_apply_ladder(GH, PROFILE, browser=full_form(), notifier=n)
+    assert n.calls == []  # a ready-to-submit form is not an interruption
+
+
+def test_notifier_is_optional():
+    # no notifier passed → no crash, wall still reported in the outcome
+    b = full_form()
+    b.wall = "cloudflare"
+    rep = run_apply_ladder(GH, PROFILE, browser=b)
+    assert rep.blocker
+
 
 def test_driver_never_actions_submit():
     b = full_form()

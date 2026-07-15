@@ -67,6 +67,7 @@ from pipeline.handoff import KNOWN_BOARDS  # noqa: E402
 def _run_apply_ladder(url: str, resume: Path | None) -> int:
     """`--apply-ladder <url>`: fill one application through the deterministic tier
     and report. Anything unanswered is left for the human with the form open."""
+    from pipeline import notify
     from pipeline.apply_driver import run_apply_ladder
     from pipeline.handoff import resolve_profile_md
     from pipeline.openclaw_client import OpenClawBrowser
@@ -77,7 +78,8 @@ def _run_apply_ladder(url: str, resume: Path | None) -> int:
               file=sys.stderr)
         return 1
     report = run_apply_ladder(url, profile_md, browser=OpenClawBrowser(),
-                              resume_path=str(resume) if resume else None)
+                              resume_path=str(resume) if resume else None,
+                              notifier=notify.notify)
     print(f"[apply] {report.message}")
     for label in report.filled:
         print(f"  filled: {label}")

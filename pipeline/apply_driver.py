@@ -35,6 +35,7 @@ from pipeline.openclaw_browser import SnapshotIndex
 
 _MAPS = {"greenhouse": greenhouse_map}
 _WALL = re.compile(r"just a moment|verify you are human|checking your browser", re.I)
+_LOGIN = re.compile(r"^password", re.I)  # a password field ⇒ a sign-in wall
 
 
 @dataclass
@@ -60,8 +61,13 @@ def map_for(ats: str | None) -> FieldMap | None:
 
 
 def _wall(index: SnapshotIndex) -> str | None:
+    """A blocker only the human can clear. Cloudflare shows its challenge
+    heading; a sign-in page carries a password field (job applications never
+    do — that lives on the ATS's login, not the application)."""
     if index.find("heading", _WALL):
-        return "verification wall (CAPTCHA / sign-in)"
+        return "CAPTCHA / verification wall"
+    if index.find("textbox", _LOGIN):
+        return "sign-in required"
     return None
 
 
@@ -103,9 +109,12 @@ def run_apply_ladder(
     browser,
     resume_path: str | None = None,
     open_url: bool = True,
+    notifier=None,
 ) -> ApplyReport:
     """Drive one application and return a report. Orchestration over the injected
-    browser; failures surface as report fields, never exceptions to the caller."""
+    browser; failures surface as report fields, never exceptions to the caller.
+    On a wall (CAPTCHA / sign-in) `notifier(title, message)` is fired so the user
+    is pulled in NOW rather than the role being silently skipped."""
     field_map = map_for(detect_ats(url))
     if field_map is None:
         host = re.sub(r"^https?://", "", url).split("/", 1)[0]
@@ -142,13 +151,20 @@ def run_apply_ladder(
         message = (f"Filled {len(filled)} field(s); {len(needs_you)} need you.{tail} "
                    "Complete them in your browser, then submit.")
 
+    if outcome.blocker and notifier is not None:
+        notifier("Job application needs you",
+                 f"Hit a {outcome.blocker} — take over in your browser, then re-run. ({url})")
+
     return ApplyReport(url, outcome.status, filled, needs_you, optional,
                        blocker=outcome.blocker, submit_ref=outcome.submit_ref, message=message)
 
 
 def apply_to_url(url: str, *, profile_path: str, resume_path: str | None = None) -> ApplyReport:
-    """Production wiring: the real OpenClaw relay + PROFILE.md from disk."""
+    """Production wiring: the real OpenClaw relay + PROFILE.md from disk, with a
+    desktop toast on a wall."""
+    from pipeline import notify
     from pipeline.openclaw_client import OpenClawBrowser
 
     profile_md = Path(profile_path).read_text(encoding="utf-8")
-    return run_apply_ladder(url, profile_md, browser=OpenClawBrowser(), resume_path=resume_path)
+    return run_apply_ladder(url, profile_md, browser=OpenClawBrowser(),
+                            resume_path=resume_path, notifier=notify.notify)
