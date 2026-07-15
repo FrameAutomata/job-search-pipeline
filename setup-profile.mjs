@@ -58,6 +58,21 @@ function error(msg) {
   console.error(`❌ ${msg}`);
 }
 
+// The only boards the scraper supports — mirror of pipeline/sites.py's
+// SUPPORTED_SITES (Node can't import the Python constant). Glassdoor and
+// ZipRecruiter are Cloudflare-walled (403 on every scripted request) and
+// Google Jobs drops connections mid-response, which crashes jobspy's scraper.
+const SUPPORTED_SITES = ['indeed', 'linkedin'];
+
+// Keep only supported boards; fall back to all supported if none survive.
+// Both the interactive prompt and --from-json feed raw site lists through here
+// so the filter+default rule lives in one place.
+function supportedSitesOrDefault(raw) {
+  const kept = (raw || []).map(s => String(s).trim().toLowerCase())
+    .filter(s => SUPPORTED_SITES.includes(s));
+  return kept.length ? kept : [...SUPPORTED_SITES];
+}
+
 // ============================================================
 // CLI Configuration
 // ============================================================
@@ -690,7 +705,7 @@ async function promptForSearchSettings(autoMode) {
     locations: [{ raw: 'United States', isRemote: true, location: 'United States', country: 'USA' }],
     hoursOld: 24,
     resultsWanted: 100,
-    sites: ['indeed', 'linkedin', 'glassdoor'],
+    sites: [...SUPPORTED_SITES],
     includeEasyApply: false,
   };
 
@@ -735,12 +750,11 @@ async function promptForSearchSettings(autoMode) {
   if (Number.isFinite(results) && results > 0) settings.resultsWanted = results;
 
   // ── sites ──────────────────────────────────────────────────────────────
-  console.log('\nWhich boards? Comma-separated. Options: linkedin, indeed, glassdoor, zip_recruiter, google');
-  const sitesInput = await prompt('[linkedin, indeed, glassdoor]\n→ ');
-  if (sitesInput) {
-    const sites = sitesInput.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-    if (sites.length > 0) settings.sites = sites;
-  }
+  console.log(`\nWhich boards? Comma-separated. Options: ${SUPPORTED_SITES.join(', ')}`);
+  console.log('   (Glassdoor/ZipRecruiter are Cloudflare-blocked and Google Jobs');
+  console.log('   drops connections that crash the scraper — no longer offered.)');
+  const sitesInput = await prompt(`[${SUPPORTED_SITES.join(', ')}]\n→ `);
+  if (sitesInput) settings.sites = supportedSitesOrDefault(sitesInput.split(','));
 
   // ── easy-apply pass ────────────────────────────────────────────────────
   const easyInput = await prompt(
@@ -1391,7 +1405,9 @@ async function runFromJson(jsonPath) {
       : [{ raw: 'United States', isRemote: true, location: 'United States', country: 'USA' }],
     hoursOld: s.hoursOld || 24,
     resultsWanted: s.resultsWanted || 100,
-    sites: (s.sites && s.sites.length) ? s.sites : ['indeed', 'linkedin', 'glassdoor'],
+    // Filter, not just default: a stale onboarding.json may still carry
+    // retired boards (glassdoor/zip_recruiter/google).
+    sites: supportedSitesOrDefault(s.sites),
     includeEasyApply: !!s.includeEasyApply,
   };
 

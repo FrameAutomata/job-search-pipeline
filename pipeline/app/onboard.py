@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from pipeline.batch_evaluate import _PROVIDER_KEYS
+from pipeline.sites import SUPPORTED_SITES
 
 # US states (50 + DC) and Canadian provinces — mirror of the sets in
 # setup-profile.mjs, used to keep "City, ST" pairs together and infer country.
@@ -51,7 +52,6 @@ SECRET_FILES = {
     "ARTICLE_DIGEST_B64": "career-ops/article-digest.md",
 }
 REQUIRED_SECRETS = ["SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64"]
-
 # GitHub caps a repository secret at 48 KB. PROFILE.md is the one append-only,
 # agent-grown secret source, so we bound the base64 blob and skip it (the cloud
 # degrades to the seed profile) rather than fail the whole onboard when it
@@ -247,7 +247,12 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "locations": entries,
             "hoursOld": int(form.get("hours_old") or 24),
             "resultsWanted": int(form.get("results_wanted") or 100),
-            "sites": _split_csv(form.get("sites")) or ["indeed", "linkedin", "glassdoor"],
+            # Filter, don't just default: a stale saved wizard state (or
+            # hand-crafted POST) may still carry retired boards.
+            "sites": [
+                s for s in _split_csv(form.get("sites"))
+                if s.strip().lower() in SUPPORTED_SITES
+            ] or ["indeed", "linkedin"],
             "includeEasyApply": bool(form.get("include_easy_apply")),
         },
         "narrative": {

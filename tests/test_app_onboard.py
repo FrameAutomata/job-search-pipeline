@@ -99,8 +99,22 @@ class TestBuildOnboardingJson:
         # No locations -> a single US-Remote default entry.
         locs = payload["searchSettings"]["locations"]
         assert len(locs) == 1 and locs[0]["isRemote"] is True
-        assert payload["searchSettings"]["sites"] == ["indeed", "linkedin", "glassdoor"]
+        assert payload["searchSettings"]["sites"] == ["indeed", "linkedin"]
         assert payload["searchSettings"]["resultsWanted"] == 100
+
+    def test_unsupported_sites_are_filtered_out(self):
+        # A stale saved wizard state (or hand-crafted POST) may still carry the
+        # retired boards — they must not reach the generated search config.
+        payload = onboard.build_onboarding_json(
+            {"sites": ["indeed", "glassdoor", "zip_recruiter", "google"]}, resume_text=""
+        )
+        assert payload["searchSettings"]["sites"] == ["indeed"]
+
+    def test_only_unsupported_sites_falls_back_to_default(self):
+        payload = onboard.build_onboarding_json(
+            {"sites": ["glassdoor", "google"]}, resume_text=""
+        )
+        assert payload["searchSettings"]["sites"] == ["indeed", "linkedin"]
 
     def test_maps_indeed_consent_toggles(self):
         info = onboard.build_onboarding_json(
@@ -439,3 +453,19 @@ class TestPortfolioUrls:
 
     def test_empty_when_nothing_supplied(self):
         assert onboard.portfolio_urls({}) == []
+
+
+class TestOnboardHtmlSites:
+    """The wizard must only offer the boards that actually produce rows.
+    Glassdoor and ZipRecruiter are Cloudflare-403-walled and Google Jobs drops
+    connections mid-response (crashing jobspy), so indeed + linkedin are the
+    only supported checkboxes."""
+
+    @pytest.fixture
+    def html(self):
+        root = Path(__file__).resolve().parent.parent
+        return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
+
+    def test_offers_exactly_the_supported_boards(self, html):
+        offered = set(re.findall(r'<input\b[^>]*\bname="sites"[^>]*\bvalue="([^"]+)"', html))
+        assert offered == {"indeed", "linkedin"}

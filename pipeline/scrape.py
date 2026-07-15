@@ -8,6 +8,8 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
+from pipeline.sites import SUPPORTED_SITES
+
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
 
@@ -32,6 +34,34 @@ OPTIONAL_PARAMS = [
     "proxies",
     "google_search_term",
 ]
+
+def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
+    """Remove unsupported sites from every pass; drop passes with none left.
+
+    Applied at load time (not just config-authoring time) so stale configs —
+    e.g. a fork's old SEARCH_CONFIG_B64 cloud secret still listing glassdoor —
+    degrade to a warning instead of wasted requests or a crash."""
+    result = []
+    for cfg in searches:
+        sites = cfg.get("sites")
+        if sites is None:
+            result.append(cfg)
+            continue
+        kept, dropped = [], []
+        for s in sites:
+            (kept if str(s).strip().lower() in SUPPORTED_SITES else dropped).append(s)
+        name = cfg.get("name", "pass")
+        if dropped:
+            print(
+                f"[scrape] [{name}] dropping unsupported sites: {', '.join(dropped)} "
+                f"(supported: {', '.join(SUPPORTED_SITES)})",
+                flush=True,
+            )
+        if not kept:
+            print(f"[scrape] [{name}] skipping pass — no supported sites left", flush=True)
+            continue
+        result.append({**cfg, "sites": kept} if dropped else cfg)
+    return result
 
 
 def load_searches(path: Path) -> list[dict]:
@@ -153,11 +183,13 @@ def run(
     easy_apply_only: bool = False,
     no_easy_apply: bool = False,
 ) -> Path:
-    searches = filter_passes(
-        load_searches(config_path),
-        only_passes,
-        easy_apply_only=easy_apply_only,
-        no_easy_apply=no_easy_apply,
+    searches = strip_unsupported_sites(
+        filter_passes(
+            load_searches(config_path),
+            only_passes,
+            easy_apply_only=easy_apply_only,
+            no_easy_apply=no_easy_apply,
+        )
     )
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 

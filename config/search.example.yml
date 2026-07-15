@@ -26,12 +26,15 @@ searches:
       # - "marketing coordinator"
       # - "software engineer"
 
-    # Boards to scrape. Options: linkedin, zip_recruiter, indeed, glassdoor,
-    # google, bayt, bdjobs. Default (if omitted): all boards.
+    # Boards to scrape. Options: indeed, linkedin — the only two the pipeline
+    # supports. The other JobSpy boards are stripped at load time with a
+    # warning: Glassdoor and ZipRecruiter sit behind a Cloudflare wall that
+    # 403s every scripted request (they contribute zero rows), and Google Jobs
+    # serves degraded responses then drops the connection mid-body, which
+    # crashes JobSpy's Google scraper and kills the whole run.
     sites:
       - indeed
       - linkedin
-      - glassdoor
 
     # Number of results to retrieve *per site per search term*.
     results_wanted: 50
@@ -67,15 +70,10 @@ searches:
     # Note: LinkedIn easy apply filter no longer works.
     # easy_apply: false
 
-    # How old job postings can be (hours). ZipRecruiter & Glassdoor round up to
-    # next day. Mutually exclusive with job_type/is_remote and easy_apply on
-    # Indeed; mutually exclusive with easy_apply on LinkedIn (see above).
+    # How old job postings can be (hours). Mutually exclusive with
+    # job_type/is_remote and easy_apply on Indeed; mutually exclusive with
+    # easy_apply on LinkedIn (see above).
     hours_old: 168  # past week
-
-    # ── Google Jobs ────────────────────────────────────────────────────────────
-    # google_search_term is the *only* supported filter for Google Jobs.
-    # All other filters (location, job_type, etc.) are ignored by Google.
-    # google_search_term: "registered nurse Toronto"
 
     # ── LinkedIn-specific ──────────────────────────────────────────────────────
 
