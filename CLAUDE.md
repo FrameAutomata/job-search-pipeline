@@ -1,6 +1,6 @@
 # job-search-pipeline
 
-Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor via **JobSpy**, scores results against a resume using YAKE keyword extraction, optionally screens for liveness, then bridges surviving jobs into **career-ops** for AI-powered evaluation. Supports interactive evaluation via any agent CLI (`--batch`) or synchronous parallel API evaluation across any LLM provider (`--evaluate-batch`).
+Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed via **JobSpy** (the only two supported boards — see the scrape-sites note under Configuration), scores results against a resume using YAKE keyword extraction, optionally screens for liveness, then bridges surviving jobs into **career-ops** for AI-powered evaluation. Supports interactive evaluation via any agent CLI (`--batch`) or synchronous parallel API evaluation across any LLM provider (`--evaluate-batch`).
 
 **Applying is not a pipeline stage.** The pipeline finds and evaluates roles; the terminal `--handoff` stage — or the UI's **🤝 Hand off** button (batch) and per-role **Hand off** prompt in the report pane — emits an agent-agnostic **work-order per job site** (`next-roles-<site>.jsonl` + `.md` — one session per site the scraper searches from, written to `HANDOFF_OUT_DIR`, default `output/handoff/`) that the user hands to whatever browser agent they prefer (Claude Cowork, OpenClaw, a local Agent-SDK/`claude -p` runner, …). The agent works one site session at a time — logging into that site once, applying through the user's own logged-in browser — writes each outcome back into the session file's `status` column (`claimed` / `applied` / `handoff` / `skip:<reason>`), and the next `--handoff` run folds those into the **shared** status tracker (`role-status.jsonl`, board-insensitive keys) so a handled role never reappears on any site. Terminal outcomes are also reflected into career-ops' `applications.md` — the tracker the UI renders and the cloud maintains — (`applied`→**Applied**, `skip`→**SKIP**; `handoff`/`claimed`/`drafted` stay dedup-only, and a row already past **Evaluated** is never clobbered), which surfaces them in the UI Kanban and queues an **identity-anchored** pending override; the UI's **Push** then dispatches it to `edit-tracker.yml` so the cloud tracker matches. Handoff is a local-only stage (the daily cloud workflow never runs it), so applied status originates locally and flows *up* to the cloud, same as a manual Kanban edit.
 
@@ -92,7 +92,7 @@ Automated end-to-end job search orchestrator. Scrapes LinkedIn/Indeed/Glassdoor 
 searches:
   - name: "pass name"
     search_terms: ["term1", "term2"]
-    sites: [indeed, linkedin, glassdoor]
+    sites: [indeed, linkedin] # the only supported boards (see note below)
     results_wanted: 50
     location: "Dallas, TX"
     hours_old: 168 # mutually exclusive with job_type/is_remote/easy_apply on Indeed
@@ -113,12 +113,14 @@ screen:
   liveness_timeout: 8
 ```
 
-**JobSpy constraint**: On Indeed/Glassdoor, `hours_old` is mutually exclusive with `job_type`, `is_remote`, and `easy_apply`. Split into separate search passes to use both filters.
+**JobSpy constraint**: On Indeed, `hours_old` is mutually exclusive with `job_type`, `is_remote`, and `easy_apply`. Split into separate search passes to use both filters.
+
+**Supported scrape sites — indeed and linkedin only**: Glassdoor and ZipRecruiter sit behind a Cloudflare wall that 403s every scripted request (they contributed zero rows across months of daily runs), and Google Jobs serves degraded responses then drops the connection mid-body — jobspy's Google scraper doesn't catch that, so one truncated response used to kill the whole run and discard every row already scraped. `strip_unsupported_sites` ([pipeline/scrape.py](pipeline/scrape.py)) removes anything else from a config at load time with a warning (protecting stale configs, e.g. an old `SEARCH_CONFIG_B64` cloud secret), and the UI/CLI wizards only offer these two boards.
 
 **Description backfill**: `linkedin_fetch_description: true` makes JobSpy fetch each LinkedIn JD individually during scrape — a sequential per-job HTTP request that easily takes 30+ minutes on 1000 results. Keep it **false**. The screen stage backfills descriptions for the jobs that survive filtering:
 
 - **LinkedIn** URLs are fetched via the public **guest job-posting endpoint** (`jobs-guest/jobs/api/jobPosting/{id}`), not the regular `/jobs/view/` page. The regular page is login-walled from datacenter IPs and inconsistently returns a sign-in preview that has no extractable JD (this caused ~17% of LinkedIn jobs to reach evaluation with an empty description). The guest endpoint returns the full JD reliably and gives a cleaner liveness signal (404 = gone, JD present = live). `linkedin_guest_jd_url()` in [pipeline/screen.py](pipeline/screen.py) does the URL mapping; `job_url` in the CSV stays the human-facing page.
-- **Indeed / Glassdoor** descriptions usually come from JobSpy directly; if missing, the screen stage extracts them from the same page it fetches for the liveness check (site-specific selectors + a generic `<body>` fallback).
+- **Indeed** descriptions usually come from JobSpy directly; if missing, the screen stage extracts them from the same page it fetches for the liveness check (site-specific selectors + a generic `<body>` fallback).
 
 Net effect: we pay ~dozens of fetches per run for the jobs that actually survive filtering, not thousands, and every LinkedIn role gets its complete JD.
 

@@ -179,11 +179,11 @@
         </div>
         <fieldset class="sites">
           <legend>Job boards</legend>
+          <!-- Indeed + LinkedIn only: Glassdoor and ZipRecruiter are
+               Cloudflare-walled (403 on every scripted request) and Google
+               Jobs drops connections that crash the scraper. -->
           <label class="chk"><input type="checkbox" name="sites" value="indeed" checked /> Indeed</label>
           <label class="chk"><input type="checkbox" name="sites" value="linkedin" checked /> LinkedIn</label>
-          <label class="chk"><input type="checkbox" name="sites" value="glassdoor" checked /> Glassdoor</label>
-          <label class="chk"><input type="checkbox" name="sites" value="zip_recruiter" /> ZipRecruiter</label>
-          <label class="chk"><input type="checkbox" name="sites" value="google" /> Google</label>
         </fieldset>
         <label class="chk">
           <input type="checkbox" name="include_easy_apply" /> Add an "Easy Apply" pass (runs every 4h in the cloud)

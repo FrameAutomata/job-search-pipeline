@@ -83,7 +83,7 @@ You'll be prompted for:
 - **Distance** (in miles) from each non-remote location
 - **How recent** results should be (`hours_old`, default 24)
 - **Max results** per site per search term (default 100)
-- **Which job boards** to scrape (default linkedin, indeed, glassdoor)
+- **Which job boards** to scrape — Indeed and/or LinkedIn, the only two supported boards (Glassdoor/ZipRecruiter are Cloudflare-blocked; Google Jobs drops connections that crash the scraper)
 - Whether to include an **easy-apply pass** (runs on a separate 4 h cloud schedule)
 
 ### What setup produces
@@ -111,7 +111,7 @@ searches:
   - name: "my search"            # used by --only-pass to select this entry
     search_terms:
       - "software engineer"
-    sites: [linkedin, indeed, glassdoor]
+    sites: [indeed, linkedin]     # the only supported boards (others are blocked or crash the scraper)
     location: "Dallas, TX"
     results_wanted: 100          # 100 is typical; bigger numbers are slow
     hours_old: 24
