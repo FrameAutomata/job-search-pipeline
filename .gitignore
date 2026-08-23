@@ -8,6 +8,11 @@ venv/
 # Node (career-ops uses node — installed locally by setup script)
 node_modules/
 
+# Nix (flake.nix + .envrc are committed; these are per-checkout state)
+.direnv/
+result
+result-*
+
 # Local env / secrets
 .env
 .env.local
