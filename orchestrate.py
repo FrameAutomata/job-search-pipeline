@@ -66,7 +66,8 @@ from pipeline.handoff import KNOWN_BOARDS  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the job-search pipeline.")
-    ap.add_argument("--skip-scrape", action="store_true", help="Reuse existing output/jobs.csv")
+    ap.add_argument("--skip-scrape", action="store_true",
+                    help="Reuse existing output/jobs.csv (empty if the last scrape returned no rows)")
     ap.add_argument("--skip-filter", action="store_true", help="Reuse existing output/filtered_jobs.csv")
     ap.add_argument("--skip-screen", action="store_true", help="Skip liveness and LLM fit screening")
     ap.add_argument("--skip-bridge", action="store_true", help="Don't push to career-ops")
