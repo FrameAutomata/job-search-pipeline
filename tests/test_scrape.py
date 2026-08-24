@@ -312,7 +312,9 @@ filter:
         # empty jobs.csv, no scrape_jobs call, downstream stages see zero rows.
         # Asserted on content, not just existence, so the previous run's rows
         # can't survive and masquerade as this run's output.
-        patch_scrape_paths.write_text(jobs_csv.read_text(), encoding="utf-8")
+        patch_scrape_paths.write_text(
+            jobs_csv.read_text(encoding="utf-8"), encoding="utf-8"
+        )
         config = tmp_path / "config.yml"
         config.write_text("""
 searches:
@@ -495,10 +497,11 @@ searches:
         assert mock_scrape.call_args[1]["search_term"] == "b"
 
     def test_only_conflicting_passes_noops_cleanly(
-        self, tmp_path, patch_scrape_paths, mocker
+        self, tmp_path, patch_scrape_paths, jobs_csv, mocker
     ):
         # Same clean no-op as an all-retired-boards config: empty jobs.csv,
-        # no jobspy call, no traceback out of the stage.
+        # no jobspy call, no traceback out of the stage. Seeded with stale
+        # rows so "empty" is asserted on content, not just existence.
         config = self._config(tmp_path, """
 searches:
   - name: "conflicting"
@@ -507,13 +510,16 @@ searches:
     hours_old: 168
     is_remote: true
 """)
+        patch_scrape_paths.write_text(
+            jobs_csv.read_text(encoding="utf-8"), encoding="utf-8"
+        )
         mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs")
 
         result = scrape_mod.run(config)
 
         mock_scrape.assert_not_called()
         assert result == patch_scrape_paths
-        assert patch_scrape_paths.exists()
+        assert patch_scrape_paths.read_text(encoding="utf-8") == ""
 
     def test_conflict_is_judged_after_retired_boards_are_stripped(
         self, tmp_path, patch_scrape_paths, mocker
@@ -607,10 +613,16 @@ class TestRun:
         must not leave the previous run's rows behind — filter/screen/bridge
         would re-process them as if they were today's results."""
         output_path = patch_scrape_paths
-        output_path.write_text(jobs_csv.read_text(), encoding="utf-8")
+        output_path.write_text(
+            jobs_csv.read_text(encoding="utf-8"), encoding="utf-8"
+        )
 
-        # Mock returns empty DataFrame
-        mocker.patch("pipeline.scrape.scrape_jobs", return_value=pd.DataFrame())
+        # A fresh empty frame per call — run() tags each one with an easy_apply
+        # column, so a shared return_value would stop being "every pass came
+        # back empty" the moment this config grows a second term.
+        mocker.patch(
+            "pipeline.scrape.scrape_jobs", side_effect=lambda *a, **kw: pd.DataFrame()
+        )
 
         result = scrape_mod.run(cfg_file)
 
