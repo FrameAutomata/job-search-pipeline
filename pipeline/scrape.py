@@ -8,7 +8,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES, is_supported
+from pipeline.sites import SUPPORTED_SITES, as_site_list, is_supported, keep_supported
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -34,6 +34,7 @@ OPTIONAL_PARAMS = [
     "proxies",
 ]
 
+
 def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
     """Remove unsupported sites from every pass; drop passes with none left.
 
@@ -47,20 +48,21 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
         if sites is None:
             result.append(cfg)
             continue
-        kept, dropped = [], []
-        for s in sites:
-            (kept if is_supported(s) else dropped).append(s)
+        listed = as_site_list(sites)
+        kept = keep_supported(listed)
+        dropped = [s for s in listed if not is_supported(s)]
         name = cfg.get("name", "pass")
         if dropped:
             print(
-                f"[scrape] [{name}] dropping unsupported sites: {', '.join(dropped)} "
+                f"[scrape] [{name}] dropping unsupported sites: "
+                f"{', '.join(str(s) for s in dropped)} "
                 f"(supported: {', '.join(SUPPORTED_SITES)})",
                 flush=True,
             )
         if not kept:
             print(f"[scrape] [{name}] skipping pass — no supported sites left", flush=True)
             continue
-        result.append({**cfg, "sites": kept} if dropped else cfg)
+        result.append({**cfg, "sites": kept})
     return result
 
 
@@ -183,24 +185,25 @@ def run(
     easy_apply_only: bool = False,
     no_easy_apply: bool = False,
 ) -> Path:
-    searches = strip_unsupported_sites(
-        filter_passes(
-            load_searches(config_path),
-            only_passes,
-            easy_apply_only=easy_apply_only,
-            no_easy_apply=no_easy_apply,
-        )
+    selected = filter_passes(
+        load_searches(config_path),
+        only_passes,
+        easy_apply_only=easy_apply_only,
+        no_easy_apply=no_easy_apply,
     )
+    searches = strip_unsupported_sites(selected)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not searches:
         # No matching passes — write an empty header-only CSV so downstream
         # stages no-op cleanly. This is the workflow-friendly path: e.g. the
         # easy-apply workflow on a user with no easy_apply pass configured.
-        print(
-            "[scrape] no searches matched the active filters — writing empty jobs.csv",
-            flush=True,
+        reason = (
+            "every matching pass listed only unsupported boards"
+            if selected
+            else "no searches matched the active filters"
         )
+        print(f"[scrape] {reason} — writing empty jobs.csv", flush=True)
         OUTPUT_PATH.write_text("", encoding="utf-8")
         return OUTPUT_PATH
 

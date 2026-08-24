@@ -24,6 +24,30 @@ def is_supported(site) -> bool:
     return str(site).strip().lower() in SUPPORTED_SITES
 
 
+def as_site_list(sites) -> list:
+    """A config's `sites` value as a list.
+
+    YAML allows a bare scalar — `sites: indeed` — which JobSpy accepts as a
+    `site_name`. Iterating that directly walks it one character at a time.
+    """
+    return [sites] if isinstance(sites, str) else list(sites)
+
+
 def keep_supported(sites) -> list:
-    """`sites` less the unsupported entries, each kept in its original spelling."""
-    return [s for s in sites if is_supported(s)]
+    """The supported entries of `sites`, trimmed and de-duplicated.
+
+    Case is left as written — JobSpy resolves the board with `Site[name.upper()]`
+    — but surrounding whitespace is stripped, because that same lookup raises
+    KeyError on `" LINKEDIN "`. Case-variant repeats collapse so a board named
+    twice is not scraped twice.
+    """
+    kept, seen = [], set()
+    for s in as_site_list(sites):
+        if not is_supported(s):
+            continue
+        name = str(s).strip()
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        kept.append(name)
+    return kept

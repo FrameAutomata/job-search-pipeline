@@ -190,6 +190,31 @@ class TestStripUnsupportedSites:
         result = scrape_mod.strip_unsupported_sites(searches)
         assert result == searches
 
+    def test_bare_string_sites_is_not_iterated_character_by_character(self):
+        # `sites: indeed` is valid YAML and a valid JobSpy site_name; iterating
+        # the string would test 'i', 'n', 'd', ... and drop the whole pass.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed"}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+
+    def test_surrounding_whitespace_is_stripped_from_kept_sites(self):
+        # jobspy resolves the board with Site[name.upper()], which raises on
+        # " LINKEDIN " — so a padded entry must not survive verbatim.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": [" linkedin "]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["linkedin"]
+
+    def test_case_variant_duplicates_collapse(self):
+        # Both map to Site.INDEED; keeping both scrapes the board twice.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "Indeed"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+
+    def test_non_string_entries_do_not_crash_the_warning(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["linkedin", 123]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["linkedin"]
+
     def test_warning_names_the_dropped_sites_and_pass(self, capsys):
         searches = [{"name": "US Remote", "search_terms": ["a"],
                      "sites": ["indeed", "glassdoor", "google"]}]

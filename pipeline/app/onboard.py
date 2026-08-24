@@ -52,6 +52,7 @@ SECRET_FILES = {
     "ARTICLE_DIGEST_B64": "career-ops/article-digest.md",
 }
 REQUIRED_SECRETS = ["SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64"]
+
 # GitHub caps a repository secret at 48 KB. PROFILE.md is the one append-only,
 # agent-grown secret source, so we bound the base64 blob and skip it (the cloud
 # degrades to the seed profile) rather than fail the whole onboard when it

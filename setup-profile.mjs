@@ -68,9 +68,20 @@ const SUPPORTED_SITES = ['indeed', 'linkedin'];
 // Both the interactive prompt and --from-json feed raw site lists through here
 // so the filter+default rule lives in one place.
 function supportedSitesOrDefault(raw) {
-  const kept = (raw || []).map(s => String(s).trim().toLowerCase())
-    .filter(s => SUPPORTED_SITES.includes(s));
-  return kept.length ? kept : [...SUPPORTED_SITES];
+  // A hand-written onboarding.json may spell `sites` as a comma-separated
+  // string rather than an array; the code this replaced accepted that.
+  const listed = Array.isArray(raw) ? raw : String(raw ?? '').split(',');
+  const kept = [...new Set(
+    listed.map(s => String(s).trim().toLowerCase())
+      .filter(s => SUPPORTED_SITES.includes(s))
+  )];
+  if (kept.length) return kept;
+  // Don't swap a real answer for the default in silence — the Python side
+  // prints when it drops boards, and this writes straight into search.yml.
+  if (listed.some(s => String(s).trim())) {
+    warn(`No supported boards in "${listed.join(', ')}" — using ${SUPPORTED_SITES.join(', ')}.`);
+  }
+  return [...SUPPORTED_SITES];
 }
 
 // ============================================================
