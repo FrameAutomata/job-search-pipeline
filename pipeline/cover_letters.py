@@ -19,6 +19,7 @@ from pathlib import Path
 from pipeline._batch_common import atomic_write_text, normalize_company, read_text
 from pipeline import role_select as queue
 from pipeline.candidate_profile import ApplyProfile
+from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -233,6 +234,8 @@ def run(
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     # python -m pipeline.cover_letters [career-ops-path] [min-score]
     # Standalone invocation regenerates (force) so it's easy to re-test output.
     # Load .env here — unlike the in-pipeline path, this bypasses orchestrate.py

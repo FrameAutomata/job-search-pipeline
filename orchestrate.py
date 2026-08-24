@@ -62,53 +62,13 @@ from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_e
 # still lazy-imported below to keep the hot pipeline path free of its tailoring
 # deps. This module-level import is cheap (handoff pulls only _batch_common + app.data).
 from pipeline.handoff import KNOWN_BOARDS  # noqa: E402
-
-
-def _line_buffer_stdio() -> None:
-    """Flush the stage log on every newline, however we were launched.
-
-    Redirected to a file or a pipe, Python block-buffers stdout at 8KB — so a
-    stage's progress lines sit unseen while it works, and the run looks hung on
-    exactly the slow steps a reader is watching. Both callers that redirect us
-    already compensate (pipeline/app/local_run.py sets PYTHONUNBUFFERED in the
-    child env; daily-pipeline.yml sets it and passes `python -u`), which is why
-    the ~90 unflushed prints across pipeline/ have never shown the symptom.
-
-    Making it true here instead means the guarantee belongs to the program
-    rather than to every caller remembering, and a `print` added to a stage
-    tomorrow is correct without anyone thinking about buffering.
-
-    stdout only: CPython has line-buffered stderr by default since 3.9, even
-    when it isn't a tty, so reconfiguring it would be a no-op.
-
-    This covers main(), which is not the whole program — `python -m
-    pipeline.scrape > log` runs a stage's __main__ block without passing
-    through here. (`python pipeline/scrape.py` is NOT that path and never was:
-    the repo isn't installed, so running a file inside pipeline/ puts pipeline/
-    on sys.path rather than the root and the module's own `from pipeline.sites
-    import ...` raises ModuleNotFoundError.)
-
-    The scattered `flush=True` calls are what carries the `-m` path, and only
-    partly: scrape is 9/9 and recheck 2/2, but screen is 3/7 and filter, bridge,
-    batch_prep and handoff are 0. So `python -m pipeline.filter > log` is
-    block-buffered regardless. Consolidating the three overlapping mechanisms
-    (PYTHONUNBUFFERED at the two callers that redirect, this, and the per-print
-    flushes) is #121; this function is not that, and does not pretend to be.
-
-    Never fatal, per the contract the caller relies on — buffering is a nicety
-    and main() has not even parsed argv yet. sys.stdout is not always a
-    TextIOWrapper (pytest's capture and some embedding hosts replace it), a
-    proxy's reconfigure may reject the keyword, and reconfigure() flushes first,
-    so a broken stream can surface as OSError.
-    """
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except Exception:
-        pass
+from pipeline.stdio import line_buffer_stdout  # noqa: E402
 
 
 def main() -> int:
-    _line_buffer_stdio()
+    # First, before argv is even parsed: every entry point under pipeline/
+    # does the same, which is the whole of the buffering rule (#121).
+    line_buffer_stdout()
     ap = argparse.ArgumentParser(description="Run the job-search pipeline.")
     ap.add_argument("--skip-scrape", action="store_true",
                     help="Reuse existing output/jobs.csv (empty if the last scrape returned no rows)")

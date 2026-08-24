@@ -17,6 +17,7 @@ optional dep only bites the user who actually hands us that format.
 import sys
 import tempfile
 from pathlib import Path
+from pipeline.stdio import line_buffer_stdout
 
 # What the setup/UI offer as importable resume formats (no .txt — that's the
 # generated sidecar, not something a user uploads).
@@ -131,4 +132,6 @@ def _main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     raise SystemExit(_main(sys.argv[1:]))

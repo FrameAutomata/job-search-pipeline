@@ -17,6 +17,7 @@ from pipeline.sites import (
     resolve_sites,
     unreadable_options,
 )
+from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -69,10 +70,9 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
                 f"[scrape] [{name}] dropping unsupported sites: "
                 f"{', '.join(dropped)} "
                 f"(supported: {', '.join(SUPPORTED_SITES)})",
-                flush=True,
             )
         if not kept:
-            print(f"[scrape] [{name}] skipping pass — no supported sites left", flush=True)
+            print(f"[scrape] [{name}] skipping pass — no supported sites left")
             continue
         result.append({**cfg, "sites": kept})
     return result
@@ -180,7 +180,7 @@ def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
     for cfg in searches:
         problem = unreadable_options(cfg) or limitation_conflict(cfg)
         if problem:
-            print(f"[scrape] skipping pass — {problem}", flush=True)
+            print(f"[scrape] skipping pass — {problem}")
             continue
         result.append(cfg)
     return result
@@ -233,7 +233,7 @@ def run(
 
     if only_passes or easy_apply_only or no_easy_apply:
         names = ", ".join(repr(s.get("name", "")) for s in searches)
-        print(f"[scrape] running passes: {names}", flush=True)
+        print(f"[scrape] running passes: {names}")
 
     all_rows = []
     for cfg in searches:
@@ -242,7 +242,7 @@ def run(
 
         pass_easy_apply = cfg.get("easy_apply") is True
         for term in cfg["search_terms"]:
-            print(f"[scrape] [{name}] searching: {term!r}", flush=True)
+            print(f"[scrape] [{name}] searching: {term!r}")
             df = scrape_jobs(
                 site_name=cfg["sites"],
                 search_term=term,
@@ -271,16 +271,18 @@ def run(
     combined = mark_easy_apply(combined)
     before = len(combined)
     combined = combined.drop_duplicates(subset=["job_url"])
-    print(f"[scrape] {before} rows -> {len(combined)} after dedup", flush=True)
+    print(f"[scrape] {before} rows -> {len(combined)} after dedup")
 
     # The happy path is the only writer left that isn't write_rows (pandas owns
     # the column set here), so it is also the only one still needing this.
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(OUTPUT_PATH, index=False)
-    print(f"[scrape] wrote {OUTPUT_PATH}", flush=True)
+    print(f"[scrape] wrote {OUTPUT_PATH}")
     return OUTPUT_PATH
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     cfg_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "config" / "search.yml"
     run(cfg_path)

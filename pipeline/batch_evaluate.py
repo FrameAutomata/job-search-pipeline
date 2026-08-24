@@ -71,6 +71,7 @@ from pipeline._batch_common import (
     write_job_result,
 )
 from pipeline import gemini_limits
+from pipeline.stdio import line_buffer_stdout
 
 # Hoisted to _batch_common (shared with the UI's local-run orphan guard); kept
 # under the old private name for callers/tests that import it from here.
@@ -318,7 +319,6 @@ def _call_with_retry(
             print(
                 f"  provider busy (attempt {attempt}/{max_attempts}): "
                 f"sleeping {jittered:.1f}s — {exc}",
-                flush=True,
             )
             sleep(jittered)
             delay *= 2
@@ -445,7 +445,7 @@ def _build_failover_caller(provider: str, models: list[str], *,
                 last_exc = exc
                 if i + 1 < len(built):
                     print(f"  model unavailable ({model}: {str(exc)[:60]}) — "
-                          f"failing over to {built[i + 1][0]}", flush=True)
+                          f"failing over to {built[i + 1][0]}")
         raise last_exc if last_exc else RuntimeError("no models configured")
 
     return call
@@ -790,7 +790,7 @@ def _run_eval(
         with state_lock:
             atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
         print(f"\n[batch-eval] interrupted — {processed} processed, {failed} failed; "
-              "remaining jobs stay pending for the next run.", flush=True)
+              "remaining jobs stay pending for the next run.")
         os._exit(130)
 
     # Install a SIGINT handler so a second Ctrl-C re-enters cleanly. Only works
@@ -890,6 +890,8 @@ def _parse_argv(argv: list[str]) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     args = _parse_argv(sys.argv[1:])

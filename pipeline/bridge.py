@@ -16,6 +16,7 @@ from pathlib import Path
 
 from pipeline._batch_common import parse_date_posted, read_url_set
 from pipeline.rowio import read_rows
+from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -276,6 +277,8 @@ def run(career_ops_path: Path) -> list[dict]:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
         os.environ.get("CAREER_OPS_PATH", ROOT / "career-ops")
     )

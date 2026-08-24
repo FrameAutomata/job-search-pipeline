@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from pipeline.stdio import line_buffer_stdout
 
 from pipeline.rowio import read_rows, write_rows
 
@@ -539,7 +540,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
             jobs = [j for j in jobs if (j.get("job_url") or "").strip() not in seen_urls]
             skipped_seen = before - len(jobs)
             if skipped_seen:
-                print(f"[screen] skipping {skipped_seen} already-seen URL(s)", flush=True)
+                print(f"[screen] skipping {skipped_seen} already-seen URL(s)")
 
     if not jobs:
         # Everything was already seen. Truncated, not header-only: a header is
@@ -569,7 +570,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
         title = (job.get("title") or "?")[:60]
         if result == "expired":
             dropped += 1
-            print(f"  SKIP {title} -- liveness: {reason}", flush=True)
+            print(f"  SKIP {title} -- liveness: {reason}")
             url = (job.get("job_url") or "").strip()
             if url:
                 dead_entries.append({
@@ -587,7 +588,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
             # so the next scrape re-finds and re-checks it — same "retry next
             # run" stance the tracker re-check (pipeline/recheck.py) takes.
             held += 1
-            print(f"  HOLD {title} -- {reason} (retry next run)", flush=True)
+            print(f"  HOLD {title} -- {reason} (retry next run)")
             continue
         # Backfill missing description from the page body we already fetched
         # (throttled bodies are held above, so anything here is a real page).
@@ -619,5 +620,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     cfg_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "config" / "search.yml"
     run(cfg_path.resolve())

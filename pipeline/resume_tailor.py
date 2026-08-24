@@ -57,6 +57,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Reuse the cover-letter conventions (same output dir, same sanitizer) and the
 # shared JD lookup (cached file → artifact → LinkedIn guest fetch).
 from pipeline.cover_letters import _safe_company, jd_text_for_job  # noqa: E402
+from pipeline.stdio import line_buffer_stdout
 
 
 # Section headers we recognize (lowercased, exact match after whitespace
@@ -796,6 +797,8 @@ def _author_name(career_ops: Path) -> str:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     # Manual test:
     #   python -m pipeline.resume_tailor "<Company>" "<Role>" [report.md] [job_url]
     import sys

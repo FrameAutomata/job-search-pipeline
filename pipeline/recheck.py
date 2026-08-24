@@ -265,7 +265,7 @@ def run(
     print(f"[recheck] checked {checked}, discarded {discarded}, "
           f"{unconfirmed} unconfirmed, {throttled} throttled, "
           f"{deferred} deferred, {unverifiable} unverifiable, {skipped} without URL"
-          + (" [dry-run]" if dry_run else ""), flush=True)
+          + (" [dry-run]" if dry_run else ""))
     return summary
 
 
@@ -340,5 +340,5 @@ def drain(career_ops, *, budget=None, cooldown=None, max_cycles=None,
             agg[k] = last.get(k, 0)
     print(f"[recheck:drain] {agg['cycles']} cycle(s): checked {agg['checked']}, "
           f"discarded {agg['discarded']}; last cycle {agg['throttled']} throttled, "
-          f"{agg['deferred']} deferred", flush=True)
+          f"{agg['deferred']} deferred")
     return agg

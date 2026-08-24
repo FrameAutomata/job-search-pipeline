@@ -4,12 +4,8 @@ These don't exercise the stages themselves (each has its own test module) — th
 pin the argparse-to-call wiring so the opt-in liveness re-check actually runs in
 the pipeline (and therefore in the cloud workflow that invokes orchestrate),
 and stays OFF by default so existing runs are unchanged.
-
-Plus the stdio setup main() does before any of that, for the same reason: the
-UI and the daily workflow both read the stage log while it is being written.
 """
 
-import io
 import sys
 
 import pytest
@@ -86,61 +82,3 @@ class TestRecheckWiring:
         monkeypatch.setattr(sys, "argv", _argv(cfg, "--recheck-liveness"))   # no --recheck-drain
         orchestrate.main()
         assert len(ran) == 1 and not drained
-
-
-class TestLineBufferStdio:
-    """main() makes the stage log line-buffered before running anything.
-
-    Redirected to a file or a pipe, stdout block-buffers at 8KB and a stage's
-    progress lines sit unseen while it works. Both callers that redirect us set
-    PYTHONUNBUFFERED today, so this is about the guarantee living in the program
-    instead of in every caller remembering to compensate for it."""
-
-    def test_a_redirected_stdout_becomes_line_buffered(self, tmp_path, monkeypatch):
-        log = tmp_path / "local-run.log"
-        # buffering=8192 is the shape a redirect to a file hands us: the text
-        # layer is not line-buffered, so a print goes into the buffer and stays.
-        #
-        # Closed via try/finally rather than `with`, and only after
-        # monkeypatch.undo(): monkeypatch restores sys.stdout at fixture
-        # teardown, which runs AFTER the test body, so a `with` block would
-        # leave sys.stdout pointing at a closed file in between. Anything that
-        # printed in that window (a teardown hook, a warning, `pytest -s`)
-        # would raise "I/O operation on closed file" against the wrong test.
-        f = open(log, "w", buffering=8192, encoding="utf-8")
-        try:
-            assert f.line_buffering is False
-            monkeypatch.setattr(sys, "stdout", f)
-
-            orchestrate._line_buffer_stdio()
-
-            print("[scrape] 120 rows -> 118 after dedup")
-            # Read through a separate handle — nothing here has flushed f, so
-            # the line is only on disk if the newline did it.
-            assert "after dedup" in log.read_text(encoding="utf-8")
-        finally:
-            monkeypatch.undo()
-            f.close()
-
-    def test_a_stdout_with_no_reconfigure_is_not_fatal(self, monkeypatch):
-        # pytest's own capture, and some embedding hosts, replace sys.stdout
-        # with an object that has no reconfigure at all.
-        monkeypatch.setattr(sys, "stdout", io.StringIO())
-
-        orchestrate._line_buffer_stdio()
-
-        # Asserting the call had no effect on a stream it cannot configure —
-        # without this the test passes just as well on an empty function body.
-        assert sys.stdout.getvalue() == ""
-
-    def test_a_broken_stdout_is_not_fatal(self, tmp_path, monkeypatch):
-        # The case a real redirect can produce, and the one an `except
-        # (AttributeError, ValueError)` tuple was sized for: reconfigure()
-        # flushes before it reconfigures, so a stream whose underlying buffer
-        # is gone raises from inside the call. main() has not parsed argv yet,
-        # so a traceback here would report buffering instead of the pipeline.
-        f = open(tmp_path / "gone.log", "w", buffering=8192, encoding="utf-8")
-        f.close()
-        monkeypatch.setattr(sys, "stdout", f)
-
-        orchestrate._line_buffer_stdio()
