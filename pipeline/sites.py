@@ -9,6 +9,14 @@ scripted request (they contributed zero rows across months of runs), and
 Google Jobs serves degraded responses then drops the connection mid-body —
 jobspy's Google scraper doesn't catch that, so one truncated response used to
 kill the whole run and discard every row already scraped.
+
+Three files hand-mirror SUPPORTED_SITES because they can't import it, and a
+test guards each: `setup-profile.mjs` and `pipeline/app/static/onboard.html`
+(tests/test_app_onboard.py), and `config/search.example.yml` — three separate
+`sites:` blocks — (tests/test_example_config.py). Prose names the boards too —
+the example config's comment above the first block, README.md, QUICKSTART.md,
+CLAUDE.md — and no test reads documentation, so walk those by hand as well when
+this constant changes.
 """
 
 SUPPORTED_SITES = ("indeed", "linkedin")
