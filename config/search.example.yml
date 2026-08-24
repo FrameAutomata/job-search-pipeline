@@ -62,6 +62,11 @@ searches:
     #
     # ⚠ LINKEDIN LIMITATION: only ONE of the following may be set per pass:
     #   hours_old  OR  easy_apply
+    #
+    # A pass that breaks either rule is SKIPPED with a warning at scrape time
+    # (the rest of the run continues) — so a conflict costs you that search
+    # silently unless you read the log. The UI's local-config editor refuses to
+    # save one at all.
 
     # Options: fulltime, parttime, internship, contract
     # job_type: fulltime

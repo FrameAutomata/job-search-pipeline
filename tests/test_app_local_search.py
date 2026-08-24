@@ -228,3 +228,90 @@ def test_post_rejects_non_iterable_sites_with_400_not_500(client):
     assert r.status_code == 400
     assert "supported board" in r.json()["detail"]
     assert not _local_file(root).exists()
+
+
+# ── JobSpy mutual-exclusion validation ──────────────────────────────────────
+# A pass combining options JobSpy refuses together parses fine, loads fine, and
+# names supported boards — the run then skips it. Refuse the save instead, while
+# the config is still in front of the user.
+
+
+def test_post_rejects_indeed_hours_old_with_is_remote(client):
+    c, root = client
+    content = ("searches:\n  - name: US Remote\n    search_terms: [python]\n"
+               "    sites: [indeed]\n    hours_old: 168\n    is_remote: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "Indeed limitation" in detail and "US Remote" in detail
+    assert not _local_file(root).exists()      # nothing written on reject
+
+
+def test_post_rejects_conflict_on_a_pass_that_never_names_indeed(client):
+    # The issue's second repro: an omitted `sites` inherits the supported boards
+    # upstream, so the rule binds a pass whose own YAML says nothing about Indeed.
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [python]\n"
+               "    hours_old: 168\n    is_remote: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "Indeed limitation" in r.json()["detail"]
+    assert not _local_file(root).exists()
+
+
+def test_post_rejects_linkedin_hours_old_with_easy_apply(client):
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [python]\n"
+               "    sites: [linkedin]\n    hours_old: 168\n    easy_apply: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "LinkedIn limitation" in r.json()["detail"]
+
+
+def test_post_rejects_when_only_one_pass_conflicts(client):
+    # One healthy pass doesn't excuse the broken one — saved, the run would drop
+    # it and the user would never learn why that search returned nothing.
+    c, root = client
+    content = ("searches:\n"
+               "  - name: fine\n    search_terms: [go]\n    sites: [indeed]\n    hours_old: 168\n"
+               "  - name: broken\n    search_terms: [go]\n    sites: [indeed]\n"
+               "    hours_old: 168\n    easy_apply: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "broken" in r.json()["detail"]
+    assert not _local_file(root).exists()
+
+
+def test_post_accepts_the_split_passes_that_fix_a_conflict(client):
+    # The documented workaround — split the filters across passes — must save.
+    c, root = client
+    content = ("searches:\n"
+               "  - name: recent\n    search_terms: [go]\n    sites: [indeed]\n"
+               "    hours_old: 168\n"
+               "  - name: remote\n    search_terms: [go]\n    sites: [indeed]\n"
+               "    is_remote: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    assert r.json()["warning"] is None
+    assert _local_file(root).read_text(encoding="utf-8") == content
+
+
+def test_post_accepts_indeed_job_type_with_is_remote(client):
+    # Both sit in the same Indeed group, so together they are legal.
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [go]\n    sites: [indeed]\n"
+               "    job_type: fulltime\n    is_remote: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+
+
+def test_post_accepts_a_conflict_on_a_retired_board_only(client):
+    # zip_recruiter never runs, so the combination it would have accepted is
+    # moot — but the pass has no supported board left, which is the older
+    # rejection, and it must be the one reported.
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [go]\n"
+               "    sites: [zip_recruiter]\n    hours_old: 168\n    is_remote: true\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "supported board" in r.json()["detail"]
