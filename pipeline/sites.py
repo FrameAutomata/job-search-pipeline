@@ -12,3 +12,18 @@ kill the whole run and discard every row already scraped.
 """
 
 SUPPORTED_SITES = ("indeed", "linkedin")
+
+
+def is_supported(site) -> bool:
+    """Whether `site` names a supported board, ignoring case and surrounding space.
+
+    The one place the match is defined. Config files, the wizard form and
+    hand-written JSON all spell boards slightly differently, and every caller
+    needs to agree on which spellings count.
+    """
+    return str(site).strip().lower() in SUPPORTED_SITES
+
+
+def keep_supported(sites) -> list:
+    """`sites` less the unsupported entries, each kept in its original spelling."""
+    return [s for s in sites if is_supported(s)]

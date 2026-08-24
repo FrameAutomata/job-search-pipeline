@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 
 from pipeline.batch_evaluate import _PROVIDER_KEYS
-from pipeline.sites import SUPPORTED_SITES
+from pipeline.sites import SUPPORTED_SITES, keep_supported
 
 # US states (50 + DC) and Canadian provinces — mirror of the sets in
 # setup-profile.mjs, used to keep "City, ST" pairs together and infer country.
@@ -249,10 +249,7 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "resultsWanted": int(form.get("results_wanted") or 100),
             # Filter, don't just default: a stale saved wizard state (or
             # hand-crafted POST) may still carry retired boards.
-            "sites": [
-                s for s in _split_csv(form.get("sites"))
-                if s.strip().lower() in SUPPORTED_SITES
-            ] or ["indeed", "linkedin"],
+            "sites": keep_supported(_split_csv(form.get("sites"))) or list(SUPPORTED_SITES),
             "includeEasyApply": bool(form.get("include_easy_apply")),
         },
         "narrative": {

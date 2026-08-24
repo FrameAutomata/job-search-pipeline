@@ -8,7 +8,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES
+from pipeline.sites import SUPPORTED_SITES, is_supported
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -32,15 +32,15 @@ OPTIONAL_PARAMS = [
     "enforce_annual_salary",
     "ca_cert",
     "proxies",
-    "google_search_term",
 ]
 
 def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
     """Remove unsupported sites from every pass; drop passes with none left.
 
-    Applied at load time (not just config-authoring time) so stale configs —
-    e.g. a fork's old SEARCH_CONFIG_B64 cloud secret still listing glassdoor —
-    degrade to a warning instead of wasted requests or a crash."""
+    Applied on the way into a run rather than only when a config is authored,
+    so stale configs — e.g. a fork's old SEARCH_CONFIG_B64 cloud secret still
+    listing glassdoor — degrade to a warning instead of wasted requests or a
+    crash."""
     result = []
     for cfg in searches:
         sites = cfg.get("sites")
@@ -49,7 +49,7 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
             continue
         kept, dropped = [], []
         for s in sites:
-            (kept if str(s).strip().lower() in SUPPORTED_SITES else dropped).append(s)
+            (kept if is_supported(s) else dropped).append(s)
         name = cfg.get("name", "pass")
         if dropped:
             print(
@@ -142,7 +142,7 @@ def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
 def validate_limitations(cfg: dict) -> None:
     """Raise ValueError if mutually exclusive JobSpy options are combined.
 
-    Indeed / Glassdoor: only one of these groups may be active:
+    Indeed: only one of these groups may be active:
       Group A — hours_old
       Group B — job_type and/or is_remote
       Group C — easy_apply
@@ -156,11 +156,11 @@ def validate_limitations(cfg: dict) -> None:
     is_remote   = cfg.get("is_remote")   is not None
     easy_apply  = cfg.get("easy_apply")  is not None
 
-    if "indeed" in sites or "glassdoor" in sites:
+    if "indeed" in sites:
         active = [hours_old, job_type or is_remote, easy_apply]
         if sum(active) > 1:
             raise ValueError(
-                "Indeed/Glassdoor limitation: only ONE of the following groups "
+                "Indeed limitation: only ONE of the following groups "
                 "may be set per search:\n"
                 "  Group A — hours_old\n"
                 "  Group B — job_type and/or is_remote\n"

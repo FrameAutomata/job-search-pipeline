@@ -43,7 +43,7 @@ searches:
 
     location: "Toronto, ON"
 
-    # Country filter for Indeed and Glassdoor.
+    # Country filter for Indeed.
     # See JobSpy docs for the full country list.
     country_indeed: "Canada"
 

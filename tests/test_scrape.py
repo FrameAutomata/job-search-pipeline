@@ -289,25 +289,19 @@ class TestValidateLimitations:
     def test_validate_indeed_hours_old_and_is_remote_raises(self):
         """hours_old + is_remote raises ValueError."""
         cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
+        with pytest.raises(ValueError, match="Indeed limitation"):
             scrape_mod.validate_limitations(cfg)
 
     def test_validate_indeed_hours_old_and_easy_apply_raises(self):
         """hours_old + easy_apply raises ValueError."""
         cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
+        with pytest.raises(ValueError, match="Indeed limitation"):
             scrape_mod.validate_limitations(cfg)
 
     def test_validate_indeed_is_remote_and_easy_apply_raises(self):
         """is_remote + easy_apply (both Group B/C) raises ValueError."""
         cfg = {"sites": ["indeed"], "is_remote": True, "easy_apply": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
-            scrape_mod.validate_limitations(cfg)
-
-    def test_validate_glassdoor_same_rules_as_indeed(self):
-        """Glassdoor has the same group constraints as Indeed."""
-        cfg = {"sites": ["glassdoor"], "hours_old": 168, "is_remote": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
+        with pytest.raises(ValueError, match="Indeed limitation"):
             scrape_mod.validate_limitations(cfg)
 
     def test_validate_linkedin_hours_old_and_easy_apply_raises(self):

@@ -13,6 +13,14 @@ from pathlib import Path
 import pytest
 
 from pipeline.app import onboard
+from pipeline.sites import SUPPORTED_SITES
+
+
+@pytest.fixture
+def html():
+    """The onboarding wizard's static markup, for the drift checks below."""
+    root = Path(__file__).resolve().parent.parent
+    return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
 
 
 def _node_deps_available() -> bool:
@@ -394,11 +402,6 @@ class TestEeoDatalists:
 
     EEO_FIELDS = ["eeo_gender", "eeo_race", "eeo_veteran", "eeo_disability"]
 
-    @pytest.fixture
-    def html(self):
-        root = Path(__file__).resolve().parent.parent
-        return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
-
     def _input_tag(self, html, name):
         m = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
         assert m, f"no <input name={name!r}> found"
@@ -461,11 +464,20 @@ class TestOnboardHtmlSites:
     connections mid-response (crashing jobspy), so indeed + linkedin are the
     only supported checkboxes."""
 
-    @pytest.fixture
-    def html(self):
-        root = Path(__file__).resolve().parent.parent
-        return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
-
     def test_offers_exactly_the_supported_boards(self, html):
         offered = set(re.findall(r'<input\b[^>]*\bname="sites"[^>]*\bvalue="([^"]+)"', html))
-        assert offered == {"indeed", "linkedin"}
+        assert offered == set(SUPPORTED_SITES)
+
+
+class TestSupportedSitesMirror:
+    """setup-profile.mjs restates SUPPORTED_SITES because Node can't import the
+    Python constant. That mirror is what writes search.yml, so drift between the
+    two silently reintroduces a dead board into every generated config."""
+
+    def test_mjs_mirror_matches_the_python_constant(self):
+        root = Path(__file__).resolve().parent.parent
+        src = (root / "setup-profile.mjs").read_text(encoding="utf-8")
+        m = re.search(r"const SUPPORTED_SITES = \[([^\]]*)\]", src)
+        assert m, "no SUPPORTED_SITES literal found in setup-profile.mjs"
+        mirrored = tuple(re.findall(r"'([^']+)'", m.group(1)))
+        assert mirrored == SUPPORTED_SITES
