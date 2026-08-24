@@ -46,6 +46,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
+from pipeline.sites import SUPPORTED_SITES, as_site_list, is_supported, keep_supported
 from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -553,24 +554,55 @@ def local_search_get() -> JSONResponse:
     return JSONResponse({"active": False, "content": content, "path": "config/search.local.yml"})
 
 
+def _unsupported_sites(entries: list) -> list[str]:
+    """Every board named across `entries` that the scraper would drop, in the
+    order first seen. Uses pipeline.sites — a dependency-free leaf module, so
+    this stays importable in the jobspy-free UI venv."""
+    seen, out = set(), []
+    for entry in entries:
+        sites = entry.get("sites")
+        if sites is None:
+            continue
+        for s in as_site_list(sites):
+            name = str(s).strip()
+            if not is_supported(s) and name.lower() not in seen:
+                seen.add(name.lower())
+                out.append(name)
+    return out
+
+
 @app.post("/api/local-search")
 def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     """Validate and write the local override. Rejects anything that wouldn't load
     as a search config so the next run can't choke on a broken file — including a
-    non-mapping or empty search entry, which would crash scrape, not no-op."""
+    non-mapping or empty search entry, which would crash scrape, not no-op — and
+    anything that would scrape nothing because every pass names retired boards."""
     import yaml
     try:
         parsed = yaml.safe_load(req.content)
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Not valid YAML: {e}")
-    if _search_entries(parsed) is None:
+    entries = _search_entries(parsed)
+    if entries is None:
         raise HTTPException(status_code=400,
                             detail="Config must have a non-empty `searches:` list of search "
                                    "mappings (or a single legacy `search:` mapping).")
+    # A pass with no `sites` key inherits the supported boards (strip_unsupported_sites
+    # fills it in), so it counts as survivable.
+    if not any(e.get("sites") is None or keep_supported(e["sites"]) for e in entries):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No pass names a supported board, so this config would scrape "
+                   f"nothing. Supported: {', '.join(SUPPORTED_SITES)}.")
     local = _local_search_path()
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(req.content, encoding="utf-8")
-    return JSONResponse({"ok": True, "active": True})
+    # Saved, but say so if some boards will be ignored — otherwise the run just
+    # quietly returns fewer rows than the config implies.
+    dropped = _unsupported_sites(entries)
+    warning = (f"Saved, but these boards are not supported and will be ignored: "
+               f"{', '.join(dropped)}.") if dropped else None
+    return JSONResponse({"ok": True, "active": True, "warning": warning})
 
 
 @app.delete("/api/local-search")

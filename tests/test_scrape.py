@@ -228,12 +228,22 @@ class TestStripUnsupportedSites:
         scrape_mod.strip_unsupported_sites(searches)
         assert capsys.readouterr().out == ""
 
-    def test_missing_sites_key_left_alone(self):
-        # A pass with no sites key fails later the same way it does today —
-        # stripping shouldn't invent or remove the key.
+    def test_missing_sites_key_defaults_to_supported(self):
+        # Left as None, jobspy's get_site_type() scrapes list(Site) — every
+        # retired board included — so the key has to be filled in.
         searches = [{"name": "p", "search_terms": ["a"]}]
         result = scrape_mod.strip_unsupported_sites(searches)
-        assert result == searches
+        assert result[0]["sites"] == list(scrape_mod.SUPPORTED_SITES)
+
+    def test_explicitly_null_sites_defaults_to_supported(self):
+        # `sites:` with nothing after it — a real None in the mapping, which
+        # made validate_limitations raise TypeError.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": None}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == list(scrape_mod.SUPPORTED_SITES)
+
+    def test_null_sites_does_not_crash_validate_limitations(self):
+        scrape_mod.validate_limitations({"sites": None, "hours_old": 168})  # must not raise
 
     def test_input_list_is_not_mutated(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "google"]}]

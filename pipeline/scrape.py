@@ -46,7 +46,11 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
     for cfg in searches:
         sites = cfg.get("sites")
         if sites is None:
-            result.append(cfg)
+            # Missing or explicitly null. Not harmless to pass through: jobspy's
+            # get_site_type() falls back to list(Site) — every board, including
+            # the ones retired here — when site_name is None, and
+            # validate_limitations raises TypeError iterating it first.
+            result.append({**cfg, "sites": list(SUPPORTED_SITES)})
             continue
         listed = as_site_list(sites)
         kept = keep_supported(listed)
@@ -152,7 +156,10 @@ def validate_limitations(cfg: dict) -> None:
     LinkedIn: only one of these may be active:
       hours_old  OR  easy_apply
     """
-    sites = [s.lower() for s in cfg.get("sites", [])]
+    # `or []`, not a get() default: `sites:` with nothing after it puts a real
+    # None in the mapping, so the default never fires and the comprehension
+    # raises TypeError.
+    sites = [str(s).strip().lower() for s in cfg.get("sites") or []]
     hours_old   = cfg.get("hours_old")   is not None
     job_type    = cfg.get("job_type")    is not None
     is_remote   = cfg.get("is_remote")   is not None

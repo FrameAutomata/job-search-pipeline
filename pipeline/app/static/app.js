@@ -578,7 +578,7 @@ localSearch.save.addEventListener("click", async () => {
     if (!resp.ok) throw new Error(body.detail || `save failed (${resp.status})`);
     localSearch.active = true;
     renderLocalSearchStatus();
-    localSearch.msg.textContent = "Saved — local runs now use this override.";
+    localSearch.msg.textContent = body.warning || "Saved — local runs now use this override.";
   } catch (e) {
     localSearch.msg.textContent = String(e.message || e);
   } finally {
