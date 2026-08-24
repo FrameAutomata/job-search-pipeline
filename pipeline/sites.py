@@ -101,6 +101,15 @@ def resolve_sites(cfg: dict) -> tuple[list, list]:
 # its display name plus the groups it allows only ONE of — two options in the
 # same group coexist (Indeed takes job_type with is_remote), two *active* groups
 # are the conflict.
+# NOTE (unverified against python-jobspy 1.1.82): the "linkedin" entry below
+# does not reproduce there. LinkedIn's builder puts BOTH options into one params
+# dict — `"f_AL": "true" if easy_apply else None` and, a few lines down,
+# `params["f_TPR"] = f"r{seconds_old}"` from hours_old — then strips only the
+# None values and sends what's left. No raise, no precedence, both filters
+# applied. So a LinkedIn-only pass setting both is skipped here over a
+# combination jobspy handles fine. Retiring the group is a behaviour change with
+# the same open question as the Indeed one, tracked in #115; left in place so
+# this stays a truthiness fix.
 MUTEX_GROUPS = {
     "indeed": ("Indeed", [("hours_old",), ("job_type", "is_remote"), ("easy_apply",)]),
     "linkedin": ("LinkedIn", [("hours_old",), ("easy_apply",)]),
@@ -112,10 +121,12 @@ def limitation_conflict(cfg: dict) -> str | None:
 
     Indeed accepts only ONE of (A) hours_old, (B) job_type and/or is_remote,
     (C) easy_apply per search; LinkedIn only one of hours_old or easy_apply.
-    Combining them used to raise out of the scrape stage; in python-jobspy
-    1.1.82 Indeed's builder is a precedence chain instead (hours_old, elif
-    easy_apply, elif job_type/is_remote), so the loser is dropped in silence.
-    Either way the pass does not search what it says it searches.
+    Combining them used to raise out of the scrape stage. Neither board does
+    that in python-jobspy 1.1.82: Indeed's builder is a precedence chain
+    (hours_old, elif easy_apply, elif job_type/is_remote) that drops the loser
+    in silence, and LinkedIn's sends both filters happily — see the note on
+    MUTEX_GROUPS. An Indeed pass therefore doesn't search what it says it
+    searches; a LinkedIn one does, and is skipped anyway. Both are #115.
 
     An option counts as set only when its value is TRUTHY, because truthiness
     is what jobspy reads it through: `elif self.scraper_input.easy_apply:`

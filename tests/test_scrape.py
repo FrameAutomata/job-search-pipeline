@@ -341,6 +341,10 @@ def _sets_clause(msg: str) -> str:
     [hours_old | job_type and/or is_remote | easy_apply]"), so a substring test
     against the whole string passes no matter which keys the rule blames.
     """
+    # Checked rather than assumed: a regression that returns None here is
+    # exactly what these assertions exist to catch, and `None.split` reports it
+    # as an AttributeError inside a test helper instead of as the failure it is.
+    assert isinstance(msg, str) and "this pass sets " in msg, f"no conflict reported: {msg!r}"
     return msg.split("this pass sets ", 1)[1].removesuffix(". Remove all but one.")
 
 
@@ -458,6 +462,56 @@ class TestLimitationConflict:
     def test_case_variant_board_name_is_still_checked(self):
         cfg = {"sites": ["Indeed"], "hours_old": 168, "is_remote": True}
         assert "Indeed limitation" in limitation_conflict(cfg)
+
+
+class TestOptionalParamForwarding:
+    """The other half of the truthiness change, pinned so it can't be "unified".
+
+    limitation_conflict asks "will jobspy act on this?" and tests truthiness;
+    OPTIONAL_PARAMS asks "did the user supply a value to forward?" and must keep
+    `is not None`. It spans 16 keys whose falsy values are deliberate settings,
+    and truthy-filtering them would silently restore jobspy's defaults — for
+    linkedin_fetch_description that means the 30+ minute per-JD fetch the
+    example config marks KEEP THIS FALSE."""
+
+    def test_explicitly_false_options_are_still_forwarded(self, patch_scrape_paths, tmp_path, mocker):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(
+            "searches:\n"
+            "  - name: 'p'\n"
+            "    search_terms: ['nurse']\n"
+            "    sites: [indeed]\n"
+            "    linkedin_fetch_description: false\n"
+            "    enforce_annual_salary: false\n",
+            encoding="utf-8",
+        )
+        mock_scrape = mocker.patch.object(scrape_mod, "scrape_jobs", return_value=pd.DataFrame())
+
+        scrape_mod.run(cfg)
+
+        kwargs = mock_scrape.call_args.kwargs
+        assert kwargs["linkedin_fetch_description"] is False
+        assert kwargs["enforce_annual_salary"] is False
+
+    def test_zero_valued_options_are_still_forwarded(self, patch_scrape_paths, tmp_path, mocker):
+        # `distance: 0` dropped would silently become jobspy's default of 50.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(
+            "searches:\n"
+            "  - name: 'p'\n"
+            "    search_terms: ['nurse']\n"
+            "    sites: [indeed]\n"
+            "    distance: 0\n"
+            "    offset: 0\n",
+            encoding="utf-8",
+        )
+        mock_scrape = mocker.patch.object(scrape_mod, "scrape_jobs", return_value=pd.DataFrame())
+
+        scrape_mod.run(cfg)
+
+        kwargs = mock_scrape.call_args.kwargs
+        assert kwargs["distance"] == 0
+        assert kwargs["offset"] == 0
 
 
 class TestDropConflictingPasses:
