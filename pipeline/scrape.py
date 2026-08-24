@@ -217,6 +217,13 @@ def run(
         # Every pass came back empty (rate-limited, network blip, boards down).
         # Truncate rather than leave the previous run's rows behind — same
         # reason as the no-passes branch above.
+        #
+        # Deliberately no jobs.prev.csv backup, unlike pipeline/app/reset.py,
+        # which snapshots before it wipes. Reset is a user action they may
+        # regret; this is a routine outcome that would leave a stale snapshot
+        # after every throttled morning. Silently re-evaluating yesterday's
+        # rows is the worse failure, and losing a raw intermediate costs one
+        # re-scrape. Documented so the trade isn't rediscovered from scratch.
         print("[scrape] no jobs returned — writing empty jobs.csv", flush=True)
         OUTPUT_PATH.write_text("", encoding="utf-8")
         return OUTPUT_PATH

@@ -256,6 +256,16 @@ These flags are for ad-hoc local runs. The daily cloud workflow runs **every** p
 .\run.ps1 --skip-scrape --skip-filter --skip-screen --skip-bridge --skip-batch-prep --evaluate-batch
 ```
 
+> **What `--skip-scrape` reuses may be empty.** A scrape that returns zero rows
+> truncates `output/jobs.csv` instead of leaving the previous run's rows to be
+> re-processed as today's. A rate-limited run looks the same as a genuinely empty
+> one — JobSpy returns no rows rather than raising, and the run exits 0 — so if a
+> re-drive produces nothing, check whether `output/jobs.csv` is 0 bytes. To tell a
+> throttle from a real empty day, look further up the same log: JobSpy logs
+> `429 Response - Blocked by LinkedIn for too many requests` or Indeed's
+> `responded with status code: 403` when a board turns it away. `--skip-filter` and
+> `output/filtered_jobs.csv` carry the same caveat.
+
 ---
 
 ## Cloud automation (GitHub Actions)
