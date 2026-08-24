@@ -116,6 +116,5 @@ class TestLineBufferStdio:
         # with an object that has no reconfigure. Buffering is a nicety;
         # failing the run over it is not.
         monkeypatch.setattr(sys, "stdout", io.StringIO())
-        monkeypatch.setattr(sys, "stderr", io.StringIO())
 
         orchestrate._line_buffer_stdio()

@@ -76,18 +76,26 @@ def _line_buffer_stdio() -> None:
 
     Making it true here instead means the guarantee belongs to the program
     rather than to every caller remembering, and a `print` added to a stage
-    tomorrow is correct without anyone thinking about buffering. The scattered
-    `flush=True` calls stay: they still carry a stage module run directly
-    (`python pipeline/scrape.py > log`), which never reaches this function.
+    tomorrow is correct without anyone thinking about buffering.
+
+    stdout only: CPython has line-buffered stderr by default since 3.9, even
+    when it isn't a tty, so reconfiguring it would be a no-op.
+
+    This covers main(), which is not quite the whole program — `python -m
+    pipeline.scrape > log` runs a stage's __main__ block without passing
+    through here. That is what the scattered `flush=True` calls still carry.
+    (`python pipeline/scrape.py` is NOT that path and never was: the repo isn't
+    installed, so running a file inside pipeline/ puts pipeline/ on sys.path
+    rather than the root and the module's own `from pipeline.sites import ...`
+    raises ModuleNotFoundError.)
 
     Guarded because sys.stdout is not always a TextIOWrapper — pytest's capture
     and some embedding hosts replace it with an object that has no reconfigure.
     """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(line_buffering=True)
-        except (AttributeError, ValueError):
-            pass
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
 
 
 def main() -> int:
