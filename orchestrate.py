@@ -81,20 +81,29 @@ def _line_buffer_stdio() -> None:
     stdout only: CPython has line-buffered stderr by default since 3.9, even
     when it isn't a tty, so reconfiguring it would be a no-op.
 
-    This covers main(), which is not quite the whole program — `python -m
+    This covers main(), which is not the whole program — `python -m
     pipeline.scrape > log` runs a stage's __main__ block without passing
-    through here. That is what the scattered `flush=True` calls still carry.
-    (`python pipeline/scrape.py` is NOT that path and never was: the repo isn't
-    installed, so running a file inside pipeline/ puts pipeline/ on sys.path
-    rather than the root and the module's own `from pipeline.sites import ...`
-    raises ModuleNotFoundError.)
+    through here. (`python pipeline/scrape.py` is NOT that path and never was:
+    the repo isn't installed, so running a file inside pipeline/ puts pipeline/
+    on sys.path rather than the root and the module's own `from pipeline.sites
+    import ...` raises ModuleNotFoundError.)
 
-    Guarded because sys.stdout is not always a TextIOWrapper — pytest's capture
-    and some embedding hosts replace it with an object that has no reconfigure.
+    The scattered `flush=True` calls are what carries the `-m` path, and only
+    partly: scrape is 9/9 and recheck 2/2, but screen is 3/7 and filter, bridge,
+    batch_prep and handoff are 0. So `python -m pipeline.filter > log` is
+    block-buffered regardless. Consolidating the three overlapping mechanisms
+    (PYTHONUNBUFFERED at the two callers that redirect, this, and the per-print
+    flushes) is #121; this function is not that, and does not pretend to be.
+
+    Never fatal, per the contract the caller relies on — buffering is a nicety
+    and main() has not even parsed argv yet. sys.stdout is not always a
+    TextIOWrapper (pytest's capture and some embedding hosts replace it), a
+    proxy's reconfigure may reject the keyword, and reconfigure() flushes first,
+    so a broken stream can surface as OSError.
     """
     try:
         sys.stdout.reconfigure(line_buffering=True)
-    except (AttributeError, ValueError):
+    except Exception:
         pass
 
 

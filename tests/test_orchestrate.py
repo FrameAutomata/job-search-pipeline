@@ -100,7 +100,15 @@ class TestLineBufferStdio:
         log = tmp_path / "local-run.log"
         # buffering=8192 is the shape a redirect to a file hands us: the text
         # layer is not line-buffered, so a print goes into the buffer and stays.
-        with open(log, "w", buffering=8192, encoding="utf-8") as f:
+        #
+        # Closed via try/finally rather than `with`, and only after
+        # monkeypatch.undo(): monkeypatch restores sys.stdout at fixture
+        # teardown, which runs AFTER the test body, so a `with` block would
+        # leave sys.stdout pointing at a closed file in between. Anything that
+        # printed in that window (a teardown hook, a warning, `pytest -s`)
+        # would raise "I/O operation on closed file" against the wrong test.
+        f = open(log, "w", buffering=8192, encoding="utf-8")
+        try:
             assert f.line_buffering is False
             monkeypatch.setattr(sys, "stdout", f)
 
@@ -110,11 +118,29 @@ class TestLineBufferStdio:
             # Read through a separate handle — nothing here has flushed f, so
             # the line is only on disk if the newline did it.
             assert "after dedup" in log.read_text(encoding="utf-8")
+        finally:
+            monkeypatch.undo()
+            f.close()
 
-    def test_a_stdout_that_cannot_reconfigure_is_not_fatal(self, monkeypatch):
+    def test_a_stdout_with_no_reconfigure_is_not_fatal(self, monkeypatch):
         # pytest's own capture, and some embedding hosts, replace sys.stdout
-        # with an object that has no reconfigure. Buffering is a nicety;
-        # failing the run over it is not.
+        # with an object that has no reconfigure at all.
         monkeypatch.setattr(sys, "stdout", io.StringIO())
+
+        orchestrate._line_buffer_stdio()
+
+        # Asserting the call had no effect on a stream it cannot configure —
+        # without this the test passes just as well on an empty function body.
+        assert sys.stdout.getvalue() == ""
+
+    def test_a_broken_stdout_is_not_fatal(self, tmp_path, monkeypatch):
+        # The case a real redirect can produce, and the one an `except
+        # (AttributeError, ValueError)` tuple was sized for: reconfigure()
+        # flushes before it reconfigures, so a stream whose underlying buffer
+        # is gone raises from inside the call. main() has not parsed argv yet,
+        # so a traceback here would report buffering instead of the pipeline.
+        f = open(tmp_path / "gone.log", "w", buffering=8192, encoding="utf-8")
+        f.close()
+        monkeypatch.setattr(sys, "stdout", f)
 
         orchestrate._line_buffer_stdio()
