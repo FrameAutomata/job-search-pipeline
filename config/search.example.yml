@@ -68,14 +68,16 @@ searches:
     # silently unless you read the log. The UI's local-config editor refuses to
     # save one at all.
     #
-    # An option counts as SET whenever the key is present, whatever its value:
-    # `easy_apply: false` activates Group C exactly like `true` does. To turn an
-    # option off, comment the line out — don't set it to false.
+    # An option counts as SET only when its value is truthy, matching what
+    # JobSpy does with it: `easy_apply: false` and `hours_old: 0` send no
+    # filter, so they don't activate their group and don't conflict with
+    # anything. Commenting the line out says the same thing more plainly.
 
     # Options: fulltime, parttime, internship, contract
     # job_type: fulltime
 
-    # true = remote only, false = in-person only, omit = all.
+    # true = remote only. JobSpy has no in-person filter, so `false` is the
+    # same as omitting the line — both return remote and on-site alike.
     # is_remote: true
 
     # Filter to jobs with one-click apply (hosted on the board). Uncommenting

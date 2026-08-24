@@ -101,6 +101,15 @@ def resolve_sites(cfg: dict) -> tuple[list, list]:
 # its display name plus the groups it allows only ONE of — two options in the
 # same group coexist (Indeed takes job_type with is_remote), two *active* groups
 # are the conflict.
+# NOTE (unverified against python-jobspy 1.1.82): the "linkedin" entry below
+# does not reproduce there. LinkedIn's builder puts BOTH options into one params
+# dict — `"f_AL": "true" if easy_apply else None` and, a few lines down,
+# `params["f_TPR"] = f"r{seconds_old}"` from hours_old — then strips only the
+# None values and sends what's left. No raise, no precedence, both filters
+# applied. So a LinkedIn-only pass setting both is skipped here over a
+# combination jobspy handles fine. Retiring the group is a behaviour change with
+# the same open question as the Indeed one, tracked in #115; left in place so
+# this stays a truthiness fix.
 MUTEX_GROUPS = {
     "indeed": ("Indeed", [("hours_old",), ("job_type", "is_remote"), ("easy_apply",)]),
     "linkedin": ("LinkedIn", [("hours_old",), ("easy_apply",)]),
@@ -112,7 +121,29 @@ def limitation_conflict(cfg: dict) -> str | None:
 
     Indeed accepts only ONE of (A) hours_old, (B) job_type and/or is_remote,
     (C) easy_apply per search; LinkedIn only one of hours_old or easy_apply.
-    Combining them makes jobspy raise, which used to abort the scrape stage.
+    Combining them used to raise out of the scrape stage. Neither board does
+    that in python-jobspy 1.1.82: Indeed's builder is a precedence chain
+    (hours_old, elif easy_apply, elif job_type/is_remote) that drops the loser
+    in silence, and LinkedIn's sends both filters happily — see the note on
+    MUTEX_GROUPS. An Indeed pass therefore doesn't search what it says it
+    searches; a LinkedIn one does, and is skipped anyway. Both are #115.
+
+    An option counts as set only when its value is TRUTHY, because truthiness
+    is what jobspy reads it through: `elif self.scraper_input.easy_apply:`
+    (indeed), `"f_AL": "true" if scraper_input.easy_apply else None` and
+    `hours_old * 3600 if hours_old else None` (linkedin). `easy_apply: false`
+    and `hours_old: 0` therefore send no filter at all, and testing
+    `is not None` here cost the user a whole pass over an option that never
+    reached the wire — turning a filter off being the obvious reason to
+    write `false` in the first place.
+
+    Note this deliberately does NOT match how pipeline.scrape forwards the same
+    keys: OPTIONAL_PARAMS keeps `is not None`, because it spans 16 keys whose
+    falsy values are meaningful settings a user typed on purpose (`distance: 0`,
+    `offset: 0`, `verbose: 0`, `linkedin_fetch_description: false`) and dropping
+    those would silently restore jobspy's defaults. The two tests answer
+    different questions — "did the user supply a value to forward?" there,
+    "will jobspy act on it?" here — so they are not to be unified.
 
     Lives here, in the dependency-free leaf, so the UI venv — which installs
     neither jobspy nor pandas and so cannot import pipeline.scrape at all — can
@@ -131,10 +162,10 @@ def limitation_conflict(cfg: dict) -> str | None:
     for board, (label, groups) in MUTEX_GROUPS.items():
         if board not in sites:
             continue
-        active = [g for g in groups if any(cfg.get(k) is not None for k in g)]
+        active = [g for g in groups if any(cfg.get(k) for k in g)]
         if len(active) < 2:
             continue
-        set_here = ", ".join(k for g in active for k in g if cfg.get(k) is not None)
+        set_here = ", ".join(k for g in active for k in g if cfg.get(k))
         allowed = " | ".join(" and/or ".join(g) for g in groups)
         return (
             f"{where}{label} limitation: only ONE of [{allowed}] may be set per "

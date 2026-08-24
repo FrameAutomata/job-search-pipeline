@@ -334,6 +334,20 @@ filter:
         assert patch_scrape_paths.read_text(encoding="utf-8") == ""
 
 
+def _sets_clause(msg: str) -> str:
+    """The options limitation_conflict names as the offenders in `msg`.
+
+    The full message also spells out every option in every group ("only ONE of
+    [hours_old | job_type and/or is_remote | easy_apply]"), so a substring test
+    against the whole string passes no matter which keys the rule blames.
+    """
+    # Checked rather than assumed: a regression that returns None here is
+    # exactly what these assertions exist to catch, and `None.split` reports it
+    # as an AttributeError inside a test helper instead of as the failure it is.
+    assert isinstance(msg, str) and "this pass sets " in msg, f"no conflict reported: {msg!r}"
+    return msg.split("this pass sets ", 1)[1].removesuffix(". Remove all but one.")
+
+
 class TestLimitationConflict:
     """pipeline.sites.limitation_conflict — JobSpy's per-pass mutual-exclusion
     rule, returning the message so the scraper can skip the pass and the UI's
@@ -372,17 +386,33 @@ class TestLimitationConflict:
 
     def test_message_names_the_options_actually_set(self):
         # "one of these groups" alone leaves the user diffing their config
-        # against the rule; name the offending keys.
+        # against the rule; name the offending keys. Read the clause rather
+        # than the whole message — `allowed` lists every option in every group,
+        # so `"is_remote" in msg` holds however the offenders are computed.
         cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": True}
-        msg = limitation_conflict(cfg)
-        assert "hours_old" in msg and "is_remote" in msg
+        assert _sets_clause(limitation_conflict(cfg)) == "hours_old, is_remote"
 
-    def test_false_still_counts_as_set(self):
-        # JobSpy sees the kwarg either way — `easy_apply: false` is passed
-        # through by OPTIONAL_PARAMS (which tests `is not None`), so it
-        # conflicts exactly like `true` does.
+    def test_explicitly_off_is_not_a_conflict(self):
+        # `easy_apply: false` asks for no easy-apply filter, and jobspy reads
+        # the value for truthiness — nothing goes on the wire either way. The
+        # user asked for one filter (hours_old) and used to be charged the
+        # whole pass for saying out loud that they didn't want the other.
         cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": False}
-        assert "Indeed limitation" in limitation_conflict(cfg)
+        assert limitation_conflict(cfg) is None
+
+    def test_zero_is_not_a_conflict(self):
+        # Same rule for the numeric option: `hours_old * 3600 if hours_old`
+        # makes 0 a no-op, not "posted in the last zero hours".
+        cfg = {"sites": ["indeed"], "hours_old": 0, "is_remote": True}
+        assert limitation_conflict(cfg) is None
+
+    def test_an_off_option_is_not_named_among_the_offenders(self):
+        # is_remote shares Group B with job_type, so the group is active on
+        # job_type alone — but telling the user to remove an option they had
+        # already turned off sends them to edit the wrong line.
+        cfg = {"sites": ["indeed"], "hours_old": 168, "job_type": "fulltime",
+               "is_remote": False}
+        assert _sets_clause(limitation_conflict(cfg)) == "hours_old, job_type"
 
     def test_linkedin_hours_old_and_easy_apply_conflicts(self):
         cfg = {"sites": ["linkedin"], "hours_old": 168, "easy_apply": True}
@@ -432,6 +462,56 @@ class TestLimitationConflict:
     def test_case_variant_board_name_is_still_checked(self):
         cfg = {"sites": ["Indeed"], "hours_old": 168, "is_remote": True}
         assert "Indeed limitation" in limitation_conflict(cfg)
+
+
+class TestOptionalParamForwarding:
+    """The other half of the truthiness change, pinned so it can't be "unified".
+
+    limitation_conflict asks "will jobspy act on this?" and tests truthiness;
+    OPTIONAL_PARAMS asks "did the user supply a value to forward?" and must keep
+    `is not None`. It spans 16 keys whose falsy values are deliberate settings,
+    and truthy-filtering them would silently restore jobspy's defaults — for
+    linkedin_fetch_description that means the 30+ minute per-JD fetch the
+    example config marks KEEP THIS FALSE."""
+
+    def test_explicitly_false_options_are_still_forwarded(self, patch_scrape_paths, tmp_path, mocker):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(
+            "searches:\n"
+            "  - name: 'p'\n"
+            "    search_terms: ['nurse']\n"
+            "    sites: [indeed]\n"
+            "    linkedin_fetch_description: false\n"
+            "    enforce_annual_salary: false\n",
+            encoding="utf-8",
+        )
+        mock_scrape = mocker.patch.object(scrape_mod, "scrape_jobs", return_value=pd.DataFrame())
+
+        scrape_mod.run(cfg)
+
+        kwargs = mock_scrape.call_args.kwargs
+        assert kwargs["linkedin_fetch_description"] is False
+        assert kwargs["enforce_annual_salary"] is False
+
+    def test_zero_valued_options_are_still_forwarded(self, patch_scrape_paths, tmp_path, mocker):
+        # `distance: 0` dropped would silently become jobspy's default of 50.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(
+            "searches:\n"
+            "  - name: 'p'\n"
+            "    search_terms: ['nurse']\n"
+            "    sites: [indeed]\n"
+            "    distance: 0\n"
+            "    offset: 0\n",
+            encoding="utf-8",
+        )
+        mock_scrape = mocker.patch.object(scrape_mod, "scrape_jobs", return_value=pd.DataFrame())
+
+        scrape_mod.run(cfg)
+
+        kwargs = mock_scrape.call_args.kwargs
+        assert kwargs["distance"] == 0
+        assert kwargs["offset"] == 0
 
 
 class TestDropConflictingPasses:
