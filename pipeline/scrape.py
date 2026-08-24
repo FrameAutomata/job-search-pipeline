@@ -175,9 +175,10 @@ def run(
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not searches:
-        # No matching passes — write an empty header-only CSV so downstream
-        # stages no-op cleanly. This is the workflow-friendly path: e.g. the
-        # easy-apply workflow on a user with no easy_apply pass configured.
+        # No matching passes — truncate jobs.csv so downstream stages no-op
+        # cleanly instead of re-processing the previous run's rows. This is the
+        # workflow-friendly path: e.g. the easy-apply workflow on a user with
+        # no easy_apply pass configured.
         reason = (
             "every matching pass was skipped (unsupported boards, or options "
             "JobSpy can't combine)"
@@ -213,7 +214,11 @@ def run(
 
     combined = pd.concat(all_rows, ignore_index=True) if all_rows else None
     if combined is None or combined.empty:
-        print("[scrape] no jobs returned")
+        # Every pass came back empty (rate-limited, network blip, boards down).
+        # Truncate rather than leave the previous run's rows behind — same
+        # reason as the no-passes branch above.
+        print("[scrape] no jobs returned — writing empty jobs.csv", flush=True)
+        OUTPUT_PATH.write_text("", encoding="utf-8")
         return OUTPUT_PATH
 
     combined = mark_easy_apply(combined)

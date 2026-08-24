@@ -439,6 +439,36 @@ filter:
         content = output_path.read_text()
         assert content == ""
 
+    def test_run_handles_zero_byte_jobs_csv(
+        self, patch_filter_paths, filtered_csv, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        """A zero-row scrape truncates jobs.csv to zero bytes (no header line).
+        csv.DictReader reads that as zero rows, so the stage no-ops instead of
+        raising on the missing header.
+
+        filtered_jobs.csv is seeded first: without a stale file to overwrite,
+        "correctly truncated" and "never written" look identical, and the
+        staleness this guards against would just move one stage downstream."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text("", encoding="utf-8")
+        output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+""")
+
+        filter_mod.run(config)
+
+        assert output_path.read_text() == ""
+
     def test_run_returns_output_path(
         self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
