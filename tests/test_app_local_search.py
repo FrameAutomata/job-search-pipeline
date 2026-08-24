@@ -268,6 +268,29 @@ def test_post_rejects_linkedin_hours_old_with_easy_apply(client):
     assert "LinkedIn limitation" in r.json()["detail"]
 
 
+def test_post_accepts_a_quoted_off_option(client):
+    # A quoted scalar is what a templating tool or a hand edit produces, and
+    # `"false"` is a truthy str to a raw read but a falsy bool to jobspy's
+    # pydantic model. Saving must go through the same normalization a run does,
+    # or the UI 400s a config that scrapes perfectly well.
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [python]\n"
+               "    sites: [indeed]\n    hours_old: 168\n    is_remote: \"false\"\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    assert _local_file(root).read_text(encoding="utf-8") == content
+
+
+def test_post_still_rejects_a_quoted_on_option(client):
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [python]\n"
+               "    sites: [indeed]\n    hours_old: 168\n    easy_apply: \"true\"\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "Indeed limitation" in r.json()["detail"]
+    assert not _local_file(root).exists()
+
+
 def test_post_rejects_when_only_one_pass_conflicts(client):
     # One healthy pass doesn't excuse the broken one — saved, the run would drop
     # it and the user would never learn why that search returned nothing.

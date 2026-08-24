@@ -9,7 +9,12 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
+from pipeline.sites import (
+    SUPPORTED_SITES,
+    limitation_conflict,
+    normalize_pass,
+    resolve_sites,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -86,6 +91,14 @@ def filter_passes(
         from the CLI.
       - `easy_apply_only`: keep only passes with `easy_apply: true`.
       - `no_easy_apply`: keep only passes without `easy_apply: true`.
+
+    The `is True` tests below are exact rather than merely conventional: run()
+    puts every pass through pipeline.sites.normalize_pass first, which rewrites
+    easy_apply to the bool jobspy will act on and drops it when that is False.
+    So a quoted `easy_apply: "true"` selects here just like an unquoted one, and
+    `easy_apply: false` is indistinguishable from an absent key — which is what
+    it means to jobspy. Called with un-normalized passes (tests, other callers),
+    these read the raw value.
 
     `easy_apply_only` and `no_easy_apply` are used by the cloud workflows to
     route passes to the right schedule by JobSpy field rather than pass name.
@@ -165,8 +178,12 @@ def run(
     easy_apply_only: bool = False,
     no_easy_apply: bool = False,
 ) -> Path:
+    # Normalize before anything reads the mutually-exclusive options: pass
+    # selection, the conflict check and the per-row easy_apply tag each used to
+    # test them differently, and a quoted or falsy value made the three
+    # disagree. See pipeline.sites.normalize_pass.
     selected = filter_passes(
-        load_searches(config_path),
+        [normalize_pass(cfg) for cfg in load_searches(config_path)],
         only_passes,
         easy_apply_only=easy_apply_only,
         no_easy_apply=no_easy_apply,

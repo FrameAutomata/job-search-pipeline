@@ -116,6 +116,150 @@ MUTEX_GROUPS = {
 }
 
 
+# The union of the MUTEX_GROUPS keys, in first-seen order. Derived rather than
+# restated so a group that gains an option can't leave normalize_pass behind.
+MUTEX_KEYS = tuple(
+    dict.fromkeys(k for _, groups in MUTEX_GROUPS.values() for group in groups for k in group)
+)
+
+# Sentinel for "no value jobspy would accept", kept distinct from None because
+# None is itself a legitimate result (an option explicitly nulled out).
+_UNREADABLE = object()
+
+# The lax-mode bool spellings pydantic accepts, which is what ScraperInput is.
+_BOOL_TOKENS = {
+    "1": True, "t": True, "true": True, "y": True, "yes": True, "on": True,
+    "0": False, "f": False, "false": False, "n": False, "no": False, "off": False,
+}
+
+
+def _as_bool(value):
+    """`value` as the bool jobspy's pydantic model will coerce it to.
+
+    ScraperInput is a pydantic BaseModel, so it accepts the lax-mode spellings
+    of a bool — the tokens above, case-insensitively, plus 0/1 as int or float.
+    Anything else pydantic rejects outright, and so do we.
+
+    Surrounding whitespace is stripped, which pydantic does NOT do (`" true "`
+    is a ValidationError there). That is deliberate and cannot cause a
+    divergence: normalize_pass replaces the value with the bool returned here,
+    so jobspy is handed `True`, never the padded string. It turns a run-killing
+    ValidationError into the filter the user plainly meant.
+    """
+    # bool before int: isinstance(True, int) is True, and `True in (0, 1)` too.
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _BOOL_TOKENS.get(value.strip().lower(), _UNREADABLE)
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return _UNREADABLE
+
+
+def _as_int(value):
+    """`value` as the int jobspy's pydantic model will coerce it to.
+
+    Lax mode takes an int-valued str or float ("168", 168.0) and — worth knowing
+    before calling it a typo — a bool, where True becomes 1. `hours_old: true`
+    really does search the last one hour. Non-integral values are rejected.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            # Matches pydantic for signs, underscores and leading zeros, and
+            # rejects "0x10" and "" exactly as it does.
+            return int(text)
+        except ValueError:
+            pass
+        # Pydantic also takes an integral decimal string ("168.0"). It does NOT
+        # take the other things float() would stretch to — "1e3", "1.", ".5",
+        # "inf", "nan" — so this splits on the point rather than calling
+        # float(), which keeps all of them out for one reason instead of five.
+        # The drift test against TypeAdapter(int) is what surfaced the gap.
+        whole, point, frac = text.partition(".")
+        if not point or not frac.isdigit():
+            return _UNREADABLE
+        try:
+            return int(whole) if int(frac) == 0 else _UNREADABLE
+        except ValueError:
+            return _UNREADABLE
+    if isinstance(value, float):
+        # Also how inf and nan get rejected, as pydantic rejects them.
+        return int(value) if value.is_integer() else _UNREADABLE
+    return _UNREADABLE
+
+
+# How jobspy reads each mutex key, so normalize_pass can rewrite the value to
+# what the scrape will actually act on. Every MUTEX_KEYS entry needs one; the
+# pairing is pinned in tests/test_scrape.py so a new group option can't quietly
+# skip normalization.
+#
+# The scoping to these four keys is the whole reason this is safe.
+# pipeline.scrape.OPTIONAL_PARAMS forwards 16 keys on `is not None` precisely
+# because falsy values there are deliberate settings — `distance: 0`,
+# `offset: 0`, `verbose: 0`, `linkedin_fetch_description: false` — and dropping
+# them would silently restore jobspy's defaults. None of those are mutex keys.
+# For these four, falsy *is* "send no filter", because truthiness is exactly how
+# jobspy reads them. Dropping them here says what the config already said.
+_MUTEX_KEY_READERS = {
+    "hours_old": _as_int,    # ScraperInput.hours_old: int | None
+    "job_type": None,        # ScraperInput.job_type: JobType | None — jobspy
+                             # resolves the string itself and only truthiness
+                             # matters here, so there is nothing to coerce.
+    "is_remote": _as_bool,   # ScraperInput.is_remote: bool = False
+    "easy_apply": _as_bool,  # ScraperInput.easy_apply: bool | None
+}
+
+
+def normalize_pass(cfg: dict) -> dict:
+    """`cfg` with its mutually-exclusive options rewritten to what jobspy acts on.
+
+    One config key used to be read three different ways in one scrape flow:
+    truthiness here in limitation_conflict, `is not None` in
+    pipeline.scrape.OPTIONAL_PARAMS, and `is True` in scrape's filter_passes and
+    its per-row easy_apply tag. A value that was truthy but not `True` — the
+    quoted `easy_apply: "true"` a templated SEARCH_CONFIG_B64 or a hand edit
+    produces — was a live filter to jobspy, a conflict to us, and *not* an
+    easy-apply pass to `--easy-apply-only` or to the tag the UI's apply-button
+    gating reads. The mirror image was worse: `is_remote: "false"` is a truthy
+    Python str to a raw read and a falsy bool to pydantic, so we skipped a whole
+    pass over a filter jobspy would never have sent.
+
+    Normalizing once, on the way into a run, retires all of that. Each of the
+    four MUTEX_KEYS is rewritten to its jobspy-effective value and dropped when
+    that value is falsy — jobspy reads every one of them through truthiness, so
+    a falsy option sends no filter and an absent key sends no filter. Afterwards
+    `is not None`, truthiness and `is True` coincide on these keys and each call
+    site's local test stops mattering.
+
+    A value pydantic itself would reject (`easy_apply: maybe`) is left verbatim,
+    because guessing at it would either invent a filter the user never asked for
+    or hide the typo. It reaches jobspy's own validation, exactly as today.
+
+    Returns a new dict; `cfg` is not mutated.
+    """
+    out = dict(cfg)
+    for key, read in _MUTEX_KEY_READERS.items():
+        if key not in out:
+            continue
+        # An explicitly nulled option (`easy_apply:` with nothing after it) is
+        # read as absent, the same reading resolve_sites gives `sites:`. A None
+        # reader means the key needs no coercion, only its truthiness.
+        raw = out[key]
+        value = raw if raw is None or read is None else read(raw)
+        if value is _UNREADABLE:
+            continue
+        if value:
+            out[key] = value
+        else:
+            del out[key]
+    return out
+
+
 def limitation_conflict(cfg: dict) -> str | None:
     """The JobSpy mutual-exclusion rule this search pass breaks, or None.
 
@@ -156,6 +300,16 @@ def limitation_conflict(cfg: dict) -> str | None:
     Indeed is still bound by Indeed's rule, and a retired board is stripped
     before the scrape so nothing it would have accepted matters here.
     """
+    # Normalized here rather than by the caller, for the same reason the boards
+    # come from resolve_sites() below rather than from cfg["sites"] verbatim:
+    # this function is the anti-drift device — the scraper, the UI's save
+    # endpoint and the example-config guard all run it precisely so they cannot
+    # disagree — and a predicate whose answer depends on the caller having
+    # remembered a preparatory call is not that. normalize_pass is pure and
+    # idempotent, so callers that already normalized (scrape.run must, because
+    # the forwarded kwargs and the per-row tag need the rewritten dict) pay only
+    # a dict copy.
+    cfg = normalize_pass(cfg)
     sites = {s.lower() for s in resolve_sites(cfg)[0]}
     where = f"[{cfg['name']}] " if cfg.get("name") else ""
 
