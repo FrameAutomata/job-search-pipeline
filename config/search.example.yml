@@ -32,6 +32,9 @@ searches:
     # 403s every scripted request (they contribute zero rows), and Google Jobs
     # serves degraded responses then drops the connection mid-body, which
     # crashes JobSpy's Google scraper and kills the whole run.
+    # Default (if omitted): indeed + linkedin. Note this is a real default, not
+    # "unset" — an omitted `sites` counts as naming Indeed, so the Indeed
+    # mutex below (hours_old vs job_type/is_remote vs easy_apply) applies.
     sites:
       - indeed
       - linkedin

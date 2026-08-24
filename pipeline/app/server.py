@@ -585,9 +585,20 @@ def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     # Saved, but say so if some boards will be ignored — otherwise the run just
     # quietly returns fewer rows than the config implies. Order first seen,
     # de-duplicated across passes.
+    notes = []
     dropped = list(dict.fromkeys(name for _, names in resolved for name in names))
-    warning = (f"Saved, but these boards are not supported and will be ignored: "
-               f"{', '.join(dropped)}.") if dropped else None
+    if dropped:
+        notes.append("these boards are not supported and will be ignored: "
+                     f"{', '.join(dropped)}")
+    # A pass can lose every board without naming an unsupported one — `sites: []`
+    # resolves to nothing at all — so it would be skipped at run time with the
+    # board list above empty and the user told nothing was wrong.
+    skipped = [str(e.get("name") or "unnamed")
+               for e, (kept, _) in zip(entries, resolved) if not kept]
+    if skipped:
+        notes.append("these passes name no supported board and will be skipped: "
+                     f"{', '.join(skipped)}")
+    warning = f"Saved, but {'; '.join(notes)}." if notes else None
     return JSONResponse({"ok": True, "active": True, "warning": warning})
 
 

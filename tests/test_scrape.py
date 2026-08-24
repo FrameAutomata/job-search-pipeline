@@ -242,8 +242,50 @@ class TestStripUnsupportedSites:
         result = scrape_mod.strip_unsupported_sites(searches)
         assert result[0]["sites"] == list(scrape_mod.SUPPORTED_SITES)
 
+    def test_mutex_error_names_the_pass(self):
+        # An omitted `sites` is filled in with the supported boards upstream, so
+        # this fires on a pass whose own config never mentions Indeed.
+        cfg = {"name": "US Remote", "hours_old": 168, "is_remote": True,
+               "sites": ["indeed", "linkedin"]}
+        with pytest.raises(ValueError, match=r"\[US Remote\] Indeed limitation"):
+            scrape_mod.validate_limitations(cfg)
+
     def test_null_sites_does_not_crash_validate_limitations(self):
         scrape_mod.validate_limitations({"sites": None, "hours_old": 168})  # must not raise
+
+    def test_comma_separated_scalar_is_split(self):
+        # `sites: indeed, linkedin` unbracketed is ONE YAML string, and it is the
+        # shape the CLI wizard prompts for. Read whole it matches no board, so
+        # naming both supported boards used to drop the pass entirely.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed, linkedin"}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed", "linkedin"]
+
+    def test_comma_separated_scalar_still_drops_unsupported(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed, glassdoor"}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+
+    def test_trailing_comma_does_not_report_a_blank_board(self, capsys):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed,"}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+        assert capsys.readouterr().out == ""
+
+    def test_non_iterable_scalar_sites_does_not_crash(self):
+        # `sites: 5` — list(5) raises TypeError, which aborted the whole scrape
+        # stage instead of degrading to the documented warning.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": 5}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result == []      # nothing supported, so the pass is skipped
+
+    def test_null_entry_is_not_reported_as_a_board_named_none(self, capsys):
+        # `- ~` in the list stringified to "None", sending the user hunting for
+        # a board by that name.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": [None, "indeed"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+        assert capsys.readouterr().out == ""
 
     def test_input_list_is_not_mutated(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "google"]}]
