@@ -14,23 +14,28 @@ kill the whole run and discard every row already scraped.
 SUPPORTED_SITES = ("indeed", "linkedin")
 
 
-def is_supported(site) -> bool:
-    """Whether `site` names a supported board, ignoring case and surrounding space.
-
-    The one place the match is defined. Config files, the wizard form and
-    hand-written JSON all spell boards slightly differently, and every caller
-    needs to agree on which spellings count.
-    """
-    return str(site).strip().lower() in SUPPORTED_SITES
-
-
 def as_site_list(sites) -> list:
-    """A config's `sites` value as a list.
+    """A config's `sites` value as a list of entries.
 
     YAML allows a bare scalar — `sites: indeed` — which JobSpy accepts as a
     `site_name`. Iterating that directly walks it one character at a time.
+
+    A comma-separated scalar (`sites: indeed, linkedin`) is split on commas.
+    That is the shape the CLI wizard prompts for ("Which boards? Comma-
+    separated"), and unbracketed it is one YAML string — read whole it matches
+    no board, so a pass naming both supported boards would be dropped entirely.
+
+    A scalar that isn't iterable at all (`sites: 5`, `sites: true`) is wrapped
+    rather than exploded. `list(5)` raises TypeError, which would abort the
+    scrape stage with a traceback and turn the save endpoint's 400 into a 500 —
+    both callers promise to degrade to a warning instead.
     """
-    return [sites] if isinstance(sites, str) else list(sites)
+    if isinstance(sites, str):
+        return sites.split(",")
+    try:
+        return list(sites)
+    except TypeError:
+        return [sites]
 
 
 def partition_sites(sites) -> tuple[list, list]:
@@ -47,7 +52,13 @@ def partition_sites(sites) -> tuple[list, list]:
     """
     kept, dropped, seen = [], [], set()
     for s in as_site_list(sites):
+        # A null entry (`- ~`) or the blank left by a trailing comma names no
+        # board; reporting it would send the user hunting for one called "None".
+        if s is None:
+            continue
         name = str(s).strip()
+        if not name:
+            continue
         key = name.lower()
         if key in seen:
             continue

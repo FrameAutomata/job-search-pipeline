@@ -156,11 +156,14 @@ def validate_limitations(cfg: dict) -> None:
     is_remote   = cfg.get("is_remote")   is not None
     easy_apply  = cfg.get("easy_apply")  is not None
 
+    # Name the pass: an omitted `sites` is filled in with the supported boards
+    # upstream, so this can fire on a pass whose config never mentions Indeed.
+    where = f"[{cfg['name']}] " if cfg.get("name") else ""
     if "indeed" in sites:
         active = [hours_old, job_type or is_remote, easy_apply]
         if sum(active) > 1:
             raise ValueError(
-                "Indeed limitation: only ONE of the following groups "
+                f"{where}Indeed limitation: only ONE of the following groups "
                 "may be set per search:\n"
                 "  Group A — hours_old\n"
                 "  Group B — job_type and/or is_remote\n"
@@ -171,7 +174,7 @@ def validate_limitations(cfg: dict) -> None:
     if "linkedin" in sites:
         if hours_old and easy_apply:
             raise ValueError(
-                "LinkedIn limitation: only ONE of [hours_old] or [easy_apply] "
+                f"{where}LinkedIn limitation: only ONE of [hours_old] or [easy_apply] "
                 "may be set per search. Remove one from config/search.yml."
             )
 
