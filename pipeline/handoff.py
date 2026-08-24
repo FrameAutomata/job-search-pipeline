@@ -1324,6 +1324,11 @@ def render_profile_md(*, cv_md: str = "", profile: dict | None = None,
         "",
         "## Identity & contact",
         f"- **Name:** {cand.get('full_name') or '(add your name)'}",
+        # "Name" is the legal name; a preferred first name (what you go by, if it
+        # differs — Robert vs Bob) fills "First Name" while "Name" fills the legal
+        # fields. Only rendered when set, so most profiles stay clean.
+        *([f"- **Preferred first name:** {cand['preferred_first_name']}"]
+          if cand.get("preferred_first_name") else []),
         f"- **Contact:** {contact or '(add email · phone · location · links)'}",
         "",
         "## Positioning",

@@ -64,6 +64,34 @@ from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_e
 from pipeline.handoff import KNOWN_BOARDS  # noqa: E402
 
 
+def _run_apply_ladder(url: str, resume: Path | None) -> int:
+    """`--apply-ladder <url>`: fill one application through the deterministic tier
+    and report. Anything unanswered is left for the human with the form open."""
+    from pipeline import notify
+    from pipeline.apply_driver import run_apply_ladder
+    from pipeline.handoff import resolve_profile_md
+    from pipeline.openclaw_client import OpenClawBrowser
+
+    profile_md = resolve_profile_md()
+    if not profile_md:
+        print("error: no PROFILE.md found — run setup / the handoff bootstrap first.",
+              file=sys.stderr)
+        return 1
+    report = run_apply_ladder(url, profile_md, browser=OpenClawBrowser(),
+                              resume_path=str(resume) if resume else None,
+                              notifier=notify.notify)
+    print(f"[apply] {report.message}")
+    for label in report.filled:
+        print(f"  filled: {label}")
+    for line in report.needs_you:
+        print(f"  NEEDS YOU: {line}")
+    for label in report.optional:
+        print(f"  optional (blank): {label}")
+    if report.ok:
+        print("[apply] Review the form in your browser and submit.")
+    return 0 if report.ok else 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the job-search pipeline.")
     ap.add_argument("--skip-scrape", action="store_true", help="Reuse existing output/jobs.csv")
@@ -113,6 +141,11 @@ def main() -> int:
                          "between bursts) until the whole Evaluated backlog is "
                          "covered, instead of one budgeted sweep. For a manual "
                          "catch-up; the cloud workflow stays single-sweep.")
+    ap.add_argument("--apply-ladder", type=str, default=None, metavar="URL",
+                    help="Deterministic apply tier: fill the application at URL in your "
+                         "logged-in browser (via OpenClaw), stop at submit, report what needs you")
+    ap.add_argument("--apply-resume", type=Path, default=None,
+                    help="Resume PDF to attach for --apply-ladder (else the field escalates to you)")
     ap.add_argument("--config", type=Path, default=None, help="Path to search.yml")
     pass_group = ap.add_mutually_exclusive_group()
     pass_group.add_argument("--only-pass", type=str, default=None,
@@ -123,6 +156,9 @@ def main() -> int:
     pass_group.add_argument("--no-easy-apply", action="store_true",
                             help="Skip passes with `easy_apply: true`. Used by the daily cloud workflow.")
     args = ap.parse_args()
+
+    if args.apply_ladder:
+        return _run_apply_ladder(args.apply_ladder, args.apply_resume)
 
     only_passes: list[str] | None = None
     if args.only_pass:

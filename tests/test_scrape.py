@@ -153,6 +153,115 @@ search:
             scrape_mod.load_searches(nonexistent)
 
 
+class TestStripUnsupportedSites:
+    """Only indeed + linkedin are supported scrape sites. Glassdoor and
+    ZipRecruiter are Cloudflare-walled (403 on every request, zero rows), and
+    Google Jobs serves degraded responses then drops the connection mid-body —
+    which jobspy's Google scraper doesn't catch, killing the whole run.
+    strip_unsupported_sites removes them at load time so stale configs (e.g.
+    an old cloud SEARCH_CONFIG_B64 secret) can't crash or waste requests."""
+
+    def test_supported_sites_are_indeed_and_linkedin(self):
+        assert set(scrape_mod.SUPPORTED_SITES) == {"indeed", "linkedin"}
+
+    def test_drops_unsupported_sites_preserving_order(self):
+        searches = [{
+            "name": "p", "search_terms": ["a"],
+            "sites": ["glassdoor", "indeed", "zip_recruiter", "linkedin", "google"],
+        }]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed", "linkedin"]
+
+    def test_matching_is_case_insensitive(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["LinkedIn", "Google"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["LinkedIn"]
+
+    def test_pass_with_no_supported_sites_is_dropped(self):
+        searches = [
+            {"name": "dead", "search_terms": ["a"], "sites": ["google", "glassdoor"]},
+            {"name": "live", "search_terms": ["a"], "sites": ["indeed"]},
+        ]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert [s["name"] for s in result] == ["live"]
+
+    def test_all_supported_passes_come_back_unchanged(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "linkedin"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result == searches
+
+    def test_warning_names_the_dropped_sites_and_pass(self, capsys):
+        searches = [{"name": "US Remote", "search_terms": ["a"],
+                     "sites": ["indeed", "glassdoor", "google"]}]
+        scrape_mod.strip_unsupported_sites(searches)
+        out = capsys.readouterr().out
+        assert "glassdoor" in out and "google" in out
+        assert "US Remote" in out
+
+    def test_no_warning_when_nothing_dropped(self, capsys):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed"]}]
+        scrape_mod.strip_unsupported_sites(searches)
+        assert capsys.readouterr().out == ""
+
+    def test_missing_sites_key_left_alone(self):
+        # A pass with no sites key fails later the same way it does today —
+        # stripping shouldn't invent or remove the key.
+        searches = [{"name": "p", "search_terms": ["a"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result == searches
+
+    def test_input_list_is_not_mutated(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "google"]}]
+        scrape_mod.strip_unsupported_sites(searches)
+        assert searches[0]["sites"] == ["indeed", "google"]
+
+
+class TestRunStripsUnsupportedSites:
+    """run() applies the strip to whatever config it loads, so even a
+    hand-edited or stale config never reaches jobspy with a dead site."""
+
+    def test_run_scrapes_only_supported_sites(self, tmp_path, patch_scrape_paths, mocker):
+        config = tmp_path / "config.yml"
+        config.write_text("""
+searches:
+  - name: "test"
+    search_terms: ["software engineer"]
+    sites: [indeed, glassdoor, zip_recruiter, linkedin, google]
+    results_wanted: 50
+filter:
+  min_score: 5
+""")
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        assert mock_scrape.call_args[1]["site_name"] == ["indeed", "linkedin"]
+
+    def test_run_with_only_unsupported_sites_noops_cleanly(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # All passes stripped away → same clean no-op as "no searches matched":
+        # empty jobs.csv, no scrape_jobs call, downstream stages see zero rows.
+        config = tmp_path / "config.yml"
+        config.write_text("""
+searches:
+  - name: "test"
+    search_terms: ["software engineer"]
+    sites: [google, glassdoor]
+    results_wanted: 50
+filter:
+  min_score: 5
+""")
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs")
+
+        result = scrape_mod.run(config)
+
+        mock_scrape.assert_not_called()
+        assert result == patch_scrape_paths
+        assert patch_scrape_paths.exists()
+
+
 class TestValidateLimitations:
     """Test scrape.validate_limitations function."""
 

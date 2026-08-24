@@ -1532,6 +1532,86 @@ def handoff_role_prompt(num: str) -> JSONResponse:
     return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})
 
 
+# ── run the apply ladder (drive the user's browser via OpenClaw) ─────────────
+# Unlike the paste-prompt hand-off, this actually FILLS the application in the
+# user's logged-in browser and reports what's left. Single-flight (one apply at
+# a time — it drives the one shared relay) and never while a local run/handoff
+# build is touching the tracker or browser.
+_apply_task: dict | None = None
+_apply_lock = threading.Lock()
+
+
+def _finish_apply(job_id: str, **fields) -> None:
+    global _apply_task
+    with _apply_lock:
+        if _apply_task and _apply_task.get("id") == job_id:
+            _apply_task = {"id": job_id, **fields}
+
+
+def _run_apply(job_id: str, num: str) -> None:
+    try:
+        row = _find_role(num)
+        if row is None:
+            return _finish_apply(job_id, status="failed", error=f"No triaged role #{num}.")
+        url = data.extract_url(row.get("notes", ""))
+        if not url:
+            return _finish_apply(job_id, status="failed",
+                                 error="This role has no posting URL in its tracker notes.")
+        from pipeline import notify
+        from pipeline.apply_driver import run_apply_ladder
+        from pipeline.handoff import resolve_profile_md
+        from pipeline.openclaw_client import OpenClawBrowser
+        from pipeline.resume_tailor import find_existing
+
+        profile_md = resolve_profile_md()
+        if not profile_md:
+            return _finish_apply(job_id, status="failed",
+                                 error="No PROFILE.md found — finish setup first.")
+        resume = find_existing(_career_ops_local(), row.get("company", ""))
+        report = run_apply_ladder(
+            url, profile_md, browser=OpenClawBrowser(),
+            resume_path=str(resume) if resume else None, notifier=notify.notify)
+        _finish_apply(job_id, status="done", report={
+            "status": report.status, "message": report.message,
+            "filled": report.filled, "needs_you": report.needs_you,
+            "optional": report.optional, "blocker": report.blocker,
+        })
+    except Exception as exc:  # never wedge the slot in "running"
+        _finish_apply(job_id, status="failed", error=str(exc))
+
+
+class ApplyRunRequest(BaseModel):
+    num: str
+
+
+@app.post("/api/apply/run")
+def apply_run(req: ApplyRunRequest) -> JSONResponse:
+    """Fill ONE role's application in the user's browser via the apply ladder.
+    Runs in the background (minutes); poll /api/apply/run-status/<job_id>. On a
+    wall (CAPTCHA / sign-in) the ladder fires a desktop toast."""
+    _refuse_during_local_run()
+    global _apply_task
+    with _apply_lock:
+        if _apply_task and _apply_task.get("status") == "running":
+            raise HTTPException(status_code=409, detail="An apply run is already in progress.")
+        if _handoff_running():
+            raise HTTPException(status_code=409, detail="A work-order build is in progress.")
+        job_id = str(uuid.uuid4())
+        _apply_task = {"id": job_id, "status": "running"}
+    threading.Thread(target=_run_apply, args=(job_id, req.num), daemon=True).start()
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/api/apply/run-status/{job_id}")
+def apply_run_status(job_id: str) -> JSONResponse:
+    with _apply_lock:
+        task = dict(_apply_task) if _apply_task and _apply_task.get("id") == job_id else None
+    if task is None:
+        raise HTTPException(status_code=404, detail="Unknown apply task")
+    task.pop("id", None)
+    return JSONResponse(task)
+
+
 class _NoCacheStaticFiles(StaticFiles):
     """Serve SPA assets with Cache-Control: no-cache so the browser revalidates
     every load (conditional GET -> 304 when unchanged). Without this a cached

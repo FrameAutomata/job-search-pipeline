@@ -845,6 +845,72 @@ function renderSkillActions() {
   handoffBtn.title = "Copy a paste-ready prompt handing this role to your browser agent";
   handoffBtn.addEventListener("click", handoffRolePrompt);
   skillActions.appendChild(handoffBtn);
+
+  // ⚡ Apply drives the ladder in your own browser (via OpenClaw) instead of
+  // copying a prompt — fills what it can, tells you what's left, and toasts on
+  // a wall. Requires the OpenClaw relay connected to your browser.
+  const applyBtn = document.createElement("button");
+  applyBtn.id = "apply-run-btn";
+  applyBtn.textContent = "⚡ Apply";
+  applyBtn.title = "Fill this application in your logged-in browser via the apply ladder";
+  applyBtn.addEventListener("click", applyRole);
+  skillActions.appendChild(applyBtn);
+}
+
+// Drive the apply ladder for the selected role: POST, then poll until the
+// background run finishes, and render what filled / what still needs the human.
+async function applyRole() {
+  if (!selectedJob) return;
+  const btn = document.getElementById("apply-run-btn");
+  if (btn) btn.disabled = true;
+  showSkill("Opening the posting and filling what I can in your browser…", "");
+  try {
+    const start = await fetch("/api/apply/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ num: String(selectedJob.num) }),
+    });
+    const started = await start.json().catch(() => ({}));
+    if (!start.ok) throw new Error(started.detail || `apply failed (${start.status})`);
+    const done = await pollApply(started.job_id);
+    if (done.status === "failed") throw new Error(done.error || "apply run failed");
+    renderApplyReport(done.report);
+  } catch (e) {
+    showSkill(String(e.message || e), "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function pollApply(jobId) {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const resp = await fetch(`/api/apply/run-status/${encodeURIComponent(jobId)}`);
+    if (!resp.ok) throw new Error(`lost track of the apply run (${resp.status})`);
+    const body = await resp.json();
+    if (body.status === "done" || body.status === "failed") return body;
+  }
+}
+
+function renderApplyReport(rep) {
+  if (!rep) { showSkill("Apply run finished with no report.", "error"); return; }
+  const list = (items) => items.map((x) => `<li>${escapeHtml(x)}</li>`).join("");
+  const section = (title, items, cls) =>
+    items && items.length
+      ? `<p class="${cls}"><b>${title}</b></p><ul>${list(items)}</ul>` : "";
+  // A wall is the one thing the user must act on right now — lead with it.
+  const wall = rep.blocker
+    ? `<p class="error"><b>⚠ ${escapeHtml(rep.blocker)}</b> — take over in your browser, then re-run.</p>`
+    : "";
+  skillPanel.hidden = false;
+  skillPanel.className = "skill-panel" + (rep.blocker ? " error" : rep.status === "ready-to-submit" ? " ok" : "");
+  skillPanel.innerHTML =
+    wall +
+    `<p>${escapeHtml(rep.message || "")}</p>` +
+    section("Filled", rep.filled, "ok") +
+    section("Needs you", rep.needs_you, "error") +
+    section("Optional (left blank)", rep.optional, "hint") +
+    `<p class="hint">Review the form in your browser and submit — the ladder never submits for you.</p>`;
 }
 
 async function handoffRolePrompt() {
