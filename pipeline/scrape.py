@@ -8,7 +8,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES, as_site_list, is_supported, keep_supported
+from pipeline.sites import SUPPORTED_SITES, as_site_list, resolve_sites
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -41,21 +41,16 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
     Applied on the way into a run rather than only when a config is authored,
     so stale configs — e.g. a fork's old SEARCH_CONFIG_B64 cloud secret still
     listing glassdoor — degrade to a warning instead of wasted requests or a
-    crash."""
+    crash. The per-pass rule lives in pipeline.sites.resolve_sites, which the
+    UI validator also calls so its save-time warning can't drift from this."""
     result = []
     for cfg in searches:
-        sites = cfg.get("sites")
-        if sites is None:
-            result.append(cfg)
-            continue
-        listed = as_site_list(sites)
-        kept = keep_supported(listed)
-        dropped = [s for s in listed if not is_supported(s)]
+        kept, dropped = resolve_sites(cfg)
         name = cfg.get("name", "pass")
         if dropped:
             print(
                 f"[scrape] [{name}] dropping unsupported sites: "
-                f"{', '.join(str(s) for s in dropped)} "
+                f"{', '.join(dropped)} "
                 f"(supported: {', '.join(SUPPORTED_SITES)})",
                 flush=True,
             )
@@ -152,17 +147,23 @@ def validate_limitations(cfg: dict) -> None:
     LinkedIn: only one of these may be active:
       hours_old  OR  easy_apply
     """
-    sites = [s.lower() for s in cfg.get("sites", [])]
+    # `or []`, not a get() default: `sites:` with nothing after it puts a real
+    # None in the mapping, so the default never fires. as_site_list keeps a bare
+    # `sites: indeed` from being walked one character at a time.
+    sites = [str(s).strip().lower() for s in as_site_list(cfg.get("sites") or [])]
     hours_old   = cfg.get("hours_old")   is not None
     job_type    = cfg.get("job_type")    is not None
     is_remote   = cfg.get("is_remote")   is not None
     easy_apply  = cfg.get("easy_apply")  is not None
 
+    # Name the pass: an omitted `sites` is filled in with the supported boards
+    # upstream, so this can fire on a pass whose config never mentions Indeed.
+    where = f"[{cfg['name']}] " if cfg.get("name") else ""
     if "indeed" in sites:
         active = [hours_old, job_type or is_remote, easy_apply]
         if sum(active) > 1:
             raise ValueError(
-                "Indeed limitation: only ONE of the following groups "
+                f"{where}Indeed limitation: only ONE of the following groups "
                 "may be set per search:\n"
                 "  Group A — hours_old\n"
                 "  Group B — job_type and/or is_remote\n"
@@ -173,7 +174,7 @@ def validate_limitations(cfg: dict) -> None:
     if "linkedin" in sites:
         if hours_old and easy_apply:
             raise ValueError(
-                "LinkedIn limitation: only ONE of [hours_old] or [easy_apply] "
+                f"{where}LinkedIn limitation: only ONE of [hours_old] or [easy_apply] "
                 "may be set per search. Remove one from config/search.yml."
             )
 

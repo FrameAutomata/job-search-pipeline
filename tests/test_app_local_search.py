@@ -138,3 +138,93 @@ def test_delete_is_idempotent_when_absent(client):
     r = c.delete("/api/local-search")
     assert r.status_code == 200
     assert r.json()["active"] is False
+
+
+# ── supported-board validation ──────────────────────────────────────────────
+# A config listing only retired boards parses fine and loads fine — it just
+# scrapes nothing, silently. These pin the save-time feedback.
+
+
+def test_post_rejects_config_that_would_scrape_nothing(client):
+    c, root = client
+    content = "searches:\n  - name: dead\n    search_terms: [go]\n    sites: [glassdoor, google]\n"
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "supported board" in r.json()["detail"]
+    assert not _local_file(root).exists()      # nothing written on reject
+
+
+def test_post_saves_with_warning_when_some_boards_unsupported(client):
+    c, root = client
+    content = ("searches:\n  - name: mixed\n    search_terms: [go]\n"
+               "    sites: [indeed, glassdoor]\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active"] is True
+    assert "glassdoor" in body["warning"]
+    assert _local_file(root).read_text(encoding="utf-8") == content
+
+
+def test_post_has_no_warning_when_every_board_supported(client):
+    c, root = client
+    content = "searches:\n  - name: ok\n    search_terms: [go]\n    sites: [indeed, linkedin]\n"
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    assert r.json()["warning"] is None
+
+
+def test_post_accepts_pass_without_sites_key(client):
+    # No `sites` key inherits the supported boards at scrape time, so it is
+    # survivable and must not be rejected as scraping nothing.
+    c, root = client
+    r = c.post("/api/local-search",
+               json={"content": "searches:\n  - name: p\n    search_terms: [go]\n"})
+    assert r.status_code == 200
+    assert r.json()["warning"] is None
+
+
+def test_post_survives_one_good_pass_among_dead_ones(client):
+    c, root = client
+    content = ("searches:\n"
+               "  - name: dead\n    search_terms: [go]\n    sites: [glassdoor]\n"
+               "  - name: live\n    search_terms: [go]\n    sites: [indeed]\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    assert "glassdoor" in r.json()["warning"]
+
+
+def test_post_warns_when_a_pass_has_an_empty_sites_list(client):
+    # `sites: []` names no unsupported board, so it contributed nothing to the
+    # dropped-board list and saved with no warning at all — then vanished at run
+    # time. The user must be told the pass will be skipped.
+    c, root = client
+    content = ("searches:\n"
+               "  - name: empty\n    search_terms: [go]\n    sites: []\n"
+               "  - name: live\n    search_terms: [go]\n    sites: [indeed]\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    warning = r.json()["warning"]
+    assert "empty" in warning and "skipped" in warning
+
+
+def test_post_accepts_comma_separated_scalar_sites(client):
+    # The CLI wizard prompts comma-separated; unbracketed this is one YAML
+    # string that matched no board, so a config naming both supported boards
+    # was rejected as scraping nothing.
+    c, root = client
+    r = c.post("/api/local-search", json={
+        "content": "searches:\n  - name: p\n    search_terms: [go]\n    sites: indeed, linkedin\n"})
+    assert r.status_code == 200
+    assert r.json()["warning"] is None
+
+
+def test_post_rejects_non_iterable_sites_with_400_not_500(client):
+    # `sites: 5` raised TypeError out of the endpoint — an unhandled 500, when
+    # the whole point of this route is to reject bad configs with a message.
+    c, root = client
+    r = c.post("/api/local-search", json={
+        "content": "searches:\n  - name: p\n    search_terms: [go]\n    sites: 5\n"})
+    assert r.status_code == 400
+    assert "supported board" in r.json()["detail"]
+    assert not _local_file(root).exists()

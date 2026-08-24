@@ -46,6 +46,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
+from pipeline.sites import SUPPORTED_SITES, resolve_sites
 from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -557,20 +558,48 @@ def local_search_get() -> JSONResponse:
 def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     """Validate and write the local override. Rejects anything that wouldn't load
     as a search config so the next run can't choke on a broken file — including a
-    non-mapping or empty search entry, which would crash scrape, not no-op."""
+    non-mapping or empty search entry, which would crash scrape, not no-op — and
+    anything that would scrape nothing because every pass names retired boards."""
     import yaml
     try:
         parsed = yaml.safe_load(req.content)
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Not valid YAML: {e}")
-    if _search_entries(parsed) is None:
+    entries = _search_entries(parsed)
+    if entries is None:
         raise HTTPException(status_code=400,
                             detail="Config must have a non-empty `searches:` list of search "
                                    "mappings (or a single legacy `search:` mapping).")
+    # resolve_sites is the rule the scraper itself applies per pass (including
+    # "no `sites` key inherits the supported boards"), so what we reject here and
+    # what we warn about can't drift from what the next run actually does.
+    resolved = [resolve_sites(e) for e in entries]
+    if not any(kept for kept, _ in resolved):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No pass names a supported board, so this config would scrape "
+                   f"nothing. Supported: {', '.join(SUPPORTED_SITES)}.")
     local = _local_search_path()
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(req.content, encoding="utf-8")
-    return JSONResponse({"ok": True, "active": True})
+    # Saved, but say so if some boards will be ignored — otherwise the run just
+    # quietly returns fewer rows than the config implies. Order first seen,
+    # de-duplicated across passes.
+    notes = []
+    dropped = list(dict.fromkeys(name for _, names in resolved for name in names))
+    if dropped:
+        notes.append("these boards are not supported and will be ignored: "
+                     f"{', '.join(dropped)}")
+    # A pass can lose every board without naming an unsupported one — `sites: []`
+    # resolves to nothing at all — so it would be skipped at run time with the
+    # board list above empty and the user told nothing was wrong.
+    skipped = [str(e.get("name") or "unnamed")
+               for e, (kept, _) in zip(entries, resolved) if not kept]
+    if skipped:
+        notes.append("these passes name no supported board and will be skipped: "
+                     f"{', '.join(skipped)}")
+    warning = f"Saved, but {'; '.join(notes)}." if notes else None
+    return JSONResponse({"ok": True, "active": True, "warning": warning})
 
 
 @app.delete("/api/local-search")
