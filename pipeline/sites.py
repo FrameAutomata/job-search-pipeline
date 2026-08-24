@@ -112,7 +112,19 @@ def limitation_conflict(cfg: dict) -> str | None:
 
     Indeed accepts only ONE of (A) hours_old, (B) job_type and/or is_remote,
     (C) easy_apply per search; LinkedIn only one of hours_old or easy_apply.
-    Combining them makes jobspy raise, which used to abort the scrape stage.
+    Combining them used to raise out of the scrape stage; in python-jobspy
+    1.1.82 Indeed's builder is a precedence chain instead (hours_old, elif
+    easy_apply, elif job_type/is_remote), so the loser is dropped in silence.
+    Either way the pass does not search what it says it searches.
+
+    An option counts as set only when its value is TRUTHY, because truthiness
+    is what jobspy reads it through: `elif self.scraper_input.easy_apply:`
+    (indeed), `"f_AL": "true" if scraper_input.easy_apply else None` and
+    `hours_old * 3600 if hours_old else None` (linkedin). `easy_apply: false`
+    and `hours_old: 0` therefore send no filter at all, and testing
+    `is not None` here cost the user a whole pass over an option that never
+    reached the wire — turning a filter off being the obvious reason to
+    write `false` in the first place.
 
     Lives here, in the dependency-free leaf, so the UI venv — which installs
     neither jobspy nor pandas and so cannot import pipeline.scrape at all — can
@@ -131,10 +143,10 @@ def limitation_conflict(cfg: dict) -> str | None:
     for board, (label, groups) in MUTEX_GROUPS.items():
         if board not in sites:
             continue
-        active = [g for g in groups if any(cfg.get(k) is not None for k in g)]
+        active = [g for g in groups if any(cfg.get(k) for k in g)]
         if len(active) < 2:
             continue
-        set_here = ", ".join(k for g in active for k in g if cfg.get(k) is not None)
+        set_here = ", ".join(k for g in active for k in g if cfg.get(k))
         allowed = " | ".join(" and/or ".join(g) for g in groups)
         return (
             f"{where}{label} limitation: only ONE of [{allowed}] may be set per "

@@ -334,6 +334,16 @@ filter:
         assert patch_scrape_paths.read_text(encoding="utf-8") == ""
 
 
+def _sets_clause(msg: str) -> str:
+    """The options limitation_conflict names as the offenders in `msg`.
+
+    The full message also spells out every option in every group ("only ONE of
+    [hours_old | job_type and/or is_remote | easy_apply]"), so a substring test
+    against the whole string passes no matter which keys the rule blames.
+    """
+    return msg.split("this pass sets ", 1)[1].removesuffix(". Remove all but one.")
+
+
 class TestLimitationConflict:
     """pipeline.sites.limitation_conflict — JobSpy's per-pass mutual-exclusion
     rule, returning the message so the scraper can skip the pass and the UI's
@@ -372,17 +382,33 @@ class TestLimitationConflict:
 
     def test_message_names_the_options_actually_set(self):
         # "one of these groups" alone leaves the user diffing their config
-        # against the rule; name the offending keys.
+        # against the rule; name the offending keys. Read the clause rather
+        # than the whole message — `allowed` lists every option in every group,
+        # so `"is_remote" in msg` holds however the offenders are computed.
         cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": True}
-        msg = limitation_conflict(cfg)
-        assert "hours_old" in msg and "is_remote" in msg
+        assert _sets_clause(limitation_conflict(cfg)) == "hours_old, is_remote"
 
-    def test_false_still_counts_as_set(self):
-        # JobSpy sees the kwarg either way — `easy_apply: false` is passed
-        # through by OPTIONAL_PARAMS (which tests `is not None`), so it
-        # conflicts exactly like `true` does.
+    def test_explicitly_off_is_not_a_conflict(self):
+        # `easy_apply: false` asks for no easy-apply filter, and jobspy reads
+        # the value for truthiness — nothing goes on the wire either way. The
+        # user asked for one filter (hours_old) and used to be charged the
+        # whole pass for saying out loud that they didn't want the other.
         cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": False}
-        assert "Indeed limitation" in limitation_conflict(cfg)
+        assert limitation_conflict(cfg) is None
+
+    def test_zero_is_not_a_conflict(self):
+        # Same rule for the numeric option: `hours_old * 3600 if hours_old`
+        # makes 0 a no-op, not "posted in the last zero hours".
+        cfg = {"sites": ["indeed"], "hours_old": 0, "is_remote": True}
+        assert limitation_conflict(cfg) is None
+
+    def test_an_off_option_is_not_named_among_the_offenders(self):
+        # is_remote shares Group B with job_type, so the group is active on
+        # job_type alone — but telling the user to remove an option they had
+        # already turned off sends them to edit the wrong line.
+        cfg = {"sites": ["indeed"], "hours_old": 168, "job_type": "fulltime",
+               "is_remote": False}
+        assert _sets_clause(limitation_conflict(cfg)) == "hours_old, job_type"
 
     def test_linkedin_hours_old_and_easy_apply_conflicts(self):
         cfg = {"sites": ["linkedin"], "hours_old": 168, "easy_apply": True}
