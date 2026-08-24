@@ -33,21 +33,46 @@ def as_site_list(sites) -> list:
     return [sites] if isinstance(sites, str) else list(sites)
 
 
-def keep_supported(sites) -> list:
-    """The supported entries of `sites`, trimmed and de-duplicated.
+def partition_sites(sites) -> tuple[list, list]:
+    """`sites` split into (supported, unsupported), each trimmed and de-duplicated.
+
+    Callers want both halves — the scraper prints what it drops, the UI warns
+    about it — so they are produced together rather than each caller inverting
+    the filter for itself.
 
     Case is left as written — JobSpy resolves the board with `Site[name.upper()]`
     — but surrounding whitespace is stripped, because that same lookup raises
     KeyError on `" LINKEDIN "`. Case-variant repeats collapse so a board named
     twice is not scraped twice.
     """
-    kept, seen = [], set()
+    kept, dropped, seen = [], [], set()
     for s in as_site_list(sites):
-        if not is_supported(s):
-            continue
         name = str(s).strip()
-        if name.lower() in seen:
+        key = name.lower()
+        if key in seen:
             continue
-        seen.add(name.lower())
-        kept.append(name)
-    return kept
+        seen.add(key)
+        (kept if key in SUPPORTED_SITES else dropped).append(name)
+    return kept, dropped
+
+
+def keep_supported(sites) -> list:
+    """Just the supported entries of `sites`, trimmed and de-duplicated."""
+    return partition_sites(sites)[0]
+
+
+def resolve_sites(cfg: dict) -> tuple[list, list]:
+    """The (supported, unsupported) boards one search pass would actually scrape.
+
+    The per-pass rule itself, so the scraper (which enforces it) and the UI
+    validator (which has to predict it before writing a config) can't drift.
+
+    A missing or explicitly null `sites` inherits the supported set rather than
+    passing through: left as None, jobspy's get_site_type() falls back to
+    list(Site) — every board, including the ones retired here — and
+    validate_limitations raises TypeError iterating it first.
+    """
+    sites = cfg.get("sites")
+    if sites is None:
+        return list(SUPPORTED_SITES), []
+    return partition_sites(sites)

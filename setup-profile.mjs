@@ -765,7 +765,7 @@ async function promptForSearchSettings(autoMode) {
   console.log('   (Glassdoor/ZipRecruiter are Cloudflare-blocked and Google Jobs');
   console.log('   drops connections that crash the scraper — no longer offered.)');
   const sitesInput = await prompt(`[${SUPPORTED_SITES.join(', ')}]\n→ `);
-  if (sitesInput) settings.sites = supportedSitesOrDefault(sitesInput.split(','));
+  if (sitesInput) settings.sites = supportedSitesOrDefault(sitesInput);
 
   // ── easy-apply pass ────────────────────────────────────────────────────
   const easyInput = await prompt(

@@ -8,7 +8,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES, as_site_list, is_supported, keep_supported
+from pipeline.sites import SUPPORTED_SITES, as_site_list, resolve_sites
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -41,25 +41,16 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
     Applied on the way into a run rather than only when a config is authored,
     so stale configs — e.g. a fork's old SEARCH_CONFIG_B64 cloud secret still
     listing glassdoor — degrade to a warning instead of wasted requests or a
-    crash."""
+    crash. The per-pass rule lives in pipeline.sites.resolve_sites, which the
+    UI validator also calls so its save-time warning can't drift from this."""
     result = []
     for cfg in searches:
-        sites = cfg.get("sites")
-        if sites is None:
-            # Missing or explicitly null. Not harmless to pass through: jobspy's
-            # get_site_type() falls back to list(Site) — every board, including
-            # the ones retired here — when site_name is None, and
-            # validate_limitations raises TypeError iterating it first.
-            result.append({**cfg, "sites": list(SUPPORTED_SITES)})
-            continue
-        listed = as_site_list(sites)
-        kept = keep_supported(listed)
-        dropped = [s for s in listed if not is_supported(s)]
+        kept, dropped = resolve_sites(cfg)
         name = cfg.get("name", "pass")
         if dropped:
             print(
                 f"[scrape] [{name}] dropping unsupported sites: "
-                f"{', '.join(str(s) for s in dropped)} "
+                f"{', '.join(dropped)} "
                 f"(supported: {', '.join(SUPPORTED_SITES)})",
                 flush=True,
             )
@@ -157,9 +148,9 @@ def validate_limitations(cfg: dict) -> None:
       hours_old  OR  easy_apply
     """
     # `or []`, not a get() default: `sites:` with nothing after it puts a real
-    # None in the mapping, so the default never fires and the comprehension
-    # raises TypeError.
-    sites = [str(s).strip().lower() for s in cfg.get("sites") or []]
+    # None in the mapping, so the default never fires. as_site_list keeps a bare
+    # `sites: indeed` from being walked one character at a time.
+    sites = [str(s).strip().lower() for s in as_site_list(cfg.get("sites") or [])]
     hours_old   = cfg.get("hours_old")   is not None
     job_type    = cfg.get("job_type")    is not None
     is_remote   = cfg.get("is_remote")   is not None
