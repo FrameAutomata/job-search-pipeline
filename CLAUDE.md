@@ -97,8 +97,8 @@ searches:
     results_wanted: 50
     location: "Dallas, TX"
     hours_old: 168 # mutually exclusive with job_type/is_remote/easy_apply on Indeed
-    is_remote: true
-    easy_apply: false
+    # is_remote: true   # a second group — uncommenting either of these makes the
+    # easy_apply: true  # pass conflict with hours_old above and be skipped
     linkedin_fetch_description: false # see "Description backfill" below
 
 filter:

@@ -67,6 +67,10 @@ searches:
     # (the rest of the run continues) — so a conflict costs you that search
     # silently unless you read the log. The UI's local-config editor refuses to
     # save one at all.
+    #
+    # An option counts as SET whenever the key is present, whatever its value:
+    # `easy_apply: false` activates Group C exactly like `true` does. To turn an
+    # option off, comment the line out — don't set it to false.
 
     # Options: fulltime, parttime, internship, contract
     # job_type: fulltime
@@ -74,9 +78,10 @@ searches:
     # true = remote only, false = in-person only, omit = all.
     # is_remote: true
 
-    # Filter to jobs with one-click apply (hosted on the board).
+    # Filter to jobs with one-click apply (hosted on the board). Uncommenting
+    # this here conflicts with hours_old below — see Pass 3 for the split.
     # Note: LinkedIn easy apply filter no longer works.
-    # easy_apply: false
+    # easy_apply: true
 
     # How old job postings can be (hours). Mutually exclusive with
     # job_type/is_remote and easy_apply on Indeed; mutually exclusive with
