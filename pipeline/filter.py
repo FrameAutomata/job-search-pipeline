@@ -304,6 +304,21 @@ def _score_job(
     return score, matched
 
 
+def _no_results(message: str) -> Path:
+    """Report `message`, truncate the output, and hand back its path.
+
+    The truncation is the point, not a detail. Leaving the previous run's
+    filtered_jobs.csv in place is #106 one stage down — screen and bridge would
+    re-process yesterday's rows as today's results. Every "nothing survived"
+    exit in run() goes through here, so a fourth one can't be added without it.
+
+    OUTPUT_PATH is read at call time, which is what the tests rebind.
+    """
+    print(message)
+    OUTPUT_PATH.write_text("", encoding="utf-8")
+    return OUTPUT_PATH
+
+
 def run(config_path: Path) -> Path:
     cfg = load_config(config_path)
     fcfg = cfg["filter"]
@@ -323,6 +338,47 @@ def run(config_path: Path) -> Path:
 
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
+
+    # Take the cuts that need only the config BEFORE resolving the resume. The
+    # win isn't speed — a YAKE pass on a two-page CV measures ~11ms, and
+    # _keywords.json caches it locally. It's that the resume work can FAIL: the
+    # gate used to sit above the CSV read, so a fork whose RESUME_TXT_B64 didn't
+    # decode reddened the daily on precisely the days the scrape came back
+    # empty, reporting two unrelated problems as one. Since #106 a zero-row
+    # scrape truncates jobs.csv rather than leaving the previous run's file, so
+    # that is the ordinary shape of a throttled morning rather than a rare one.
+    #
+    # A new cut that reads only config belongs in this loop, not the scoring one
+    # below. The standing exception is negative_titles, which stays inside
+    # _score_job because score_job() is the documented public entry point and
+    # promises to apply it.
+    scraped = 0
+    candidates = []
+    too_old = 0
+    ineligible = 0
+    with open(JOBS_PATH, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            scraped += 1
+            if cutoff:
+                posted = parse_date_posted(row.get("date_posted") or "")
+                if posted is not None and posted < cutoff:
+                    too_old += 1
+                    continue
+            if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
+                ineligible += 1
+                continue
+            candidates.append(row)
+
+    if not scraped:
+        # Named as an empty scrape rather than left to fall through to the
+        # min_score message below, which reads as a threshold to lower.
+        return _no_results(f"[filter] {JOBS_PATH.name} has no rows — nothing to filter")
+
+    if not candidates:
+        return _no_results(
+            f"[filter] nothing left to score of {scraped} scraped "
+            f"({ineligible} ineligible, {too_old} too old)"
+        )
 
     # Resolve via _resolve_resume_path so an unset RESUME_PATH still discovers a
     # dropped resume.docx/resume.odt, not just resume.pdf. An explicitly empty
@@ -365,40 +421,27 @@ def run(config_path: Path) -> Path:
 
     jobs = []
     excluded = 0
-    too_old = 0
-    ineligible = 0
-    with open(JOBS_PATH, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if cutoff:
-                posted = parse_date_posted(row.get("date_posted") or "")
-                if posted is not None and posted < cutoff:
-                    too_old += 1
-                    continue
-            if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
-                ineligible += 1
-                continue
-            result = _score_job(
-                row, keywords, keyword_pattern, target_pattern, negative_pattern, target_lookup,
-            )
-            if result is None:
-                excluded += 1
-                continue
-            score, matches = result
-            row["relevance_score"] = score
-            row["matched_keywords"] = ", ".join(matches)
-            jobs.append(row)
+    for row in candidates:
+        result = _score_job(
+            row, keywords, keyword_pattern, target_pattern, negative_pattern, target_lookup,
+        )
+        if result is None:
+            excluded += 1
+            continue
+        score, matches = result
+        row["relevance_score"] = score
+        row["matched_keywords"] = ", ".join(matches)
+        jobs.append(row)
 
     relevant = [j for j in jobs if j["relevance_score"] >= min_score]
     relevant.sort(key=lambda r: r["relevance_score"], reverse=True)
 
     if not relevant:
-        print(
+        return _no_results(
             f"[filter] no jobs scored >= {min_score} "
             f"(of {len(jobs)} scored, {excluded} negative-excluded, "
             f"{ineligible} ineligible, {too_old} too old)"
         )
-        OUTPUT_PATH.write_text("", encoding="utf-8")
-        return OUTPUT_PATH
 
     summary_cols = [
         "title", "company", "location", "is_remote",

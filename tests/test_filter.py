@@ -469,6 +469,64 @@ filter:
 
         assert output_path.read_text() == ""
 
+    def test_zero_byte_jobs_csv_does_not_need_a_resume(
+        self, patch_filter_paths, filtered_csv, monkeypatch
+    ):
+        """A missing resume is not a reason to fail a run with nothing to score.
+
+        The resume gate used to sit above the CSV read, so a fork whose
+        RESUME_TXT_B64 failed to decode reddened the daily on exactly the days
+        the scrape came back empty — two unrelated problems reported as one."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text("", encoding="utf-8")
+        output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setenv("RESUME_PATH", "/nonexistent/resume.pdf")
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+""")
+
+        assert filter_mod.run(config) == output_path
+        assert output_path.read_text() == ""
+
+    def test_run_skips_the_resume_work_when_every_row_is_pre_filtered(
+        self, jobs_csv, patch_filter_paths, filtered_csv, monkeypatch
+    ):
+        """The date and location cuts need no keywords, so when they leave
+        nothing behind the resume work is skipped too — the truncated-scrape
+        case above is just the extreme of it.
+
+        Probed the same way as its sibling, with a resume that isn't there:
+        reaching the resume block at all raises, so completing proves it was
+        never entered. Every fixture row is dated 2026-05, so a one-hour
+        max_age_hours ages all five out."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv.read_text())
+        output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setenv("RESUME_PATH", "/nonexistent/resume.pdf")
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+  max_age_hours: 1
+""")
+
+        assert filter_mod.run(config) == output_path
+        assert output_path.read_text() == ""
+
     def test_run_returns_output_path(
         self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
