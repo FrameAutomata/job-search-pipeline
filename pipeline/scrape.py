@@ -224,10 +224,10 @@ def run(
     combined = mark_easy_apply(combined)
     before = len(combined)
     combined = combined.drop_duplicates(subset=["job_url"])
-    print(f"[scrape] {before} rows -> {len(combined)} after dedup")
+    print(f"[scrape] {before} rows -> {len(combined)} after dedup", flush=True)
 
     combined.to_csv(OUTPUT_PATH, index=False)
-    print(f"[scrape] wrote {OUTPUT_PATH}")
+    print(f"[scrape] wrote {OUTPUT_PATH}", flush=True)
     return OUTPUT_PATH
 
 
