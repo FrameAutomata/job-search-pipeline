@@ -211,9 +211,14 @@ These flags are for ad-hoc local runs; the daily cloud workflow runs **every** p
 > truncates `output/jobs.csv` rather than leaving the previous run's rows behind to
 > be re-processed as today's results. JobSpy swallows rate-limit responses
 > (403/429/999) and returns an empty result instead of raising, so a throttled
-> overnight run is indistinguishable from a genuine zero-result day: the run exits 0
-> and `jobs.csv` is 0 bytes. If a re-drive comes back with nothing, check the size of
-> `output/jobs.csv` before adjusting your filters.
+> overnight run produces the same 0-byte `jobs.csv` as a genuine zero-result day,
+> and the run exits 0 either way. If a re-drive comes back with nothing, check the
+> size of `output/jobs.csv` before adjusting your filters — and to tell the two
+> apart, scroll up in the same run log: JobSpy logs the refusal itself, e.g.
+> `429 Response - Blocked by LinkedIn for too many requests` or Indeed's
+> `responded with status code: 403`. Filters are worth touching only if neither
+> appears. The same caveat applies to `--skip-filter` and `output/filtered_jobs.csv`,
+> which is truncated whenever nothing survives the filter.
 
 ## Local triage UI
 
