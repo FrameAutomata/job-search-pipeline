@@ -9,6 +9,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
+from pipeline.rowio import write_rows
 from pipeline.sites import (
     SUPPORTED_SITES,
     limitation_conflict,
@@ -185,6 +186,19 @@ def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
     return result
 
 
+def _no_results(reason: str) -> Path:
+    """Report `reason`, truncate jobs.csv, and hand back its path.
+
+    Mirrors pipeline.filter._no_results and exists for the same reason: both of
+    run()'s "nothing to write" exits go through here, so a third can't be added
+    without the truncation. Why it must truncate — and why zero bytes rather
+    than a header — is pipeline.rowio's contract.
+    """
+    print(f"[scrape] {reason} — writing empty jobs.csv", flush=True)
+    write_rows(OUTPUT_PATH, [])
+    return OUTPUT_PATH
+
+
 def run(
     config_path: Path,
     only_passes: list[str] | None = None,
@@ -203,7 +217,6 @@ def run(
         no_easy_apply=no_easy_apply,
     )
     searches = drop_conflicting_passes(strip_unsupported_sites(selected))
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not searches:
         # No matching passes — truncate jobs.csv so downstream stages no-op
@@ -216,9 +229,7 @@ def run(
             if selected
             else "no searches matched the active filters"
         )
-        print(f"[scrape] {reason} — writing empty jobs.csv", flush=True)
-        OUTPUT_PATH.write_text("", encoding="utf-8")
-        return OUTPUT_PATH
+        return _no_results(reason)
 
     if only_passes or easy_apply_only or no_easy_apply:
         names = ", ".join(repr(s.get("name", "")) for s in searches)
@@ -255,15 +266,16 @@ def run(
         # after every throttled morning. Silently re-evaluating yesterday's
         # rows is the worse failure, and losing a raw intermediate costs one
         # re-scrape. Documented so the trade isn't rediscovered from scratch.
-        print("[scrape] no jobs returned — writing empty jobs.csv", flush=True)
-        OUTPUT_PATH.write_text("", encoding="utf-8")
-        return OUTPUT_PATH
+        return _no_results("no jobs returned")
 
     combined = mark_easy_apply(combined)
     before = len(combined)
     combined = combined.drop_duplicates(subset=["job_url"])
     print(f"[scrape] {before} rows -> {len(combined)} after dedup", flush=True)
 
+    # The happy path is the only writer left that isn't write_rows (pandas owns
+    # the column set here), so it is also the only one still needing this.
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(OUTPUT_PATH, index=False)
     print(f"[scrape] wrote {OUTPUT_PATH}", flush=True)
     return OUTPUT_PATH

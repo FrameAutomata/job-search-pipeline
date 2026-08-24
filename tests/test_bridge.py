@@ -363,23 +363,28 @@ class TestAppendToScanHistory:
 class TestRun:
     """Test bridge.run function."""
 
-    def test_run_missing_filtered_csv_returns_zero(self, career_ops_dir, monkeypatch, tmp_path):
-        """Missing filtered_jobs.csv returns empty list."""
-        nonexistent = tmp_path / "nonexistent.csv"
-        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", nonexistent)
+    @pytest.mark.parametrize(
+        "seed",
+        [None, "", "title,company,job_url,relevance_score\n"],
+        ids=["missing", "zero-byte", "header-only"],
+    )
+    def test_run_with_no_rows_returns_empty(
+        self, career_ops_dir, monkeypatch, tmp_path, seed
+    ):
+        """All three "produced nothing" shapes are one condition to bridge.
 
-        result = bridge_mod.run(career_ops_dir)
-        assert result == []
-
-    def test_run_empty_filtered_csv_returns_zero(self, career_ops_dir, monkeypatch, tmp_path):
-        """Empty filtered_jobs.csv returns empty list."""
+        Header-only is the case that used to differ: it is the shape screen
+        wrote on its all-seen path, and bridge's old `st_size == 0` test read it
+        as a file with content — so bridge announced it was bridging and then
+        found no rows. read_rows collapses the three, so they are parametrized
+        rather than written out as three tests asserting one line.
+        """
         filtered = tmp_path / "filtered_jobs.csv"
-        filtered.write_text("")
-
+        if seed is not None:
+            filtered.write_text(seed, encoding="utf-8")
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
-        result = bridge_mod.run(career_ops_dir)
-        assert result == []
+        assert bridge_mod.run(career_ops_dir) == []
 
     def test_run_missing_career_ops_raises(self, tmp_path, monkeypatch):
         """Missing career_ops_path raises FileNotFoundError."""

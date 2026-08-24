@@ -197,25 +197,33 @@ class TestClassifyLiveness:
         assert result == "expired"
 
 
+def write_filtered_csv(path: Path, rows: list[dict]) -> None:
+    """A filtered_jobs.csv with the columns the screen stage reads.
+
+    Module-level so the run() test classes share one copy — the column list is
+    what the stage screens against, and it had started accumulating a copy per
+    class.
+    """
+    fieldnames = ["title", "company", "job_url", "relevance_score"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_screen_config(path: Path, liveness: bool = False, timeout: int = 8) -> None:
+    path.write_text(
+        f"screen:\n  liveness: {'true' if liveness else 'false'}\n  liveness_timeout: {timeout}\n",
+        encoding="utf-8",
+    )
+
+
 class TestRunScreen:
-    def _write_filtered_csv(self, path: Path, rows: list[dict]) -> None:
-        fieldnames = ["title", "company", "job_url", "relevance_score"]
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-    def _write_config(self, path: Path, liveness: bool = False, timeout: int = 8) -> None:
-        path.write_text(
-            f"screen:\n  liveness: {'true' if liveness else 'false'}\n  liveness_timeout: {timeout}\n",
-            encoding="utf-8",
-        )
-
     def test_liveness_disabled_is_noop(self, tmp_path, monkeypatch):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg, liveness=False)
+        write_screen_config(cfg, liveness=False)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_csv(filtered, [
+        write_filtered_csv(filtered, [
             {"title": "Eng", "company": "Acme", "job_url": "https://job.com", "relevance_score": 8},
         ])
         monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
@@ -227,7 +235,7 @@ class TestRunScreen:
 
     def test_missing_csv_returns_zero(self, tmp_path, monkeypatch):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg, liveness=True)
+        write_screen_config(cfg, liveness=True)
         monkeypatch.setattr(screen_mod, "FILTERED_PATH", tmp_path / "nonexistent.csv")
         result = run(cfg)
         assert result == 0
@@ -239,7 +247,7 @@ class TestRunScreen:
         from pipeline.bridge import load_easy_apply_urls
 
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg, liveness=True)
+        write_screen_config(cfg, liveness=True)
         (career_ops_dir / "data" / "scan-history.tsv").write_text(
             "url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n"
             "https://www.indeed.com/viewjob?jk=seen\t2026-01-01\tjobspy\teng\tacme\tadded\n",
@@ -269,9 +277,9 @@ class TestRunScreen:
 
     def test_drops_expired_keeps_active(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg, liveness=True)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_csv(filtered, [
+        write_filtered_csv(filtered, [
             {"title": "Active Job", "company": "Acme", "job_url": "https://active.com", "relevance_score": 8},
             {"title": "Expired Job", "company": "Globex", "job_url": "https://expired.com", "relevance_score": 6},
         ])
@@ -292,9 +300,9 @@ class TestRunScreen:
 
     def test_keeps_uncertain_jobs(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg, liveness=True)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_csv(filtered, [
+        write_filtered_csv(filtered, [
             {"title": "Uncertain Job", "company": "Initech", "job_url": "https://uncertain.com", "relevance_score": 7},
         ])
         monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
@@ -318,9 +326,9 @@ class TestRunScreen:
         co = tmp_path / "career-ops"
         (co / "data").mkdir(parents=True)
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg, liveness=True)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_csv(filtered, [
+        write_filtered_csv(filtered, [
             {"title": "Active Job", "company": "Acme", "job_url": "https://active.com", "relevance_score": 8},
             {"title": "Throttled Job", "company": "Globex", "job_url": "https://throttled.com", "relevance_score": 6},
         ])
@@ -1069,3 +1077,66 @@ class TestClassifyLivenessEach:
             items, lambda it: it["url"], timeout=8, max_workers=1))
         assert len(rows) == 3
         assert all(result == "active" for _, result, _, _ in rows)
+
+
+class TestScreenEmptyOutputShape:
+    """Every "nothing survived" exit writes zero bytes, not a header.
+
+    A header-only file is not zero bytes, so bridge's "did upstream produce
+    anything" test read one as a file with content. pipeline.rowio is the shared
+    answer; these pin both exits that used to write one.
+    """
+
+    def _cfg(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        write_screen_config(cfg, liveness=True)
+        return cfg
+
+    def _filtered(self, tmp_path, urls):
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, [
+            {"title": f"Eng {i}", "company": "Acme", "job_url": u, "relevance_score": 8}
+            for i, u in enumerate(urls)
+        ])
+        return filtered
+
+    def test_all_seen_exit_truncates(self, tmp_path, monkeypatch, career_ops_dir):
+        url = "https://www.indeed.com/viewjob?jk=seen"
+        (career_ops_dir / "data" / "scan-history.tsv").write_text(
+            "url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n"
+            f"{url}\t2026-01-01\tjobspy\teng\tacme\tadded\n",
+            encoding="utf-8",
+        )
+        filtered = self._filtered(tmp_path, [url])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+
+        run(self._cfg(tmp_path), career_ops_dir)
+
+        assert filtered.read_text(encoding="utf-8") == ""
+
+    def test_everything_dropped_exit_truncates(self, tmp_path, monkeypatch):
+        # The exit the issue didn't name: `kept` is empty when liveness drops
+        # every job, and that wrote a header too.
+        filtered = self._filtered(tmp_path, ["https://expired-a.com", "https://expired-b.com"])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        monkeypatch.setattr(screen_mod, "fetch_and_classify",
+                            lambda url, timeout=8: ("expired", "HTTP 404", ""))
+
+        run(self._cfg(tmp_path))
+
+        assert filtered.read_text(encoding="utf-8") == ""
+
+    def test_a_header_only_file_left_by_an_older_run_is_read_as_empty(
+        self, tmp_path, monkeypatch
+    ):
+        # Upgrade path: the shape screen used to write may still be on disk.
+        # Asserted as "no posting was fetched" rather than "returned 0" — the
+        # liveness-disabled path and a clean run return 0 too, so the return
+        # code alone would pass for reasons unrelated to the claim.
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text("title,company,job_url,relevance_score\n", encoding="utf-8")
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        monkeypatch.setattr(screen_mod, "fetch_and_classify",
+                            lambda *a, **kw: pytest.fail("fetched a posting for a file with no rows"))
+
+        assert run(self._cfg(tmp_path)) == 0
