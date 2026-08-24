@@ -7,12 +7,13 @@ onboard.html do (both guarded in tests/test_app_onboard.py); without a check of
 its own, retiring a board leaves the example shipping the dead one, and every
 first run prints "dropping unsupported sites" against a config the repo wrote.
 """
+import re
 from pathlib import Path
 
 import pytest
 
 from pipeline.scrape import load_searches
-from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
+from pipeline.sites import MUTEX_GROUPS, SUPPORTED_SITES, limitation_conflict, resolve_sites
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "config" / "search.example.yml"
 
@@ -57,3 +58,23 @@ def test_no_pass_breaks_the_mutex_rule(passes):
     would hand the user a search that silently never runs."""
     conflicts = [c for c in (limitation_conflict(cfg) for cfg in passes) if c]
     assert not conflicts, "\n".join(conflicts)
+
+
+def test_limitation_headings_match_the_boards_that_have_a_rule():
+    """The example config's prose is a mirror of MUTEX_GROUPS; guard it.
+
+    `test_no_pass_breaks_the_mutex_rule` runs the rule over the parsed passes,
+    so the YAML keys are covered — but the "⚠ <BOARD> LIMITATION" blocks a user
+    actually reads are invisible to it. That is exactly how a retired LinkedIn
+    rule survived in this file after the code stopped enforcing it (#115), in a
+    file setup copies to config/search.yml, where it contradicted a comment
+    twenty lines below.
+
+    Same treatment SUPPORTED_SITES already gets for its three hand-mirrors.
+    """
+    headings = set(re.findall(r"⚠ (\w+) LIMITATION", EXAMPLE.read_text(encoding="utf-8")))
+    expected = {label.upper() for label, _ in MUTEX_GROUPS.values()}
+    assert headings == expected, (
+        f"config/search.example.yml documents limitations for {sorted(headings)}, "
+        f"but MUTEX_GROUPS enforces them for {sorted(expected)}."
+    )

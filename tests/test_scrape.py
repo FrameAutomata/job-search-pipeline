@@ -439,20 +439,22 @@ class TestLimitationConflict:
                "is_remote": False}
         assert _sets_clause(limitation_conflict(cfg)) == "hours_old, job_type"
 
-    def test_linkedin_hours_old_and_easy_apply_conflicts(self):
-        cfg = {"sites": ["linkedin"], "hours_old": 168, "easy_apply": True}
-        assert "LinkedIn limitation" in limitation_conflict(cfg)
-
-    def test_linkedin_hours_old_alone(self):
-        assert limitation_conflict({"sites": ["linkedin"], "hours_old": 48}) is None
-
-    def test_linkedin_easy_apply_alone(self):
-        assert limitation_conflict({"sites": ["linkedin"], "easy_apply": True}) is None
-
-    def test_linkedin_ignores_the_indeed_only_group(self):
-        # is_remote is unrestricted on LinkedIn; only Indeed groups it with job_type.
-        cfg = {"sites": ["linkedin"], "hours_old": 48, "is_remote": True}
+    def test_no_linkedin_only_combination_is_refused(self):
+        # LinkedIn has no entry in MUTEX_GROUPS, so every LinkedIn-only pass
+        # takes one path and the every-filter case subsumes the rest. Refusing
+        # any of them discarded a pass over a combination jobspy handles
+        # correctly — the same harm #109 removed for `easy_apply: false` (#115).
+        # That LinkedIn really does send them all is asserted against the
+        # installed library in tests/test_jobspy_contract.py.
+        cfg = {"sites": ["linkedin"], "hours_old": 168, "easy_apply": True,
+               "is_remote": True, "job_type": "fulltime"}
         assert limitation_conflict(cfg) is None
+
+    def test_a_pass_naming_both_boards_is_still_bound_by_indeeds_rule(self):
+        # The guard against over-retiring: the pass still reaches Indeed, whose
+        # chain silently drops one of the two.
+        cfg = {"sites": ["linkedin", "indeed"], "hours_old": 168, "easy_apply": True}
+        assert "Indeed limitation" in limitation_conflict(cfg)
 
     def test_retired_site_is_not_checked(self):
         # zip_recruiter is stripped before the scrape, so its options can't

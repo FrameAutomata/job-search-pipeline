@@ -1,4 +1,7 @@
-python-jobspy
+# Pinned because pipeline/sites.py's MUTEX_GROUPS is a claim about this
+# version's filter builders. Read the note there, and run
+# tests/test_jobspy_contract.py, before bumping.
+python-jobspy==1.1.82
 pdfplumber          # PDF resume text extraction (scoring)
 odfpy               # ODT resume text extraction (scoring); python-docx (below) handles DOCX
 pyyaml
