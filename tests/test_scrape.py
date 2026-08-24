@@ -608,6 +608,52 @@ class TestRun:
         result = scrape_mod.run(cfg_file)
         assert result == output_path
 
+    def test_run_empty_results_truncates_stale_output(
+        self, cfg_file, patch_scrape_paths, mocker
+    ):
+        # A zero-row scrape (rate-limited, network blip) must not leave the
+        # previous run's rows behind — filter/screen/bridge would re-process
+        # them as if they were today's results. Same handling as the
+        # no-passes branch.
+        output_path = patch_scrape_paths
+        output_path.write_text(
+            "job_url,title\nhttps://indeed.com/yesterday,software engineer\n",
+            encoding="utf-8",
+        )
+
+        mocker.patch("pipeline.scrape.scrape_jobs", return_value=pd.DataFrame())
+
+        scrape_mod.run(cfg_file)
+
+        assert output_path.read_text(encoding="utf-8") == ""
+
+    def test_run_no_passes_truncates_stale_output(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # Same guarantee on the sibling path — asserted on content, not just
+        # existence, so a stale file can't masquerade as this run's output.
+        config = tmp_path / "config.yml"
+        config.write_text("""
+searches:
+  - name: "test"
+    search_terms: ["software engineer"]
+    sites: [google, glassdoor]
+    results_wanted: 50
+filter:
+  min_score: 5
+""")
+        output_path = patch_scrape_paths
+        output_path.write_text(
+            "job_url,title\nhttps://indeed.com/yesterday,software engineer\n",
+            encoding="utf-8",
+        )
+
+        mocker.patch("pipeline.scrape.scrape_jobs")
+
+        scrape_mod.run(config)
+
+        assert output_path.read_text(encoding="utf-8") == ""
+
     def test_run_calls_scrape_per_term(self, tmp_path, patch_scrape_paths, mocker):
         """scrape_jobs called once per search term."""
         # Config with two search terms
