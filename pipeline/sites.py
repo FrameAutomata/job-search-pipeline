@@ -126,6 +126,14 @@ def limitation_conflict(cfg: dict) -> str | None:
     reached the wire — turning a filter off being the obvious reason to
     write `false` in the first place.
 
+    Note this deliberately does NOT match how pipeline.scrape forwards the same
+    keys: OPTIONAL_PARAMS keeps `is not None`, because it spans 16 keys whose
+    falsy values are meaningful settings a user typed on purpose (`distance: 0`,
+    `offset: 0`, `verbose: 0`, `linkedin_fetch_description: false`) and dropping
+    those would silently restore jobspy's defaults. The two tests answer
+    different questions — "did the user supply a value to forward?" there,
+    "will jobspy act on it?" here — so they are not to be unified.
+
     Lives here, in the dependency-free leaf, so the UI venv — which installs
     neither jobspy nor pandas and so cannot import pipeline.scrape at all — can
     predict the rule by running it rather than by restating it. Returns the
