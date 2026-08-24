@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from pipeline import scrape as scrape_mod
+from pipeline.sites import limitation_conflict
 
 
 class TestFilterPasses:
@@ -237,21 +238,10 @@ class TestStripUnsupportedSites:
 
     def test_explicitly_null_sites_defaults_to_supported(self):
         # `sites:` with nothing after it — a real None in the mapping, which
-        # made validate_limitations raise TypeError.
+        # made the mutex check raise TypeError.
         searches = [{"name": "p", "search_terms": ["a"], "sites": None}]
         result = scrape_mod.strip_unsupported_sites(searches)
         assert result[0]["sites"] == list(scrape_mod.SUPPORTED_SITES)
-
-    def test_mutex_error_names_the_pass(self):
-        # An omitted `sites` is filled in with the supported boards upstream, so
-        # this fires on a pass whose own config never mentions Indeed.
-        cfg = {"name": "US Remote", "hours_old": 168, "is_remote": True,
-               "sites": ["indeed", "linkedin"]}
-        with pytest.raises(ValueError, match=r"\[US Remote\] Indeed limitation"):
-            scrape_mod.validate_limitations(cfg)
-
-    def test_null_sites_does_not_crash_validate_limitations(self):
-        scrape_mod.validate_limitations({"sites": None, "hours_old": 168})  # must not raise
 
     def test_comma_separated_scalar_is_split(self):
         # `sites: indeed, linkedin` unbracketed is ONE YAML string, and it is the
@@ -339,78 +329,207 @@ filter:
         assert patch_scrape_paths.exists()
 
 
-class TestValidateLimitations:
-    """Test scrape.validate_limitations function."""
+class TestLimitationConflict:
+    """pipeline.sites.limitation_conflict — JobSpy's per-pass mutual-exclusion
+    rule, returning the message so the scraper can skip the pass and the UI's
+    save endpoint (which cannot import this module's jobspy-bound caller) can
+    reject the save with it."""
 
     # Indeed group constraints: only ONE of {hours_old}, {job_type/is_remote}, {easy_apply}
-    def test_validate_indeed_hours_old_alone(self):
-        """hours_old alone is allowed."""
-        cfg = {"sites": ["indeed"], "hours_old": 168}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_indeed_hours_old_alone(self):
+        assert limitation_conflict({"sites": ["indeed"], "hours_old": 168}) is None
 
-    def test_validate_indeed_is_remote_alone(self):
-        """is_remote alone is allowed."""
-        cfg = {"sites": ["indeed"], "is_remote": True}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_indeed_is_remote_alone(self):
+        assert limitation_conflict({"sites": ["indeed"], "is_remote": True}) is None
 
-    def test_validate_indeed_job_type_alone(self):
-        """job_type alone is allowed."""
-        cfg = {"sites": ["indeed"], "job_type": "fulltime"}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_indeed_job_type_alone(self):
+        assert limitation_conflict({"sites": ["indeed"], "job_type": "fulltime"}) is None
 
-    def test_validate_indeed_easy_apply_alone(self):
-        """easy_apply alone is allowed."""
-        cfg = {"sites": ["indeed"], "easy_apply": True}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_indeed_job_type_with_is_remote_is_one_group(self):
+        # Both live in Group B, so together they are not a conflict.
+        cfg = {"sites": ["indeed"], "job_type": "fulltime", "is_remote": True}
+        assert limitation_conflict(cfg) is None
 
-    def test_validate_indeed_hours_old_and_is_remote_raises(self):
-        """hours_old + is_remote raises ValueError."""
+    def test_indeed_easy_apply_alone(self):
+        assert limitation_conflict({"sites": ["indeed"], "easy_apply": True}) is None
+
+    def test_indeed_hours_old_and_is_remote_conflicts(self):
         cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": True}
-        with pytest.raises(ValueError, match="Indeed limitation"):
-            scrape_mod.validate_limitations(cfg)
+        assert "Indeed limitation" in limitation_conflict(cfg)
 
-    def test_validate_indeed_hours_old_and_easy_apply_raises(self):
-        """hours_old + easy_apply raises ValueError."""
+    def test_indeed_hours_old_and_easy_apply_conflicts(self):
         cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": True}
-        with pytest.raises(ValueError, match="Indeed limitation"):
-            scrape_mod.validate_limitations(cfg)
+        assert "Indeed limitation" in limitation_conflict(cfg)
 
-    def test_validate_indeed_is_remote_and_easy_apply_raises(self):
-        """is_remote + easy_apply (both Group B/C) raises ValueError."""
+    def test_indeed_is_remote_and_easy_apply_conflicts(self):
         cfg = {"sites": ["indeed"], "is_remote": True, "easy_apply": True}
-        with pytest.raises(ValueError, match="Indeed limitation"):
-            scrape_mod.validate_limitations(cfg)
+        assert "Indeed limitation" in limitation_conflict(cfg)
 
-    def test_validate_linkedin_hours_old_and_easy_apply_raises(self):
-        """LinkedIn: hours_old + easy_apply raises ValueError."""
+    def test_message_names_the_options_actually_set(self):
+        # "one of these groups" alone leaves the user diffing their config
+        # against the rule; name the offending keys.
+        cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": True}
+        msg = limitation_conflict(cfg)
+        assert "hours_old" in msg and "is_remote" in msg
+
+    def test_false_still_counts_as_set(self):
+        # JobSpy sees the kwarg either way — `easy_apply: false` is passed
+        # through by OPTIONAL_PARAMS (which tests `is not None`), so it
+        # conflicts exactly like `true` does.
+        cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": False}
+        assert "Indeed limitation" in limitation_conflict(cfg)
+
+    def test_linkedin_hours_old_and_easy_apply_conflicts(self):
         cfg = {"sites": ["linkedin"], "hours_old": 168, "easy_apply": True}
-        with pytest.raises(ValueError, match="LinkedIn limitation"):
-            scrape_mod.validate_limitations(cfg)
+        assert "LinkedIn limitation" in limitation_conflict(cfg)
 
-    def test_validate_linkedin_hours_old_alone(self):
-        """LinkedIn: hours_old alone is allowed."""
-        cfg = {"sites": ["linkedin"], "hours_old": 48}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_linkedin_hours_old_alone(self):
+        assert limitation_conflict({"sites": ["linkedin"], "hours_old": 48}) is None
 
-    def test_validate_linkedin_easy_apply_alone(self):
-        """LinkedIn: easy_apply alone is allowed."""
-        cfg = {"sites": ["linkedin"], "easy_apply": True}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_linkedin_easy_apply_alone(self):
+        assert limitation_conflict({"sites": ["linkedin"], "easy_apply": True}) is None
 
-    def test_validate_non_restricted_site_any_combo(self):
-        """Non-restricted site (e.g. zip_recruiter) allows any combo."""
-        cfg = {
-            "sites": ["zip_recruiter"],
-            "hours_old": 168,
-            "is_remote": True,
-            "easy_apply": True,
-        }
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+    def test_linkedin_ignores_the_indeed_only_group(self):
+        # is_remote is unrestricted on LinkedIn; only Indeed groups it with job_type.
+        cfg = {"sites": ["linkedin"], "hours_old": 48, "is_remote": True}
+        assert limitation_conflict(cfg) is None
 
-    def test_validate_empty_sites(self):
-        """Empty sites list does not trigger validation."""
+    def test_retired_site_is_not_checked(self):
+        # zip_recruiter is stripped before the scrape, so its options can't
+        # conflict with anything — checking it would reject a survivable config.
+        cfg = {"sites": ["zip_recruiter"], "hours_old": 168, "is_remote": True,
+               "easy_apply": True}
+        assert limitation_conflict(cfg) is None
+
+    def test_empty_sites_is_not_checked(self):
         cfg = {"sites": [], "hours_old": 168, "is_remote": True}
-        scrape_mod.validate_limitations(cfg)  # Should not raise
+        assert limitation_conflict(cfg) is None
+
+    def test_missing_sites_key_inherits_the_supported_boards(self):
+        # The repro from the issue's second half: a pass that never names Indeed
+        # is still bound by Indeed's rule, because the key is filled in upstream.
+        cfg = {"name": "US Remote", "hours_old": 168, "is_remote": True}
+        assert "Indeed limitation" in limitation_conflict(cfg)
+
+    def test_null_sites_does_not_crash(self):
+        # `sites:` with nothing after it is a real None in the mapping.
+        assert "Indeed limitation" in limitation_conflict(
+            {"sites": None, "hours_old": 168, "is_remote": True})
+
+    def test_null_sites_without_a_conflict_is_clean(self):
+        assert limitation_conflict({"sites": None, "hours_old": 168}) is None
+
+    def test_message_names_the_pass(self):
+        cfg = {"name": "US Remote", "hours_old": 168, "is_remote": True,
+               "sites": ["indeed", "linkedin"]}
+        assert limitation_conflict(cfg).startswith("[US Remote] ")
+
+    def test_case_variant_board_name_is_still_checked(self):
+        cfg = {"sites": ["Indeed"], "hours_old": 168, "is_remote": True}
+        assert "Indeed limitation" in limitation_conflict(cfg)
+
+
+class TestDropConflictingPasses:
+    """A conflicting pass is skipped with a warning, not raised: a config can
+    reach a run without passing the UI validator (stale cloud secret, hand-edited
+    file), and aborting took every healthy pass down with it."""
+
+    def test_conflicting_pass_is_dropped(self):
+        searches = [{"name": "bad", "search_terms": ["a"], "sites": ["indeed"],
+                     "hours_old": 168, "is_remote": True}]
+        assert scrape_mod.drop_conflicting_passes(searches) == []
+
+    def test_healthy_passes_survive_a_conflicting_neighbour(self):
+        searches = [
+            {"name": "bad", "search_terms": ["a"], "sites": ["indeed"],
+             "hours_old": 168, "is_remote": True},
+            {"name": "good", "search_terms": ["a"], "sites": ["indeed"], "hours_old": 168},
+        ]
+        result = scrape_mod.drop_conflicting_passes(searches)
+        assert [s["name"] for s in result] == ["good"]
+
+    def test_warning_names_the_pass_and_the_rule(self, capsys):
+        searches = [{"name": "US Remote", "search_terms": ["a"], "sites": ["indeed"],
+                     "hours_old": 168, "is_remote": True}]
+        scrape_mod.drop_conflicting_passes(searches)
+        out = capsys.readouterr().out
+        assert "US Remote" in out and "Indeed limitation" in out and "skipping" in out
+
+    def test_no_warning_when_nothing_conflicts(self, capsys):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed"], "hours_old": 168}]
+        assert scrape_mod.drop_conflicting_passes(searches) == searches
+        assert capsys.readouterr().out == ""
+
+
+class TestRunDropsConflictingPasses:
+    """run() applies the drop to whatever config it loads, so a conflicting pass
+    can no longer abort the stage — and with it the rest of the pipeline."""
+
+    def _config(self, tmp_path, body):
+        config = tmp_path / "config.yml"
+        config.write_text(body)
+        return config
+
+    def test_healthy_pass_still_scrapes(self, tmp_path, patch_scrape_paths, mocker):
+        config = self._config(tmp_path, """
+searches:
+  - name: "conflicting"
+    search_terms: ["a"]
+    sites: [indeed]
+    hours_old: 168
+    is_remote: true
+  - name: "healthy"
+    search_terms: ["b"]
+    sites: [indeed]
+    hours_old: 168
+""")
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        assert mock_scrape.call_count == 1
+        assert mock_scrape.call_args[1]["search_term"] == "b"
+
+    def test_only_conflicting_passes_noops_cleanly(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # Same clean no-op as an all-retired-boards config: empty jobs.csv,
+        # no jobspy call, no traceback out of the stage.
+        config = self._config(tmp_path, """
+searches:
+  - name: "conflicting"
+    search_terms: ["a"]
+    sites: [indeed]
+    hours_old: 168
+    is_remote: true
+""")
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs")
+
+        result = scrape_mod.run(config)
+
+        mock_scrape.assert_not_called()
+        assert result == patch_scrape_paths
+        assert patch_scrape_paths.exists()
+
+    def test_conflict_is_judged_after_retired_boards_are_stripped(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # zip_recruiter accepts the combination, but it never runs — the pass
+        # scrapes Indeed, which does not, so this must still be dropped.
+        config = self._config(tmp_path, """
+searches:
+  - name: "mixed"
+    search_terms: ["a"]
+    sites: [zip_recruiter, indeed]
+    hours_old: 168
+    easy_apply: true
+""")
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs")
+
+        scrape_mod.run(config)
+
+        mock_scrape.assert_not_called()
 
 
 class TestRun:

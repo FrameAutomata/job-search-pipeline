@@ -80,10 +80,56 @@ def resolve_sites(cfg: dict) -> tuple[list, list]:
 
     A missing or explicitly null `sites` inherits the supported set rather than
     passing through: left as None, jobspy's get_site_type() falls back to
-    list(Site) — every board, including the ones retired here — and
-    validate_limitations raises TypeError iterating it first.
+    list(Site) — every board, including the ones retired here — and the
+    mutex check below raises TypeError iterating it first.
     """
     sites = cfg.get("sites")
     if sites is None:
         return list(SUPPORTED_SITES), []
     return partition_sites(sites)
+
+
+# The options JobSpy rejects in combination, keyed by board. Each board maps to
+# its display name plus the groups it allows only ONE of — two options in the
+# same group coexist (Indeed takes job_type with is_remote), two *active* groups
+# are the conflict.
+MUTEX_GROUPS = {
+    "indeed": ("Indeed", [("hours_old",), ("job_type", "is_remote"), ("easy_apply",)]),
+    "linkedin": ("LinkedIn", [("hours_old",), ("easy_apply",)]),
+}
+
+
+def limitation_conflict(cfg: dict) -> str | None:
+    """The JobSpy mutual-exclusion rule this search pass breaks, or None.
+
+    Indeed accepts only ONE of (A) hours_old, (B) job_type and/or is_remote,
+    (C) easy_apply per search; LinkedIn only one of hours_old or easy_apply.
+    Combining them makes jobspy raise, which used to abort the scrape stage.
+
+    Lives here, in the dependency-free leaf, so the UI venv — which installs
+    neither jobspy nor pandas and so cannot import pipeline.scrape at all — can
+    predict the rule by running it rather than by restating it. Returns the
+    message instead of raising so each caller shapes its own consequence: the
+    scraper skips the pass, the save endpoint answers 400.
+
+    The boards checked are resolve_sites()'s, not `cfg["sites"]` verbatim — an
+    omitted `sites` inherits the supported boards, so a pass that never names
+    Indeed is still bound by Indeed's rule, and a retired board is stripped
+    before the scrape so nothing it would have accepted matters here.
+    """
+    sites = {s.lower() for s in resolve_sites(cfg)[0]}
+    where = f"[{cfg['name']}] " if cfg.get("name") else ""
+
+    for board, (label, groups) in MUTEX_GROUPS.items():
+        if board not in sites:
+            continue
+        active = [g for g in groups if any(cfg.get(k) is not None for k in g)]
+        if len(active) < 2:
+            continue
+        set_here = ", ".join(k for g in active for k in g if cfg.get(k) is not None)
+        allowed = " | ".join(" and/or ".join(g) for g in groups)
+        return (
+            f"{where}{label} limitation: only ONE of [{allowed}] may be set per "
+            f"search, but this pass sets {set_here}. Remove all but one."
+        )
+    return None

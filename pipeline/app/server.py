@@ -46,7 +46,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
-from pipeline.sites import SUPPORTED_SITES, resolve_sites
+from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
 from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -558,8 +558,9 @@ def local_search_get() -> JSONResponse:
 def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     """Validate and write the local override. Rejects anything that wouldn't load
     as a search config so the next run can't choke on a broken file — including a
-    non-mapping or empty search entry, which would crash scrape, not no-op — and
-    anything that would scrape nothing because every pass names retired boards."""
+    non-mapping or empty search entry, which would crash scrape, not no-op —
+    anything that would scrape nothing because every pass names retired boards,
+    and any pass combining options JobSpy refuses together."""
     import yaml
     try:
         parsed = yaml.safe_load(req.content)
@@ -579,6 +580,13 @@ def local_search_set(req: LocalSearchConfig) -> JSONResponse:
             status_code=400,
             detail=f"No pass names a supported board, so this config would scrape "
                    f"nothing. Supported: {', '.join(SUPPORTED_SITES)}.")
+    # JobSpy's per-pass mutual-exclusion rule, run rather than restated —
+    # limitation_conflict is the same function the scraper applies. Refused, not
+    # warned: a run skips a conflicting pass, so saving one would silently drop a
+    # search the user believes they configured, and here it is still editable.
+    conflicts = [c for c in (limitation_conflict(e) for e in entries) if c]
+    if conflicts:
+        raise HTTPException(status_code=400, detail=" ".join(conflicts))
     local = _local_search_path()
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(req.content, encoding="utf-8")

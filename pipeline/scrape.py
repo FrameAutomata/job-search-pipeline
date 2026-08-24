@@ -1,5 +1,6 @@
 """Scrape job boards via JobSpy. Reads search params from config/search.yml,
-validates mutually exclusive Indeed/LinkedIn options, and writes output/jobs.csv."""
+drops passes JobSpy would reject (retired boards, mutually exclusive
+Indeed/LinkedIn options), and writes output/jobs.csv."""
 
 import sys
 from pathlib import Path
@@ -8,7 +9,7 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES, as_site_list, resolve_sites
+from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
@@ -136,47 +137,25 @@ def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
-def validate_limitations(cfg: dict) -> None:
-    """Raise ValueError if mutually exclusive JobSpy options are combined.
+def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
+    """Drop passes that combine mutually exclusive JobSpy options.
 
-    Indeed: only one of these groups may be active:
-      Group A — hours_old
-      Group B — job_type and/or is_remote
-      Group C — easy_apply
-
-    LinkedIn: only one of these may be active:
-      hours_old  OR  easy_apply
+    Same degradation as strip_unsupported_sites above, for the same reason: a
+    config reaches a run without ever passing the UI's save-time validator — a
+    stale SEARCH_CONFIG_B64 cloud secret, a hand-edited search.yml — and one bad
+    pass used to raise out of the scrape stage, taking every pass that was fine
+    (in the cloud, the whole day's run) down with it. The rule itself is
+    pipeline.sites.limitation_conflict, which the UI validator also calls, so
+    what it can refuse to save and what a run enforces can't drift.
     """
-    # `or []`, not a get() default: `sites:` with nothing after it puts a real
-    # None in the mapping, so the default never fires. as_site_list keeps a bare
-    # `sites: indeed` from being walked one character at a time.
-    sites = [str(s).strip().lower() for s in as_site_list(cfg.get("sites") or [])]
-    hours_old   = cfg.get("hours_old")   is not None
-    job_type    = cfg.get("job_type")    is not None
-    is_remote   = cfg.get("is_remote")   is not None
-    easy_apply  = cfg.get("easy_apply")  is not None
-
-    # Name the pass: an omitted `sites` is filled in with the supported boards
-    # upstream, so this can fire on a pass whose config never mentions Indeed.
-    where = f"[{cfg['name']}] " if cfg.get("name") else ""
-    if "indeed" in sites:
-        active = [hours_old, job_type or is_remote, easy_apply]
-        if sum(active) > 1:
-            raise ValueError(
-                f"{where}Indeed limitation: only ONE of the following groups "
-                "may be set per search:\n"
-                "  Group A — hours_old\n"
-                "  Group B — job_type and/or is_remote\n"
-                "  Group C — easy_apply\n"
-                "Remove the conflicting options from config/search.yml."
-            )
-
-    if "linkedin" in sites:
-        if hours_old and easy_apply:
-            raise ValueError(
-                f"{where}LinkedIn limitation: only ONE of [hours_old] or [easy_apply] "
-                "may be set per search. Remove one from config/search.yml."
-            )
+    result = []
+    for cfg in searches:
+        conflict = limitation_conflict(cfg)
+        if conflict:
+            print(f"[scrape] skipping pass — {conflict}", flush=True)
+            continue
+        result.append(cfg)
+    return result
 
 
 def run(
@@ -192,7 +171,7 @@ def run(
         easy_apply_only=easy_apply_only,
         no_easy_apply=no_easy_apply,
     )
-    searches = strip_unsupported_sites(selected)
+    searches = drop_conflicting_passes(strip_unsupported_sites(selected))
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not searches:
@@ -200,7 +179,8 @@ def run(
         # stages no-op cleanly. This is the workflow-friendly path: e.g. the
         # easy-apply workflow on a user with no easy_apply pass configured.
         reason = (
-            "every matching pass listed only unsupported boards"
+            "every matching pass was skipped (unsupported boards, or options "
+            "JobSpy can't combine)"
             if selected
             else "no searches matched the active filters"
         )
@@ -215,7 +195,6 @@ def run(
     all_rows = []
     for cfg in searches:
         name = cfg.get("name", "pass")
-        validate_limitations(cfg)
         optional = {k: cfg[k] for k in OPTIONAL_PARAMS if cfg.get(k) is not None}
 
         pass_easy_apply = cfg.get("easy_apply") is True
