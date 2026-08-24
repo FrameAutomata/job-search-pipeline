@@ -103,7 +103,7 @@ If you're maintaining this template (rather than using it for a job search), no 
 
 A local, fully automated pipeline that runs the complete job-search loop end to end:
 
-1. **Scrape** — [JobSpy](https://github.com/speedyapply/JobSpy) pulls postings from Indeed, LinkedIn, Glassdoor, ZipRecruiter, etc. into `output/jobs.csv`.
+1. **Scrape** — [JobSpy](https://github.com/speedyapply/JobSpy) pulls postings from Indeed and LinkedIn into `output/jobs.csv`. These are the only two supported boards: Glassdoor and ZipRecruiter sit behind a Cloudflare wall that 403s every scripted request (zero rows contributed), and Google Jobs drops connections mid-response in a way that crashes JobSpy's scraper. Unsupported sites in a config are stripped at load time with a warning.
 2. **Filter** — keywords are extracted *from your resume* (YAKE statistical extraction — works for nursing, marketing, trades, finance, tech, any field). Each job is scored by keyword + target-title matches; negative titles hard-exclude. Output: `output/filtered_jobs.csv`.
 3. **Screen** *(opt-in)* — for jobs that survived the filter, runs an HTTP liveness check (drops expired/filled postings), backfills each LinkedIn description via LinkedIn's public guest job-posting endpoint (reliable full JD, so `linkedin_fetch_description: false` is safe at scrape time), and dedupes against `scan-history.tsv` *before* the fetch so previously-seen URLs cost nothing.
 4. **Bridge** — surviving postings are appended to [career-ops](https://github.com/santifer/career-ops)'s `data/pipeline.md` queue. Second dedup pass against scan-history, pipeline.md, and `company::role` pairs in applications.md.
@@ -171,7 +171,7 @@ screen:
 What the screen step does when `liveness: true`:
 - **Pre-screen dedup**: drops URLs already in `scan-history.tsv` / `pipeline.md` / `applications.md` *before* fetching. With 100-result scrapes on a daily cadence ~80% of rows are repeats — this is the biggest cost saving.
 - **Liveness check**: HTTP GET per remaining URL; drops 404/410, "no longer available" / "position filled" pages, listing pages, etc.
-- **Description backfill**: extracts the JD from the same fetched page (LinkedIn / Indeed / Glassdoor selectors + `<body>` fallback). Lets you set `linkedin_fetch_description: false` and skip thousands of sequential per-job fetches during scrape.
+- **Description backfill**: extracts the JD from the same fetched page (LinkedIn / Indeed selectors + `<body>` fallback). Lets you set `linkedin_fetch_description: false` and skip thousands of sequential per-job fetches during scrape.
 - **Dead URL recording**: URLs that fail liveness get written to `scan-history.tsv` with status `screened-dead` so future runs skip them at the pre-screen step too.
 
 When `liveness: false` the screen stage is a no-op (no dedup, no fetches, no backfill — bridge still does its own dedup pass).

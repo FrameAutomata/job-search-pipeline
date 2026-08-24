@@ -153,6 +153,140 @@ search:
             scrape_mod.load_searches(nonexistent)
 
 
+class TestStripUnsupportedSites:
+    """Only indeed + linkedin are supported scrape sites. Glassdoor and
+    ZipRecruiter are Cloudflare-walled (403 on every request, zero rows), and
+    Google Jobs serves degraded responses then drops the connection mid-body —
+    which jobspy's Google scraper doesn't catch, killing the whole run.
+    strip_unsupported_sites removes them at load time so stale configs (e.g.
+    an old cloud SEARCH_CONFIG_B64 secret) can't crash or waste requests."""
+
+    def test_supported_sites_are_indeed_and_linkedin(self):
+        assert set(scrape_mod.SUPPORTED_SITES) == {"indeed", "linkedin"}
+
+    def test_drops_unsupported_sites_preserving_order(self):
+        searches = [{
+            "name": "p", "search_terms": ["a"],
+            "sites": ["glassdoor", "indeed", "zip_recruiter", "linkedin", "google"],
+        }]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed", "linkedin"]
+
+    def test_matching_is_case_insensitive(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["LinkedIn", "Google"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["LinkedIn"]
+
+    def test_pass_with_no_supported_sites_is_dropped(self):
+        searches = [
+            {"name": "dead", "search_terms": ["a"], "sites": ["google", "glassdoor"]},
+            {"name": "live", "search_terms": ["a"], "sites": ["indeed"]},
+        ]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert [s["name"] for s in result] == ["live"]
+
+    def test_all_supported_passes_come_back_unchanged(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "linkedin"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result == searches
+
+    def test_bare_string_sites_is_not_iterated_character_by_character(self):
+        # `sites: indeed` is valid YAML and a valid JobSpy site_name; iterating
+        # the string would test 'i', 'n', 'd', ... and drop the whole pass.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed"}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+
+    def test_surrounding_whitespace_is_stripped_from_kept_sites(self):
+        # jobspy resolves the board with Site[name.upper()], which raises on
+        # " LINKEDIN " — so a padded entry must not survive verbatim.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": [" linkedin "]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["linkedin"]
+
+    def test_case_variant_duplicates_collapse(self):
+        # Both map to Site.INDEED; keeping both scrapes the board twice.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "Indeed"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["indeed"]
+
+    def test_non_string_entries_do_not_crash_the_warning(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["linkedin", 123]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result[0]["sites"] == ["linkedin"]
+
+    def test_warning_names_the_dropped_sites_and_pass(self, capsys):
+        searches = [{"name": "US Remote", "search_terms": ["a"],
+                     "sites": ["indeed", "glassdoor", "google"]}]
+        scrape_mod.strip_unsupported_sites(searches)
+        out = capsys.readouterr().out
+        assert "glassdoor" in out and "google" in out
+        assert "US Remote" in out
+
+    def test_no_warning_when_nothing_dropped(self, capsys):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed"]}]
+        scrape_mod.strip_unsupported_sites(searches)
+        assert capsys.readouterr().out == ""
+
+    def test_missing_sites_key_left_alone(self):
+        # A pass with no sites key fails later the same way it does today —
+        # stripping shouldn't invent or remove the key.
+        searches = [{"name": "p", "search_terms": ["a"]}]
+        result = scrape_mod.strip_unsupported_sites(searches)
+        assert result == searches
+
+    def test_input_list_is_not_mutated(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "google"]}]
+        scrape_mod.strip_unsupported_sites(searches)
+        assert searches[0]["sites"] == ["indeed", "google"]
+
+
+class TestRunStripsUnsupportedSites:
+    """run() applies the strip to whatever config it loads, so even a
+    hand-edited or stale config never reaches jobspy with a dead site."""
+
+    def test_run_scrapes_only_supported_sites(self, tmp_path, patch_scrape_paths, mocker):
+        config = tmp_path / "config.yml"
+        config.write_text("""
+searches:
+  - name: "test"
+    search_terms: ["software engineer"]
+    sites: [indeed, glassdoor, zip_recruiter, linkedin, google]
+    results_wanted: 50
+filter:
+  min_score: 5
+""")
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        assert mock_scrape.call_args[1]["site_name"] == ["indeed", "linkedin"]
+
+    def test_run_with_only_unsupported_sites_noops_cleanly(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # All passes stripped away → same clean no-op as "no searches matched":
+        # empty jobs.csv, no scrape_jobs call, downstream stages see zero rows.
+        config = tmp_path / "config.yml"
+        config.write_text("""
+searches:
+  - name: "test"
+    search_terms: ["software engineer"]
+    sites: [google, glassdoor]
+    results_wanted: 50
+filter:
+  min_score: 5
+""")
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs")
+
+        result = scrape_mod.run(config)
+
+        mock_scrape.assert_not_called()
+        assert result == patch_scrape_paths
+        assert patch_scrape_paths.exists()
+
+
 class TestValidateLimitations:
     """Test scrape.validate_limitations function."""
 
@@ -180,25 +314,19 @@ class TestValidateLimitations:
     def test_validate_indeed_hours_old_and_is_remote_raises(self):
         """hours_old + is_remote raises ValueError."""
         cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
+        with pytest.raises(ValueError, match="Indeed limitation"):
             scrape_mod.validate_limitations(cfg)
 
     def test_validate_indeed_hours_old_and_easy_apply_raises(self):
         """hours_old + easy_apply raises ValueError."""
         cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
+        with pytest.raises(ValueError, match="Indeed limitation"):
             scrape_mod.validate_limitations(cfg)
 
     def test_validate_indeed_is_remote_and_easy_apply_raises(self):
         """is_remote + easy_apply (both Group B/C) raises ValueError."""
         cfg = {"sites": ["indeed"], "is_remote": True, "easy_apply": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
-            scrape_mod.validate_limitations(cfg)
-
-    def test_validate_glassdoor_same_rules_as_indeed(self):
-        """Glassdoor has the same group constraints as Indeed."""
-        cfg = {"sites": ["glassdoor"], "hours_old": 168, "is_remote": True}
-        with pytest.raises(ValueError, match="Indeed/Glassdoor limitation"):
+        with pytest.raises(ValueError, match="Indeed limitation"):
             scrape_mod.validate_limitations(cfg)
 
     def test_validate_linkedin_hours_old_and_easy_apply_raises(self):

@@ -13,6 +13,14 @@ from pathlib import Path
 import pytest
 
 from pipeline.app import onboard
+from pipeline.sites import SUPPORTED_SITES
+
+
+@pytest.fixture
+def html():
+    """The onboarding wizard's static markup, for the drift checks below."""
+    root = Path(__file__).resolve().parent.parent
+    return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
 
 
 def _node_deps_available() -> bool:
@@ -99,8 +107,22 @@ class TestBuildOnboardingJson:
         # No locations -> a single US-Remote default entry.
         locs = payload["searchSettings"]["locations"]
         assert len(locs) == 1 and locs[0]["isRemote"] is True
-        assert payload["searchSettings"]["sites"] == ["indeed", "linkedin", "glassdoor"]
+        assert payload["searchSettings"]["sites"] == ["indeed", "linkedin"]
         assert payload["searchSettings"]["resultsWanted"] == 100
+
+    def test_unsupported_sites_are_filtered_out(self):
+        # A stale saved wizard state (or hand-crafted POST) may still carry the
+        # retired boards — they must not reach the generated search config.
+        payload = onboard.build_onboarding_json(
+            {"sites": ["indeed", "glassdoor", "zip_recruiter", "google"]}, resume_text=""
+        )
+        assert payload["searchSettings"]["sites"] == ["indeed"]
+
+    def test_only_unsupported_sites_falls_back_to_default(self):
+        payload = onboard.build_onboarding_json(
+            {"sites": ["glassdoor", "google"]}, resume_text=""
+        )
+        assert payload["searchSettings"]["sites"] == ["indeed", "linkedin"]
 
     def test_maps_indeed_consent_toggles(self):
         info = onboard.build_onboarding_json(
@@ -380,11 +402,6 @@ class TestEeoDatalists:
 
     EEO_FIELDS = ["eeo_gender", "eeo_race", "eeo_veteran", "eeo_disability"]
 
-    @pytest.fixture
-    def html(self):
-        root = Path(__file__).resolve().parent.parent
-        return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
-
     def _input_tag(self, html, name):
         m = re.search(rf'<input\b[^>]*\bname="{re.escape(name)}"[^>]*>', html)
         assert m, f"no <input name={name!r}> found"
@@ -439,3 +456,28 @@ class TestPortfolioUrls:
 
     def test_empty_when_nothing_supplied(self):
         assert onboard.portfolio_urls({}) == []
+
+
+class TestOnboardHtmlSites:
+    """The wizard must only offer the boards that actually produce rows.
+    Glassdoor and ZipRecruiter are Cloudflare-403-walled and Google Jobs drops
+    connections mid-response (crashing jobspy), so indeed + linkedin are the
+    only supported checkboxes."""
+
+    def test_offers_exactly_the_supported_boards(self, html):
+        offered = set(re.findall(r'<input\b[^>]*\bname="sites"[^>]*\bvalue="([^"]+)"', html))
+        assert offered == set(SUPPORTED_SITES)
+
+
+class TestSupportedSitesMirror:
+    """setup-profile.mjs restates SUPPORTED_SITES because Node can't import the
+    Python constant. That mirror is what writes search.yml, so drift between the
+    two silently reintroduces a dead board into every generated config."""
+
+    def test_mjs_mirror_matches_the_python_constant(self):
+        root = Path(__file__).resolve().parent.parent
+        src = (root / "setup-profile.mjs").read_text(encoding="utf-8")
+        m = re.search(r"const SUPPORTED_SITES = \[([^\]]*)\]", src)
+        assert m, "no SUPPORTED_SITES literal found in setup-profile.mjs"
+        mirrored = tuple(re.findall(r"'([^']+)'", m.group(1)))
+        assert mirrored == SUPPORTED_SITES
