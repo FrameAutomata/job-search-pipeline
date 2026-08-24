@@ -46,7 +46,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
-from pipeline.sites import SUPPORTED_SITES, as_site_list, is_supported, keep_supported
+from pipeline.sites import SUPPORTED_SITES, resolve_sites
 from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -554,23 +554,6 @@ def local_search_get() -> JSONResponse:
     return JSONResponse({"active": False, "content": content, "path": "config/search.local.yml"})
 
 
-def _unsupported_sites(entries: list) -> list[str]:
-    """Every board named across `entries` that the scraper would drop, in the
-    order first seen. Uses pipeline.sites — a dependency-free leaf module, so
-    this stays importable in the jobspy-free UI venv."""
-    seen, out = set(), []
-    for entry in entries:
-        sites = entry.get("sites")
-        if sites is None:
-            continue
-        for s in as_site_list(sites):
-            name = str(s).strip()
-            if not is_supported(s) and name.lower() not in seen:
-                seen.add(name.lower())
-                out.append(name)
-    return out
-
-
 @app.post("/api/local-search")
 def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     """Validate and write the local override. Rejects anything that wouldn't load
@@ -587,9 +570,11 @@ def local_search_set(req: LocalSearchConfig) -> JSONResponse:
         raise HTTPException(status_code=400,
                             detail="Config must have a non-empty `searches:` list of search "
                                    "mappings (or a single legacy `search:` mapping).")
-    # A pass with no `sites` key inherits the supported boards (strip_unsupported_sites
-    # fills it in), so it counts as survivable.
-    if not any(e.get("sites") is None or keep_supported(e["sites"]) for e in entries):
+    # resolve_sites is the rule the scraper itself applies per pass (including
+    # "no `sites` key inherits the supported boards"), so what we reject here and
+    # what we warn about can't drift from what the next run actually does.
+    resolved = [resolve_sites(e) for e in entries]
+    if not any(kept for kept, _ in resolved):
         raise HTTPException(
             status_code=400,
             detail=f"No pass names a supported board, so this config would scrape "
@@ -598,8 +583,9 @@ def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(req.content, encoding="utf-8")
     # Saved, but say so if some boards will be ignored — otherwise the run just
-    # quietly returns fewer rows than the config implies.
-    dropped = _unsupported_sites(entries)
+    # quietly returns fewer rows than the config implies. Order first seen,
+    # de-duplicated across passes.
+    dropped = list(dict.fromkeys(name for _, names in resolved for name in names))
     warning = (f"Saved, but these boards are not supported and will be ignored: "
                f"{', '.join(dropped)}.") if dropped else None
     return JSONResponse({"ok": True, "active": True, "warning": warning})
