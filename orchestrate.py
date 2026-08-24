@@ -64,7 +64,34 @@ from pipeline._batch_common import env_float  # noqa: E402  (shared with batch_e
 from pipeline.handoff import KNOWN_BOARDS  # noqa: E402
 
 
+def _line_buffer_stdio() -> None:
+    """Flush the stage log on every newline, however we were launched.
+
+    Redirected to a file or a pipe, Python block-buffers stdout at 8KB — so a
+    stage's progress lines sit unseen while it works, and the run looks hung on
+    exactly the slow steps a reader is watching. Both callers that redirect us
+    already compensate (pipeline/app/local_run.py sets PYTHONUNBUFFERED in the
+    child env; daily-pipeline.yml sets it and passes `python -u`), which is why
+    the ~90 unflushed prints across pipeline/ have never shown the symptom.
+
+    Making it true here instead means the guarantee belongs to the program
+    rather than to every caller remembering, and a `print` added to a stage
+    tomorrow is correct without anyone thinking about buffering. The scattered
+    `flush=True` calls stay: they still carry a stage module run directly
+    (`python pipeline/scrape.py > log`), which never reaches this function.
+
+    Guarded because sys.stdout is not always a TextIOWrapper — pytest's capture
+    and some embedding hosts replace it with an object that has no reconfigure.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
+
 def main() -> int:
+    _line_buffer_stdio()
     ap = argparse.ArgumentParser(description="Run the job-search pipeline.")
     ap.add_argument("--skip-scrape", action="store_true", help="Reuse existing output/jobs.csv")
     ap.add_argument("--skip-filter", action="store_true", help="Reuse existing output/filtered_jobs.csv")
