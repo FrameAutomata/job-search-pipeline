@@ -440,7 +440,8 @@ filter:
         assert content == ""
 
     def test_run_handles_zero_byte_jobs_csv(
-        self, patch_filter_paths, filtered_csv, fake_pdf, monkeypatch, mock_pdf_extract
+        self, patch_filter_paths, filtered_csv, fake_pdf, monkeypatch, mock_pdf_extract,
+        mocker,
     ):
         """A zero-row scrape truncates jobs.csv to zero bytes (no header line).
         csv.DictReader reads that as zero rows, so the stage no-ops instead of
@@ -448,7 +449,12 @@ filter:
 
         filtered_jobs.csv is seeded first: without a stale file to overwrite,
         "correctly truncated" and "never written" look identical, and the
-        staleness this guards against would just move one stage downstream."""
+        staleness this guards against would just move one stage downstream.
+
+        It also no-ops *cheaply*: resume extraction and the YAKE pass exist to
+        score rows, and there are none. The cloud daily caches career-ops/**
+        only, so output/_keywords.json misses every run and the YAKE branch is
+        not amortised away."""
         jobs_path, output_path = patch_filter_paths
 
         jobs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -456,6 +462,7 @@ filter:
         output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
 
         monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+        keywords = mocker.spy(filter_mod, "_load_or_extract_keywords")
 
         config = jobs_path.parent.parent / "config.yml"
         config.write_text("""
@@ -468,6 +475,67 @@ filter:
         filter_mod.run(config)
 
         assert output_path.read_text() == ""
+        assert keywords.call_count == 0
+
+    def test_zero_byte_jobs_csv_does_not_need_a_resume(
+        self, patch_filter_paths, filtered_csv, monkeypatch
+    ):
+        """A missing resume is not a reason to fail a run with nothing to score.
+
+        The resume gate used to sit above the CSV read, so a fork whose
+        RESUME_TXT_B64 failed to decode reddened the daily on exactly the days
+        the scrape came back empty — two unrelated problems reported as one."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text("", encoding="utf-8")
+        output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setenv("RESUME_PATH", "/nonexistent/resume.pdf")
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+""")
+
+        assert filter_mod.run(config) == output_path
+        assert output_path.read_text() == ""
+
+    def test_run_skips_the_resume_work_when_every_row_is_pre_filtered(
+        self, jobs_csv, patch_filter_paths, filtered_csv, fake_pdf, monkeypatch,
+        mock_pdf_extract, mocker,
+    ):
+        """The date and location cuts need no keywords, so when they leave
+        nothing behind the resume work is skipped too — the truncated-scrape
+        case is just the extreme of it.
+
+        Every fixture row is dated 2026-05, so a one-hour max_age_hours ages
+        all five out."""
+        jobs_path, output_path = patch_filter_paths
+
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(jobs_csv.read_text())
+        output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+        keywords = mocker.spy(filter_mod, "_load_or_extract_keywords")
+
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text("""
+filter:
+  target_titles: []
+  negative_titles: []
+  min_score: 5
+  max_age_hours: 1
+""")
+
+        filter_mod.run(config)
+
+        assert output_path.read_text() == ""
+        assert keywords.call_count == 0
 
     def test_run_returns_output_path(
         self, jobs_csv, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract

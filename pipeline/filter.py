@@ -324,6 +324,50 @@ def run(config_path: Path) -> Path:
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
 
+    # Read the scrape's output BEFORE resolving the resume. Everything between
+    # here and the scoring loop is expensive and none of it depends on the rows:
+    # PDF/DOCX text extraction, a full YAKE pass (n=3, top=75), a _keywords.json
+    # write the cloud never gets to reuse (the daily caches career-ops/** only).
+    # Since #106 a scrape that returns zero rows truncates jobs.csv instead of
+    # leaving the previous run's file behind, so "nothing to score" is now the
+    # ordinary shape of a throttled morning rather than a rare one.
+    with open(JOBS_PATH, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        # Truncate, don't just return: leaving yesterday's filtered_jobs.csv in
+        # place is #106 one stage down — screen and bridge would re-process
+        # those rows as today's results. Named as an empty scrape rather than
+        # left to fall through to the min_score message below, which reads as a
+        # threshold the user should lower.
+        print(f"[filter] {JOBS_PATH.name} has no rows — nothing to filter")
+        OUTPUT_PATH.write_text("", encoding="utf-8")
+        return OUTPUT_PATH
+
+    # The date and eligibility cuts need nothing from the resume, so they run
+    # first and can rule out the resume work entirely.
+    candidates = []
+    too_old = 0
+    ineligible = 0
+    for row in rows:
+        if cutoff:
+            posted = parse_date_posted(row.get("date_posted") or "")
+            if posted is not None and posted < cutoff:
+                too_old += 1
+                continue
+        if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
+            ineligible += 1
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        print(
+            f"[filter] nothing left to score of {len(rows)} scraped "
+            f"({ineligible} ineligible, {too_old} too old)"
+        )
+        OUTPUT_PATH.write_text("", encoding="utf-8")
+        return OUTPUT_PATH
+
     # Resolve via _resolve_resume_path so an unset RESUME_PATH still discovers a
     # dropped resume.docx/resume.odt, not just resume.pdf. An explicitly empty
     # RESUME_PATH (e.g. a workflow `${{ vars.X || '' }}` pattern) is treated the
@@ -365,28 +409,17 @@ def run(config_path: Path) -> Path:
 
     jobs = []
     excluded = 0
-    too_old = 0
-    ineligible = 0
-    with open(JOBS_PATH, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if cutoff:
-                posted = parse_date_posted(row.get("date_posted") or "")
-                if posted is not None and posted < cutoff:
-                    too_old += 1
-                    continue
-            if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
-                ineligible += 1
-                continue
-            result = _score_job(
-                row, keywords, keyword_pattern, target_pattern, negative_pattern, target_lookup,
-            )
-            if result is None:
-                excluded += 1
-                continue
-            score, matches = result
-            row["relevance_score"] = score
-            row["matched_keywords"] = ", ".join(matches)
-            jobs.append(row)
+    for row in candidates:
+        result = _score_job(
+            row, keywords, keyword_pattern, target_pattern, negative_pattern, target_lookup,
+        )
+        if result is None:
+            excluded += 1
+            continue
+        score, matches = result
+        row["relevance_score"] = score
+        row["matched_keywords"] = ", ".join(matches)
+        jobs.append(row)
 
     relevant = [j for j in jobs if j["relevance_score"] >= min_score]
     relevant.sort(key=lambda r: r["relevance_score"], reverse=True)
