@@ -73,13 +73,15 @@
           # downloads is a generic-linux build that will not start here, so skip
           # that download and hand it the nixpkgs browsers instead.
           #
-          # The catch: browsers are keyed to the driver version, and career-ops
-          # asks for "playwright": "^1.58.1", which floats well past what
-          # nixpkgs ships. Pin the npm side to match:
-          #   nix eval --raw nixpkgs#playwright-driver.version
-          #   cd career-ops && npm install --save-exact playwright@<that>
-          # Re-pin whenever playwright-driver moves.
+          # The browsers are keyed to a driver version, and career-ops asks for
+          # "playwright": "^1.58.1" with no committed lockfile — so a plain npm
+          # install floats past whatever nixpkgs ships and chromium then
+          # refuses to launch. setup.sh reconciles the two: BROWSERS_PATH is
+          # its signal that the browsers are managed outside npm, and
+          # DRIVER_VERSION is what it pins the npm side to. Both move together
+          # on a nixpkgs bump, so there is nothing to re-pin by hand.
           PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+          PLAYWRIGHT_DRIVER_VERSION = pkgs.playwright-driver.version;
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
           PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
 
