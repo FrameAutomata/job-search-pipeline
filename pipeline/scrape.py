@@ -192,7 +192,7 @@ def _no_results(reason: str) -> Path:
     without the truncation. Why it must truncate — and why zero bytes rather
     than a header — is pipeline.rowio's contract.
     """
-    print(f"[scrape] {reason} — writing empty jobs.csv", flush=True)
+    print(f"[scrape] {reason} — writing empty jobs.csv")
     write_rows(OUTPUT_PATH, [])
     return OUTPUT_PATH
 
