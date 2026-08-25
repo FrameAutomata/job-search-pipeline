@@ -594,13 +594,32 @@ def local_search_set(req: LocalSearchConfig) -> JSONResponse:
             status_code=400,
             detail=f"No pass names a supported board, so this config would scrape "
                    f"nothing. Supported: {', '.join(SUPPORTED_SITES)}.")
-    # JobSpy's per-pass mutual-exclusion rule, run rather than restated —
-    # limitation_conflict is the same function the scraper applies. Refused, not
-    # warned: a run skips a conflicting pass, so saving one would silently drop a
-    # search the user believes they configured, and here it is still editable.
+    # JobSpy's mutual-exclusion rule, run rather than restated — the same
+    # pipeline.sites predicate the scraper applies, so neither can drift from the
+    # other about which passes break it.
+    #
+    # The CONSEQUENCE deliberately differs, and this is the one place that
+    # divergence lives (#126). A run degrades per board — scrape.resolve_pass_sites
+    # drops the board the pass conflicts on and searches the rest. This refuses the save outright,
+    # for any conflicting board, because a conflict is repairable while the
+    # config is still on screen and repairing it beats degrading it — split the
+    # pass in two and BOTH boards search both filters, where saving it costs the
+    # Indeed half permanently and the user learns that only from a log line. An
+    # unsupported board is warned about rather than refused precisely because it
+    # is not repairable; that is the asymmetry, not an inconsistency.
+    #
+    # It is also one-directional: on THIS rule, everything the endpoint accepts is
+    # a config the next run acts on exactly as written. Scoped to this rule on
+    # purpose — an unsupported board saves with a warning and is then stripped by
+    # the run, so the endpoint is not globally stricter, it is stricter where the
+    # user can still do something about it. The runtime's degradation exists for
+    # the configs that never come through here — a stale SEARCH_CONFIG_B64, a
+    # hand-edited search.yml.
+    #
     # unreadable_options first: a value jobspy would reject aborts the scrape
-    # stage outright, so saving one breaks this endpoint's promise that what it
-    # accepts is a config the next run can load.
+    # stage outright — no board survives it, so a run skips the whole pass —
+    # and saving one breaks this endpoint's promise that what it accepts is a
+    # config the next run can load.
     conflicts = [
         c for c in (unreadable_options(e) or limitation_conflict(e) for e in entries) if c
     ]

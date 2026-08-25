@@ -1,6 +1,8 @@
 """Scrape job boards via JobSpy. Reads search params from config/search.yml,
-drops passes JobSpy would reject (retired boards, mutually exclusive Indeed
-options), and writes output/jobs.csv."""
+narrows each pass to the boards JobSpy would really search it on (retired boards
+and ones whose mutually exclusive options the pass combines are dropped), skips
+the passes left with none and the passes it cannot run at all, and writes
+output/jobs.csv."""
 
 import sys
 from pathlib import Path
@@ -12,7 +14,7 @@ from jobspy import scrape_jobs
 from pipeline.rowio import write_rows
 from pipeline.sites import (
     SUPPORTED_SITES,
-    limitation_conflict,
+    board_conflicts,
     normalize_pass,
     resolve_sites,
     unreadable_options,
@@ -53,25 +55,96 @@ OPTIONAL_PARAMS = [
 ]
 
 
-def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
-    """Remove unsupported sites from every pass; drop passes with none left.
+def resolve_pass_sites(searches: list[dict]) -> list[dict]:
+    """Every pass JobSpy can actually run, with `sites` narrowed to the boards it
+    will really search — passes it cannot run at all, and passes left with no
+    board, are dropped.
 
-    Applied on the way into a run rather than only when a config is authored,
-    so stale configs — e.g. a fork's old SEARCH_CONFIG_B64 cloud secret still
-    listing glassdoor — degrade to a warning instead of wasted requests or a
-    crash. The per-pass rule lives in pipeline.sites.resolve_sites, which the
-    UI validator also calls so its save-time warning can't drift from this."""
+    Three rules, all pipeline.sites', so the UI validator can predict them by
+    running the same code rather than restating it. Two narrow the board list:
+
+      - a **retired** board (resolve_sites) — glassdoor and friends are
+        Cloudflare-walled or serve responses that kill the run;
+      - a board whose **mutual-exclusion rule** this pass breaks
+        (board_conflicts) — Indeed acts on only one of hours_old /
+        job_type+is_remote / easy_apply, and silently drops the loser.
+
+    The two narrowing rules share one loop because they answer one question —
+    which boards does this pass actually scrape — about one field, and the second
+    subtracts from what the first resolved. Split across two loops the mutex rule
+    had to resolve the board list a second time to have something to subtract
+    from, and would then strip a retired board with none of the warning the first
+    rule owes it. (`board_conflicts` still resolves the boards internally, on
+    purpose — it is the anti-drift device the UI runs too, so it must not depend
+    on a caller having prepared its input. What the shared loop buys is one
+    `kept` list that both rules narrow, not one call to resolve_sites.)
+
+    Applied on the way into a run rather than only when a config is authored, so
+    a config that never met the UI's save-time validator — a fork's stale
+    SEARCH_CONFIG_B64 cloud secret, a hand-edited search.yml — degrades with a
+    warning instead of wasting requests or aborting the stage and taking every
+    healthy pass (in the cloud, the whole day's run) with it.
+
+    The mutex rule degrades PER BOARD (#126). It is a property of a board, not
+    of a pass: every pass in the shipped example config — and everything
+    setup-profile.mjs generates — names `[indeed, linkedin]`, so adding
+    `easy_apply: true` to an `hours_old:` pass conflicts on Indeed and on
+    nothing else. Skipping the pass discarded the LinkedIn search that would
+    have run exactly as configured, which is verbatim the harm #115 cited when
+    it retired the LinkedIn mutex group, reached one level up. Every single-board
+    case still loses the pass, `sites: [indeed]` included — that is the same
+    rule, not an exception to it.
+
+    The third rule answers a different question — can this pass run at all? — and
+    so has a different consequence: an **unreadable option value** (`easy_apply:
+    maybe`) drops the whole pass, boards and all. That asymmetry is real rather
+    than an oversight: `scrape_jobs` builds one ScraperInput before it dispatches
+    to any board, so a value pydantic rejects raises a ValidationError no board
+    survives. There is no healthy half to keep, which is why the rule shares this
+    loop rather than narrowing anything. tests/test_jobspy_contract.py pins that
+    reading against the library, since it is what makes the two consequences
+    differ.
+
+    Where this and the UI validator deliberately differ is the *consequence* of
+    a mutex conflict — a run degrades, the save endpoint refuses — and that is
+    written down at the UI's call site.
+    """
     result = []
     for cfg in searches:
-        kept, dropped = resolve_sites(cfg)
         name = cfg.get("name", "pass")
-        if dropped:
+        kept, retired = resolve_sites(cfg)
+        if retired:
             print(f"[scrape] [{name}] dropping unsupported sites: "
-                  f"{', '.join(dropped)} "
+                  f"{', '.join(retired)} "
                   f"(supported: {', '.join(SUPPORTED_SITES)})")
         if not kept:
             print(f"[scrape] [{name}] skipping pass — no supported sites left")
             continue
+
+        unreadable = unreadable_options(cfg)
+        if unreadable:
+            print(f"[scrape] skipping pass — {unreadable}")
+            continue
+
+        # Judged against the whole pass, but answered per board: board_conflicts
+        # resolves the same boards as `kept` above, so subtracting its keys is
+        # exact. Its messages already carry the pass name.
+        conflicts = board_conflicts(cfg)
+        if conflicts:
+            # Both halves of the message name boards as the CONFIG spelled them.
+            # conflicts' keys are MUTEX_GROUPS' lower-case ones, so reporting
+            # those would print `dropping indeed ... Still searching: LinkedIn`
+            # for a pass that wrote both capitalised — half a log line a user
+            # can grep for with the spelling they used.
+            blocked = [s for s in kept if s.lower() in conflicts]
+            kept = [s for s in kept if s.lower() not in conflicts]
+            why = " ".join(conflicts.values())
+            if not kept:
+                print(f"[scrape] skipping pass — {why}")
+                continue
+            print(f"[scrape] dropping {', '.join(blocked)} from this pass — {why} "
+                  f"Still searching: {', '.join(kept)}.")
+
         result.append({**cfg, "sites": kept})
     return result
 
@@ -159,31 +232,6 @@ def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
-def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
-    """Drop passes JobSpy can't run as written.
-
-    Two ways that happens: options it can't honour together, and a value it
-    can't read at all (which would raise a ValidationError out of scrape_jobs
-    and take the run with it). Both degrade the same way, for the reason below.
-
-    Same degradation as strip_unsupported_sites above, for the same reason: a
-    config reaches a run without ever passing the UI's save-time validator — a
-    stale SEARCH_CONFIG_B64 cloud secret, a hand-edited search.yml — and one bad
-    pass used to raise out of the scrape stage, taking every pass that was fine
-    (in the cloud, the whole day's run) down with it. The rule itself is
-    pipeline.sites.limitation_conflict, which the UI validator also calls, so
-    what it can refuse to save and what a run enforces can't drift.
-    """
-    result = []
-    for cfg in searches:
-        problem = unreadable_options(cfg) or limitation_conflict(cfg)
-        if problem:
-            print(f"[scrape] skipping pass — {problem}")
-            continue
-        result.append(cfg)
-    return result
-
-
 def _no_results(reason: str) -> Path:
     """Report `reason`, truncate jobs.csv, and hand back its path.
 
@@ -214,7 +262,7 @@ def run(
         easy_apply_only=easy_apply_only,
         no_easy_apply=no_easy_apply,
     )
-    searches = drop_conflicting_passes(strip_unsupported_sites(selected))
+    searches = resolve_pass_sites(selected)
 
     if not searches:
         # No matching passes — truncate jobs.csv so downstream stages no-op

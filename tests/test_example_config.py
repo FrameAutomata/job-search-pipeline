@@ -54,8 +54,10 @@ def test_the_passes_together_show_every_supported_board(passes):
 
 def test_no_pass_breaks_the_mutex_rule(passes):
     """The passes exist to demonstrate working around JobSpy's mutex rule. One
-    that breaks it is skipped with a warning at scrape time, so shipping it
-    would hand the user a search that silently never runs."""
+    that breaks it loses the offending board at scrape time — and, being
+    `[indeed, linkedin]` like every pass here, loses the Indeed half of a search
+    the user believes they configured. A single-board one would be skipped
+    outright. Either way, shipping it teaches the wrong shape."""
     conflicts = [c for c in (limitation_conflict(cfg) for cfg in passes) if c]
     assert not conflicts, "\n".join(conflicts)
 
