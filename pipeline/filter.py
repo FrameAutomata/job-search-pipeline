@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from pipeline import resume_text as _resume_text
 from pipeline.rowio import read_rows, write_rows
+from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -472,5 +473,7 @@ def run(config_path: Path) -> Path:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     cfg_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "config" / "search.yml"
     run(cfg_path)

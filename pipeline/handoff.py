@@ -43,6 +43,7 @@ from pipeline._batch_common import (
     atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
 )
 from pipeline.app import data as _data
+from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1743,5 +1744,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     import sys
     sys.exit(main())

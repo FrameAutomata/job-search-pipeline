@@ -18,6 +18,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from pipeline.stdio import line_buffer_stdout
+
 # What the setup/UI offer as importable resume formats (no .txt — that's the
 # generated sidecar, not something a user uploads).
 IMPORT_SUFFIXES = (".pdf", ".docx", ".odt")
@@ -131,4 +133,6 @@ def _main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     raise SystemExit(_main(sys.argv[1:]))

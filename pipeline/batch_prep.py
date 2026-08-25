@@ -9,6 +9,8 @@ import csv
 import sys
 from pathlib import Path
 
+from pipeline.stdio import line_buffer_stdout
+
 ROOT = Path(__file__).resolve().parent.parent
 BATCH_INPUT = "batch/batch-input.tsv"
 FIELDNAMES = ["id", "url", "source", "notes"]
@@ -78,6 +80,8 @@ def run(career_ops_path: Path, new_offers: list[dict]) -> int:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     import json
     career_ops = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "career-ops"
     offers = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []

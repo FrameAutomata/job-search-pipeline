@@ -210,7 +210,7 @@ jobs:
           # easy_apply pass) in a single daily run. --recheck-liveness re-checks
           # the tracker's still-open roles once a day and Discards any whose
           # posting has since closed.
-          python -u orchestrate.py --evaluate-batch \
+          python orchestrate.py --evaluate-batch \
             --recheck-liveness \
             --batch-concurrency "$BATCH_CONCURRENCY"
 

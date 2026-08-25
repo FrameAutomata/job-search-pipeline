@@ -52,6 +52,7 @@ from pipeline.sites import (
     resolve_sites,
     unreadable_options,
 )
+from pipeline.stdio import line_buffer_stdout
 from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -149,6 +150,14 @@ def _refuse_during_local_run() -> None:
                    "adding a job now would collide on report/tracker numbering.",
         )
 
+
+# The UI process is an entry point too, and one the buffering rule has to
+# cover explicitly: uvicorn imports this module rather than running a
+# __main__ block, and unlike local_run.py's child it gets no
+# PYTHONUNBUFFERED. pipeline code runs in-process here — recheck.drain on a
+# background thread, batch_evaluate's retry notices from Add-Job — so
+# without this `./run-ui.sh > ui.log` buffers those lines for 8KB.
+line_buffer_stdout()
 
 app = FastAPI(title="job-search-pipeline UI")
 

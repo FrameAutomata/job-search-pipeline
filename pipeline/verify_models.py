@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 from pipeline.batch_evaluate import PROVIDER_BASE_URLS, PROVIDER_DEFAULTS, _PROVIDER_KEYS
+from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
 _TIMEOUT = 40
@@ -231,4 +232,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    line_buffer_stdout()
+
     sys.exit(main())
