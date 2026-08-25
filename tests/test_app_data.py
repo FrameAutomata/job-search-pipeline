@@ -497,3 +497,115 @@ class TestEasyApplyTag:
     def test_missing_file_all_false(self, tmp_path):
         apps = self._write(tmp_path, urls=None)
         assert all(r["easy_apply"] is False for r in data.parse_applications(apps))
+
+
+class TestReportLinkNormalization:
+    """merge-tracker.mjs now rewrites the Report link relative to the tracker
+    FILE, and the pipeline seeds the tracker at career-ops/data/applications.md
+    — so a link written as `reports/042-x.md` comes back as `../reports/042-x.md`.
+    Consumers resolve `report_path` as `career_ops / report_path`, which the
+    ascent escapes; `read_text` returns "" on the miss, so tailoring and cover
+    letters silently drop the evaluation report's proof points. Both shapes
+    coexist in one file, since the older merge-tracker copied the cell verbatim."""
+
+    def _tracker(self, tmp_path, link):
+        p = tmp_path / "applications.md"
+        p.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            f"| 1 | 2026-08-25 | Acme | SWE | 4.5/5 | Evaluated | null | {link} | n |\n",
+            encoding="utf-8")
+        return p
+
+    def test_ascent_is_stripped(self, tmp_path):
+        row = data.parse_applications(
+            self._tracker(tmp_path, "[001](../reports/001-acme.md)"))[0]
+        assert row["report_path"] == "reports/001-acme.md"
+        assert row["report_num"] == "001"
+
+    def test_plain_path_unchanged(self, tmp_path):
+        row = data.parse_applications(
+            self._tracker(tmp_path, "[001](reports/001-acme.md)"))[0]
+        assert row["report_path"] == "reports/001-acme.md"
+
+    def test_resolves_under_career_ops(self, tmp_path):
+        """The property that actually matters to the three consumers."""
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "reports").mkdir(parents=True)
+        (career_ops / "reports" / "001-acme.md").write_text("body", encoding="utf-8")
+        row = data.parse_applications(
+            self._tracker(tmp_path, "[001](../reports/001-acme.md)"))[0]
+        assert (career_ops / row["report_path"]).exists()
+
+
+class TestViaColumnLayout:
+    """career-ops supports an optional `Via` column (the agency a role comes
+    through) after Company, migrated in with `merge-tracker.mjs --migrate-via`.
+    Read positionally, the extra cell puts the agency where Role should be — and
+    company::role is the key bridge dedup, handoff's role_key, the résumé-base
+    picker and the tailored role all run on."""
+
+    VIA = (
+        "| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|---|---|---|---|---|---|---|---|---|\n"
+        "| 1 | 2026-08-25 | Acme Corp | Robert Half | Senior Software Engineer "
+        "| 4.5/5 | Applied | null | [001](../reports/001-a.md) | fintech |\n"
+    )
+
+    def test_role_is_the_role_not_the_agency(self, tmp_path):
+        p = tmp_path / "applications.md"; p.write_text(self.VIA, encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert row["company"] == "Acme Corp"
+        assert row["role"] == "Senior Software Engineer"
+        assert row["via"] == "Robert Half"
+
+    def test_remaining_columns_still_land(self, tmp_path):
+        p = tmp_path / "applications.md"; p.write_text(self.VIA, encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert row["score"] == "4.5/5"
+        assert row["status_canonical"] == "Applied"
+        assert row["report_num"] == "001"
+        assert row["notes"] == "fintech"
+
+    def test_identity_lookup_reads_the_role_column(self, tmp_path):
+        assert data.resolve_num_by_identity(
+            self.VIA, "Acme Corp", "Senior Software Engineer") == "1"
+
+    def test_canonical_layout_is_unaffected(self, tmp_path):
+        p = tmp_path / "applications.md"
+        p.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            "| 7 | 2026-08-25 | Initech | SRE | 4.0/5 | Evaluada | null "
+            "| [007](reports/007-i.md) | x |\n", encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert (row["company"], row["role"]) == ("Initech", "SRE")
+        assert row["status_canonical"] == "Evaluated"
+
+
+class TestHiredStatus:
+    """`Hired` is career-ops' 9th canonical state. An unrecognized status is not
+    inert in the UI: the board falls back to Evaluated, so a landed job rendered
+    in the Evaluated column and the report pane pre-selected Evaluated for it."""
+
+    def test_hired_is_canonical(self):
+        assert "Hired" in data.CANONICAL_STATES
+        assert data.canonical_status("Hired") == "Hired"
+
+    @pytest.mark.parametrize("alias,expected", [
+        ("accepted", "Hired"), ("contratado", "Hired"),
+        ("geo blocker", "SKIP"), ("reddedildi", "Rejected"),
+        ("mülakat", "Interview"), ("teklif", "Offer"),
+        ("evaluada", "Evaluated"),
+    ])
+    def test_states_yml_aliases(self, alias, expected):
+        assert data.canonical_status(alias) == expected
+
+    def test_kanban_mirror_is_in_sync(self):
+        """app.js keeps its own copy of the column list; drift between the two
+        is what put a Hired row in the Evaluated column."""
+        js = (Path(__file__).resolve().parent.parent
+              / "pipeline" / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        line = next(l for l in js.splitlines() if l.startswith("const STATES"))
+        for state in data.CANONICAL_STATES:
+            assert f'"{state}"' in line, f"{state} missing from app.js STATES"

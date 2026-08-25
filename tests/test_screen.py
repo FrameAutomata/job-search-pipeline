@@ -1169,3 +1169,56 @@ class TestScreenEmptyOutputShape:
                             lambda *a, **kw: pytest.fail("fetched a posting for a file with no rows"))
 
         assert run(self._cfg(tmp_path)) == 0
+
+
+class TestLivenessNotPermanentlyDead:
+    """A posting is recorded `screened-dead` in scan-history.tsv — permanently,
+    across every future run — only on an `expired` verdict. These are the cases
+    that used to reach `expired` through the "insufficient content" fallthrough
+    despite carrying no evidence the posting was gone."""
+
+    CLOUDFLARE = (
+        "<html><head><title>Just a moment...</title></head><body>"
+        "Enable JavaScript and cookies to continue. Ray ID: 8f2a1b3c9d0e"
+        "</body></html>"
+    )
+
+    @pytest.mark.parametrize("status", [500, 502, 503, 504, 520])
+    def test_server_error_is_uncertain_not_expired(self, status):
+        """A 5xx is the site being broken, not the posting being removed. Its
+        error page is short and has no apply control, so it used to land on
+        `insufficient content` -> expired."""
+        result, _ = classify_liveness(status, "https://x/j/1", "<html>502 Bad Gateway</html>")
+        assert result == "uncertain"
+
+    def test_bot_challenge_served_200_is_throttled(self):
+        """Cloudflare answers the challenge with HTTP 200, so the status-based
+        throttle check never sees it."""
+        result, reason = classify_liveness(200, "https://x/j/1", self.CLOUDFLARE)
+        assert result == "throttled"
+        assert "anti-bot" in reason
+
+    def test_live_posting_wins_over_challenge_wording(self):
+        """The bot-challenge patterns are matched against the whole page, JD
+        prose included. A posting that carries an apply control is live, whatever
+        its copy says — a false `throttled` holds the row on every run, so the
+        job is never evaluated at all."""
+        body = ("<html><body>" + "Great infra role. " * 30 +
+                "It takes just a moment to apply. We use Ray for training."
+                "<button>Apply now</button></body></html>")
+        result, _ = classify_liveness(200, "https://x/j/1", body)
+        assert result == "active"
+
+    def test_bare_ray_mention_is_not_a_challenge(self):
+        """"Ray" without Cloudflare's hex id is an ML framework, not a wall."""
+        body = "<html><body>" + "We use Ray and Kubernetes. " * 20 + "</body></html>"
+        result, _ = classify_liveness(200, "https://x/j/1", body)
+        assert result != "throttled"
+
+    def test_real_removals_still_expire(self):
+        """The guards above must not blunt the genuine signals."""
+        assert classify_liveness(404, "https://x/j/1", "")[0] == "expired"
+        assert classify_liveness(410, "https://x/j/1", "")[0] == "expired"
+        body = "<html>" + "x " * 200 + "This job is no longer available</html>"
+        assert classify_liveness(200, "https://x/j/1", body)[0] == "expired"
+        assert classify_liveness(200, "https://x/j/1", "<html></html>")[0] == "expired"

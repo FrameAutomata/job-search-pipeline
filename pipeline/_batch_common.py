@@ -359,6 +359,60 @@ def _strip_role_pipe(tracker_tsv: str) -> str:
     return "\t".join(parts)
 
 
+# Score cells merge-tracker.mjs accepts verbatim (tracker-parse.mjs's
+# `looksLikeScoreCell`), beyond the plain `N/5` / `N.N/5` form.
+_SCORE_SENTINELS = {"N/A", "DUP", "—", "-"}
+# The leading number of whatever the model wrote: "4.2", "4.2/5", "4.2 / 5.0",
+# "**4/5**", "4,2/5" (comma decimal). Anything else has no score in it.
+_SCORE_LEAD_RE = re.compile(r"(\d+(?:[.,]\d+)?)")
+
+
+def _normalize_score_cell(tracker_tsv: str) -> str:
+    """Rewrite the score column (col 6) to the exact `N.N/5` shape
+    merge-tracker.mjs requires, or to the `N/A` sentinel when it holds no number.
+
+    merge-tracker resolves which of columns 5-6 is the status and which is the
+    score by asking whether exactly one of them *looks like* a score cell
+    (`tracker-parse.mjs:resolveScoreStatus` — `/^\\d+(?:\\.\\d+)?\\/5$/`, plus the
+    N/A / DUP / dash sentinels). When neither matches it refuses the row rather
+    than risk merging a column swap. That refusal is counted as `skipped`, not
+    as a failure: merge-tracker still exits 0 AND still moves the TSV into
+    tracker-additions/merged/. So a model that writes "4.2" instead of "4.2/5"
+    loses the evaluation outright — the report is on disk, the row never
+    reaches applications.md, `run_merge_tracker` sees returncode 0, and
+    `has_pending_tracker_additions` goes false so no later run retries it.
+
+    The older merge-tracker had a heuristic whose final fallback assumed
+    "status then score" — this row order — so any score string merged and the
+    prompt's "format X.X/5" rule was advisory. It is load-bearing now, and a
+    prompt rule is not something a local Ollama/Groq/DeepSeek model reliably
+    honours. This is the one place we own the value, so normalize it here
+    rather than depend on model compliance."""
+    line = tracker_tsv.strip()
+    parts = line.split("\t")
+    if len(parts) != _TRACKER_TSV_COLUMNS:
+        return tracker_tsv
+    raw = parts[5].replace("*", "").strip()
+    if raw.upper() in {s.upper() for s in _SCORE_SENTINELS}:
+        parts[5] = raw.upper() if raw.upper() in ("N/A", "DUP") else raw
+        return "\t".join(parts)
+    m = _SCORE_LEAD_RE.search(raw)
+    if not m:
+        # No number at all (empty, "unknown", a stray status). N/A is a shape
+        # merge-tracker recognises, so the row still merges and the evaluation
+        # stays visible — a scoreless row beats a silently discarded one.
+        parts[5] = "N/A"
+        return "\t".join(parts)
+    value = float(m.group(1).replace(",", "."))
+    # Out of range means the model answered on some other scale ("8/10", "84%")
+    # and we cannot know which. Clamping to 5 would invent a perfect score, and
+    # the handoff work-order ranks by score descending — a fabricated 5 puts the
+    # role first. N/A merges the row and leaves it unranked, which is the true
+    # statement.
+    parts[5] = f"{value:g}/5" if 0 <= value <= 5 else "N/A"
+    return "\t".join(parts)
+
+
 def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     """Splice the job URL into the notes (last) column of the tracker row so
     the UI's "Open posting" link works.
@@ -410,6 +464,7 @@ def write_job_result(
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
     if tracker_tsv:
         tracker_tsv = _strip_role_pipe(tracker_tsv)
+        tracker_tsv = _normalize_score_cell(tracker_tsv)
         tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
@@ -537,9 +592,41 @@ def run_merge_tracker(career_ops: Path) -> bool:
     r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
     if r.returncode == 0:
         print("[batch] tracker merged")
+        _warn_on_skipped_additions(r.stdout, r.stderr)
         return True
     print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
+    _hint_missing_node_modules(r.stderr)
     return False
+
+
+# merge-tracker declines a row it can't read confidently (an unreadable score
+# cell, a report number marked failed in batch-state.tsv) by printing a
+# "Skipping <file>" line — and then still archives the TSV and exits 0. Exit 0
+# therefore no longer means "everything merged", so surface the lines.
+_SKIP_LINE_RE = re.compile(r"^.*\bSkipping\b.*$", re.MULTILINE)
+
+
+def _warn_on_skipped_additions(stdout: str, stderr: str) -> None:
+    skipped = _SKIP_LINE_RE.findall(f"{stdout}\n{stderr}")
+    if not skipped:
+        return
+    print(f"[batch] WARNING: merge-tracker skipped {len(skipped)} addition(s) — "
+          "these evaluations are NOT in applications.md, and their TSVs have "
+          "already been archived to batch/tracker-additions/merged/:")
+    for line in skipped:
+        print(f"[batch]   {line.strip()}")
+
+
+def _hint_missing_node_modules(stderr: str) -> None:
+    """merge-tracker.mjs used to import only Node builtins; it now reaches
+    js-yaml through tracker-utils.mjs. A career-ops checkout that was updated
+    without a fresh `npm install` fails to resolve it, and the raw
+    ERR_MODULE_NOT_FOUND stack doesn't say what to do about it."""
+    if "ERR_MODULE_NOT_FOUND" not in stderr and "Cannot find package" not in stderr:
+        return
+    print("[batch] hint: career-ops now has npm dependencies that merge-tracker "
+          "needs (js-yaml). Run `npm install --ignore-scripts` in your "
+          "career-ops checkout — a `git pull`/rebase there does not install them.")
 
 
 def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article_digest: str = "", *, profile_master: str = "") -> str:

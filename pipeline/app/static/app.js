@@ -11,10 +11,10 @@ let view = "table"; // "table" | "board"
 let pending = 0;
 
 // Canonical kanban columns — mirror of data.CANONICAL_STATES.
-const STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"];
+const STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP", "Hired"];
 
 // Statuses hidden by default: terminal/actioned states where no further action is needed.
-const ACTIONED_STATUSES = new Set(["Applied", "Rejected", "Discarded", "SKIP"]);
+const ACTIONED_STATUSES = new Set(["Applied", "Rejected", "Discarded", "SKIP", "Hired"]);
 let hideActioned = localStorage.getItem("hideActioned") !== "false";
 
 const els = {

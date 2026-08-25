@@ -191,18 +191,22 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str) 
     if not want_company:
         return None
     want_role = normalize_company(role)
+    # Read Company/Role by name, not by slot — a tracker migrated to the Via
+    # layout puts the agency where Role used to sit.
+    columns = _header_columns(applications_md_text)
+    company_idx, role_idx = columns.index("company"), columns.index("role")
     for line in applications_md_text.splitlines():
         if not line.lstrip().startswith("|"):
             continue
         if _SEPARATOR_RE.match(line.strip()):
             continue
         cells = _split_row(line)
-        if len(cells) < len(_COLUMNS):
+        if len(cells) < len(columns):
             continue
         if cells[0].lower() in ("#", "num"):
             continue
-        if normalize_company(cells[2]) == want_company and (
-            not want_role or normalize_company(cells[3]) == want_role
+        if normalize_company(cells[company_idx]) == want_company and (
+            not want_role or normalize_company(cells[role_idx]) == want_role
         ):
             return cells[0].strip()
     return None
@@ -249,25 +253,43 @@ def resolve_overrides_for_push(applications_md_text: str, overrides: dict,
 
 # Canonical applications.md statuses (mirror of career-ops templates/states.yml
 # + merge-tracker.mjs). The kanban board uses these as its columns.
+# "Hired" is career-ops' 9th state (terminal — "offer accepted, job landed").
+# It postdates this list, and an unknown status is NOT inert: the board falls
+# back to `STATES.includes(s) ? s : "Evaluated"`, so a landed job rendered in
+# the Evaluated column and the report pane's dropdown pre-selected Evaluated
+# for it — one save away from downgrading it.
 CANONICAL_STATES = [
     "Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected",
-    "Discarded", "SKIP",
+    "Discarded", "SKIP", "Hired",
 ]
 
 # Map the aliases merge-tracker accepts (Spanish defaults + variants) onto the
 # canonical English states, so a card written as "Evaluada" lands in the
-# "Evaluated" column. Lowercased keys.
+# "Evaluated" column. Lowercased keys. Mirrors templates/states.yml.
 _STATUS_ALIASES = {
     "evaluada": "Evaluated", "evaluar": "Evaluated", "condicional": "Evaluated",
     "hold": "Evaluated", "verificar": "Evaluated",
+    "degerlendirildi": "Evaluated", "değerlendirildi": "Evaluated",
     "aplicado": "Applied", "aplicada": "Applied", "enviada": "Applied", "sent": "Applied",
+    "basvuruldu": "Applied", "başvuruldu": "Applied",
     "respondido": "Responded",
-    "entrevista": "Interview",
-    "oferta": "Offer",
-    "rechazado": "Rejected", "rechazada": "Rejected",
+    "yanit verildi": "Responded", "yanıt verildi": "Responded",
+    "yanit_verildi": "Responded", "yanıt_verildi": "Responded",
+    "entrevista": "Interview", "mulakat": "Interview", "mülakat": "Interview",
+    "oferta": "Offer", "teklif": "Offer",
+    "rechazado": "Rejected", "rechazada": "Rejected", "reddedildi": "Rejected",
     "descartado": "Discarded", "descartada": "Discarded",
     "cerrada": "Discarded", "cancelada": "Discarded",
+    "iptal edildi": "Discarded", "iptal_edildi": "Discarded",
+    "ıptal edildi": "Discarded", "ıptal_edildi": "Discarded",
     "no aplicar": "SKIP", "no_aplicar": "SKIP", "monitor": "SKIP",
+    "geo blocker": "SKIP", "geo_blocker": "SKIP",
+    "uygun degil": "SKIP", "uygun değil": "SKIP",
+    "uygun_degil": "SKIP", "uygun_değil": "SKIP",
+    "contratado": "Hired", "contratada": "Hired",
+    "accepted": "Hired", "accept": "Hired",
+    "kabul edildi": "Hired", "kabul_edildi": "Hired",
+    "ise alindi": "Hired", "işe alındı": "Hired", "işe alindi": "Hired",
 }
 
 
@@ -285,6 +307,61 @@ def canonical_status(raw: str) -> str:
 #   | # | Date | Company | Role | Score | Status | PDF | Report | Notes |
 _COLUMNS = ["num", "date", "company", "role", "score", "status", "pdf", "report", "notes"]
 
+# career-ops supports a second layout with an optional `Via` column (the agency
+# a role comes through) inserted after Company, migrated into an existing
+# tracker with `node merge-tracker.mjs --migrate-via`. Its own readers map
+# columns by header name (tracker-parse.mjs `detectColumns`), so both layouts
+# work there. Reading positionally against _COLUMNS does not: the extra cell
+# shifts everything right, `_realign_cells` then rebuilds the row from a Report
+# anchor and takes the Via cell as the role. Score/status/report survive that;
+# identity does not — and `company::role` is what bridge dedup, handoff's
+# role_key, the résumé-base picker and the tailored role all key on. So detect
+# the header and map by name, falling back to the positional order for a
+# tracker with no header row (which is how the merge seeds one).
+_HEADER_ALIASES = {
+    "#": "num", "num": "num", "n": "num",
+    "date": "date", "fecha": "date",
+    "company": "company", "empresa": "company",
+    "via": "via",
+    "role": "role", "puesto": "role", "rol": "role",
+    "score": "score", "puntuacion": "score", "puntuación": "score",
+    "status": "status", "estado": "status",
+    "pdf": "pdf",
+    "report": "report", "informe": "report",
+    "notes": "notes", "notas": "notes",
+    "url": "url",
+}
+# Columns a row must carry for name-mapping to be trusted. Short of these we
+# keep the positional read rather than half-map a table we misread.
+_ESSENTIAL_COLUMNS = ("num", "company", "role", "status", "report")
+
+
+def _detect_columns(cells: list[str]) -> list[str] | None:
+    """Map a candidate header row to our column keys, or None if it isn't one.
+
+    Unrecognized headers keep their slot under a synthetic key so every later
+    column still lines up."""
+    keys: list[str] = []
+    for i, c in enumerate(cells):
+        label = c.replace("*", "").strip().lower()
+        keys.append(_HEADER_ALIASES.get(label, f"_col{i}"))
+    if not all(k in keys for k in _ESSENTIAL_COLUMNS):
+        return None
+    return keys
+
+
+def _header_columns(text: str) -> list[str]:
+    """The column layout of a tracker's markdown table — from its header row
+    when it has a readable one, else the canonical positional order."""
+    for line in text.splitlines():
+        if not line.lstrip().startswith("|") or _SEPARATOR_RE.match(line.strip()):
+            continue
+        detected = _detect_columns(_split_row(line))
+        if detected:
+            return detected
+        break        # first table row isn't a header — positional it is
+    return list(_COLUMNS)
+
 # Tracker-additions TSV column order — note status comes BEFORE score here
 # (merge-tracker.mjs swaps them when merging into applications.md):
 #   num \t date \t company \t role \t status \t score \t pdf \t report \t notes
@@ -294,19 +371,42 @@ _TRACKER_COLUMNS = ["num", "date", "company", "role", "status", "score", "pdf", 
 # markdown link like: [042](reports/042-acme-2026-05-27.md)
 _REPORT_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
+# merge-tracker.mjs now normalizes the Report link relative to the tracker FILE
+# (tracker-links.mjs:normalizeReportLink), and the pipeline seeds the tracker at
+# career-ops/data/applications.md — so a link the pipeline emitted as
+# `reports/042-x.md` comes back as `../reports/042-x.md`. The older
+# merge-tracker copied the cell verbatim, so both shapes are now in circulation
+# within one file. Every consumer of `report_path` (cover_letters, resume_tailor,
+# resume_content, via handoff) resolves it as `career_ops / report_path`, which
+# the `../` form escapes — and `read_text` returns "" on the miss, so tailoring
+# and cover letters silently lose the evaluation report's proof points. Strip the
+# ascent here, at the single point both parsers extract it, so the stored value
+# is career-ops-relative whichever shape the file holds.
+_REPORT_ASCENT_RE = re.compile(r"^(?:\.\./)+")
+
+
+def _report_link(cell: str) -> tuple[str, str]:
+    """(report_num, career-ops-relative report_path) from a Report cell."""
+    m = _REPORT_LINK_RE.search(cell or "")
+    if not m:
+        return "", ""
+    return m.group(1).strip(), _REPORT_ASCENT_RE.sub("", m.group(2).strip())
+
 # A markdown table separator row: | --- | :--: | ... |
 _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|?\s*$")
 
 # Report link cell: [num](path). Used to re-anchor columns when extra cells
 # shift the layout (e.g. LLM writes "Role | Remote" and the pipe splits the cell).
 _REPORT_CELL_RE = re.compile(r"^\[[\w\d]+\]\([^)]+\)$")
-# Expected 0-indexed position of the Report cell in a well-formed row.
+# 0-indexed Report slot in the canonical layout. Used where the pipeline
+# *emits* rows (the merge writes canonical 9-column rows), not where it reads
+# them — reads go through the detected layout instead.
 _REPORT_COL_IDX = _COLUMNS.index("report")  # 7
 # Score cell: X.X/5
 _SCORE_CELL_RE = re.compile(r"^\d+\.?\d*/5$")
 
 
-def _realign_cells(cells: list[str]) -> list[str]:
+def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[str]:
     """Recover correct column mapping when a row has extra cells.
 
     The LLM occasionally appends context to a role title with a bare pipe
@@ -316,13 +416,21 @@ def _realign_cells(cells: list[str]) -> list[str]:
 
     Strategy: anchor on the Report link cell (always [num](path)), scan the
     middle cells for a recognisable score (X.X/5) and a recognisable status
-    (canonical value lookup), then reconstruct a clean 9-cell row. Defaults
-    status to "Evaluated" when none of the middle cells is a canonical value —
-    which happens for compound-corrupted rows that have accumulated multiple
-    extra score cells from re-evaluations."""
+    (canonical value lookup), then reconstruct a clean row. Defaults status to
+    "Evaluated" when none of the middle cells is a canonical value — which
+    happens for compound-corrupted rows that have accumulated multiple extra
+    score cells from re-evaluations.
+
+    `columns` is the table's own layout, so a tracker carrying the optional Via
+    column keeps its leading identity cells intact — the head to preserve and
+    the Report anchor's expected slot both come from it, not from a hardcoded
+    9-column assumption."""
+    columns = columns or _COLUMNS
+    report_idx = columns.index("report")
+    head = columns.index("role") + 1      # identity cells to keep verbatim
     for i, c in enumerate(cells):
-        if _REPORT_CELL_RE.match(c) and i > _REPORT_COL_IDX:
-            before = cells[4:i]   # cells between role and report
+        if _REPORT_CELL_RE.match(c) and i > report_idx:
+            before = cells[head:i]   # cells between role and report
             score = next((v for v in before if _SCORE_CELL_RE.match(v)), "")
             status = next(
                 (v for v in before
@@ -332,7 +440,7 @@ def _realign_cells(cells: list[str]) -> list[str]:
             )
             notes_parts = cells[i + 1:]
             return (
-                cells[:4]
+                cells[:head]
                 + [score, status, "null", c]
                 + ([" | ".join(notes_parts)] if notes_parts else [""])
             )
@@ -395,6 +503,7 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
     local trackers without a file. `easy_apply_urls` tags the easy_apply flag;
     omitted for callers (like the merge) that don't need it."""
     easy_apply_urls = easy_apply_urls or set()
+    columns = _header_columns(text)
     rows: list[dict] = []
     for line in text.splitlines():
         if not line.lstrip().startswith("|"):
@@ -402,20 +511,18 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
         if _SEPARATOR_RE.match(line.strip()):
             continue
         cells = _split_row(line)
-        if len(cells) < len(_COLUMNS):
+        if len(cells) < len(columns):
             continue
         # Skip the header row.
         if cells[0].lower() in ("#", "num") and cells[1].lower() == "date":
             continue
-        if len(cells) > len(_COLUMNS):
-            cells = _realign_cells(cells)
+        if len(cells) > len(columns):
+            cells = _realign_cells(cells, columns)
 
-        row = dict(zip(_COLUMNS, cells))
+        row = dict(zip(columns, cells))
 
         # Derive report number + path from the Report link cell.
-        m = _REPORT_LINK_RE.search(row.get("report", ""))
-        row["report_num"] = m.group(1).strip() if m else ""
-        row["report_path"] = m.group(2).strip() if m else ""
+        row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
 
         # Parse the leading float out of "4.2/5" → 4.2 for sorting.
         row["score_value"] = _parse_score(row.get("score", ""))
@@ -624,9 +731,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
             if len(cells) < len(_TRACKER_COLUMNS):
                 continue
             row = dict(zip(_TRACKER_COLUMNS, [c.strip() for c in cells]))
-            m = _REPORT_LINK_RE.search(row.get("report", ""))
-            row["report_num"] = m.group(1).strip() if m else ""
-            row["report_path"] = m.group(2).strip() if m else ""
+            row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
             row["score_value"] = _parse_score(row.get("score", ""))
             row["status_canonical"] = canonical_status(row.get("status", ""))
             row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls

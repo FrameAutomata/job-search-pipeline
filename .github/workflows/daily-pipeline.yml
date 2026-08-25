@@ -111,7 +111,13 @@ jobs:
             https://github.com/FrameAutomata/career-ops career-ops
 
       - name: Install career-ops Node deps
-        run: npm install --prefix career-ops
+        # --ignore-scripts: career-ops' postinstall runs
+        # `npx playwright install chromium --with-deps`, downloading a browser
+        # and apt-installing its system libraries. The daily run only shells out
+        # to merge-tracker.mjs, which needs js-yaml and nothing else — so that
+        # is minutes of runner time and a sudo-dependent apt step, on every run,
+        # for a browser nothing here launches. A failure in it fails the step.
+        run: npm install --prefix career-ops --ignore-scripts
 
       - name: Decode setup secrets into place
         env:

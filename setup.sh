@@ -26,7 +26,14 @@ else
 fi
 
 echo "==> Installing career-ops node deps"
-(cd "$root/career-ops" && npm install)
+# --ignore-scripts: career-ops now ships a postinstall that runs
+# `npx playwright install chromium --with-deps`. That fights this script on two
+# fronts — it downloads a browser before the pin block below has decided which
+# version (or whether) we want one, and `--with-deps` shells out to the system
+# package manager, which needs root and fails on most dev machines. Under
+# `set -euo pipefail` that failure aborts setup outright, before the venv is
+# usable. Chromium is installed deliberately further down instead.
+(cd "$root/career-ops" && npm install --ignore-scripts)
 
 echo "==> Installing pipeline node deps (yaml, pdf-parse)"
 (cd "$root" && npm install)

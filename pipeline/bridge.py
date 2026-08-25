@@ -35,6 +35,12 @@ EASY_APPLY_URLS = "data/easy-apply-urls.txt"
 DESCRIPTION_PREVIEW_CHARS = 500
 
 
+def _find_section(text: str, markers: tuple[str, ...]) -> str | None:
+    """The first of `markers` that appears as a heading in `text`, else None."""
+    return next((m for m in markers
+                 if re.search(rf"^{re.escape(m)}\s*$", text, re.MULTILINE)), None)
+
+
 def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     """Walk applications.md once. Return (urls, company::role pairs)."""
     urls: set[str] = set()
@@ -43,6 +49,15 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     # URLs can appear anywhere — links, table cells, raw markdown. Use the same
     # cheap regex the original code used.
     urls.update(re.findall(r"https?://[^\s|)]+", text))
+
+    # Column slots for Company and Role. Canonical layout is
+    # `# | Date | Company | Role | Score | Status | …`, but career-ops supports
+    # an optional `Via` column after Company (`merge-tracker.mjs --migrate-via`),
+    # which shifts Role right by one. Reading fixed slots there keys dedup on
+    # the agency name instead of the role, so every role at an agency-mediated
+    # company collapses to one key and reposted roles sail through. Take the
+    # slots from the header row when the table has one.
+    company_idx, role_idx = 2, 3
 
     for line in text.splitlines():
         if not line.startswith("|"):
@@ -58,11 +73,19 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
         if stripped.endswith("|"):
             stripped = stripped[:-1]
         cols = [c.strip() for c in stripped.split("|")]
-        # Expected layout: # | Date | Company | Role | URL | Status
         if len(cols) < 4:
             continue
-        company, role = cols[2].lower(), cols[3].lower()
-        # Skip header row
+        lower = [c.lower() for c in cols]
+        # Header row — re-anchor on it, then skip it. Anchored on cell 0 being
+        # the `#`/`Num` label as well, so a data row that merely happens to hold
+        # the word "role" somewhere can't be read as a header.
+        if lower[0] in ("#", "num", "n") and "company" in lower and "role" in lower:
+            company_idx, role_idx = lower.index("company"), lower.index("role")
+            continue
+        if role_idx >= len(cols):
+            continue
+        company, role = lower[company_idx], lower[role_idx]
+        # A header the re-anchor above didn't recognize (no `#` in cell 0).
         if company == "company" and role == "role":
             continue
         if company and role:
@@ -135,14 +158,22 @@ def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
     block = "\n" + "\n".join(format_offer(o) for o in offers) + "\n"
 
     if not pipe.exists():
+        # Fresh file: our own heading. career-ops reads both spellings.
         pipe.write_text(f"# Pipeline\n\n## Pendientes\n{block}\n", encoding="utf-8")
         return
 
     text = pipe.read_text(encoding="utf-8")
-    marker = "## Pendientes"
+    # career-ops writes the pending/processed headings in English now and reads
+    # both spellings (scan.mjs `PENDING_MARKERS`, reconcile-pipeline.mjs
+    # `PENDING_RE`). Match the file's own heading rather than only our Spanish
+    # one: against a pipeline.md that scan.mjs created, looking for "Pendientes"
+    # alone finds nothing and appends a SECOND pending section, splitting the
+    # queue in two. Write ours only when the file has neither.
+    marker = _find_section(text, ("## Pendientes", "## Pending")) or "## Pendientes"
     idx = text.find(marker)
     if idx == -1:
-        proc_idx = text.find("## Procesadas")
+        proc = _find_section(text, ("## Procesadas", "## Processed"))
+        proc_idx = text.find(proc) if proc else -1
         insert_at = proc_idx if proc_idx != -1 else len(text)
         new_block = f"\n{marker}\n{block}\n"
         text = text[:insert_at] + new_block + text[insert_at:]

@@ -76,6 +76,39 @@ _EXPIRED_URL = re.compile(r"[?&]error=true|expired_jd_redirect", re.I)
 # resolve to `throttled` (couldn't read it), never active/expired.
 _THROTTLE_STATUSES = frozenset({403, 429, 999})
 
+# Anti-bot interstitials (Cloudflare "Just a moment...", hCaptcha walls) render
+# a short challenge page INSTEAD of the posting — and serve it with HTTP 200,
+# so the status check above never sees them. Without this the body is short and
+# carries no apply control, so it falls through to `insufficient content` and is
+# recorded `expired` — which screen writes to scan-history.tsv as
+# `screened-dead`, permanently filtering out a live job. Upstream's
+# liveness-core.mjs added the same guard for the same reason.
+#
+# These are matched against the WHOLE page, including a real JD's prose, so they
+# are spelled to be unambiguous: "Ray ID" needs Cloudflare's hex id after it (an
+# ML-infra JD can say "Ray" on its own), and the check runs only after the apply
+# control has had its say — a posting that says "it takes just a moment to
+# apply" is a live posting, and a challenge page never carries an apply control.
+# A false positive here is not free: `throttled` holds the row every run, so the
+# job is never evaluated at all.
+_BOT_CHALLENGE = [
+    re.compile(r"just a moment\s*(\.{3}|…|</title>)", re.I),
+    re.compile(r"performing security verification", re.I),
+    re.compile(r"checking your browser before", re.I),
+    re.compile(r"verify you are (a |not a )?human", re.I),
+    re.compile(r"enable javascript and cookies to continue", re.I),
+    re.compile(r"attention required.*cloudflare", re.I),
+    re.compile(r"\bray id:?\s*[0-9a-f]{8,}", re.I),
+    re.compile(r"\bcf-ray\b", re.I),
+    re.compile(r"please complete the security check", re.I),
+]
+
+# A server-side failure is the site being broken, not the posting being gone.
+# 5xx bodies are short error pages with no apply control, so they used to reach
+# the `insufficient content` branch and be recorded `expired` — the same
+# permanent, irreversible outcome as a real 404, for what is usually a blip.
+_SERVER_ERROR_MIN = 500
+
 # classify_each retries a throttled fetch this many times (a transient limit may
 # clear on a re-fetch) with linear backoff between attempts.
 _THROTTLE_RETRIES = 2
@@ -240,6 +273,8 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     # the body here would misread a wall as active (or its emptiness as expired).
     if status in _THROTTLE_STATUSES:
         return "throttled", f"HTTP {status} (rate-limited / sign-in wall)"
+    if status >= _SERVER_ERROR_MIN:
+        return "uncertain", f"HTTP {status} (server error — not a removed posting)"
     if _EXPIRED_URL.search(final_url):
         return "expired", f"error redirect: {final_url}"
     for pat in _HARD_EXPIRED:
@@ -247,6 +282,11 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
             return "expired", f"body: {pat.pattern}"
     if any(p.search(body) for p in _APPLY):
         return "active", "apply control visible"
+    # No apply control. Before reading that absence as "gone", rule out a
+    # 200-served anti-bot wall — its body is the challenge, not the posting.
+    for pat in _BOT_CHALLENGE:
+        if pat.search(body):
+            return "throttled", f"anti-bot challenge: {pat.pattern}"
     for pat in _LISTING_PAGE:
         if pat.search(body):
             return "expired", f"listing page: {pat.pattern}"
