@@ -46,7 +46,12 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
-from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
+from pipeline.sites import (
+    SUPPORTED_SITES,
+    limitation_conflict,
+    resolve_sites,
+    unreadable_options,
+)
 from pipeline import handoff, recheck
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -584,7 +589,12 @@ def local_search_set(req: LocalSearchConfig) -> JSONResponse:
     # limitation_conflict is the same function the scraper applies. Refused, not
     # warned: a run skips a conflicting pass, so saving one would silently drop a
     # search the user believes they configured, and here it is still editable.
-    conflicts = [c for c in (limitation_conflict(e) for e in entries) if c]
+    # unreadable_options first: a value jobspy would reject aborts the scrape
+    # stage outright, so saving one breaks this endpoint's promise that what it
+    # accepts is a config the next run can load.
+    conflicts = [
+        c for c in (unreadable_options(e) or limitation_conflict(e) for e in entries) if c
+    ]
     if conflicts:
         raise HTTPException(status_code=400, detail=" ".join(conflicts))
     local = _local_search_path()

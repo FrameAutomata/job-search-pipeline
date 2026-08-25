@@ -9,13 +9,28 @@ import pandas as pd
 import yaml
 from jobspy import scrape_jobs
 
-from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
+from pipeline.sites import (
+    SUPPORTED_SITES,
+    limitation_conflict,
+    normalize_pass,
+    resolve_sites,
+    unreadable_options,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
 
 # All optional JobSpy kwargs that map 1-to-1 from config keys.
-# Passed through only when explicitly set (not None/missing).
+# Passed through only when explicitly set (not None/missing) — which is the
+# right test for the twelve keys whose falsy values are deliberate settings
+# (`distance: 0`, `verbose: 0`, `linkedin_fetch_description: false`); dropping
+# those would silently restore jobspy's defaults.
+#
+# The four MUTEX_KEYS in this list are the exception, and they never reach the
+# `is not None` test carrying a falsy value: pipeline.sites.normalize_pass has
+# already deleted the key when jobspy would act on it as "no filter". So
+# `is_remote: false` and `hours_old: 0` are absent here rather than forwarded,
+# which is the same thing on the wire.
 OPTIONAL_PARAMS = [
     "location",
     "distance",
@@ -87,6 +102,14 @@ def filter_passes(
       - `easy_apply_only`: keep only passes with `easy_apply: true`.
       - `no_easy_apply`: keep only passes without `easy_apply: true`.
 
+    The `is True` tests below are exact rather than merely conventional: run()
+    puts every pass through pipeline.sites.normalize_pass first, which rewrites
+    easy_apply to the bool jobspy will act on and drops it when that is False.
+    So a quoted `easy_apply: "true"` selects here just like an unquoted one, and
+    `easy_apply: false` is indistinguishable from an absent key — which is what
+    it means to jobspy. Called with un-normalized passes (tests, other callers),
+    these read the raw value.
+
     `easy_apply_only` and `no_easy_apply` are used by the cloud workflows to
     route passes to the right schedule by JobSpy field rather than pass name.
     When they filter to zero passes, this returns an empty list — the workflow
@@ -138,7 +161,11 @@ def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
-    """Drop passes that combine mutually exclusive JobSpy options.
+    """Drop passes JobSpy can't run as written.
+
+    Two ways that happens: options it can't honour together, and a value it
+    can't read at all (which would raise a ValidationError out of scrape_jobs
+    and take the run with it). Both degrade the same way, for the reason below.
 
     Same degradation as strip_unsupported_sites above, for the same reason: a
     config reaches a run without ever passing the UI's save-time validator — a
@@ -150,9 +177,9 @@ def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
     """
     result = []
     for cfg in searches:
-        conflict = limitation_conflict(cfg)
-        if conflict:
-            print(f"[scrape] skipping pass — {conflict}", flush=True)
+        problem = unreadable_options(cfg) or limitation_conflict(cfg)
+        if problem:
+            print(f"[scrape] skipping pass — {problem}", flush=True)
             continue
         result.append(cfg)
     return result
@@ -165,8 +192,12 @@ def run(
     easy_apply_only: bool = False,
     no_easy_apply: bool = False,
 ) -> Path:
+    # Normalize before anything reads the mutually-exclusive options: pass
+    # selection, the conflict check and the per-row easy_apply tag each used to
+    # test them differently, and a quoted or falsy value made the three
+    # disagree. See pipeline.sites.normalize_pass.
     selected = filter_passes(
-        load_searches(config_path),
+        [normalize_pass(cfg) for cfg in load_searches(config_path)],
         only_passes,
         easy_apply_only=easy_apply_only,
         no_easy_apply=no_easy_apply,

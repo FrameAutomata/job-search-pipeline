@@ -8,7 +8,8 @@ import pandas as pd
 import pytest
 
 from pipeline import scrape as scrape_mod
-from pipeline.sites import limitation_conflict
+from pipeline import sites as sites_mod
+from pipeline.sites import limitation_conflict, normalize_pass, unreadable_options
 
 
 class TestFilterPasses:
@@ -91,16 +92,29 @@ class TestFilterPassesEasyApply:
                 self.SEARCHES, easy_apply_only=True, no_easy_apply=True,
             )
 
-    def test_easy_apply_routing_does_not_match_truthy_strings(self):
-        # Only literal Python True should match — protects against accidental
-        # `easy_apply: "true"` strings in YAML being interpreted as a flag.
+    def test_routing_reads_the_raw_value_when_called_un_normalized(self):
+        # filter_passes tests `is True`, so on its own it matches only a literal
+        # bool. This used to be pinned as protection — "accidental
+        # `easy_apply: \"true\"` strings in YAML" being kept out — but that was
+        # backwards: a quoted "true" IS a live filter to jobspy, so refusing to
+        # route it meant --easy-apply-only silently scraped nothing on a config
+        # jobspy would happily have filtered, and the rows came back untagged.
+        # That is #120.
+        #
+        # The fix is upstream, not here: run() normalizes every pass before this
+        # sees it, so `is True` is exact on the run path (asserted by
+        # TestRunNormalizesMutexOptions). This test now pins what it always
+        # actually tested — the raw reading a direct caller gets — so that the
+        # suite states one contract for the key instead of two.
         searches = [
             {"name": "a", "easy_apply": "true",  "search_terms": ["x"], "sites": ["indeed"]},
             {"name": "b", "easy_apply": 1,        "search_terms": ["x"], "sites": ["indeed"]},
             {"name": "c", "easy_apply": True,     "search_terms": ["x"], "sites": ["indeed"]},
         ]
-        result = scrape_mod.filter_passes(searches, easy_apply_only=True)
-        assert [r["name"] for r in result] == ["c"]
+        assert [r["name"] for r in scrape_mod.filter_passes(searches, easy_apply_only=True)] == ["c"]
+        normalized = [normalize_pass(s) for s in searches]
+        assert [r["name"] for r in
+                scrape_mod.filter_passes(normalized, easy_apply_only=True)] == ["a", "b", "c"]
 
     def test_only_pass_combines_with_easy_apply_filter(self):
         # If both are specified, only_pass narrows first then easy_apply filters.
@@ -334,6 +348,17 @@ filter:
         assert patch_scrape_paths.read_text(encoding="utf-8") == ""
 
 
+def _write_search_config(tmp_path, body: str):
+    """A search config on disk, for the run()-level tests.
+
+    One copy: the two run() test classes below each grew their own identical
+    `_config`, and the next one would have copied it a third time.
+    """
+    config = tmp_path / "config.yml"
+    config.write_text(body, encoding="utf-8")
+    return config
+
+
 def _sets_clause(msg: str) -> str:
     """The options limitation_conflict names as the offenders in `msg`.
 
@@ -550,13 +575,8 @@ class TestRunDropsConflictingPasses:
     """run() applies the drop to whatever config it loads, so a conflicting pass
     can no longer abort the stage — and with it the rest of the pipeline."""
 
-    def _config(self, tmp_path, body):
-        config = tmp_path / "config.yml"
-        config.write_text(body)
-        return config
-
     def test_healthy_pass_still_scrapes(self, tmp_path, patch_scrape_paths, mocker):
-        config = self._config(tmp_path, """
+        config = _write_search_config(tmp_path, """
 searches:
   - name: "conflicting"
     search_terms: ["a"]
@@ -582,7 +602,7 @@ searches:
         # Same clean no-op as an all-retired-boards config: empty jobs.csv,
         # no jobspy call, no traceback out of the stage. Seeded with stale
         # rows so "empty" is asserted on content, not just existence.
-        config = self._config(tmp_path, """
+        config = _write_search_config(tmp_path, """
 searches:
   - name: "conflicting"
     search_terms: ["a"]
@@ -606,7 +626,7 @@ searches:
     ):
         # zip_recruiter accepts the combination, but it never runs — the pass
         # scrapes Indeed, which does not, so this must still be dropped.
-        config = self._config(tmp_path, """
+        config = _write_search_config(tmp_path, """
 searches:
   - name: "mixed"
     search_terms: ["a"]
@@ -851,3 +871,339 @@ class TestMarkEasyApply:
         out = scrape_mod.mark_easy_apply(df)
         assert "easy_apply" in out.columns
         assert bool(out["easy_apply"].iloc[0]) is False
+
+
+class TestNormalizePass:
+    """pipeline.sites.normalize_pass — the single reading of the mutually
+    exclusive options, so the call sites that used to interpret them differently
+    (truthiness here, `is not None` in OPTIONAL_PARAMS, `is True` in the pass
+    selectors and the per-row tag) can no longer disagree about one value."""
+
+    def test_mutex_keys_is_the_union_of_the_groups(self):
+        assert set(sites_mod.MUTEX_KEYS) == {"hours_old", "job_type", "is_remote", "easy_apply"}
+
+    # The coercion table is a hand-mirror of pydantic's lax mode, and this repo
+    # test-guards its mirrors rather than trusting them (see sites.py's module
+    # docstring on SUPPORTED_SITES). Without these two, the tests would pin
+    # normalize_pass against the copy instead of against the source, and a
+    # pydantic change would reintroduce the divergence with a green suite.
+    @pytest.mark.parametrize(
+        "value",
+        [True, False, 1, 0, 1.0, 0.0, 2, -1, 0.5, 168,
+         "true", "false", "True", "FALSE", "yes", "no", "y", "n",
+         "t", "f", "on", "off", "1", "0", "maybe", "", "tru"],
+    )
+    def test_as_bool_agrees_with_pydantic(self, value):
+        from pydantic import TypeAdapter, ValidationError
+        try:
+            expected = TypeAdapter(bool).validate_python(value)
+        except ValidationError:
+            expected = sites_mod._UNREADABLE
+        assert sites_mod._as_bool(value) is expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, False, 1, 0, 2, -1, 168, 168.0, 168.5, 0.5,
+         float("inf"), float("nan"),
+         "168", "168.0", "0", "1", "maybe", "", " ", "1e3", "1E3",
+         " 168 ", "+168", "-168", "1_000", "00168", "0x10", "inf", "nan",
+         "1.", ".5"],
+    )
+    def test_as_int_agrees_with_pydantic(self, value):
+        from pydantic import TypeAdapter, ValidationError
+        try:
+            expected = TypeAdapter(int).validate_python(value)
+        except ValidationError:
+            expected = sites_mod._UNREADABLE
+        assert sites_mod._as_int(value) == expected
+
+    def test_padded_bools_are_accepted_where_pydantic_rejects_them(self):
+        # A deliberate divergence, pinned as a choice rather than left to look
+        # like an accident of the two mirror tests above: normalize_pass
+        # rewrites the value, so jobspy is handed the bool and never the string.
+        from pydantic import TypeAdapter, ValidationError
+        with pytest.raises(ValidationError):
+            TypeAdapter(bool).validate_python(" true ")
+        assert sites_mod._as_bool(" true ") is True
+
+    def test_a_string_only_pydantic_can_read_is_reported_not_guessed(self):
+        # The mirror is deliberately not exhaustive in the other direction:
+        # pydantic-core's string parsing accepts shapes Python's int() does not
+        # ("0-0" reads as 0 there). Rather than chase parity on pathological
+        # values, they classify as unreadable — which routes into the same
+        # warn-and-skip that a mutex conflict gets, instead of being read as a
+        # truthy string and misdiagnosed as an active filter.
+        from pydantic import TypeAdapter
+        assert TypeAdapter(int).validate_python("0-0") == 0
+        assert sites_mod._as_int("0-0") is sites_mod._UNREADABLE
+        assert "hours_old" in sites_mod.unreadable_options(
+            {"sites": ["indeed"], "hours_old": "0-0"})
+
+    def test_every_mutex_key_has_a_reader(self):
+        # A group gaining an option without gaining a reader would leave that
+        # option un-normalized and quietly reintroduce the divergence.
+        assert set(sites_mod._MUTEX_KEY_READERS) == set(sites_mod.MUTEX_KEYS)
+
+    # --- quoted scalars: the templated-secret and hand-edit case ---
+
+    @pytest.mark.parametrize("value", ["true", "True", "YES", "y", "on", "t", "1", 1, 1.0, True])
+    def test_truthy_spellings_all_become_a_real_bool(self, value):
+        assert normalize_pass({"easy_apply": value})["easy_apply"] is True
+
+    @pytest.mark.parametrize(
+        "value", ["false", "FALSE", "no", "n", "off", "f", "0", 0, 0.0, False, None]
+    )
+    def test_falsy_spellings_all_drop_the_key(self, value):
+        # Falsy means "send no filter" to jobspy, which is what an absent key
+        # means too — so the two become indistinguishable, as they should be.
+        assert "easy_apply" not in normalize_pass({"easy_apply": value})
+
+    def test_quoted_off_option_is_no_longer_a_conflict(self):
+        # The repro: "false" is a truthy str to a raw read and a falsy bool to
+        # pydantic, so a whole pass was skipped over a filter never sent.
+        # Called WITHOUT normalize_pass: limitation_conflict normalizes its own
+        # input, so no caller can get a different answer by forgetting to.
+        cfg = {"sites": ["indeed"], "hours_old": 168, "is_remote": "false"}
+        assert limitation_conflict(cfg) is None
+
+    def test_quoted_on_option_is_still_a_conflict(self):
+        cfg = {"sites": ["indeed"], "hours_old": 168, "easy_apply": "true"}
+        assert "Indeed limitation" in limitation_conflict(cfg)
+
+    def test_normalizing_twice_changes_nothing(self):
+        # limitation_conflict normalizes internally while scrape.run normalizes
+        # up front, so every conflict check on the run path sees a pass that has
+        # been through it twice.
+        cfg = {"sites": ["indeed"], "hours_old": "168", "easy_apply": "false",
+               "job_type": "fulltime", "is_remote": 1, "name": "p"}
+        once = normalize_pass(cfg)
+        twice = normalize_pass(once)
+        assert twice == once
+        # `==` alone cannot tell True from 1 in a dict, and filter_passes tests
+        # `is True` — so a regression that turned the bool into an int would
+        # pass an equality check while silently un-selecting every easy-apply
+        # pass under --easy-apply-only.
+        assert twice["is_remote"] is True
+        assert type(twice["hours_old"]) is int
+
+    def test_padded_bool_is_read_rather_than_killing_the_run(self):
+        # pydantic rejects " true " outright, which aborts the scrape stage.
+        # Normalizing hands jobspy the bool, so the padding never reaches it.
+        assert normalize_pass({"easy_apply": " true "})["easy_apply"] is True
+
+    # --- hours_old, an int rather than a flag ---
+
+    def test_numeric_string_becomes_an_int(self):
+        assert normalize_pass({"hours_old": "168"})["hours_old"] == 168
+
+    def test_zero_is_dropped(self):
+        assert "hours_old" not in normalize_pass({"hours_old": 0})
+
+    def test_true_reads_as_one_hour_because_that_is_what_pydantic_does(self):
+        # Not a typo this corrects: lax coercion really does make bool an int,
+        # so `hours_old: true` searches the last hour. Normalizing says so out
+        # loud instead of leaving it to be discovered from an empty scrape.
+        assert normalize_pass({"hours_old": True})["hours_old"] == 1
+
+    def test_non_integral_value_is_left_verbatim(self):
+        assert normalize_pass({"hours_old": "168.5"})["hours_old"] == "168.5"
+
+    # --- job_type, which needs only its truthiness ---
+
+    def test_empty_job_type_is_dropped(self):
+        assert "job_type" not in normalize_pass({"job_type": ""})
+
+    def test_job_type_string_is_untouched(self):
+        assert normalize_pass({"job_type": "fulltime"})["job_type"] == "fulltime"
+
+    # --- what it must not touch ---
+
+    def test_unreadable_value_is_left_for_jobspy_to_reject(self):
+        # Guessing would either invent a filter the user never asked for or
+        # hide the typo; jobspy's own validation is the honest reporter.
+        assert normalize_pass({"easy_apply": "maybe"})["easy_apply"] == "maybe"
+
+    def test_non_mutex_falsy_options_are_preserved(self):
+        # The OPTIONAL_PARAMS keys whose falsy values are deliberate settings.
+        # Dropping these would silently restore jobspy's defaults — for
+        # linkedin_fetch_description, the 30+ minute per-JD fetch.
+        cfg = {"linkedin_fetch_description": False, "distance": 0, "offset": 0,
+               "verbose": 0, "enforce_annual_salary": False}
+        assert normalize_pass(cfg) == cfg
+
+    def test_unrelated_keys_survive(self):
+        cfg = {"name": "p", "search_terms": ["a"], "sites": ["indeed"], "easy_apply": "true"}
+        out = normalize_pass(cfg)
+        assert out["name"] == "p" and out["sites"] == ["indeed"]
+        assert out["search_terms"] == ["a"]
+
+    def test_input_is_not_mutated(self):
+        cfg = {"easy_apply": "true", "hours_old": 0}
+        normalize_pass(cfg)
+        assert cfg == {"easy_apply": "true", "hours_old": 0}
+
+
+class TestRunNormalizesMutexOptions:
+    """run() normalizes before anything reads these options, so pass selection,
+    the conflict check, the forwarded kwargs and the per-row easy_apply tag all
+    see one value."""
+
+    # The one input the easy-apply selector pair is about: a quoted scalar,
+    # which is what a templating tool or a hand edit produces. Shared so the
+    # two tests provably agree on what they are selecting for and against.
+    QUOTED_EA = (
+        "searches:\n"
+        "  - name: 'ea'\n"
+        "    search_terms: ['a']\n"
+        "    sites: [indeed]\n"
+        "    easy_apply: 'true'\n"
+    )
+
+    def test_quoted_easy_apply_pass_is_selected_and_tagged(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # Before normalizing, `is True` said "not an easy-apply pass", so
+        # --easy-apply-only silently scraped nothing on a config jobspy would
+        # happily have filtered — and any rows that did arrive came back
+        # untagged, leaving the UI's apply-button gating blind to them.
+        config = _write_search_config(tmp_path, self.QUOTED_EA)
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config, easy_apply_only=True)
+
+        assert mock_scrape.call_count == 1
+        assert mock_scrape.call_args.kwargs["easy_apply"] is True
+        assert pd.read_csv(patch_scrape_paths)["easy_apply"].tolist() == [True]
+
+    def test_quoted_easy_apply_pass_is_excluded_by_no_easy_apply(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        config = _write_search_config(tmp_path, self.QUOTED_EA)
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs")
+
+        scrape_mod.run(config, no_easy_apply=True)
+
+        mock_scrape.assert_not_called()
+
+    def test_quoted_off_option_no_longer_costs_the_whole_pass(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        config = _write_search_config(tmp_path, (
+            "searches:\n"
+            "  - name: 'recent'\n"
+            "    search_terms: ['a']\n"
+            "    sites: [indeed]\n"
+            "    hours_old: 168\n"
+            "    is_remote: 'false'\n"
+        ))
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        assert mock_scrape.call_count == 1
+        kwargs = mock_scrape.call_args.kwargs
+        assert kwargs["hours_old"] == 168
+        # Dropped rather than forwarded as False — the same no-filter outcome,
+        # and the only way the conflict check can agree with the wire.
+        assert "is_remote" not in kwargs
+
+    def test_off_easy_apply_pass_still_runs_under_no_easy_apply(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # `easy_apply: false` is a pass without easy-apply, so --no-easy-apply
+        # must keep it.
+        config = _write_search_config(tmp_path, (
+            "searches:\n"
+            "  - name: 'broad'\n"
+            "    search_terms: ['a']\n"
+            "    sites: [indeed]\n"
+            "    easy_apply: false\n"
+        ))
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config, no_easy_apply=True)
+
+        assert mock_scrape.call_count == 1
+        assert "easy_apply" not in mock_scrape.call_args.kwargs
+        assert pd.read_csv(patch_scrape_paths)["easy_apply"].tolist() == [False]
+
+
+class TestUnreadableOptions:
+    """A mutex value JobSpy cannot read must not reach it.
+
+    scrape_jobs builds a ScraperInput before any network call, so a value
+    pydantic rejects raises a ValidationError from inside run()'s pass loop —
+    discarding the rows every healthy pass already returned, and in the cloud
+    the whole day. normalize_pass is the one place that knows, so it surfaces
+    the knowledge instead of forwarding the value verbatim.
+    """
+
+    def test_a_readable_pass_reports_nothing(self):
+        assert unreadable_options({"sites": ["indeed"], "hours_old": 168}) is None
+
+    def test_an_absent_or_null_option_reports_nothing(self):
+        assert unreadable_options({"sites": ["indeed"], "easy_apply": None}) is None
+
+    @pytest.mark.parametrize("value", ["maybe", "yeah", "2", 2, 0.5])
+    def test_an_unreadable_bool_is_reported(self, value):
+        msg = unreadable_options({"sites": ["indeed"], "easy_apply": value})
+        assert msg and "easy_apply" in msg
+
+    def test_the_message_names_the_pass_and_the_value(self):
+        msg = unreadable_options({"name": "US Remote", "hours_old": "soon"})
+        assert msg.startswith("[US Remote] ") and "'soon'" in msg
+
+    def test_every_offending_option_is_named(self):
+        msg = unreadable_options({"easy_apply": "maybe", "hours_old": "soon"})
+        assert "easy_apply" in msg and "hours_old" in msg
+
+    def test_pydantic_really_would_reject_what_we_report(self):
+        # The claim the whole mechanism rests on: these abort scrape_jobs.
+        from pydantic import TypeAdapter, ValidationError
+        with pytest.raises(ValidationError):
+            TypeAdapter(bool).validate_python("maybe")
+        with pytest.raises(ValidationError):
+            TypeAdapter(int).validate_python("soon")
+
+
+class TestRunSurvivesAnUnreadableOption:
+    """The end-to-end version: one bad pass costs that pass, not the run."""
+
+    BAD_THEN_GOOD = (
+        "searches:\n"
+        "  - name: 'broken'\n"
+        "    search_terms: ['a']\n"
+        "    sites: [indeed]\n"
+        "    easy_apply: maybe\n"
+        "  - name: 'healthy'\n"
+        "    search_terms: ['b']\n"
+        "    sites: [indeed]\n"
+        "    hours_old: 168\n"
+    )
+
+    def test_the_healthy_pass_still_scrapes(self, tmp_path, patch_scrape_paths, mocker):
+        config = _write_search_config(tmp_path, self.BAD_THEN_GOOD)
+        df = pd.DataFrame({"job_url": ["https://indeed.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        # Before this, the broken pass reached scrape_jobs, pydantic raised, and
+        # the traceback left run() with the healthy pass's rows discarded.
+        assert mock_scrape.call_count == 1
+        assert mock_scrape.call_args.kwargs["search_term"] == "b"
+        assert pd.read_csv(patch_scrape_paths)["job_url"].tolist() == ["https://indeed.com/job1"]
+
+    def test_the_warning_names_the_pass_and_the_option(self, tmp_path, patch_scrape_paths,
+                                                       mocker, capsys):
+        config = _write_search_config(tmp_path, self.BAD_THEN_GOOD)
+        mocker.patch("pipeline.scrape.scrape_jobs",
+                     return_value=pd.DataFrame({"job_url": ["https://x"]}))
+
+        scrape_mod.run(config)
+
+        out = capsys.readouterr().out
+        assert "broken" in out and "easy_apply" in out and "skipping pass" in out
