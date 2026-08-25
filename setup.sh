@@ -43,22 +43,25 @@ echo "==> Installing pipeline node deps (yaml, pdf-parse)"
 # nixpkgs pins, because the chromium `npx playwright install` downloads is a
 # generic-linux build that will not start on NixOS.
 #
-# Those browsers are keyed to a driver version, while career-ops asks for
-# "playwright": "^1.58.1" and commits no lockfile — so the npm install above
-# resolves to whatever is newest, and chromium.launch() then fails looking for
-# a browser revision that is not there. Pin the npm side to the version the
-# browsers actually belong to, and skip the download entirely.
+# Those browsers are keyed to a driver version, while career-ops asks for a
+# specific playwright and commits no lockfile — so chromium.launch() fails
+# looking for a browser revision that is not there. Pin the npm side to the
+# version the browsers actually belong to, and skip the download entirely.
 if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ -n "${PLAYWRIGHT_DRIVER_VERSION:-}" ]; then
   echo "==> Pinning Playwright to $PLAYWRIGHT_DRIVER_VERSION (browsers supplied by PLAYWRIGHT_BROWSERS_PATH)"
   # --no-save, deliberately: career-ops is a checkout the user may pull, and a
   # modified package.json there would conflict.
   #
   # The lockfile has to go first. The npm install above just wrote one naming
-  # the floated version, and npm honours a lock over the range in package.json,
-  # so the next install would drag that version back. It is generated, and
-  # career-ops does not track it, so dropping it costs nothing. Afterwards a
-  # plain `npm install` leaves the pin alone: the pinned version still
-  # satisfies package.json's range, so npm sees nothing to do.
+  # the resolved version, and npm honours a lock over package.json, so the next
+  # install would drag that version back. It is generated, and career-ops does
+  # not track it, so dropping it costs nothing.
+  #
+  # This pin is no longer self-sustaining. career-ops used to ask for a RANGE
+  # ("^1.58.1"), so a pinned version inside it satisfied package.json and a
+  # later plain `npm install` was a no-op. It now pins playwright EXACTLY, so
+  # any driver version other than that one is a mismatch npm will "repair" —
+  # re-run this script after any `npm install` inside career-ops.
   if ! (cd "$root/career-ops" && rm -f package-lock.json && \
         npm install --no-save --no-audit --no-fund \
           "playwright@$PLAYWRIGHT_DRIVER_VERSION"); then

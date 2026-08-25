@@ -315,7 +315,7 @@ first cloud run.
 ## Requirements
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, which has no Python 3.13 wheel; setup scripts auto-select 3.12 via `py -3.12` / `python3.12`)
-- Node.js 18+ (career-ops and profile setup)
+- Node.js 20+ (career-ops and profile setup — career-ops pins `playwright@1.62.1`, which requires Node 20)
 - The agent CLI of your choice for `--batch` — whichever you have installed:
   - `claude` (default): [Claude Code](https://claude.ai/code)
   - `opencode`: [OpenCode](https://opencode.ai)

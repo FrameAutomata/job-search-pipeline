@@ -13,7 +13,7 @@ Scrapes job boards, filters results against your resume, optionally pre-screens 
 ## Prerequisites
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, no 3.13 wheel)
-- Node.js 18+ (career-ops + profile setup)
+- Node.js 20+ (career-ops + profile setup — career-ops pins `playwright@1.62.1`, which requires Node 20)
 - A resume — DOCX, ODT, or PDF (DOCX recommended: per-job resume tailoring slot-edits a DOCX, and editable formats extract more cleanly than PDF)
 - At least one of:
   - An agent CLI for `--batch` (interactive evaluation): [Claude Code](https://claude.ai/code) (default), [OpenCode](https://opencode.ai), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or Qwen CLI — any of these can be backed by a local [Ollama](https://ollama.com) model via `OLLAMA_MODEL`
