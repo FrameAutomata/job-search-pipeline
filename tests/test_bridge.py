@@ -386,6 +386,22 @@ class TestRun:
 
         assert bridge_mod.run(career_ops_dir) == []
 
+    def test_missing_career_ops_is_reported_even_with_no_rows(
+        self, tmp_path, monkeypatch
+    ):
+        """A bad CAREER_OPS_PATH is the user's .env, not their scrape.
+
+        read_rows treats one more shape as empty than the old size test did, so
+        testing rows first would answer "run filter first" to someone whose
+        actual fault is a path that doesn't exist.
+        """
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text("title,company,job_url\n", encoding="utf-8")
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+
+        with pytest.raises(FileNotFoundError, match="career-ops not found"):
+            bridge_mod.run(tmp_path / "nope")
+
     def test_run_missing_career_ops_raises(self, tmp_path, monkeypatch):
         """Missing career_ops_path raises FileNotFoundError."""
         filtered = tmp_path / "filtered_jobs.csv"

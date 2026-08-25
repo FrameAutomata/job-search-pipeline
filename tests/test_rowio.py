@@ -117,3 +117,48 @@ class TestRoundTrip:
         assert rows == []
         write_rows(p, rows)
         assert p.read_text(encoding="utf-8") == ""
+
+
+class TestDurability:
+    """What makes "no rows <-> zero bytes" trustworthy rather than merely
+    intended: a failed write must not leave a third shape behind."""
+
+    def test_a_failed_write_leaves_the_previous_file_intact(self, tmp_path):
+        # open(path, "w") truncates before the first row lands, so a raise
+        # mid-write used to leave a header plus however many rows got out —
+        # neither zero bytes nor complete, and so indistinguishable from a
+        # genuine short result to read_rows. screen writes over the file it
+        # just read, which is where that would bite.
+        p = tmp_path / "f.csv"
+        write_rows(p, ROWS)
+        before = p.read_text(encoding="utf-8")
+
+        # A row carrying a key the header lacks is what DictWriter refuses —
+        # after the header has already been written.
+        with pytest.raises(ValueError):
+            write_rows(p, [dict(ROWS[0]), {**ROWS[1], "surprise": "x"}])
+
+        assert p.read_text(encoding="utf-8") == before
+        assert read_rows(p) == ROWS
+
+    def test_a_failed_write_leaves_no_temp_file_behind(self, tmp_path):
+        p = tmp_path / "f.csv"
+        with pytest.raises(ValueError):
+            write_rows(p, [dict(ROWS[0]), {**ROWS[1], "surprise": "x"}])
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestEncoding:
+    def test_a_byte_order_mark_is_not_glued_to_the_first_column(self, tmp_path):
+        # Excel writes a BOM on save, and --skip-scrape exists to reuse whatever
+        # is on disk. Decoded strictly, "title" becomes "\ufefftitle": filter's
+        # target-title bonus and negative-title exclusion both stop firing, and
+        # bridge drops every row as malformed, with no error anywhere.
+        p = tmp_path / "f.csv"
+        p.write_text("title,company\nEng,Acme\n", encoding="utf-8-sig")
+        assert read_rows(p) == [{"title": "Eng", "company": "Acme"}]
+
+    def test_plain_utf8_is_unaffected(self, tmp_path):
+        p = tmp_path / "f.csv"
+        p.write_text("title,company\nEngenharia,Acm\u00e9\n", encoding="utf-8")
+        assert read_rows(p) == [{"title": "Engenharia", "company": "Acm\u00e9"}]

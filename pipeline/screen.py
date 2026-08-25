@@ -498,7 +498,15 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     # ever drew between them.
     jobs = read_rows(FILTERED_PATH)
     if not jobs:
-        print("[screen] no filtered_jobs.csv -- nothing to screen")
+        # Converge the file on the one shape a producer writes. A header-only
+        # filtered_jobs.csv — left by a pre-rowio run, or by a tool that wrote a
+        # header — reads as no rows here but is not zero bytes on disk, so
+        # without this it stays that way through every later --skip-filter run
+        # and the invariant is permanently violated in the one place it matters.
+        # Nothing is created if the file is simply absent.
+        if FILTERED_PATH.exists() and FILTERED_PATH.stat().st_size:
+            write_rows(FILTERED_PATH, [])
+        print("[screen] no rows in filtered_jobs.csv -- nothing to screen")
         return 0
 
     # A filter run on a minimal CSV may have no `description` column at all,

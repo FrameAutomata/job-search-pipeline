@@ -197,16 +197,21 @@ class TestClassifyLiveness:
         assert result == "expired"
 
 
-def write_filtered_csv(path: Path, rows: list[dict]) -> None:
-    """A filtered_jobs.csv with the columns the screen stage reads.
+SCREEN_COLS = ["title", "company", "job_url", "relevance_score"]
+DESC_COLS = ["title", "company", "job_url", "description", "relevance_score"]
 
-    Module-level so the run() test classes share one copy — the column list is
-    what the stage screens against, and it had started accumulating a copy per
-    class.
+
+def write_filtered_csv(path: Path, cols_or_rows, rows=None) -> None:
+    """A filtered_jobs.csv for the run() tests.
+
+    Module-level so every run() test class shares one copy — the column list is
+    what the stage screens against, and it had accumulated a copy per class.
+    Called as (path, rows) for the default columns, or (path, cols, rows) when a
+    test needs the description column too.
     """
-    fieldnames = ["title", "company", "job_url", "relevance_score"]
+    cols, rows = (SCREEN_COLS, cols_or_rows) if rows is None else (cols_or_rows, rows)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=cols)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -443,21 +448,11 @@ class TestBackfillDescription:
     """Test that screen.run populates missing description fields from the
     fetched page body — the whole point of skipping linkedin_fetch_description."""
 
-    def _write_filtered_with_desc(self, path: Path, rows: list[dict]) -> None:
-        fieldnames = ["title", "company", "job_url", "description", "relevance_score"]
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-    def _write_config(self, path: Path) -> None:
-        path.write_text("screen:\n  liveness: true\n  liveness_timeout: 8\n", encoding="utf-8")
-
     def test_backfills_empty_description(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Eng", "company": "Acme", "job_url": "https://x.com",
              "description": "", "relevance_score": 8},
         ])
@@ -486,10 +481,10 @@ class TestBackfillDescription:
         # through the guest job-posting API, not the login-walled /jobs/view/
         # page. job_url in the CSV stays unchanged; only the fetch target swaps.
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
         view_url = "https://www.linkedin.com/jobs/view/4419521927"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Eng", "company": "Acme", "job_url": view_url,
              "description": "", "relevance_score": 8},
         ])
@@ -523,10 +518,10 @@ class TestBackfillDescription:
 
     def test_non_linkedin_job_fetched_via_original_url(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
         indeed_url = "https://www.indeed.com/viewjob?jk=abc123"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Eng", "company": "Acme", "job_url": indeed_url,
              "description": "", "relevance_score": 8},
         ])
@@ -545,10 +540,10 @@ class TestBackfillDescription:
 
     def test_preserves_existing_description(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
         original_desc = "Original Indeed-provided description that should not be overwritten."
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Eng", "company": "Acme", "job_url": "https://x.com",
              "description": original_desc, "relevance_score": 8},
         ])
@@ -571,9 +566,9 @@ class TestBackfillDescription:
 
     def test_no_backfill_when_extract_finds_nothing(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Eng", "company": "Acme", "job_url": "https://x.com",
              "description": "", "relevance_score": 8},
         ])
@@ -596,9 +591,9 @@ class TestBackfillDescription:
         """URLs in scan-history.tsv must not trigger an HTTP fetch — that's
         the whole point of pre-screen dedup."""
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Old", "company": "Acme", "job_url": "https://seen.com",
              "description": "", "relevance_score": 8},
             {"title": "New", "company": "Globex", "job_url": "https://new.com",
@@ -637,9 +632,9 @@ class TestBackfillDescription:
         """Expired URLs get appended to scan-history with status `screened-dead`
         so subsequent runs skip them via the same early-dedup path."""
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Dead Role", "company": "Acme", "job_url": "https://dead.com",
              "description": "", "relevance_score": 8},
             {"title": "Live Role", "company": "Globex", "job_url": "https://live.com",
@@ -672,13 +667,13 @@ class TestBackfillDescription:
         """End-to-end: first run records the dead URL; second run skips it
         entirely (no fetch attempted)."""
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         career_ops = tmp_path / "career-ops"
         (career_ops / "data").mkdir(parents=True)
 
         # Run 1: URL is dead.
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Dead", "company": "Acme", "job_url": "https://gone.com",
              "description": "", "relevance_score": 8},
         ])
@@ -692,7 +687,7 @@ class TestBackfillDescription:
 
         # Run 2: same URL appears again in filtered_jobs.csv. We expect ZERO
         # additional fetches because it's now in scan-history.
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Dead", "company": "Acme", "job_url": "https://gone.com",
              "description": "", "relevance_score": 8},
         ])
@@ -704,9 +699,9 @@ class TestBackfillDescription:
         """Back-compat: callers that don't pass career_ops_path get the old
         behavior — screen runs everything and records nothing externally."""
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        self._write_filtered_with_desc(filtered, [
+        write_filtered_csv(filtered, DESC_COLS, [
             {"title": "Dead", "company": "Acme", "job_url": "https://dead.com",
              "description": "", "relevance_score": 8},
         ])
@@ -724,7 +719,7 @@ class TestBackfillDescription:
         """A CSV written without a `description` column should still get one
         added so the backfill survives the write-back."""
         cfg = tmp_path / "search.yml"
-        self._write_config(cfg)
+        write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
         # No description column at all.
         fieldnames = ["title", "company", "job_url", "relevance_score"]
@@ -1125,6 +1120,40 @@ class TestScreenEmptyOutputShape:
         run(self._cfg(tmp_path))
 
         assert filtered.read_text(encoding="utf-8") == ""
+
+    def test_everything_held_exit_truncates(self, tmp_path, monkeypatch):
+        # The other way `kept` empties, and the likelier one in production:
+        # LinkedIn rate-limits a burst and every posting comes back a sign-in
+        # wall. It takes a different branch from "dropped" — `continue` before
+        # kept.append, no dead_entries, no scan-history write — so the dropped
+        # test alone would ship a regression in the held path.
+        filtered = self._filtered(tmp_path, ["https://a.com", "https://b.com"])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        monkeypatch.setattr(screen_mod, "fetch_and_classify",
+                            lambda url, timeout=8: ("throttled", "sign-in wall", ""))
+
+        run(self._cfg(tmp_path))
+
+        assert filtered.read_text(encoding="utf-8") == ""
+
+    def test_a_header_only_file_is_converged_to_zero_bytes(self, tmp_path, monkeypatch):
+        # Reading it as empty is half the contract; the other half is that a
+        # producer leaves exactly zero bytes. Without this the stale shape
+        # survives every later --skip-filter run.
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text("title,company,job_url,relevance_score\n", encoding="utf-8")
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+
+        run(self._cfg(tmp_path))
+
+        assert filtered.read_text(encoding="utf-8") == ""
+
+    def test_a_missing_file_is_not_created(self, tmp_path, monkeypatch):
+        missing = tmp_path / "filtered_jobs.csv"
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", missing)
+
+        assert run(self._cfg(tmp_path)) == 0
+        assert not missing.exists()
 
     def test_a_header_only_file_left_by_an_older_run_is_read_as_empty(
         self, tmp_path, monkeypatch

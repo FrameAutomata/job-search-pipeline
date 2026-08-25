@@ -204,16 +204,21 @@ def append_easy_apply_urls(career_ops: Path, urls) -> None:
 
 
 def run(career_ops_path: Path) -> list[dict]:
-    rows = read_rows(FILTERED_PATH)
-    if not rows:
-        print("[bridge] no filtered_jobs.csv — run filter first (or nothing passed the threshold)")
-        return []
-
+    # Checked before the rows, deliberately: a misconfigured CAREER_OPS_PATH is
+    # the user's .env, not their scrape, and the no-rows branch below returns
+    # cleanly — so testing rows first would answer "run filter first" to someone
+    # whose actual fault is a path that doesn't exist. read_rows treats one more
+    # shape as empty than the old size test did, which widened that window.
     if not career_ops_path.exists():
         raise FileNotFoundError(
             f"career-ops not found at {career_ops_path}. "
             "Run setup.ps1/setup.sh or set CAREER_OPS_PATH in .env."
         )
+
+    rows = read_rows(FILTERED_PATH)
+    if not rows:
+        print("[bridge] no filtered_jobs.csv — run filter first (or nothing passed the threshold)")
+        return []
 
     seen_urls, seen_roles = load_seen(career_ops_path)
 

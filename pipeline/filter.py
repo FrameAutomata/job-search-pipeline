@@ -363,6 +363,7 @@ def run(config_path: Path) -> Path:
         # min_score message below, which reads as a threshold to lower.
         return _no_results(f"[filter] {JOBS_PATH.name} has no rows — nothing to filter")
 
+    scraped = len(rows)
     candidates = []
     too_old = 0
     ineligible = 0
@@ -377,9 +378,16 @@ def run(config_path: Path) -> Path:
             continue
         candidates.append(row)
 
+    # The raw scrape is the largest file in the chain and most of it is already
+    # discarded by here. Dropping the reference frees the non-survivors before
+    # resume extraction, YAKE and scoring run, so peak memory tracks `candidates`
+    # rather than everything scraped — which is what the streaming read used to
+    # give us for free.
+    del rows
+
     if not candidates:
         return _no_results(
-            f"[filter] nothing left to score of {len(rows)} scraped "
+            f"[filter] nothing left to score of {scraped} scraped "
             f"({ineligible} ineligible, {too_old} too old)"
         )
 

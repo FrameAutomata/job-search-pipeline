@@ -469,6 +469,30 @@ filter:
 
         assert output_path.read_text() == ""
 
+    def test_run_handles_header_only_jobs_csv(
+        self, patch_filter_paths, filtered_csv, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        """The shape the whole contract is about, pinned for filter too.
+
+        bridge and screen both have a header-only case; filter's read semantics
+        changed most and had none, so a regression in the `not rows` guard — or
+        a return to reading before the emptiness test — would go green here.
+        """
+        jobs_path, output_path = patch_filter_paths
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text("title,company,job_url,date_posted\n", encoding="utf-8")
+        output_path.write_text(filtered_csv.read_text(encoding="utf-8"), encoding="utf-8")
+
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text(
+            "filter:\n  target_titles: []\n  negative_titles: []\n  min_score: 5\n"
+        )
+
+        filter_mod.run(config)
+
+        assert output_path.read_text() == ""
+
     def test_zero_byte_jobs_csv_does_not_need_a_resume(
         self, patch_filter_paths, filtered_csv, monkeypatch
     ):
