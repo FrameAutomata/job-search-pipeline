@@ -18,7 +18,6 @@ Liveness logic is a Python port of career-ops/liveness-core.mjs. When
 disabled (or `screen:` is absent) the stage is a no-op.
 """
 
-import csv
 import html
 import re
 import sys
@@ -27,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from pipeline.rowio import read_rows, write_rows
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -492,22 +493,29 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
         print("[screen] liveness disabled -- skipping (set screen.liveness: true to enable)")
         return 0
 
-    if not FILTERED_PATH.exists() or FILTERED_PATH.stat().st_size == 0:
-        print("[screen] no filtered_jobs.csv -- nothing to screen")
-        return 0
-
-    with open(FILTERED_PATH, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames or []
-        jobs = list(reader)
-
+    # One guard where there were two: read_rows reads missing, zero-byte and
+    # header-only alike as "no rows", which is the only distinction this stage
+    # ever drew between them.
+    jobs = read_rows(FILTERED_PATH)
     if not jobs:
+        # Converge the file on the one shape a producer writes. A header-only
+        # filtered_jobs.csv — left by a pre-rowio run, or by a tool that wrote a
+        # header — reads as no rows here but is not zero bytes on disk, so
+        # without this it stays that way through every later --skip-filter run
+        # and the invariant is permanently violated in the one place it matters.
+        # Nothing is created if the file is simply absent.
+        if FILTERED_PATH.exists() and FILTERED_PATH.stat().st_size:
+            write_rows(FILTERED_PATH, [])
+        print("[screen] no rows in filtered_jobs.csv -- nothing to screen")
         return 0
 
-    # `description` may not be in fieldnames if the filter was run with a
-    # minimal CSV. Ensure it's present so we can write back any backfills.
-    if "description" not in fieldnames:
-        fieldnames = list(fieldnames) + ["description"]
+    # A filter run on a minimal CSV may have no `description` column at all,
+    # and the backfill below sets the key on some rows only. Normalizing it onto
+    # every row here means write_rows' own default — the first row's keys — is
+    # already the right column set, so there is no fieldnames local to thread
+    # through the eighty lines between the read and the write.
+    for job in jobs:
+        job.setdefault("description", "")
 
     # Early dedup against scan-history / pipeline / applications — these URLs
     # have been seen before, so an HTTP fetch and description extract would be
@@ -534,9 +542,15 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
                 print(f"[screen] skipping {skipped_seen} already-seen URL(s)", flush=True)
 
     if not jobs:
-        # Everything was already seen — overwrite filtered_jobs.csv with header only.
-        with open(FILTERED_PATH, "w", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=fieldnames).writeheader()
+        # Everything was already seen. Truncated, not header-only: a header is
+        # not zero bytes, so bridge's "did upstream produce anything" test saw a
+        # file with content and went looking for rows that were never there.
+        #
+        # Kept as its own exit rather than falling through to the identical
+        # write at the end (`kept` would also be empty): the count in this
+        # message is the one a reader wants when a whole run is a repeat, and
+        # the tail's "kept 0, dropped 0 of 0 new" does not carry it.
+        write_rows(FILTERED_PATH, [])
         print(f"[screen] all {skipped_seen} job(s) already seen — nothing new to screen")
         return 0
 
@@ -584,10 +598,10 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
                 backfilled += 1
         kept.append(job)
 
-    with open(FILTERED_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(kept)
+    # `kept` is empty when every job was dropped or held, which wrote the same
+    # header-only file as the all-seen exit above until write_rows made every
+    # "produced nothing" exit in the chain agree on one shape.
+    write_rows(FILTERED_PATH, kept)
 
     # Record dead URLs so we don't re-fetch them next run. Done after the pool
     # completes so we hit the TSV with a single appender, not 8 concurrent ones.

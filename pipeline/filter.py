@@ -4,7 +4,6 @@ Extracts keywords from the user's resume (YAKE — domain-agnostic statistical
 extraction, works for any field) and scores each job by keyword and target-title
 matches. Negative titles hard-exclude. No hardcoded vocabulary."""
 
-import csv
 import hashlib
 import json
 import os
@@ -18,6 +17,7 @@ import yaml
 from dotenv import load_dotenv
 
 from pipeline import resume_text as _resume_text
+from pipeline.rowio import read_rows, write_rows
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -307,15 +307,14 @@ def _score_job(
 def _no_results(message: str) -> Path:
     """Report `message`, truncate the output, and hand back its path.
 
-    The truncation is the point, not a detail. Leaving the previous run's
-    filtered_jobs.csv in place is #106 one stage down — screen and bridge would
-    re-process yesterday's rows as today's results. Every "nothing survived"
-    exit in run() goes through here, so a fourth one can't be added without it.
+    Every "nothing survived" exit in run() goes through here, so a fourth one
+    can't be added without the truncation. Why it has to truncate — and why zero
+    bytes rather than a header — is pipeline.rowio's contract.
 
     OUTPUT_PATH is read at call time, which is what the tests rebind.
     """
     print(message)
-    OUTPUT_PATH.write_text("", encoding="utf-8")
+    write_rows(OUTPUT_PATH, [])
     return OUTPUT_PATH
 
 
@@ -336,6 +335,12 @@ def run(config_path: Path) -> Path:
     eligible_loc_pattern = _compile_alternation(eligible_locations)
     negative_desc_pattern = _compile_alternation(negative_description_terms)
 
+    # Deliberately louder than the no-op screen and bridge give the same
+    # condition, and decided here rather than left implicit in the choice of
+    # read: a *missing* jobs.csv means the scrape stage never ran, because a
+    # scrape that ran and found nothing still leaves the file behind at zero
+    # bytes (pipeline.rowio). "Run scrape first" is actionable; filtering
+    # nothing in silence would read as a search that returned nothing.
     if not JOBS_PATH.exists():
         raise FileNotFoundError(f"{JOBS_PATH} not found — run scrape first.")
 
@@ -352,27 +357,33 @@ def run(config_path: Path) -> Path:
     # below. The standing exception is negative_titles, which stays inside
     # _score_job because score_job() is the documented public entry point and
     # promises to apply it.
-    scraped = 0
-    candidates = []
-    too_old = 0
-    ineligible = 0
-    with open(JOBS_PATH, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            scraped += 1
-            if cutoff:
-                posted = parse_date_posted(row.get("date_posted") or "")
-                if posted is not None and posted < cutoff:
-                    too_old += 1
-                    continue
-            if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
-                ineligible += 1
-                continue
-            candidates.append(row)
-
-    if not scraped:
+    rows = read_rows(JOBS_PATH)
+    if not rows:
         # Named as an empty scrape rather than left to fall through to the
         # min_score message below, which reads as a threshold to lower.
         return _no_results(f"[filter] {JOBS_PATH.name} has no rows — nothing to filter")
+
+    scraped = len(rows)
+    candidates = []
+    too_old = 0
+    ineligible = 0
+    for row in rows:
+        if cutoff:
+            posted = parse_date_posted(row.get("date_posted") or "")
+            if posted is not None and posted < cutoff:
+                too_old += 1
+                continue
+        if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
+            ineligible += 1
+            continue
+        candidates.append(row)
+
+    # The raw scrape is the largest file in the chain and most of it is already
+    # discarded by here. Dropping the reference frees the non-survivors before
+    # resume extraction, YAKE and scoring run, so peak memory tracks `candidates`
+    # rather than everything scraped — which is what the streaming read used to
+    # give us for free.
+    del rows
 
     if not candidates:
         return _no_results(
@@ -450,10 +461,7 @@ def run(config_path: Path) -> Path:
     ]
     all_cols = summary_cols + [c for c in relevant[0].keys() if c not in summary_cols]
 
-    with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=all_cols)
-        writer.writeheader()
-        writer.writerows(relevant)
+    write_rows(OUTPUT_PATH, relevant, all_cols)
 
     print(
         f"[filter] kept {len(relevant)} of {len(jobs)} "

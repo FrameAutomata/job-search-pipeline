@@ -363,23 +363,44 @@ class TestAppendToScanHistory:
 class TestRun:
     """Test bridge.run function."""
 
-    def test_run_missing_filtered_csv_returns_zero(self, career_ops_dir, monkeypatch, tmp_path):
-        """Missing filtered_jobs.csv returns empty list."""
-        nonexistent = tmp_path / "nonexistent.csv"
-        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", nonexistent)
+    @pytest.mark.parametrize(
+        "seed",
+        [None, "", "title,company,job_url,relevance_score\n"],
+        ids=["missing", "zero-byte", "header-only"],
+    )
+    def test_run_with_no_rows_returns_empty(
+        self, career_ops_dir, monkeypatch, tmp_path, seed
+    ):
+        """All three "produced nothing" shapes are one condition to bridge.
 
-        result = bridge_mod.run(career_ops_dir)
-        assert result == []
-
-    def test_run_empty_filtered_csv_returns_zero(self, career_ops_dir, monkeypatch, tmp_path):
-        """Empty filtered_jobs.csv returns empty list."""
+        Header-only is the case that used to differ: it is the shape screen
+        wrote on its all-seen path, and bridge's old `st_size == 0` test read it
+        as a file with content — so bridge announced it was bridging and then
+        found no rows. read_rows collapses the three, so they are parametrized
+        rather than written out as three tests asserting one line.
+        """
         filtered = tmp_path / "filtered_jobs.csv"
-        filtered.write_text("")
-
+        if seed is not None:
+            filtered.write_text(seed, encoding="utf-8")
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
 
-        result = bridge_mod.run(career_ops_dir)
-        assert result == []
+        assert bridge_mod.run(career_ops_dir) == []
+
+    def test_missing_career_ops_is_reported_even_with_no_rows(
+        self, tmp_path, monkeypatch
+    ):
+        """A bad CAREER_OPS_PATH is the user's .env, not their scrape.
+
+        read_rows treats one more shape as empty than the old size test did, so
+        testing rows first would answer "run filter first" to someone whose
+        actual fault is a path that doesn't exist.
+        """
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text("title,company,job_url\n", encoding="utf-8")
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+
+        with pytest.raises(FileNotFoundError, match="career-ops not found"):
+            bridge_mod.run(tmp_path / "nope")
 
     def test_run_missing_career_ops_raises(self, tmp_path, monkeypatch):
         """Missing career_ops_path raises FileNotFoundError."""

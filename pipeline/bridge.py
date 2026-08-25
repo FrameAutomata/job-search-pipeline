@@ -7,7 +7,6 @@ Mirrors scan.mjs's output format:
 
 The user then runs `/career-ops pipeline` in their AI CLI to evaluate the queue."""
 
-import csv
 import html
 import os
 import re
@@ -16,6 +15,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from pipeline._batch_common import parse_date_posted, read_url_set
+from pipeline.rowio import read_rows
 
 ROOT = Path(__file__).resolve().parent.parent
 FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
@@ -204,51 +204,56 @@ def append_easy_apply_urls(career_ops: Path, urls) -> None:
 
 
 def run(career_ops_path: Path) -> list[dict]:
-    if not FILTERED_PATH.exists() or FILTERED_PATH.stat().st_size == 0:
-        print("[bridge] no filtered_jobs.csv — run filter first (or nothing passed the threshold)")
-        return []
-
+    # Checked before the rows, deliberately: a misconfigured CAREER_OPS_PATH is
+    # the user's .env, not their scrape, and the no-rows branch below returns
+    # cleanly — so testing rows first would answer "run filter first" to someone
+    # whose actual fault is a path that doesn't exist. read_rows treats one more
+    # shape as empty than the old size test did, which widened that window.
     if not career_ops_path.exists():
         raise FileNotFoundError(
             f"career-ops not found at {career_ops_path}. "
             "Run setup.ps1/setup.sh or set CAREER_OPS_PATH in .env."
         )
 
+    rows = read_rows(FILTERED_PATH)
+    if not rows:
+        print("[bridge] no filtered_jobs.csv — run filter first (or nothing passed the threshold)")
+        return []
+
     seen_urls, seen_roles = load_seen(career_ops_path)
 
     new_offers = []
     easy_apply_urls = []
-    with open(FILTERED_PATH, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            url = (row.get("job_url") or "").strip()
-            title = (row.get("title") or "").strip()
-            company = (row.get("company") or "").strip()
-            # Record easy-apply URLs from the full file — independent of the
-            # tracker-dedup below — so a listing already in scan-history still
-            # gets its SmartApply flag persisted for the UI. (Screen also
-            # records these pre-dedup; this covers a --skip-screen run.)
-            if url and is_easy_apply_row(row):
-                easy_apply_urls.append(url)
-            if not url or not title or not company:
-                continue
-            if url in seen_urls:
-                continue
-            key = f"{company.lower()}::{title.lower()}"
-            if key in seen_roles:
-                continue
-            seen_urls.add(url)
-            seen_roles.add(key)
+    for row in rows:
+        url = (row.get("job_url") or "").strip()
+        title = (row.get("title") or "").strip()
+        company = (row.get("company") or "").strip()
+        # Record easy-apply URLs from the full file — independent of the
+        # tracker-dedup below — so a listing already in scan-history still
+        # gets its SmartApply flag persisted for the UI. (Screen also
+        # records these pre-dedup; this covers a --skip-screen run.)
+        if url and is_easy_apply_row(row):
+            easy_apply_urls.append(url)
+        if not url or not title or not company:
+            continue
+        if url in seen_urls:
+            continue
+        key = f"{company.lower()}::{title.lower()}"
+        if key in seen_roles:
+            continue
+        seen_urls.add(url)
+        seen_roles.add(key)
 
-            description = (row.get("description") or "").strip()
-            date_posted_str = (row.get("date_posted") or "").strip()
+        description = (row.get("description") or "").strip()
+        date_posted_str = (row.get("date_posted") or "").strip()
 
-            new_offers.append({
-                "url": url,
-                "title": title,
-                "company": company,
-                "description": description,
-                "date_posted": date_posted_str,
-            })
+        new_offers.append({
+            "url": url,
+            "title": title,
+            "company": company,
+            "description": description,
+            "date_posted": date_posted_str,
+        })
 
     append_easy_apply_urls(career_ops_path, easy_apply_urls)
 
