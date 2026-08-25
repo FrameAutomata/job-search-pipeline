@@ -325,12 +325,14 @@ def limitation_conflict(cfg: dict) -> str | None:
     write `false` in the first place.
 
     Note this deliberately does NOT match how pipeline.scrape forwards the same
-    keys: OPTIONAL_PARAMS keeps `is not None`, because it spans 16 keys whose
-    falsy values are meaningful settings a user typed on purpose (`distance: 0`,
-    `offset: 0`, `verbose: 0`, `linkedin_fetch_description: false`) and dropping
-    those would silently restore jobspy's defaults. The two tests answer
-    different questions — "did the user supply a value to forward?" there,
-    "will jobspy act on it?" here — so they are not to be unified.
+    keys: OPTIONAL_PARAMS keeps `is not None`, because twelve of the sixteen it
+    spans have falsy values that are meaningful settings a user typed on purpose
+    (`distance: 0`, `offset: 0`, `verbose: 0`, `linkedin_fetch_description:
+    false`), and dropping those would silently restore jobspy's defaults. The
+    two tests answer different questions — "did the user supply a value to
+    forward?" there, "will jobspy act on it?" here — so they are not to be
+    unified. The remaining four are the MUTEX_KEYS, and they never reach that
+    test carrying a falsy value: normalize_pass has already deleted the key.
 
     Lives here, in the dependency-free leaf, so the UI venv — which installs
     neither jobspy nor pandas and so cannot import pipeline.scrape at all — can
