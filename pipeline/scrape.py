@@ -66,11 +66,9 @@ def strip_unsupported_sites(searches: list[dict]) -> list[dict]:
         kept, dropped = resolve_sites(cfg)
         name = cfg.get("name", "pass")
         if dropped:
-            print(
-                f"[scrape] [{name}] dropping unsupported sites: "
-                f"{', '.join(dropped)} "
-                f"(supported: {', '.join(SUPPORTED_SITES)})",
-            )
+            print(f"[scrape] [{name}] dropping unsupported sites: "
+                  f"{', '.join(dropped)} "
+                  f"(supported: {', '.join(SUPPORTED_SITES)})")
         if not kept:
             print(f"[scrape] [{name}] skipping pass — no supported sites left")
             continue

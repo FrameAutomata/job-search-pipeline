@@ -57,7 +57,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Reuse the cover-letter conventions (same output dir, same sanitizer) and the
 # shared JD lookup (cached file → artifact → LinkedIn guest fetch).
 from pipeline.cover_letters import _safe_company, jd_text_for_job  # noqa: E402
-from pipeline.stdio import line_buffer_stdout
+from pipeline.stdio import line_buffer_stdout  # noqa: E402
 
 
 # Section headers we recognize (lowercased, exact match after whitespace

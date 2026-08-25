@@ -17,6 +17,7 @@ optional dep only bites the user who actually hands us that format.
 import sys
 import tempfile
 from pathlib import Path
+
 from pipeline.stdio import line_buffer_stdout
 
 # What the setup/UI offer as importable resume formats (no .txt — that's the

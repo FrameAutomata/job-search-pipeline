@@ -8,6 +8,7 @@ by URL against the existing file, and writes the TSV header if the file is new.
 import csv
 import sys
 from pathlib import Path
+
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent

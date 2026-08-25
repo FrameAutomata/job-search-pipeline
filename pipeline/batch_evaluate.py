@@ -316,10 +316,8 @@ def _call_with_retry(
             jittered = delay + random.uniform(0, 0.5)
             if monotonic() + jittered >= deadline:
                 raise  # the next wait would blow the per-job budget
-            print(
-                f"  provider busy (attempt {attempt}/{max_attempts}): "
-                f"sleeping {jittered:.1f}s — {exc}",
-            )
+            print(f"  provider busy (attempt {attempt}/{max_attempts}): "
+                  f"sleeping {jittered:.1f}s — {exc}")
             sleep(jittered)
             delay *= 2
     # Unreachable: the for-loop above either returns or raises on the last attempt.
@@ -791,6 +789,13 @@ def _run_eval(
             atomic_write_text(state_path, json.dumps(state, indent=2, ensure_ascii=False))
         print(f"\n[batch-eval] interrupted — {processed} processed, {failed} failed; "
               "remaining jobs stay pending for the next run.")
+        # os._exit skips stdio flushing and atexit entirely, so this is the one
+        # place a print needs an explicit push: line_buffer_stdout() swallows
+        # its own failure by design, and if the reconfigure didn't take (a
+        # supervisor or embedding host replacing sys.stdout) the buffered
+        # summary would simply be discarded. Every other retired flush=True
+        # degraded to "shows up later"; this one degraded to "never".
+        sys.stdout.flush()
         os._exit(130)
 
     # Install a SIGINT handler so a second Ctrl-C re-enters cleanly. Only works

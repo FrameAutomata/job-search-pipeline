@@ -38,6 +38,22 @@ Two deliberate exclusions:
   from the call site. So: 12 conventional call sites plus two guards, bought at
   the price of not doing that. (If the stage modules and the UI ever stop
   sharing one package, this becomes free and should be revisited.)
+The UI process is covered explicitly rather than by the rule above: uvicorn
+imports pipeline.app.server instead of running a `__main__` block, and unlike
+local_run.py's child it inherits no PYTHONUNBUFFERED — while pipeline code does
+print from it (recheck.drain on a background thread, batch_evaluate's retry
+notices from Add-Job). So server.py calls this at import. That is an entry point
+calling it, not a package doing it as a side effect, which is the distinction
+the __init__.py note below turns on.
+
+One deliberate exception, and one deliberate exclusion:
+
+- **pipeline/batch_evaluate.py's interrupt summary** still pushes explicitly,
+  because the line after it is `os._exit(130)` — which skips stdio flushing and
+  atexit entirely. line_buffer_stdout() swallows its own failure by design, so
+  if the reconfigure didn't take, a buffered summary would simply be discarded.
+  It uses `sys.stdout.flush()` rather than `flush=True`, so it reads as the
+  bypass it is rather than as the cargo this change removed.
 - **Not pipeline/app/server.py's handoff log**, which opens its sink with
   `buffering=1` under a `redirect_stdout`. That is the same guarantee reached
   the only way it can be there — reconfiguring `sys.stdout` cannot help when the

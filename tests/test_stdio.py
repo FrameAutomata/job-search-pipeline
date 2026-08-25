@@ -20,14 +20,13 @@ would have permitted the shape that actually occurred.
 """
 
 import ast
+import contextlib
 import io
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-
-import pytest
 
 from pipeline.stdio import line_buffer_stdout
 
@@ -79,7 +78,10 @@ class TestLineBufferStdout:
         # traceback here would report buffering instead of the actual work.
         f = open(tmp_path / "gone.log", "w", buffering=8192, encoding="utf-8")
         f.close()
-        monkeypatch.setattr(sys, "stderr", f)
+        # stdout only. Pointing sys.stderr at a closed handle is the hazard the
+        # sibling test above spends six lines defending against, applied to the
+        # stream logging and pytest fall back to — and stderr is already covered,
+        # correctly, by test_stderr_is_left_alone.
         monkeypatch.setattr(sys, "stdout", f)
 
         line_buffer_stdout()
@@ -120,17 +122,48 @@ def _main_guard_body(tree: ast.Module) -> list | None:
     return None
 
 
-def _entry_points() -> list[Path]:
-    """Every module under pipeline/ runnable with `python -m`.
+def _parse_tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"))
 
-    rglob, not glob: pipeline/app/ has no entry point today, and a guard that
-    silently stops looking is how the previous mess accumulated.
+
+# Parsed once and shared. rglob, not glob: pipeline/app/ has no __main__ today,
+# and a guard that silently stops looking is how the previous mess accumulated.
+_PIPELINE_TREES = {p: _parse_tree(p) for p in sorted((ROOT / "pipeline").rglob("*.py"))}
+
+
+def _entry_points() -> list[tuple[Path, list]]:
+    """Every module under pipeline/ runnable with `python -m`, and its guard body."""
+    return [
+        (path, body)
+        for path, tree in _PIPELINE_TREES.items()
+        if (body := _main_guard_body(tree)) is not None
+    ]
+
+
+def _imports_the_helper(tree: ast.Module) -> bool:
+    """Whether the module brings `line_buffer_stdout` (or `stdio`) into scope.
+
+    Checked separately from the call, because the AST guard never executes the
+    module: a new entry point that calls it without importing it satisfies every
+    other check here and then dies with NameError before doing any work — which
+    is precisely the failure this guard exists to prevent.
     """
-    found = []
-    for path in sorted((ROOT / "pipeline").rglob("*.py")):
-        if _main_guard_body(ast.parse(path.read_text(encoding="utf-8"))) is not None:
-            found.append(path)
-    return found
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= {(a.asname or a.name).split(".")[0] for a in node.names}
+    return "line_buffer_stdout" in names or "stdio" in names
+
+
+def _calls_helper_first(body: list) -> bool:
+    first = body[0]
+    if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)):
+        return False
+    func = first.value.func
+    # Name or Attribute: `stdio.line_buffer_stdout()` is the same thing said a
+    # different way, and mandating one import style is not this guard's job.
+    return getattr(func, "id", None) == "line_buffer_stdout" or \
+        getattr(func, "attr", None) == "line_buffer_stdout"
 
 
 class TestEveryEntryPointBuffers:
@@ -141,24 +174,41 @@ class TestEveryEntryPointBuffers:
         # A collection bug that returned [] would make this class pass forever.
         assert len(entries) >= 10, f"only found {len(entries)} entry points"
 
-        offenders = []
-        for path in entries:
-            body = _main_guard_body(ast.parse(path.read_text(encoding="utf-8")))
-            first = body[0]
-            called_first = (
-                isinstance(first, ast.Expr)
-                and isinstance(first.value, ast.Call)
-                and isinstance(first.value.func, ast.Name)
-                and first.value.func.id == "line_buffer_stdout"
-            )
-            if not called_first:
-                offenders.append(str(path.relative_to(ROOT)))
         # First, not merely present: a stage that calls it after thirty seconds
         # of setup passes a "was it mentioned" check while failing the rule.
+        offenders = [
+            str(path.relative_to(ROOT))
+            for path, body in entries if not _calls_helper_first(body)
+        ]
         assert not offenders, (
             f"{offenders}: line_buffer_stdout() must be the first statement of the "
             "__main__ block, or `python -m pipeline.<stage> > log` is block-buffered."
         )
+
+    def test_every_entry_point_imports_what_it_calls(self):
+        missing = [
+            str(path.relative_to(ROOT))
+            for path, _ in _entry_points()
+            if not _imports_the_helper(_PIPELINE_TREES[path])
+        ]
+        assert not missing, (
+            f"{missing}: call line_buffer_stdout() without importing it and "
+            "`python -m pipeline.<stage>` dies with NameError before doing any work."
+        )
+
+    def test_the_ui_server_buffers_too(self):
+        # uvicorn imports server.py rather than running a __main__ block, and
+        # gets no PYTHONUNBUFFERED — but recheck.drain and batch_evaluate's
+        # retry notices print from that process, so it is an entry point for
+        # this rule even though the guard above cannot see it.
+        server = ROOT / "pipeline" / "app" / "server.py"
+        assert _imports_the_helper(_PIPELINE_TREES[server])
+        calls = [
+            n for n in ast.parse(server.read_text(encoding="utf-8")).body
+            if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+            and getattr(n.value.func, "id", None) == "line_buffer_stdout"
+        ]
+        assert calls, "pipeline/app/server.py must call line_buffer_stdout() at import"
 
     def test_orchestrate_calls_it_before_parsing_argv(self):
         tree = ast.parse((ROOT / "orchestrate.py").read_text(encoding="utf-8"))
@@ -175,8 +225,8 @@ class TestNoResidualFlushCargo:
 
     def test_no_call_passes_flush(self):
         offenders = []
-        for path in sorted(list((ROOT / "pipeline").rglob("*.py")) + [ROOT / "orchestrate.py"]):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+        trees = {**_PIPELINE_TREES, ROOT / "orchestrate.py": _parse_tree(ROOT / "orchestrate.py")}
+        for path, tree in trees.items():
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and any(
                     kw.arg == "flush" for kw in node.keywords
@@ -231,5 +281,14 @@ class TestEndToEnd:
                 # the line sits in an 8KB buffer until it exits.
                 assert "searching" in log.read_text(encoding="utf-8")
             finally:
-                proc.stdin.close()
-                proc.wait(timeout=10)
+                # Suppressed: if the child already died the assertion above is
+                # the interesting failure, and closing a pipe with no reader
+                # would replace it in the traceback with a BrokenPipeError
+                # about plumbing. kill() so a hung child is never orphaned.
+                with contextlib.suppress(OSError):
+                    proc.stdin.close()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()

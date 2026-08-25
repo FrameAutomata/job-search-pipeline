@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
 from pipeline.stdio import line_buffer_stdout
 
 from pipeline.rowio import read_rows, write_rows
