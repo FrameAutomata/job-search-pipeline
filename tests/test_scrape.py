@@ -9,7 +9,12 @@ import pytest
 
 from pipeline import scrape as scrape_mod
 from pipeline import sites as sites_mod
-from pipeline.sites import limitation_conflict, normalize_pass, unreadable_options
+from pipeline.sites import (
+    board_conflicts,
+    limitation_conflict,
+    normalize_pass,
+    unreadable_options,
+)
 
 
 class TestFilterPasses:
@@ -169,12 +174,17 @@ search:
 
 
 class TestStripUnsupportedSites:
-    """Only indeed + linkedin are supported scrape sites. Glassdoor and
+    """resolve_pass_sites, exercised through the RETIRED-BOARD rule.
+
+    Only indeed + linkedin are supported scrape sites. Glassdoor and
     ZipRecruiter are Cloudflare-walled (403 on every request, zero rows), and
     Google Jobs serves degraded responses then drops the connection mid-body —
     which jobspy's Google scraper doesn't catch, killing the whole run.
-    strip_unsupported_sites removes them at load time so stale configs (e.g.
-    an old cloud SEARCH_CONFIG_B64 secret) can't crash or waste requests."""
+    resolve_pass_sites removes them at load time so stale configs (e.g. an old
+    cloud SEARCH_CONFIG_B64 secret) can't crash or waste requests.
+
+    Split from TestStripConflictingSites below (the mutex rule) because the two
+    rules are worth documenting separately even though one loop applies both."""
 
     def test_supported_sites_are_indeed_and_linkedin(self):
         assert set(scrape_mod.SUPPORTED_SITES) == {"indeed", "linkedin"}
@@ -184,12 +194,12 @@ class TestStripUnsupportedSites:
             "name": "p", "search_terms": ["a"],
             "sites": ["glassdoor", "indeed", "zip_recruiter", "linkedin", "google"],
         }]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed", "linkedin"]
 
     def test_matching_is_case_insensitive(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["LinkedIn", "Google"]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["LinkedIn"]
 
     def test_pass_with_no_supported_sites_is_dropped(self):
@@ -197,64 +207,64 @@ class TestStripUnsupportedSites:
             {"name": "dead", "search_terms": ["a"], "sites": ["google", "glassdoor"]},
             {"name": "live", "search_terms": ["a"], "sites": ["indeed"]},
         ]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert [s["name"] for s in result] == ["live"]
 
     def test_all_supported_passes_come_back_unchanged(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "linkedin"]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result == searches
 
     def test_bare_string_sites_is_not_iterated_character_by_character(self):
         # `sites: indeed` is valid YAML and a valid JobSpy site_name; iterating
         # the string would test 'i', 'n', 'd', ... and drop the whole pass.
         searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed"}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed"]
 
     def test_surrounding_whitespace_is_stripped_from_kept_sites(self):
         # jobspy resolves the board with Site[name.upper()], which raises on
         # " LINKEDIN " — so a padded entry must not survive verbatim.
         searches = [{"name": "p", "search_terms": ["a"], "sites": [" linkedin "]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["linkedin"]
 
     def test_case_variant_duplicates_collapse(self):
         # Both map to Site.INDEED; keeping both scrapes the board twice.
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "Indeed"]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed"]
 
     def test_non_string_entries_do_not_crash_the_warning(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["linkedin", 123]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["linkedin"]
 
     def test_warning_names_the_dropped_sites_and_pass(self, capsys):
         searches = [{"name": "US Remote", "search_terms": ["a"],
                      "sites": ["indeed", "glassdoor", "google"]}]
-        scrape_mod.strip_unsupported_sites(searches)
+        scrape_mod.resolve_pass_sites(searches)
         out = capsys.readouterr().out
         assert "glassdoor" in out and "google" in out
         assert "US Remote" in out
 
     def test_no_warning_when_nothing_dropped(self, capsys):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed"]}]
-        scrape_mod.strip_unsupported_sites(searches)
+        scrape_mod.resolve_pass_sites(searches)
         assert capsys.readouterr().out == ""
 
     def test_missing_sites_key_defaults_to_supported(self):
         # Left as None, jobspy's get_site_type() scrapes list(Site) — every
         # retired board included — so the key has to be filled in.
         searches = [{"name": "p", "search_terms": ["a"]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == list(scrape_mod.SUPPORTED_SITES)
 
     def test_explicitly_null_sites_defaults_to_supported(self):
         # `sites:` with nothing after it — a real None in the mapping, which
         # made the mutex check raise TypeError.
         searches = [{"name": "p", "search_terms": ["a"], "sites": None}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == list(scrape_mod.SUPPORTED_SITES)
 
     def test_comma_separated_scalar_is_split(self):
@@ -262,17 +272,17 @@ class TestStripUnsupportedSites:
         # shape the CLI wizard prompts for. Read whole it matches no board, so
         # naming both supported boards used to drop the pass entirely.
         searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed, linkedin"}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed", "linkedin"]
 
     def test_comma_separated_scalar_still_drops_unsupported(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed, glassdoor"}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed"]
 
     def test_trailing_comma_does_not_report_a_blank_board(self, capsys):
         searches = [{"name": "p", "search_terms": ["a"], "sites": "indeed,"}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed"]
         assert capsys.readouterr().out == ""
 
@@ -280,20 +290,20 @@ class TestStripUnsupportedSites:
         # `sites: 5` — list(5) raises TypeError, which aborted the whole scrape
         # stage instead of degrading to the documented warning.
         searches = [{"name": "p", "search_terms": ["a"], "sites": 5}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result == []      # nothing supported, so the pass is skipped
 
     def test_null_entry_is_not_reported_as_a_board_named_none(self, capsys):
         # `- ~` in the list stringified to "None", sending the user hunting for
         # a board by that name.
         searches = [{"name": "p", "search_terms": ["a"], "sites": [None, "indeed"]}]
-        result = scrape_mod.strip_unsupported_sites(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert result[0]["sites"] == ["indeed"]
         assert capsys.readouterr().out == ""
 
     def test_input_list_is_not_mutated(self):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "google"]}]
-        scrape_mod.strip_unsupported_sites(searches)
+        scrape_mod.resolve_pass_sites(searches)
         assert searches[0]["sites"] == ["indeed", "google"]
 
 
@@ -374,10 +384,14 @@ def _sets_clause(msg: str) -> str:
 
 
 class TestLimitationConflict:
-    """pipeline.sites.limitation_conflict — JobSpy's per-pass mutual-exclusion
-    rule, returning the message so the scraper can skip the pass and the UI's
-    save endpoint (which cannot import this module's jobspy-bound caller) can
-    reject the save with it."""
+    """pipeline.sites.limitation_conflict — "does this pass break JobSpy's
+    mutual-exclusion rule on any of its boards?", returning the message so the
+    UI's save endpoint (which cannot import this module's jobspy-bound caller)
+    can reject the save with it.
+
+    The rule itself is exercised here because this is where it reads most
+    plainly; board_conflicts below, which the scraper uses to drop just the
+    offending board, is the same computation and is pinned against this one."""
 
     # Indeed group constraints: only ONE of {hours_old}, {job_type/is_remote}, {easy_apply}
     def test_indeed_hours_old_alone(self):
@@ -491,6 +505,64 @@ class TestLimitationConflict:
         assert "Indeed limitation" in limitation_conflict(cfg)
 
 
+class TestBoardConflicts:
+    """pipeline.sites.board_conflicts — the same rule, per board rather than per
+    pass, because the constraint it encodes belongs to a board (#126).
+
+    limitation_conflict is this collapsed to one message, so the rule itself is
+    covered by TestLimitationConflict above; these pin the shape the scraper
+    needs to drop only the board that actually conflicts."""
+
+    def test_clean_pass_reports_nothing(self):
+        assert board_conflicts({"sites": ["indeed", "linkedin"], "hours_old": 168}) == {}
+
+    def test_only_the_board_with_the_rule_is_named(self):
+        # The whole point: LinkedIn sends both filters, so it must not appear
+        # here and the scraper must not drop it.
+        cfg = {"sites": ["linkedin", "indeed"], "hours_old": 168, "easy_apply": True}
+        assert list(board_conflicts(cfg)) == ["indeed"]
+
+    def test_key_is_lower_case_however_the_config_spelled_it(self):
+        # The scraper matches these keys against the board names it read out of
+        # the config, which keep the user's casing (partition_sites preserves it
+        # because jobspy resolves Site[name.upper()]).
+        cfg = {"sites": ["LinkedIn", "Indeed"], "hours_old": 168, "easy_apply": True}
+        assert list(board_conflicts(cfg)) == ["indeed"]
+
+    def test_message_matches_the_collapsed_one(self):
+        # limitation_conflict is this function's messages joined; with one
+        # rule-bearing board that is exactly this one. If the two ever stop
+        # agreeing, the UI would refuse a save quoting a different rule from the
+        # one the run enforces. The multi-board half is pinned below.
+        cfg = {"name": "p", "sites": ["indeed"], "hours_old": 168, "is_remote": True}
+        assert board_conflicts(cfg)["indeed"] == limitation_conflict(cfg)
+
+
+
+class TestLimitationConflictJoinsEveryBoard:
+    """The half MUTEX_GROUPS' single entry makes unreachable today.
+
+    limitation_conflict joins every offending board's message rather than taking
+    the first, and its docstring makes that the point of the shape — a second
+    rule-bearing board must not hand the UI a 400 naming one of two broken
+    boards, sending the user back for a second 400 after they fix it. With one
+    board in MUTEX_GROUPS, `next(iter(...))` and `" ".join(...)` are
+    indistinguishable, so a regression to first-wins would keep the suite green.
+    """
+
+    def test_both_boards_are_named(self, monkeypatch):
+        groups = [("hours_old",), ("easy_apply",)]
+        monkeypatch.setattr(sites_mod, "MUTEX_GROUPS", {
+            "indeed": ("Indeed", groups),
+            "linkedin": ("LinkedIn", groups),
+        })
+        cfg = {"sites": ["indeed", "linkedin"], "hours_old": 168, "easy_apply": True}
+
+        assert list(board_conflicts(cfg)) == ["indeed", "linkedin"]
+        message = limitation_conflict(cfg)
+        assert "Indeed limitation" in message and "LinkedIn limitation" in message
+
+
 class TestOptionalParamForwarding:
     """The other half of the truthiness change, pinned so it can't be "unified".
 
@@ -541,15 +613,56 @@ class TestOptionalParamForwarding:
         assert kwargs["offset"] == 0
 
 
-class TestDropConflictingPasses:
-    """A conflicting pass is skipped with a warning, not raised: a config can
-    reach a run without passing the UI validator (stale cloud secret, hand-edited
-    file), and aborting took every healthy pass down with it."""
+class TestStripConflictingSites:
+    """resolve_pass_sites, exercised through the MUTEX rule.
 
-    def test_conflicting_pass_is_dropped(self):
+    A board JobSpy can't search as configured is dropped from the pass with a
+    warning, not raised: a config can reach a run without passing the UI
+    validator (stale cloud secret, hand-edited file), and aborting took every
+    healthy pass down with it. The pass itself is skipped only when the conflict
+    costs it every board."""
+
+    def test_single_board_conflict_still_drops_the_pass(self):
         searches = [{"name": "bad", "search_terms": ["a"], "sites": ["indeed"],
                      "hours_old": 168, "is_remote": True}]
-        assert scrape_mod.drop_conflicting_passes(searches) == []
+        assert scrape_mod.resolve_pass_sites(searches) == []
+
+    def test_only_the_conflicting_board_is_dropped(self):
+        # The issue (#126): Indeed's precedence chain would silently drop one of
+        # these two filters, LinkedIn sends both — and the LinkedIn search that
+        # would have run exactly as written used to go with it.
+        #
+        # Asserted as a whole dict rather than just `sites`: only that key may
+        # change, and rebuilding the pass from scratch would be the easy way to
+        # lose search_terms or results_wanted along with the board.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "linkedin"],
+                     "results_wanted": 25, "hours_old": 168, "easy_apply": True}]
+        kept = scrape_mod.resolve_pass_sites(searches)[0]
+        assert kept == {**searches[0], "sites": ["linkedin"]}
+
+    def test_the_input_pass_is_not_mutated(self):
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "linkedin"],
+                     "hours_old": 168, "easy_apply": True}]
+        scrape_mod.resolve_pass_sites(searches)
+        assert searches[0]["sites"] == ["indeed", "linkedin"]
+
+    def test_a_pass_with_no_sites_key_keeps_the_boards_it_inherits(self):
+        # resolve_sites fills in the supported boards upstream, so the rule
+        # binds a pass whose YAML never mentions Indeed — and the same fill-in
+        # is what leaves LinkedIn to search.
+        searches = [{"name": "p", "search_terms": ["a"], "hours_old": 168, "easy_apply": True}]
+        assert [s["sites"] for s in scrape_mod.resolve_pass_sites(searches)] == [["linkedin"]]
+
+    def test_a_retired_board_is_still_reported_when_the_pass_also_conflicts(self, capsys):
+        # The reason the two rules share one loop. Judged separately, the mutex
+        # branch re-resolved the boards for itself and dropped glassdoor with
+        # none of the warning the retired-board rule owes it.
+        searches = [{"name": "p", "search_terms": ["a"],
+                     "sites": ["glassdoor", "indeed", "linkedin"],
+                     "hours_old": 168, "easy_apply": True}]
+        assert [s["sites"] for s in scrape_mod.resolve_pass_sites(searches)] == [["linkedin"]]
+        out = capsys.readouterr().out
+        assert "unsupported sites: glassdoor" in out and "dropping indeed" in out
 
     def test_healthy_passes_survive_a_conflicting_neighbour(self):
         searches = [
@@ -557,25 +670,112 @@ class TestDropConflictingPasses:
              "hours_old": 168, "is_remote": True},
             {"name": "good", "search_terms": ["a"], "sites": ["indeed"], "hours_old": 168},
         ]
-        result = scrape_mod.drop_conflicting_passes(searches)
+        result = scrape_mod.resolve_pass_sites(searches)
         assert [s["name"] for s in result] == ["good"]
 
     def test_warning_names_the_pass_and_the_rule(self, capsys):
         searches = [{"name": "US Remote", "search_terms": ["a"], "sites": ["indeed"],
                      "hours_old": 168, "is_remote": True}]
-        scrape_mod.drop_conflicting_passes(searches)
+        scrape_mod.resolve_pass_sites(searches)
         out = capsys.readouterr().out
         assert "US Remote" in out and "Indeed limitation" in out and "skipping" in out
 
+    def test_warning_names_the_dropped_board_and_what_still_runs(self, capsys):
+        # A partial drop is quieter than a skipped pass — the pass still returns
+        # rows — so the log has to say which board went and which did not, or
+        # the missing half looks like a bad day on Indeed.
+        searches = [{"name": "US Remote", "search_terms": ["a"], "sites": ["indeed", "linkedin"],
+                     "hours_old": 168, "easy_apply": True}]
+        scrape_mod.resolve_pass_sites(searches)
+        out = capsys.readouterr().out
+        assert "dropping indeed" in out and "Still searching: linkedin" in out
+        assert "skipping pass" not in out
+
+    def test_the_warning_spells_both_board_lists_the_way_the_config_did(self, capsys):
+        # conflicts' keys are MUTEX_GROUPS' lower-case names; the surviving
+        # boards keep the config's casing. Reporting one of each spelled the
+        # same line two ways, so half of it wouldn't grep.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["Indeed", "LinkedIn"],
+                     "hours_old": 168, "easy_apply": True}]
+        scrape_mod.resolve_pass_sites(searches)
+        out = capsys.readouterr().out
+        assert "dropping Indeed" in out and "Still searching: LinkedIn" in out
+
+    def test_an_unreadable_value_skips_the_pass_even_with_a_clean_board(self, capsys):
+        # No per-board degradation here, and deliberately: scrape_jobs builds one
+        # ScraperInput before it dispatches to any board, so pydantic rejects the
+        # value out of the whole call. LinkedIn would not run either.
+        searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed", "linkedin"],
+                     "easy_apply": "maybe"}]
+        assert scrape_mod.resolve_pass_sites(searches) == []
+        assert "easy_apply" in capsys.readouterr().out
+
     def test_no_warning_when_nothing_conflicts(self, capsys):
         searches = [{"name": "p", "search_terms": ["a"], "sites": ["indeed"], "hours_old": 168}]
-        assert scrape_mod.drop_conflicting_passes(searches) == searches
+        assert scrape_mod.resolve_pass_sites(searches) == searches
+        assert capsys.readouterr().out == ""
+
+    def test_a_clean_pass_keeps_every_board_it_asked_for(self, capsys):
+        # The mutex rule subtracts from the board list the retired-board rule
+        # resolved; with nothing to subtract, the pass comes back with the boards
+        # it inherits and no warning at all.
+        searches = [{"name": "p", "search_terms": ["a"], "hours_old": 168}]
+        assert [s["sites"] for s in scrape_mod.resolve_pass_sites(searches)] == [
+            ["indeed", "linkedin"]
+        ]
         assert capsys.readouterr().out == ""
 
 
-class TestRunDropsConflictingPasses:
-    """run() applies the drop to whatever config it loads, so a conflicting pass
-    can no longer abort the stage — and with it the rest of the pipeline."""
+class TestRunKeepsTheBoardsThatCanRun:
+    """run() applies the rule to whatever config it loads, so a conflicting pass
+    can no longer abort the stage — and, since #126, no longer costs the run the
+    boards that were never bound by the rule in the first place."""
+
+    # The default shape of every config the repo generates, plus the two filters
+    # Indeed can't combine. Shared so the two tests below provably agree on what
+    # they are scraping: one asserts LinkedIn is what runs, the other that the
+    # row it returns is still tagged easy-apply, and that only holds if both are
+    # reading the same easy-apply pass.
+    BOTH_BOARDS = """
+searches:
+  - name: "both boards"
+    search_terms: ["a"]
+    sites: [indeed, linkedin]
+    hours_old: 168
+    easy_apply: true
+"""
+
+    def test_a_pass_naming_both_boards_still_scrapes_the_clean_one(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # The case the issue is about: the whole pass used to vanish over a rule
+        # that binds one of its two boards.
+        config = _write_search_config(tmp_path, self.BOTH_BOARDS)
+        df = pd.DataFrame({"job_url": ["https://linkedin.com/job1"]})
+        mock_scrape = mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        kwargs = mock_scrape.call_args.kwargs
+        assert kwargs["site_name"] == ["linkedin"]
+        # Both filters still forwarded — LinkedIn drops neither, which is the
+        # whole reason the pass was worth keeping.
+        assert kwargs["hours_old"] == 168
+        assert kwargs["easy_apply"] is True
+
+    def test_the_surviving_half_is_still_tagged_easy_apply(
+        self, tmp_path, patch_scrape_paths, mocker
+    ):
+        # The per-row tag is read off the pass, and the pass survived — a row
+        # scraped from the LinkedIn half of an easy-apply pass is still an
+        # easy-apply row downstream (the UI gates its apply button on this).
+        config = _write_search_config(tmp_path, self.BOTH_BOARDS)
+        df = pd.DataFrame({"job_url": ["https://linkedin.com/job1"]})
+        mocker.patch("pipeline.scrape.scrape_jobs", return_value=df)
+
+        scrape_mod.run(config)
+
+        assert pd.read_csv(patch_scrape_paths)["easy_apply"].tolist() == [True]
 
     def test_healthy_pass_still_scrapes(self, tmp_path, patch_scrape_paths, mocker):
         config = _write_search_config(tmp_path, """

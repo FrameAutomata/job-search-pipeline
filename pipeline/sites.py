@@ -234,9 +234,13 @@ def unreadable_options(cfg: dict) -> str | None:
     ScraperInput, before any network call. Left to reach that point it aborts
     the whole scrape stage from inside run()'s pass loop, discarding the rows
     every healthy pass already returned. That is precisely the failure
-    strip_unsupported_sites and drop_conflicting_passes exist to prevent, so the
-    knowledge is surfaced here instead of thrown away, and the same
-    warn-and-skip / refuse-the-save mechanism handles it.
+    pipeline.scrape.resolve_pass_sites exists to prevent, so the knowledge is
+    surfaced here instead of thrown away, and the same warn-and-skip /
+    refuse-the-save mechanism handles it.
+
+    Unlike a mutex conflict this is not degraded per board — `scrape_jobs` builds
+    one ScraperInput before it dispatches to any board, so there is no half of
+    the pass left standing to keep.
 
     Reported rather than guessed at: coercing `easy_apply: "maybe"` to True
     would invent a filter the user never asked for, and to False would hide the
@@ -309,12 +313,23 @@ def normalize_pass(cfg: dict) -> dict:
     return out
 
 
-def limitation_conflict(cfg: dict) -> str | None:
-    """The JobSpy mutual-exclusion rule this search pass breaks, or None.
+def board_conflicts(cfg: dict) -> dict[str, str]:
+    """The boards this search pass breaks a JobSpy limitation on: board -> why.
 
-    Indeed acts on only ONE of (A) hours_old, (B) job_type and/or is_remote,
-    (C) easy_apply per search. LinkedIn has no such rule and is not checked.
-    Why, for both, is on MUTEX_GROUPS above.
+    Keyed by the MUTEX_GROUPS board name (lower-case, so a caller can test a
+    board it read out of a config without re-normalizing its case), in
+    MUTEX_GROUPS order. Empty for a clean pass, which is nearly every pass.
+
+    Per board, because the constraint is per board — that is the whole point of
+    the shape. Indeed acts on only ONE of (A) hours_old, (B) job_type and/or
+    is_remote, (C) easy_apply per search; LinkedIn has no such rule and is not
+    checked. Why, for both, is on MUTEX_GROUPS above. A pass naming both boards
+    and setting hours_old + easy_apply is therefore a conflict on exactly one of
+    the two it names, and reporting one message for the pass made the scraper
+    discard the LinkedIn half as well — verbatim the harm #115 cited when it
+    retired the LinkedIn group, one level up (#126). Callers that need the
+    per-pass question ("does this break the rule anywhere?") ask
+    limitation_conflict below, which is this function collapsed.
 
     An option counts as set only when its value is TRUTHY, because truthiness
     is what jobspy reads it through: `if self.scraper_input.hours_old:` and
@@ -336,9 +351,9 @@ def limitation_conflict(cfg: dict) -> str | None:
 
     Lives here, in the dependency-free leaf, so the UI venv — which installs
     neither jobspy nor pandas and so cannot import pipeline.scrape at all — can
-    predict the rule by running it rather than by restating it. Returns the
-    message instead of raising so each caller shapes its own consequence: the
-    scraper skips the pass, the save endpoint answers 400.
+    predict the rule by running it rather than by restating it. Returns messages
+    instead of raising so each caller shapes its own consequence: the scraper
+    drops the named board from the pass, the save endpoint answers 400.
 
     The boards checked are resolve_sites()'s, not `cfg["sites"]` verbatim — an
     omitted `sites` inherits the supported boards, so a pass that never names
@@ -358,6 +373,7 @@ def limitation_conflict(cfg: dict) -> str | None:
     sites = {s.lower() for s in resolve_sites(cfg)[0]}
     where = f"[{cfg['name']}] " if cfg.get("name") else ""
 
+    found = {}
     for board, (label, groups) in MUTEX_GROUPS.items():
         if board not in sites:
             continue
@@ -366,8 +382,26 @@ def limitation_conflict(cfg: dict) -> str | None:
             continue
         set_here = ", ".join(k for g in active for k in g if cfg.get(k))
         allowed = " | ".join(" and/or ".join(g) for g in groups)
-        return (
+        found[board] = (
             f"{where}{label} limitation: only ONE of [{allowed}] may be set per "
             f"search, but this pass sets {set_here}. Remove all but one."
         )
-    return None
+    return found
+
+
+def limitation_conflict(cfg: dict) -> str | None:
+    """A JobSpy mutual-exclusion rule this pass breaks on ANY of its boards, or None.
+
+    The per-pass question, for the two callers that only ever ask that much: the
+    UI's save endpoint, which refuses the whole config (see the note there on why
+    it refuses what a run degrades per board), and tests/test_example_config.py,
+    which certifies that the shipped example breaks the rule nowhere.
+
+    Every offending board's message, joined — not just the first. Today only
+    Indeed has a rule, so there is never more than one; joining rather than
+    picking means a second rule-bearing board wouldn't hand the UI a 400 naming
+    one of two broken boards, sending the user round for a second 400 after they
+    fix it. A caller that needs to know *which* boards — the scraper does, so it
+    can drop just those — calls board_conflicts instead.
+    """
+    return " ".join(board_conflicts(cfg).values()) or None

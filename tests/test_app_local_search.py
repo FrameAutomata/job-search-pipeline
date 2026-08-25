@@ -232,8 +232,10 @@ def test_post_rejects_non_iterable_sites_with_400_not_500(client):
 
 # ── JobSpy mutual-exclusion validation ──────────────────────────────────────
 # A pass combining options JobSpy refuses together parses fine, loads fine, and
-# names supported boards — the run then skips it. Refuse the save instead, while
-# the config is still in front of the user.
+# names supported boards — the run then drops the board that can't honour it,
+# and skips the pass outright when that was its only board. Refuse the save
+# instead, in either case, while the config is still in front of the user and
+# the fix (split the pass) is one that costs no coverage at all.
 
 
 def test_post_rejects_indeed_hours_old_with_is_remote(client):
@@ -275,6 +277,16 @@ def test_post_accepts_linkedin_hours_old_with_easy_apply(client):
 
 
 def test_post_still_rejects_that_combination_when_indeed_is_named_too(client):
+    # The deliberate divergence, pinned (#126). A RUN degrades this per board —
+    # it drops Indeed and searches LinkedIn, rather than discarding the pass — so
+    # this 400 refuses a config the scraper would partly honour. That is the
+    # decision, not a drift: the conflict is repairable while the config is still
+    # on screen, and splitting the pass gets BOTH boards searching both filters,
+    # where saving it costs the Indeed half for good. The divergence is
+    # one-directional on this rule — a config this endpoint accepts breaks the
+    # mutex rule nowhere, so a run honours it as written. (Only this rule: an
+    # unsupported board saves with a warning and is stripped by the run.) The
+    # reasoning lives at the call site in pipeline/app/server.py.
     c, root = client
     content = ("searches:\n  - name: p\n    search_terms: [python]\n"
                "    sites: [linkedin, indeed]\n    hours_old: 168\n    easy_apply: true\n")

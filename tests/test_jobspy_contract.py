@@ -27,6 +27,7 @@ from pipeline.sites import MUTEX_GROUPS
 # `importorskip` would turn exactly that into a green build with all of these
 # silently gone. CI installs requirements.txt, so jobspy is always present.
 from jobspy.model import JobType, ScraperInput, Site
+from pydantic import ValidationError
 
 # The Indeed GraphQL filter fragments. Only FULL_TIME_KEY comes from
 # _build_filters' job_type_key_mapping; DSQF7 is appended by a separate
@@ -138,6 +139,71 @@ class TestLinkedInDropsNothing:
             "gained a precedence rule, in which case MUTEX_GROUPS needs a "
             '"linkedin" entry again — see #115.'
         )
+
+
+def test_one_scraper_input_is_built_before_any_board_is_dispatched():
+    """The reading that justifies the OTHER degradation — the whole-pass one.
+
+    `pipeline.scrape.resolve_pass_sites` degrades two ways, and the difference
+    rests on this: a mutex conflict costs the pass one BOARD, but an option value
+    pydantic can't read costs it the whole pass. That is only correct if
+    `scrape_jobs` validates once, up front, for every board at once — if it built
+    a ScraperInput per board, a bad value would take only the boards that read
+    that field and `unreadable_options` would be over-punishing the rest.
+
+    Asserted by construction: a value no board could object to individually
+    (`easy_apply` is meaningless to a board that never reads it) still raises
+    before a single scraper class is instantiated. Read against the source,
+    jobspy builds `ScraperInput(...)` at module scope in `scrape_jobs` and only
+    then fans out over `scraper_input.site_type` in a ThreadPoolExecutor.
+
+    If this ever fails, `unreadable_options` should degrade per board too, and
+    the asymmetry documented in resolve_pass_sites stops being true.
+
+    Scraping is stubbed rather than trusted to go unreached: the failure mode
+    under test is "validation no longer raises", and unstubbed that would send
+    this test out to scrape two live job boards instead of failing.
+
+    The stub replaces each scraper's `scrape` METHOD, not the class binding in
+    jobspy's namespace. `SCRAPER_MAPPING` is currently rebuilt from module
+    globals on every `scrape_jobs` call — so patching the names would work today
+    — but jobspy's own source comment invites hoisting that dict to module
+    scope, which would silently turn a name patch into a no-op and leave this
+    test making live requests on exactly the bump it exists to catch. The
+    mapping holds the class object wherever it is built, so patching the method
+    survives the move.
+    """
+    import jobspy
+    from jobspy.indeed import Indeed
+    from jobspy.linkedin import LinkedIn
+    from jobspy.model import JobResponse
+
+    scraped = []
+
+    def stub(self, scraper_input):
+        scraped.append(type(self).__name__)
+        return JobResponse(jobs=[])
+
+    error = None
+    with pytest.MonkeyPatch().context() as m:
+        m.setattr(Indeed, "scrape", stub)
+        m.setattr(LinkedIn, "scrape", stub)
+        try:
+            jobspy.scrape_jobs(site_name=["indeed", "linkedin"],
+                               search_term="nurse", easy_apply="maybe")
+        except Exception as e:  # noqa: BLE001 — classified below, not handled
+            error = e
+
+    # Checked before the exception type, because it is the reading that matters
+    # and it carries the actionable message.
+    assert scraped == [], (
+        f"jobspy dispatched to {scraped} before rejecting the value — validation "
+        "may now be per board, in which case an unreadable option no longer "
+        "costs every board and resolve_pass_sites should degrade per board too."
+    )
+    assert isinstance(error, ValidationError), (
+        f"expected a pydantic ValidationError up front, got {error!r}"
+    )
 
 
 def test_mutex_groups_lists_exactly_the_boards_that_drop_filters():

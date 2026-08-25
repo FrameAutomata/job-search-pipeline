@@ -63,10 +63,18 @@ searches:
     # LinkedIn has no such rule — it sends every filter it is given, so a
     # LinkedIn-only pass can combine all of the above freely.
     #
-    # A pass that breaks the rule is SKIPPED with a warning at scrape time
-    # (the rest of the run continues) — so a conflict costs you that search
-    # silently unless you read the log. The UI's local-config editor refuses to
-    # save one at all.
+    # A pass that breaks the rule loses the OFFENDING BOARD at scrape time,
+    # with a warning; the boards with no such rule still search it as written,
+    # and only a pass left with no board at all is skipped. So the pass above,
+    # given both hours_old and is_remote, would search LinkedIn — which sends
+    # both filters — and not Indeed. A conflict costs you that board silently
+    # unless you read the log. The UI's local-config editor refuses to save one
+    # at all, because splitting the pass costs you neither board.
+    #
+    # easy_apply is the one to be careful with here: LinkedIn accepts it
+    # alongside hours_old and JobSpy sends both, but LinkedIn's easy-apply
+    # filter no longer works on their end (see Pass 3), so what survives the
+    # drop is a LinkedIn search filtered by date alone.
     #
     # An option counts as SET only when JobSpy would actually act on it.
     # `easy_apply: false` and `hours_old: 0` send no filter, so they don't
