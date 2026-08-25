@@ -268,6 +268,19 @@ def test_post_rejects_linkedin_hours_old_with_easy_apply(client):
     assert "LinkedIn limitation" in r.json()["detail"]
 
 
+def test_post_rejects_a_value_jobspy_cannot_read(client):
+    # Saving this would break the endpoint's promise that what it accepts is a
+    # config the next run can load: jobspy rejects the value while building
+    # ScraperInput, which aborts the scrape stage rather than skipping a pass.
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [python]\n"
+               "    sites: [indeed]\n    easy_apply: maybe\n")
+    r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 400
+    assert "easy_apply" in r.json()["detail"]
+    assert not _local_file(root).exists()
+
+
 def test_post_accepts_a_quoted_off_option(client):
     # A quoted scalar is what a templating tool or a hand edit produces, and
     # `"false"` is a truthy str to a raw read but a falsy bool to jobspy's

@@ -156,6 +156,11 @@ def _as_bool(value):
     return _UNREADABLE
 
 
+def _as_is(value):
+    """Identity. For a key jobspy resolves itself, where only truthiness matters."""
+    return value
+
+
 def _as_int(value):
     """`value` as the int jobspy's pydantic model will coerce it to.
 
@@ -207,12 +212,51 @@ def _as_int(value):
 # jobspy reads them. Dropping them here says what the config already said.
 _MUTEX_KEY_READERS = {
     "hours_old": _as_int,    # ScraperInput.hours_old: int | None
-    "job_type": None,        # ScraperInput.job_type: JobType | None — jobspy
-                             # resolves the string itself and only truthiness
-                             # matters here, so there is nothing to coerce.
+    "job_type": _as_is,      # ScraperInput.job_type: JobType | None — jobspy
+                             # resolves the string itself, so only truthiness
+                             # matters and there is nothing to coerce.
     "is_remote": _as_bool,   # ScraperInput.is_remote: bool = False
     "easy_apply": _as_bool,  # ScraperInput.easy_apply: bool | None
 }
+
+
+def unreadable_options(cfg: dict) -> str | None:
+    """The mutex options whose values JobSpy cannot read, or None.
+
+    normalize_pass is the one place that *knows* a value is unusable — pydantic
+    would reject it, so `scrape_jobs` raises a ValidationError while building
+    ScraperInput, before any network call. Left to reach that point it aborts
+    the whole scrape stage from inside run()'s pass loop, discarding the rows
+    every healthy pass already returned. That is precisely the failure
+    strip_unsupported_sites and drop_conflicting_passes exist to prevent, so the
+    knowledge is surfaced here instead of thrown away, and the same
+    warn-and-skip / refuse-the-save mechanism handles it.
+
+    Reported rather than guessed at: coercing `easy_apply: "maybe"` to True
+    would invent a filter the user never asked for, and to False would hide the
+    typo. Naming the key and its value sends them to the right line.
+
+    Note this also catches the handful of pathological strings where the
+    coercion mirror is deliberately not exhaustive — pydantic-core's string
+    parsing accepts a few shapes Python's own int() does not (`"0-0"` reads as
+    0 there). Chasing exact parity on those is a losing game; classifying them
+    unreadable costs the user that pass plus a warning naming the option, which
+    is a great deal better than the silent misdiagnosis of reading a truthy
+    string as an active filter.
+    """
+    where = f"[{cfg['name']}] " if cfg.get("name") else ""
+    bad = [
+        f"{key}: {cfg[key]!r}"
+        for key, read in _MUTEX_KEY_READERS.items()
+        if key in cfg and cfg[key] is not None and read(cfg[key]) is _UNREADABLE
+    ]
+    if not bad:
+        return None
+    return (
+        f"{where}JobSpy cannot read {', '.join(bad)} — it would reject the value "
+        f"and abort the scrape. Use a plain YAML value (true/false, or a whole "
+        f"number of hours)."
+    )
 
 
 def normalize_pass(cfg: dict) -> dict:
@@ -247,10 +291,9 @@ def normalize_pass(cfg: dict) -> dict:
         if key not in out:
             continue
         # An explicitly nulled option (`easy_apply:` with nothing after it) is
-        # read as absent, the same reading resolve_sites gives `sites:`. A None
-        # reader means the key needs no coercion, only its truthiness.
+        # read as absent, the same reading resolve_sites gives `sites:`.
         raw = out[key]
-        value = raw if raw is None or read is None else read(raw)
+        value = None if raw is None else read(raw)
         if value is _UNREADABLE:
             continue
         if value:

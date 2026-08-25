@@ -14,13 +14,23 @@ from pipeline.sites import (
     limitation_conflict,
     normalize_pass,
     resolve_sites,
+    unreadable_options,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = ROOT / "output" / "jobs.csv"
 
 # All optional JobSpy kwargs that map 1-to-1 from config keys.
-# Passed through only when explicitly set (not None/missing).
+# Passed through only when explicitly set (not None/missing) — which is the
+# right test for the twelve keys whose falsy values are deliberate settings
+# (`distance: 0`, `verbose: 0`, `linkedin_fetch_description: false`); dropping
+# those would silently restore jobspy's defaults.
+#
+# The four MUTEX_KEYS in this list are the exception, and they never reach the
+# `is not None` test carrying a falsy value: pipeline.sites.normalize_pass has
+# already deleted the key when jobspy would act on it as "no filter". So
+# `is_remote: false` and `hours_old: 0` are absent here rather than forwarded,
+# which is the same thing on the wire.
 OPTIONAL_PARAMS = [
     "location",
     "distance",
@@ -151,7 +161,11 @@ def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
-    """Drop passes that combine mutually exclusive JobSpy options.
+    """Drop passes JobSpy can't run as written.
+
+    Two ways that happens: options it can't honour together, and a value it
+    can't read at all (which would raise a ValidationError out of scrape_jobs
+    and take the run with it). Both degrade the same way, for the reason below.
 
     Same degradation as strip_unsupported_sites above, for the same reason: a
     config reaches a run without ever passing the UI's save-time validator — a
@@ -163,9 +177,9 @@ def drop_conflicting_passes(searches: list[dict]) -> list[dict]:
     """
     result = []
     for cfg in searches:
-        conflict = limitation_conflict(cfg)
-        if conflict:
-            print(f"[scrape] skipping pass — {conflict}", flush=True)
+        problem = unreadable_options(cfg) or limitation_conflict(cfg)
+        if problem:
+            print(f"[scrape] skipping pass — {problem}", flush=True)
             continue
         result.append(cfg)
     return result
