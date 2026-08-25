@@ -62,8 +62,10 @@ if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ -n "${PLAYWRIGHT_DRIVER_VERSION:-
   # later plain `npm install` was a no-op. It now pins playwright EXACTLY, so
   # any driver version other than that one is a mismatch npm will "repair" —
   # re-run this script after any `npm install` inside career-ops.
+  # --ignore-scripts here too: this install runs inside career-ops, so its
+  # postinstall would fetch the very Chromium this branch exists to avoid.
   if ! (cd "$root/career-ops" && rm -f package-lock.json && \
-        npm install --no-save --no-audit --no-fund \
+        npm install --no-save --no-audit --no-fund --ignore-scripts \
           "playwright@$PLAYWRIGHT_DRIVER_VERSION"); then
     echo "    Playwright pin failed — chromium will likely not launch." >&2
     echo "    See the PLAYWRIGHT_* block in flake.nix." >&2

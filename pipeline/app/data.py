@@ -11,7 +11,19 @@ import shutil
 import threading
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text, normalize_company, read_url_set
+from pipeline._batch_common import (
+    atomic_write_text,
+    normalize_company,
+    read_url_set,
+    score_value,
+)
+from pipeline.tracker_layout import (
+    CANONICAL_COLUMNS,
+    SEPARATOR_RE as _SEPARATOR_RE,
+    header_columns as _header_columns,
+    is_header_row as _is_header_row,
+    split_row as _split_row,
+)
 
 # The UI's pending-status-changes channel: {row key: status-or-record}. Kanban
 # drags and the apply stage's auto-submits both write here; /api/jobs overlays
@@ -181,7 +193,8 @@ def record_status_change(applications_md: Path, num: str, status: str, *,
     record_status_changes(applications_md, [(num, status, company, role)])
 
 
-def resolve_num_by_identity(applications_md_text: str, company: str, role: str) -> str | None:
+def resolve_num_by_identity(applications_md_text: str, company: str, role: str,
+                            columns: list[str] | None = None) -> str | None:
     """Find the tracker row matching company (+ role when given) and return its
     num. Used to re-anchor an identity-carrying override onto the correct row of
     whatever tracker it's being applied to. Matches on the first four cells
@@ -192,8 +205,9 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str) 
         return None
     want_role = normalize_company(role)
     # Read Company/Role by name, not by slot — a tracker migrated to the Via
-    # layout puts the agency where Role used to sit.
-    columns = _header_columns(applications_md_text)
+    # layout puts the agency where Role used to sit. `columns` lets a caller
+    # resolving many identities against one tracker derive the layout once.
+    columns = columns or _header_columns(applications_md_text)
     company_idx, role_idx = columns.index("company"), columns.index("role")
     for line in applications_md_text.splitlines():
         if not line.lstrip().startswith("|"):
@@ -203,7 +217,7 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str) 
         cells = _split_row(line)
         if len(cells) < len(columns):
             continue
-        if cells[0].lower() in ("#", "num"):
+        if _is_header_row(cells):
             continue
         if normalize_company(cells[company_idx]) == want_company and (
             not want_role or normalize_company(cells[role_idx]) == want_role
@@ -235,11 +249,14 @@ def resolve_overrides_for_push(applications_md_text: str, overrides: dict,
     new_text = applications_md_text
     cloud_payload: dict[str, str] = {}
     unresolved: list[str] = []
+    # The layout can't change under us — set_status_in_text only rewrites Status
+    # cells — so derive it once rather than per override.
+    columns = _header_columns(applications_md_text)
     for key, value in overrides.items():
         status = override_status(value)
         identity = override_identity(value)
         if identity:
-            num = resolve_num_by_identity(new_text, *identity)
+            num = resolve_num_by_identity(new_text, *identity, columns=columns)
             if num is None:
                 unresolved.append(key)
                 continue
@@ -305,62 +322,9 @@ def canonical_status(raw: str) -> str:
 
 # Canonical applications.md column order (see career-ops AGENTS.md):
 #   | # | Date | Company | Role | Score | Status | PDF | Report | Notes |
-_COLUMNS = ["num", "date", "company", "role", "score", "status", "pdf", "report", "notes"]
-
-# career-ops supports a second layout with an optional `Via` column (the agency
-# a role comes through) inserted after Company, migrated into an existing
-# tracker with `node merge-tracker.mjs --migrate-via`. Its own readers map
-# columns by header name (tracker-parse.mjs `detectColumns`), so both layouts
-# work there. Reading positionally against _COLUMNS does not: the extra cell
-# shifts everything right, `_realign_cells` then rebuilds the row from a Report
-# anchor and takes the Via cell as the role. Score/status/report survive that;
-# identity does not — and `company::role` is what bridge dedup, handoff's
-# role_key, the résumé-base picker and the tailored role all key on. So detect
-# the header and map by name, falling back to the positional order for a
-# tracker with no header row (which is how the merge seeds one).
-_HEADER_ALIASES = {
-    "#": "num", "num": "num", "n": "num",
-    "date": "date", "fecha": "date",
-    "company": "company", "empresa": "company",
-    "via": "via",
-    "role": "role", "puesto": "role", "rol": "role",
-    "score": "score", "puntuacion": "score", "puntuación": "score",
-    "status": "status", "estado": "status",
-    "pdf": "pdf",
-    "report": "report", "informe": "report",
-    "notes": "notes", "notas": "notes",
-    "url": "url",
-}
-# Columns a row must carry for name-mapping to be trusted. Short of these we
-# keep the positional read rather than half-map a table we misread.
-_ESSENTIAL_COLUMNS = ("num", "company", "role", "status", "report")
-
-
-def _detect_columns(cells: list[str]) -> list[str] | None:
-    """Map a candidate header row to our column keys, or None if it isn't one.
-
-    Unrecognized headers keep their slot under a synthetic key so every later
-    column still lines up."""
-    keys: list[str] = []
-    for i, c in enumerate(cells):
-        label = c.replace("*", "").strip().lower()
-        keys.append(_HEADER_ALIASES.get(label, f"_col{i}"))
-    if not all(k in keys for k in _ESSENTIAL_COLUMNS):
-        return None
-    return keys
-
-
-def _header_columns(text: str) -> list[str]:
-    """The column layout of a tracker's markdown table — from its header row
-    when it has a readable one, else the canonical positional order."""
-    for line in text.splitlines():
-        if not line.lstrip().startswith("|") or _SEPARATOR_RE.match(line.strip()):
-            continue
-        detected = _detect_columns(_split_row(line))
-        if detected:
-            return detected
-        break        # first table row isn't a header — positional it is
-    return list(_COLUMNS)
+# The layout a tracker actually uses is read from its header — see
+# pipeline/tracker_layout.py, which both this module and bridge.py share.
+_COLUMNS = list(CANONICAL_COLUMNS)
 
 # Tracker-additions TSV column order — note status comes BEFORE score here
 # (merge-tracker.mjs swaps them when merging into applications.md):
@@ -391,9 +355,6 @@ def _report_link(cell: str) -> tuple[str, str]:
     if not m:
         return "", ""
     return m.group(1).strip(), _REPORT_ASCENT_RE.sub("", m.group(2).strip())
-
-# A markdown table separator row: | --- | :--: | ... |
-_SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|?\s*$")
 
 # Report link cell: [num](path). Used to re-anchor columns when extra cells
 # shift the layout (e.g. LLM writes "Role | Remote" and the pipe splits the cell).
@@ -446,16 +407,6 @@ def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[s
             )
     return cells
 
-
-def _split_row(line: str) -> list[str]:
-    """Split a markdown table row into trimmed cell values, dropping the
-    leading/trailing pipe so empty edge columns don't shift positions."""
-    s = line.strip()
-    if s.startswith("|"):
-        s = s[1:]
-    if s.endswith("|"):
-        s = s[:-1]
-    return [c.strip() for c in s.split("|")]
 
 
 # A bare posting URL inside a tracker row's Notes cell (the link the bridge
@@ -514,7 +465,7 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
         if len(cells) < len(columns):
             continue
         # Skip the header row.
-        if cells[0].lower() in ("#", "num") and cells[1].lower() == "date":
+        if _is_header_row(cells):
             continue
         if len(cells) > len(columns):
             cells = _realign_cells(cells, columns)
@@ -806,13 +757,7 @@ def load_jobs(career_ops: Path) -> dict:
 
 
 def _parse_score(score_cell: str) -> float | None:
-    m = re.search(r"(\d+(?:\.\d+)?)", score_cell or "")
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except ValueError:
-        return None
+    return score_value(score_cell)
 
 
 def find_report_file(reports_dir: Path, report_num: str) -> Path | None:

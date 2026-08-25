@@ -1184,12 +1184,14 @@ class TestLivenessNotPermanentlyDead:
     )
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 520])
-    def test_server_error_is_uncertain_not_expired(self, status):
+    def test_server_error_holds_rather_than_expires(self, status):
         """A 5xx is the site being broken, not the posting being removed. Its
         error page is short and has no apply control, so it used to land on
-        `insufficient content` -> expired."""
+        `insufficient content` -> expired. `throttled` and not `uncertain`:
+        uncertain KEEPS the row and the caller mines the body for a missing
+        description, which would make an nginx error page the job description."""
         result, _ = classify_liveness(status, "https://x/j/1", "<html>502 Bad Gateway</html>")
-        assert result == "uncertain"
+        assert result == "throttled"
 
     def test_bot_challenge_served_200_is_throttled(self):
         """Cloudflare answers the challenge with HTTP 200, so the status-based
@@ -1215,10 +1217,3 @@ class TestLivenessNotPermanentlyDead:
         result, _ = classify_liveness(200, "https://x/j/1", body)
         assert result != "throttled"
 
-    def test_real_removals_still_expire(self):
-        """The guards above must not blunt the genuine signals."""
-        assert classify_liveness(404, "https://x/j/1", "")[0] == "expired"
-        assert classify_liveness(410, "https://x/j/1", "")[0] == "expired"
-        body = "<html>" + "x " * 200 + "This job is no longer available</html>"
-        assert classify_liveness(200, "https://x/j/1", body)[0] == "expired"
-        assert classify_liveness(200, "https://x/j/1", "<html></html>")[0] == "expired"

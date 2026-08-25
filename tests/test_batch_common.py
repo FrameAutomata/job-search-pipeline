@@ -595,12 +595,8 @@ class TestNormalizeScoreCell:
         """The normalization has to be on the write path, not just available."""
         reports, tracker = tmp_path / "reports", tmp_path / "tsv"
         reports.mkdir(); tracker.mkdir()
-        response = (
-            "<report>body</report>"
-            "<tracker_tsv>" + self._row("4.2") + "</tracker_tsv>"
-            '<summary>{"company": "Initech", "report_num": "003"}</summary>'
-        )
+        response = TestWriteJobResult()._make_response(tracker=self._row("4.2"))
         write_job_result(response, {"id": 3, "url": "https://x/j/3"},
-                            reports, tracker, "2026-08-25")
+                         reports, tracker, "2026-08-25")
         written = (tracker / "3.tsv").read_text(encoding="utf-8")
         assert written.split("\t")[5] == "4.2/5"

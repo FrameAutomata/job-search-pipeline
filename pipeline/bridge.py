@@ -16,6 +16,9 @@ from pathlib import Path
 
 from pipeline._batch_common import parse_date_posted, read_url_set
 from pipeline.rowio import read_rows
+from pipeline.tracker_layout import (
+    SEPARATOR_RE, header_columns, is_header_row, split_row,
+)
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,10 +38,11 @@ EASY_APPLY_URLS = "data/easy-apply-urls.txt"
 DESCRIPTION_PREVIEW_CHARS = 500
 
 
-def _find_section(text: str, markers: tuple[str, ...]) -> str | None:
-    """The first of `markers` that appears as a heading in `text`, else None."""
-    return next((m for m in markers
-                 if re.search(rf"^{re.escape(m)}\s*$", text, re.MULTILINE)), None)
+def _find_section(text: str, markers: tuple[str, ...]) -> re.Match | None:
+    """The first of `markers` present in `text` as a heading, as a Match — so a
+    caller gets both "which spelling" and "where" from the one scan."""
+    return next(filter(None, (re.search(rf"^{re.escape(m)}[ \t]*$", text, re.MULTILINE)
+                              for m in markers)), None)
 
 
 def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
@@ -50,44 +54,20 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     # cheap regex the original code used.
     urls.update(re.findall(r"https?://[^\s|)]+", text))
 
-    # Column slots for Company and Role. Canonical layout is
-    # `# | Date | Company | Role | Score | Status | …`, but career-ops supports
-    # an optional `Via` column after Company (`merge-tracker.mjs --migrate-via`),
-    # which shifts Role right by one. Reading fixed slots there keys dedup on
-    # the agency name instead of the role, so every role at an agency-mediated
-    # company collapses to one key and reposted roles sail through. Take the
-    # slots from the header row when the table has one.
-    company_idx, role_idx = 2, 3
+    # Which cells hold Company and Role — from the table's own header, since
+    # career-ops has two supported layouts and the Via one shifts Role right by
+    # one. Shared with the UI's parser so the two can't disagree about a row's
+    # identity; see pipeline/tracker_layout.py.
+    columns = header_columns(text)
+    company_idx, role_idx = columns.index("company"), columns.index("role")
 
     for line in text.splitlines():
-        if not line.startswith("|"):
+        if not line.lstrip().startswith("|") or SEPARATOR_RE.match(line.strip()):
             continue
-        # Markdown separator row: |---|---|...
-        if re.match(r"^\|[\s|:\-]+\|?\s*$", line):
+        cols = split_row(line)
+        if len(cols) <= role_idx or is_header_row(cols):
             continue
-        # Strip optional leading/trailing pipes before splitting so empty
-        # columns at the ends don't shift positions.
-        stripped = line.strip()
-        if stripped.startswith("|"):
-            stripped = stripped[1:]
-        if stripped.endswith("|"):
-            stripped = stripped[:-1]
-        cols = [c.strip() for c in stripped.split("|")]
-        if len(cols) < 4:
-            continue
-        lower = [c.lower() for c in cols]
-        # Header row — re-anchor on it, then skip it. Anchored on cell 0 being
-        # the `#`/`Num` label as well, so a data row that merely happens to hold
-        # the word "role" somewhere can't be read as a header.
-        if lower[0] in ("#", "num", "n") and "company" in lower and "role" in lower:
-            company_idx, role_idx = lower.index("company"), lower.index("role")
-            continue
-        if role_idx >= len(cols):
-            continue
-        company, role = lower[company_idx], lower[role_idx]
-        # A header the re-anchor above didn't recognize (no `#` in cell 0).
-        if company == "company" and role == "role":
-            continue
+        company, role = cols[company_idx].lower(), cols[role_idx].lower()
         if company and role:
             roles.add(f"{company}::{role}")
 
@@ -169,17 +149,13 @@ def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
     # one: against a pipeline.md that scan.mjs created, looking for "Pendientes"
     # alone finds nothing and appends a SECOND pending section, splitting the
     # queue in two. Write ours only when the file has neither.
-    marker = _find_section(text, ("## Pendientes", "## Pending")) or "## Pendientes"
-    idx = text.find(marker)
-    if idx == -1:
-        proc = _find_section(text, ("## Procesadas", "## Processed"))
-        proc_idx = text.find(proc) if proc else -1
-        insert_at = proc_idx if proc_idx != -1 else len(text)
-        new_block = f"\n{marker}\n{block}\n"
-        text = text[:insert_at] + new_block + text[insert_at:]
+    pending = _find_section(text, ("## Pendientes", "## Pending"))
+    if pending is None:
+        processed = _find_section(text, ("## Procesadas", "## Processed"))
+        insert_at = processed.start() if processed else len(text)
+        text = text[:insert_at] + f"\n## Pendientes\n{block}\n" + text[insert_at:]
     else:
-        after = idx + len(marker)
-        next_section = text.find("\n## ", after)
+        next_section = text.find("\n## ", pending.end())
         insert_at = next_section if next_section != -1 else len(text)
         text = text[:insert_at] + block + text[insert_at:]
 

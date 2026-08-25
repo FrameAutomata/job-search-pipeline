@@ -107,6 +107,10 @@ _BOT_CHALLENGE = [
 # 5xx bodies are short error pages with no apply control, so they used to reach
 # the `insufficient content` branch and be recorded `expired` — the same
 # permanent, irreversible outcome as a real 404, for what is usually a blip.
+# Resolved `throttled` rather than `uncertain` for the same reason a wall is:
+# `uncertain` KEEPS the row, and the caller then mines the body it has for a
+# missing description — so an nginx error page would become the job description
+# and go to the evaluator as one. `throttled` holds the row for the next run.
 _SERVER_ERROR_MIN = 500
 
 # classify_each retries a throttled fetch this many times (a transient limit may
@@ -274,7 +278,7 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     if status in _THROTTLE_STATUSES:
         return "throttled", f"HTTP {status} (rate-limited / sign-in wall)"
     if status >= _SERVER_ERROR_MIN:
-        return "uncertain", f"HTTP {status} (server error — not a removed posting)"
+        return "throttled", f"HTTP {status} (server error — not a removed posting)"
     if _EXPIRED_URL.search(final_url):
         return "expired", f"error redirect: {final_url}"
     for pat in _HARD_EXPIRED:
