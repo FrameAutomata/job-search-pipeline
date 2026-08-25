@@ -97,22 +97,28 @@ def resolve_sites(cfg: dict) -> tuple[list, list]:
     return partition_sites(sites)
 
 
-# The options JobSpy rejects in combination, keyed by board. Each board maps to
-# its display name plus the groups it allows only ONE of — two options in the
-# same group coexist (Indeed takes job_type with is_remote), two *active* groups
-# are the conflict.
-# NOTE (unverified against python-jobspy 1.1.82): the "linkedin" entry below
-# does not reproduce there. LinkedIn's builder puts BOTH options into one params
-# dict — `"f_AL": "true" if easy_apply else None` and, a few lines down,
-# `params["f_TPR"] = f"r{seconds_old}"` from hours_old — then strips only the
-# None values and sends what's left. No raise, no precedence, both filters
-# applied. So a LinkedIn-only pass setting both is skipped here over a
-# combination jobspy handles fine. Retiring the group is a behaviour change with
-# the same open question as the Indeed one, tracked in #115; left in place so
-# this stays a truthiness fix.
+# The options JobSpy cannot honour in combination, keyed by board. Each board
+# maps to its display name plus the groups it acts on only ONE of — two options
+# in the same group coexist (Indeed takes job_type with is_remote), two *active*
+# groups are the conflict.
+#
+# Only Indeed is listed. This has never been about jobspy raising — the rule
+# exists to stop it "silently producing unexpected results" — so the only
+# question per board is whether a filter gets dropped without a word:
+#
+#   Indeed  — _build_filters is a precedence chain (hours_old, elif easy_apply,
+#             elif job_type/is_remote) and its own docstring notes hours_old
+#             makes the job_type/is_remote filter "not possible". The loser is
+#             dropped in silence, so the pass does not search what it says it
+#             searches. Listed.
+#   LinkedIn — one params dict holding f_TPR, f_AL, f_WT and f_JT, stripped of
+#             None values and sent whole. Nothing is dropped. Not listed (#115).
+#
+# Read against python-jobspy 1.1.82, which requirements.txt pins for this
+# reason. tests/test_jobspy_contract.py asserts both readings against the
+# installed library, so a bump fails loudly instead of leaving this stale.
 MUTEX_GROUPS = {
     "indeed": ("Indeed", [("hours_old",), ("job_type", "is_remote"), ("easy_apply",)]),
-    "linkedin": ("LinkedIn", [("hours_old",), ("easy_apply",)]),
 }
 
 
@@ -306,31 +312,27 @@ def normalize_pass(cfg: dict) -> dict:
 def limitation_conflict(cfg: dict) -> str | None:
     """The JobSpy mutual-exclusion rule this search pass breaks, or None.
 
-    Indeed accepts only ONE of (A) hours_old, (B) job_type and/or is_remote,
-    (C) easy_apply per search; LinkedIn only one of hours_old or easy_apply.
-    Combining them used to raise out of the scrape stage. Neither board does
-    that in python-jobspy 1.1.82: Indeed's builder is a precedence chain
-    (hours_old, elif easy_apply, elif job_type/is_remote) that drops the loser
-    in silence, and LinkedIn's sends both filters happily — see the note on
-    MUTEX_GROUPS. An Indeed pass therefore doesn't search what it says it
-    searches; a LinkedIn one does, and is skipped anyway. Both are #115.
+    Indeed acts on only ONE of (A) hours_old, (B) job_type and/or is_remote,
+    (C) easy_apply per search. LinkedIn has no such rule and is not checked.
+    Why, for both, is on MUTEX_GROUPS above.
 
     An option counts as set only when its value is TRUTHY, because truthiness
-    is what jobspy reads it through: `elif self.scraper_input.easy_apply:`
-    (indeed), `"f_AL": "true" if scraper_input.easy_apply else None` and
-    `hours_old * 3600 if hours_old else None` (linkedin). `easy_apply: false`
+    is what jobspy reads it through: `if self.scraper_input.hours_old:` and
+    `elif self.scraper_input.easy_apply:` in the chain above. `easy_apply: false`
     and `hours_old: 0` therefore send no filter at all, and testing
     `is not None` here cost the user a whole pass over an option that never
     reached the wire — turning a filter off being the obvious reason to
     write `false` in the first place.
 
     Note this deliberately does NOT match how pipeline.scrape forwards the same
-    keys: OPTIONAL_PARAMS keeps `is not None`, because it spans 16 keys whose
-    falsy values are meaningful settings a user typed on purpose (`distance: 0`,
-    `offset: 0`, `verbose: 0`, `linkedin_fetch_description: false`) and dropping
-    those would silently restore jobspy's defaults. The two tests answer
-    different questions — "did the user supply a value to forward?" there,
-    "will jobspy act on it?" here — so they are not to be unified.
+    keys: OPTIONAL_PARAMS keeps `is not None`, because twelve of the sixteen it
+    spans have falsy values that are meaningful settings a user typed on purpose
+    (`distance: 0`, `offset: 0`, `verbose: 0`, `linkedin_fetch_description:
+    false`), and dropping those would silently restore jobspy's defaults. The
+    two tests answer different questions — "did the user supply a value to
+    forward?" there, "will jobspy act on it?" here — so they are not to be
+    unified. The remaining four are the MUTEX_KEYS, and they never reach that
+    test carrying a falsy value: normalize_pass has already deleted the key.
 
     Lives here, in the dependency-free leaf, so the UI venv — which installs
     neither jobspy nor pandas and so cannot import pipeline.scrape at all — can

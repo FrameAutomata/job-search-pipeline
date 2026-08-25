@@ -7,12 +7,13 @@ onboard.html do (both guarded in tests/test_app_onboard.py); without a check of
 its own, retiring a board leaves the example shipping the dead one, and every
 first run prints "dropping unsupported sites" against a config the repo wrote.
 """
+import re
 from pathlib import Path
 
 import pytest
 
 from pipeline.scrape import load_searches
-from pipeline.sites import SUPPORTED_SITES, limitation_conflict, resolve_sites
+from pipeline.sites import MUTEX_GROUPS, SUPPORTED_SITES, limitation_conflict, resolve_sites
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "config" / "search.example.yml"
 
@@ -57,3 +58,72 @@ def test_no_pass_breaks_the_mutex_rule(passes):
     would hand the user a search that silently never runs."""
     conflicts = [c for c in (limitation_conflict(cfg) for cfg in passes) if c]
     assert not conflicts, "\n".join(conflicts)
+
+
+def test_limitation_headings_match_the_boards_that_have_a_rule():
+    """The example config's prose is a mirror of MUTEX_GROUPS; guard it.
+
+    `test_no_pass_breaks_the_mutex_rule` runs the rule over the parsed passes,
+    so the YAML keys are covered — but the "⚠ <BOARD> LIMITATION" blocks a user
+    actually reads are invisible to it. That is exactly how a retired LinkedIn
+    rule survived in this file after the code stopped enforcing it (#115), in a
+    file setup copies to config/search.yml, where it contradicted a comment
+    twenty lines below.
+
+    Same treatment SUPPORTED_SITES already gets for its three hand-mirrors.
+    """
+    # [\w ]+ rather than \w+: a multi-word display label ("Google Jobs") would
+    # otherwise fail this assertion with a message blaming the config.
+    headings = set(re.findall(r"⚠ ([\w ]+?) LIMITATION", EXAMPLE.read_text(encoding="utf-8")))
+    expected = {label.upper() for label, _ in MUTEX_GROUPS.values()}
+    assert headings == expected, (
+        f"config/search.example.yml documents limitations for {sorted(headings)}, "
+        f"but MUTEX_GROUPS enforces them for {sorted(expected)}."
+    )
+
+
+# Words that mark a sentence as describing a mutual-exclusion rule.
+_MUTEX_WORDS = ("exclusiv", "limitation", "mutually", "only one")
+
+
+def _comment_sentences(path) -> list[str]:
+    """The example config's comment prose, unwrapped, split into sentences.
+
+    Comments are joined before splitting because the statements that matter wrap
+    across lines — "Indeed/LinkedIn\n# group-exclusivity constraints" is one
+    claim, and a line-at-a-time scan sees neither half of it.
+    """
+    text = " ".join(
+        line.split("#", 1)[1] for line in path.read_text(encoding="utf-8").splitlines()
+        if "#" in line
+    )
+    return re.split(r"(?<=[.:])\s+", " ".join(text.split()))
+
+
+def test_no_retired_board_is_described_as_having_a_mutex_rule():
+    """The prose guard the heading check should have been.
+
+    Matching only "⚠ <BOARD> LIMITATION" catches the headline block and nothing
+    else — which is how two plain-prose statements of the retired LinkedIn rule
+    ("Use multiple passes to work around Indeed/LinkedIn group-exclusivity
+    constraints") survived in this file *after* the headline was fixed, in the
+    config setup copies to search.yml. A user reading them splits a LinkedIn
+    pass to dodge a constraint that no longer exists.
+
+    So: a board with no entry in MUTEX_GROUPS must not be named in the same
+    sentence as an exclusivity word.
+    """
+    unruled = {b for b in SUPPORTED_SITES if b not in MUTEX_GROUPS}
+    assert unruled, "every supported board has a mutex rule — this guard is inert"
+
+    offenders = [
+        f"{board}: {sentence.strip()[:90]}"
+        for sentence in _comment_sentences(EXAMPLE)
+        if any(w in sentence.lower() for w in _MUTEX_WORDS)
+        for board in unruled
+        if board in sentence.lower()
+    ]
+    assert not offenders, (
+        "config/search.example.yml describes a mutual-exclusion rule for a board "
+        f"that has none in MUTEX_GROUPS: {offenders}"
+    )

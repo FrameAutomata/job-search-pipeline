@@ -1,6 +1,6 @@
 """Scrape job boards via JobSpy. Reads search params from config/search.yml,
-drops passes JobSpy would reject (retired boards, mutually exclusive
-Indeed/LinkedIn options), and writes output/jobs.csv."""
+drops passes JobSpy would reject (retired boards, mutually exclusive Indeed
+options), and writes output/jobs.csv."""
 
 import sys
 from pathlib import Path

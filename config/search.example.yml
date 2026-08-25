@@ -4,8 +4,8 @@
 # ── Multi-pass scraping ───────────────────────────────────────────────────────
 # `searches` is a list of independent search passes. Each pass is scraped in
 # full, then all results are merged and deduped by job_url before writing
-# output/jobs.csv. Use multiple passes to work around Indeed/LinkedIn
-# group-exclusivity constraints (see below).
+# output/jobs.csv. Use multiple passes to work around Indeed's
+# group-exclusivity constraint (see below).
 #
 # Single-pass shorthand (backwards-compatible):
 #   search:          ← singular key, same fields, no `name` required
@@ -60,10 +60,10 @@ searches:
     #   Group C — easy_apply
     # Use separate passes (see Pass 2 / Pass 3 below) for the other groups.
     #
-    # ⚠ LINKEDIN LIMITATION: only ONE of the following may be set per pass:
-    #   hours_old  OR  easy_apply
+    # LinkedIn has no such rule — it sends every filter it is given, so a
+    # LinkedIn-only pass can combine all of the above freely.
     #
-    # A pass that breaks either rule is SKIPPED with a warning at scrape time
+    # A pass that breaks the rule is SKIPPED with a warning at scrape time
     # (the rest of the run continues) — so a conflict costs you that search
     # silently unless you read the log. The UI's local-config editor refuses to
     # save one at all.
@@ -86,14 +86,14 @@ searches:
     # same as omitting the line — both return remote and on-site alike.
     # is_remote: true
 
-    # Filter to jobs with one-click apply (hosted on the board). Uncommenting
-    # this here conflicts with hours_old below — see Pass 3 for the split.
+    # Filter to jobs with one-click apply (hosted on the board). Group C, so
+    # uncommenting it here conflicts with hours_old below — see Pass 3 for the
+    # split.
     # Note: LinkedIn easy apply filter no longer works.
     # easy_apply: true
 
-    # How old job postings can be (hours). Mutually exclusive with
-    # job_type/is_remote and easy_apply on Indeed; mutually exclusive with
-    # easy_apply on LinkedIn (see above).
+    # How old job postings can be (hours). Group A — see the limitation note
+    # above.
     hours_old: 168  # past week
 
     # ── LinkedIn-specific ──────────────────────────────────────────────────────
@@ -154,8 +154,7 @@ searches:
 
   # ── Pass 3: easy apply ──────────────────────────────────────────────────────
   # Separate pass required because easy_apply (Group C) is mutually exclusive
-  # with hours_old (Group A) and is_remote (Group B) on Indeed, and mutually
-  # exclusive with hours_old on LinkedIn.
+  # with hours_old (Group A) and is_remote (Group B) on Indeed.
   # Note: LinkedIn's easy_apply filter no longer works on their end.
   - name: "easy apply"
     search_terms:
@@ -172,7 +171,7 @@ searches:
 filter:
   # Drop jobs older than this many hours, measured against date_posted.
   # Useful for passes (e.g. is_remote) that can't use hours_old on the scraper
-  # side due to Indeed/LinkedIn group-exclusivity constraints. Jobs with a
+  # side due to Indeed's group-exclusivity constraint. Jobs with a
   # missing or unparseable date_posted are kept regardless.
   # max_age_hours: 168  # past week
 

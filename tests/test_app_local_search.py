@@ -259,13 +259,30 @@ def test_post_rejects_conflict_on_a_pass_that_never_names_indeed(client):
     assert not _local_file(root).exists()
 
 
-def test_post_rejects_linkedin_hours_old_with_easy_apply(client):
+def test_post_accepts_linkedin_hours_old_with_easy_apply(client):
+    # LinkedIn sends both filters; only Indeed drops one. Refusing the save was
+    # rejecting a config that scrapes exactly as written (#115).
     c, root = client
     content = ("searches:\n  - name: p\n    search_terms: [python]\n"
                "    sites: [linkedin]\n    hours_old: 168\n    easy_apply: true\n")
     r = c.post("/api/local-search", json={"content": content})
+    assert r.status_code == 200
+    # Its sibling accept tests check this; without it a later change that
+    # attached a warning to LinkedIn-only passes would show a banner on the
+    # very config this declares clean, and still pass.
+    assert r.json()["warning"] is None
+    assert _local_file(root).read_text(encoding="utf-8") == content
+
+
+def test_post_still_rejects_that_combination_when_indeed_is_named_too(client):
+    c, root = client
+    content = ("searches:\n  - name: p\n    search_terms: [python]\n"
+               "    sites: [linkedin, indeed]\n    hours_old: 168\n    easy_apply: true\n")
+    r = c.post("/api/local-search", json={"content": content})
     assert r.status_code == 400
-    assert "LinkedIn limitation" in r.json()["detail"]
+    assert "Indeed limitation" in r.json()["detail"]
+    # The half the unit test cannot cover: a refused save writes nothing.
+    assert not _local_file(root).exists()
 
 
 def test_post_rejects_a_value_jobspy_cannot_read(client):
