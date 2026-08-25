@@ -72,9 +72,58 @@ def test_limitation_headings_match_the_boards_that_have_a_rule():
 
     Same treatment SUPPORTED_SITES already gets for its three hand-mirrors.
     """
-    headings = set(re.findall(r"⚠ (\w+) LIMITATION", EXAMPLE.read_text(encoding="utf-8")))
+    # [\w ]+ rather than \w+: a multi-word display label ("Google Jobs") would
+    # otherwise fail this assertion with a message blaming the config.
+    headings = set(re.findall(r"⚠ ([\w ]+?) LIMITATION", EXAMPLE.read_text(encoding="utf-8")))
     expected = {label.upper() for label, _ in MUTEX_GROUPS.values()}
     assert headings == expected, (
         f"config/search.example.yml documents limitations for {sorted(headings)}, "
         f"but MUTEX_GROUPS enforces them for {sorted(expected)}."
+    )
+
+
+# Words that mark a sentence as describing a mutual-exclusion rule.
+_MUTEX_WORDS = ("exclusiv", "limitation", "mutually", "only one")
+
+
+def _comment_sentences(path) -> list[str]:
+    """The example config's comment prose, unwrapped, split into sentences.
+
+    Comments are joined before splitting because the statements that matter wrap
+    across lines — "Indeed/LinkedIn\n# group-exclusivity constraints" is one
+    claim, and a line-at-a-time scan sees neither half of it.
+    """
+    text = " ".join(
+        line.split("#", 1)[1] for line in path.read_text(encoding="utf-8").splitlines()
+        if "#" in line
+    )
+    return re.split(r"(?<=[.:])\s+", " ".join(text.split()))
+
+
+def test_no_retired_board_is_described_as_having_a_mutex_rule():
+    """The prose guard the heading check should have been.
+
+    Matching only "⚠ <BOARD> LIMITATION" catches the headline block and nothing
+    else — which is how two plain-prose statements of the retired LinkedIn rule
+    ("Use multiple passes to work around Indeed/LinkedIn group-exclusivity
+    constraints") survived in this file *after* the headline was fixed, in the
+    config setup copies to search.yml. A user reading them splits a LinkedIn
+    pass to dodge a constraint that no longer exists.
+
+    So: a board with no entry in MUTEX_GROUPS must not be named in the same
+    sentence as an exclusivity word.
+    """
+    unruled = {b for b in SUPPORTED_SITES if b not in MUTEX_GROUPS}
+    assert unruled, "every supported board has a mutex rule — this guard is inert"
+
+    offenders = [
+        f"{board}: {sentence.strip()[:90]}"
+        for sentence in _comment_sentences(EXAMPLE)
+        if any(w in sentence.lower() for w in _MUTEX_WORDS)
+        for board in unruled
+        if board in sentence.lower()
+    ]
+    assert not offenders, (
+        "config/search.example.yml describes a mutual-exclusion rule for a board "
+        f"that has none in MUTEX_GROUPS: {offenders}"
     )

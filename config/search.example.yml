@@ -4,8 +4,8 @@
 # ── Multi-pass scraping ───────────────────────────────────────────────────────
 # `searches` is a list of independent search passes. Each pass is scraped in
 # full, then all results are merged and deduped by job_url before writing
-# output/jobs.csv. Use multiple passes to work around Indeed/LinkedIn
-# group-exclusivity constraints (see below).
+# output/jobs.csv. Use multiple passes to work around Indeed's
+# group-exclusivity constraint (see below).
 #
 # Single-pass shorthand (backwards-compatible):
 #   search:          ← singular key, same fields, no `name` required
@@ -171,7 +171,7 @@ searches:
 filter:
   # Drop jobs older than this many hours, measured against date_posted.
   # Useful for passes (e.g. is_remote) that can't use hours_old on the scraper
-  # side due to Indeed/LinkedIn group-exclusivity constraints. Jobs with a
+  # side due to Indeed's group-exclusivity constraint. Jobs with a
   # missing or unparseable date_posted are kept regardless.
   # max_age_hours: 168  # past week
 

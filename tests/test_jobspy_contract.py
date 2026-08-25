@@ -22,12 +22,16 @@ import pytest
 
 from pipeline.sites import MUTEX_GROUPS
 
-jobspy_model = pytest.importorskip("jobspy.model")
-ScraperInput = jobspy_model.ScraperInput
-JobType = jobspy_model.JobType
-Site = jobspy_model.Site
+# Imported, not importorskip'd. A skip here would defeat the entire point:
+# module reorganisation is the most likely shape of a breaking bump, and
+# `importorskip` would turn exactly that into a green build with all of these
+# silently gone. CI installs requirements.txt, so jobspy is always present.
+from jobspy.model import JobType, ScraperInput, Site
 
-# The Indeed GraphQL filter fragments, from its own job_type_key_mapping.
+# The Indeed GraphQL filter fragments. Only FULL_TIME_KEY comes from
+# _build_filters' job_type_key_mapping; DSQF7 is appended by a separate
+# `if self.scraper_input.is_remote:` branch, and the other two are literals
+# inside the hours_old and easy_apply filter strings.
 DATE_FILTER = "dateOnIndeed"
 EASY_APPLY_FILTER = "indeedApplyScope"
 FULL_TIME_KEY = "CF3CP"
@@ -63,10 +67,20 @@ class TestIndeedDropsTheLoserSilently:
         assert DATE_FILTER in filters
         assert EASY_APPLY_FILTER not in filters
 
+    def test_hours_old_wins_over_job_type(self):
+        filters = _indeed_filters(hours_old=168, job_type=JobType.FULL_TIME)
+        assert DATE_FILTER in filters
+        assert FULL_TIME_KEY not in filters
+
     def test_easy_apply_wins_over_job_type(self):
         filters = _indeed_filters(easy_apply=True, job_type=JobType.FULL_TIME)
         assert EASY_APPLY_FILTER in filters
         assert FULL_TIME_KEY not in filters
+
+    def test_easy_apply_wins_over_is_remote(self):
+        filters = _indeed_filters(easy_apply=True, is_remote=True)
+        assert EASY_APPLY_FILTER in filters
+        assert REMOTE_KEY not in filters
 
     def test_job_type_and_is_remote_are_honoured_together(self):
         # Why those two share one group rather than being a conflict.
@@ -90,11 +104,27 @@ class TestLinkedInDropsNothing:
             text = ""  # no base-search-card, so scrape() returns after one request
 
         class _StubSession:
+            calls = 0
+
             def get(self, url, params=None, **kwargs):
+                # Bounded deliberately. scrape()'s loop only exits on the
+                # empty-job-cards return; if a bump turned that into a
+                # `continue`, an unbounded stub would spin forever with a
+                # multi-second sleep per pass. For a test whose job is to
+                # survive bumps, hanging CI is strictly worse than failing it.
+                _StubSession.calls += 1
+                assert _StubSession.calls <= 2, (
+                    "LinkedIn.scrape did not stop after an empty result page — "
+                    "its loop-exit branch has changed; re-read the builder."
+                )
                 captured.update(params or {})
                 return _StubResponse()
 
-        scraper = LinkedIn()
+        # Built without __init__ for the same reason as _indeed_filters: it
+        # opens a rotating requests.Session we would immediately discard
+        # unclosed, and it would fail this test for reasons unrelated to the
+        # reading if construction ever gains a required argument.
+        scraper = LinkedIn.__new__(LinkedIn)
         scraper.session = _StubSession()
         scraper.scrape(ScraperInput(
             site_type=[Site.LINKEDIN], search_term="nurse",
@@ -113,3 +143,22 @@ class TestLinkedInDropsNothing:
 def test_mutex_groups_lists_exactly_the_boards_that_drop_filters():
     """Ties the two readings above back to the constant they justify."""
     assert set(MUTEX_GROUPS) == {"indeed"}
+
+
+def test_indeeds_groups_match_the_precedence_chain():
+    """And ties the partition, which is the load-bearing half.
+
+    Keys alone would let `[("hours_old", "job_type", "is_remote"), ("easy_apply",)]`
+    pass every test in this file: the contract tests exercise jobspy, and the
+    key check inspects only the dict. This asserts the tuples themselves are the
+    branches of `_build_filters` — one group per branch, in precedence order.
+    """
+    _, groups = MUTEX_GROUPS["indeed"]
+    assert [tuple(g) for g in groups] == [
+        ("hours_old",),            # if self.scraper_input.hours_old:
+        ("job_type", "is_remote"),  # elif job_type or is_remote:  (one branch)
+        ("easy_apply",),           # elif easy_apply:
+    ], (
+        "MUTEX_GROUPS['indeed'] no longer mirrors _build_filters' branches. Each "
+        "branch is one group; options sharing a branch share a group."
+    )

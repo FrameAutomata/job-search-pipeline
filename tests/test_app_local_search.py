@@ -267,6 +267,10 @@ def test_post_accepts_linkedin_hours_old_with_easy_apply(client):
                "    sites: [linkedin]\n    hours_old: 168\n    easy_apply: true\n")
     r = c.post("/api/local-search", json={"content": content})
     assert r.status_code == 200
+    # Its sibling accept tests check this; without it a later change that
+    # attached a warning to LinkedIn-only passes would show a banner on the
+    # very config this declares clean, and still pass.
+    assert r.json()["warning"] is None
     assert _local_file(root).read_text(encoding="utf-8") == content
 
 
