@@ -1,0 +1,101 @@
+name: Export Reports
+
+# Manual one-shot: package the FULL accumulated `career-ops/reports/` from the
+# pipeline state cache as a downloadable artifact.
+#
+# Why this exists (issue #129). The daily artifact used to carry the whole
+# report history, so downloading any one of them re-seeded a machine with
+# everything. That is what exhausted the account's Actions storage — every
+# daily artifact was O(all history) — so the daily now uploads only the reports
+# its own run minted. The history still lives in the `pipeline-state-v1` cache,
+# but a cache is not downloadable, which left a fresh local install with a
+# complete tracker (applications.md ships whole) and almost no report files
+# behind it: every Report link in the UI would 404.
+#
+# This is the recovery path for that. Run it once when you:
+#   - set up the local UI on a new machine after the cloud has been running,
+#   - went more than the 7-day artifact retention without a Refresh,
+#   - or otherwise want the whole history in one download.
+#
+# Then extract the artifact over your local `career-ops/` (or point the UI at
+# it with `run-ui.sh --data <extracted>`). Day to day, the UI's ↻ Refresh keeps
+# local topped up a run at a time — this is for the backlog, not the routine.
+#
+# It is the mirror of seed-reports.yml: that one repairs the CACHE from past
+# artifacts, this one exports the cache TO an artifact. Read-only with respect
+# to the cache — it restores and never saves — so unlike seed-reports it is safe
+# to run while a pipeline is in flight.
+#
+# Deliberately workflow_dispatch-only. A scheduled job uploading the full
+# history is precisely the bug (issue #129); a human asking for it once is
+# bounded by the asking. tests/test_workflow_artifacts.py enforces that
+# distinction rather than trusting it.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  preflight:
+    if: github.repository != 'FrameAutomata/job-search-pipeline'
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check repo visibility and template status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IS_TEMPLATE=$(gh api repos/${{ github.repository }} --jq .is_template)
+          VIS=$(gh api repos/${{ github.repository }} --jq .visibility)
+          echo "is_template=$IS_TEMPLATE visibility=$VIS"
+          if [ "$IS_TEMPLATE" = "true" ]; then
+            echo "Template repository — manual runs no-op here."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$VIS" != "private" ]; then
+            echo "::error::This workflow only runs in PRIVATE repositories. Your evaluated roles are job-search activity; a public repo's artifacts and run history would expose them."
+            exit 1
+          fi
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+  export:
+    needs: preflight
+    if: needs.preflight.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Restore only — no matching save step, so this cannot race a pipeline run
+      # the way seed-reports.yml's save can.
+      - name: Restore pipeline state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            career-ops/data/applications.md
+            career-ops/reports
+          key: pipeline-state-v1-
+          restore-keys: |
+            pipeline-state-v1-
+
+      - name: Report what was found
+        run: |
+          set -euo pipefail
+          count=$(find career-ops/reports -name '*.md' 2>/dev/null | wc -l)
+          echo "Reports in the cache: $count"
+          if [ "$count" = 0 ]; then
+            echo "::warning::No reports in the pipeline state cache. Either no run has produced any yet, or the cache was evicted (GitHub drops entries after 7 days of inactivity)."
+          fi
+
+      - name: Upload the full report history
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-export-${{ github.run_id }}
+          path: career-ops
+          if-no-files-found: warn
+          # Same ceiling as every other upload here. It only has to survive long
+          # enough to be downloaded once — re-run the workflow if it expires.
+          retention-days: 7

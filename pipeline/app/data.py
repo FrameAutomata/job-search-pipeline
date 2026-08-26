@@ -537,6 +537,30 @@ def _row_identity(row: dict) -> str:
     return f"{normalize_company(row.get('company', ''))}::{normalize_company(row.get('role', ''))}"
 
 
+def _report_int(value) -> int | None:
+    """A report number as an int, or None if it isn't one."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_ints(values) -> set[int]:
+    """Report numbers as a set of ints, dropping anything non-numeric.
+
+    Numbers, not strings, because the pipeline mints them zero-padded
+    (`f"{n:03d}"` in assign_job_numbers) while a renumber here emits `str(n)`.
+    A string membership test therefore reads "43" as unclaimed against a cloud
+    that holds "043" — so the very number this function's callers assign would
+    be invisible to the next merge's collision check."""
+    return {n for n in (_report_int(v) for v in values) if n is not None}
+
+
+def _row_report_nums(rows: list[dict]) -> set[int]:
+    """The report numbers a set of tracker rows link to."""
+    return _report_ints(r["report_num"] for r in rows if r.get("report_num"))
+
+
 def reconcile_trackers(
     cloud_md: str, local_md: str, cloud_report_nums: set[str],
     local_report_nums: set[str] = frozenset(),
@@ -548,12 +572,17 @@ def reconcile_trackers(
     only in local (offline `Run local` results) are preserved, renumbered to sit
     after the cloud max so row numbers stay unique. A local-only row whose report
     number collides with a cloud report is given a fresh number (max(used)+1) and
-    its Report link rewritten; the (old, new) pair is returned so the caller can
-    rename the report file. Triage edits live in the overrides overlay, not here.
+    its Report link rewritten; the (old filename, new filename) pair is returned
+    so the caller can move that one file. Triage edits live in the overrides
+    overlay, not here.
 
-    `local_report_nums` is the set of report numbers that exist as files in the
-    local reports dir — passed so a renumber can't target an existing local file
-    (including one orphaned by a cloud-shared row). Returns (merged_md, renames)."""
+    `cloud_report_nums` is the set of report numbers whose FILES came down in
+    the artifact; the cloud tracker's own rows are consulted as well, since the
+    artifact is a per-run delta and need not carry a file for every number the
+    cloud has minted. `local_report_nums` is the set of report numbers that
+    exist as files in the local reports dir — passed so a renumber can't target
+    an existing local file (including one orphaned by a cloud-shared row).
+    Returns (merged_md, renames)."""
     cloud_rows = parse_applications_text(cloud_md)
     local_rows = parse_applications_text(local_md)
 
@@ -562,23 +591,22 @@ def reconcile_trackers(
     if not local_only:
         return cloud_md, []
 
-    def _ints(vals):
-        out = []
-        for v in vals:
-            try:
-                out.append(int(str(v).strip()))
-            except (TypeError, ValueError):
-                pass
-        return out
+    # Which report numbers belong to the cloud. The artifact's report FILES are
+    # no longer the whole answer: since issue #129 the daily artifact carries
+    # only the reports that run minted, so a cloud report from a Refresh the
+    # user missed (artifacts expire after a week) would look unclaimed, and a
+    # local-only row holding that number would keep it — leaving the cloud row's
+    # `[42](reports/42-….md)` link pointing at the local report. The cloud
+    # tracker names every number it has ever used, so ask it too.
+    cloud_claimed = _report_ints(cloud_report_nums) | _row_report_nums(cloud_rows)
 
-    next_num = max(_ints(r.get("num") for r in cloud_rows), default=0)
+    next_num = max(_report_ints(r.get("num") for r in cloud_rows), default=0)
     # A renumbered report must avoid every number already in use: cloud reports
     # (about to be copied in), every report referenced by a local row, and every
     # report file on local disk (orphans included). Seed the running max from all
     # three so an assigned number can't collide with any of them.
-    reserved = (set(cloud_report_nums) | set(local_report_nums)
-                | {r.get("report_num") for r in local_rows if r.get("report_num")})
-    next_rep = max(_ints(reserved), default=0)
+    reserved = cloud_claimed | _report_ints(local_report_nums) | _row_report_nums(local_rows)
+    next_rep = max(reserved, default=0)
 
     # Emit rows in the CLOUD table's own layout, not the canonical order: rows
     # are appended to the cloud tracker, and a cloud tracker migrated to the Via
@@ -597,11 +625,17 @@ def reconcile_trackers(
         cells[num_idx] = str(next_num)
 
         old_rep = row.get("report_num", "")
-        if old_rep and old_rep in cloud_report_nums and report_idx is not None:
+        if _report_int(old_rep) in cloud_claimed and report_idx is not None:
             next_rep += 1
             new_rep = str(next_rep)
-            renames.append((old_rep, new_rep))
             cells[report_idx] = _renumber_report_cell(cells[report_idx], old_rep, new_rep)
+            # Name the file, not the number. A number can match two files in a
+            # local reports dir — the cloud report a past Refresh copied in, and
+            # a local-only one that happens to share it — and only this row's is
+            # meant to move. Read the pair back out of the cell just rewritten,
+            # so the rename and the link the tracker now carries cannot disagree.
+            renames.append((Path(row["report_path"]).name,
+                            Path(_report_link(cells[report_idx])[1]).name))
         new_lines.append("| " + " | ".join(cells) + " |")
 
     return _append_rows(cloud_md, new_lines), renames
@@ -614,7 +648,12 @@ def _renumber_report_cell(cell: str, old: str, new: str) -> str:
         text, path = m.group(1).strip(), m.group(2).strip()
         if text == old:
             text = new
-        path = re.sub(rf"(^|/){re.escape(old)}-", rf"\g<1>{new}-", path)
+        # Both filename shapes _REPORT_FILE_RE accepts: `NNN-slug.md` and the
+        # slug-less `NNN.md`. Missing the second one is not cosmetic — the
+        # rename pair is read back out of this cell, so a path left un-rewritten
+        # produces a (same, same) self-rename and the incoming cloud file
+        # overwrites the local-only report the renumber existed to protect.
+        path = re.sub(rf"(^|/){re.escape(old)}(-|\.md$)", rf"\g<1>{new}\g<2>", path)
         return f"[{text}]({path})"
     return _REPORT_LINK_RE.sub(repl, cell)
 
@@ -699,15 +738,16 @@ def sync_pulled_tracker(artifact_dir: Path, local_dir: Path) -> dict:
 
 
 def _rename_report_file(reports_dir: Path, old: str, new: str) -> None:
-    """Rename `old-slug.md` (or `old.md`) to use the `new` number prefix,
-    preserving the slug. No-op if the source file isn't present."""
-    if not reports_dir.is_dir():
-        return
-    for f in reports_dir.glob(f"{old}-*.md"):
-        f.rename(reports_dir / f"{new}-{f.name[len(old) + 1:]}")
-    plain = reports_dir / f"{old}.md"
-    if plain.exists():
-        plain.rename(reports_dir / f"{new}.md")
+    """Move a renumbered row's report file from `old` to `new` — both basenames,
+    as reconcile_trackers read them out of the row's own Report link. No-op if
+    the source isn't present (the row can outlive its file).
+
+    Named files rather than a `{num}-*.md` glob: a number matches two files
+    whenever local holds both a synced cloud report and a local-only one that
+    shares it, and moving the cloud one breaks the tracker row that links to it."""
+    src = reports_dir / old
+    if src.is_file():
+        src.rename(reports_dir / new)
 
 
 def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
