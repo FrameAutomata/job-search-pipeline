@@ -173,6 +173,151 @@ search:
             scrape_mod.load_searches(nonexistent)
 
 
+# Every shape below used to reach run() as an exception naming neither the file
+# nor what to do about it — `TypeError: argument of type 'NoneType' is not
+# iterable` for most of them. The cloud is where they land: config/search.yml is
+# written on the runner by decoding SEARCH_CONFIG_B64, and the workflow's
+# decode_secret guard only catches a ZERO-BYTE decode. A comments-only secret is
+# not zero bytes.
+MALFORMED_CONFIGS = {
+    "empty file": "",
+    "whitespace only": "\n   \n \n",
+    # The one actually observed in the cloud: passes the decode_secret
+    # non-empty check, then parses to None.
+    "comments only": "# my search config\n# (todo: fill this in)\n",
+    "no searches or search key": "filter:\n  min_score: 5\nscreen:\n  liveness: true\n",
+    "empty mapping": "{}\n",
+    # `"searches" in raw` is a membership test on a list, not a key test — this
+    # is the passes written at the top level with the key left off.
+    "top-level list": "- name: pass 1\n  search_terms: [go]\n",
+    # ...and a substring test on a string, so prose mentioning the word used to
+    # answer yes and then be indexed like a mapping.
+    "top-level prose naming searches": "searches are configured in the UI\n",
+    "top-level scalar": "42\n",
+    "searches key with nothing under it": "searches:\n",
+    "searches not a list": "searches:\n  name: pass 1\n  search_terms: [go]\n",
+    "scalar inside searches": "searches: [python, rust]\n",
+    "null inside searches": "searches:\n  - name: pass 1\n  -\n",
+    "legacy search key with nothing under it": "search:\n",
+    "legacy search is a scalar": "search: python\n",
+}
+
+
+class TestLoadSearchesRejectsMalformedConfigs:
+    """load_searches is the last place that can name the file before every stage
+    downstream assumes a list of mappings. It refuses anything else with a
+    ValueError that says which file, what is wrong and how to repair it —
+    including the cloud repair, which is the half a user in Actions cannot guess
+    because there is no local file to open."""
+
+    @pytest.mark.parametrize("label", sorted(MALFORMED_CONFIGS))
+    def test_raises_value_error(self, tmp_path, label):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(MALFORMED_CONFIGS[label])
+        with pytest.raises(ValueError):
+            scrape_mod.load_searches(cfg)
+
+    @pytest.mark.parametrize("label", sorted(MALFORMED_CONFIGS))
+    def test_message_names_the_file_and_the_repair(self, tmp_path, label):
+        # The property, not the wording: whatever is wrong, the message must be
+        # actionable from a log line alone — locally by naming the path, in the
+        # cloud by naming the secret the path was written from.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(MALFORMED_CONFIGS[label])
+        with pytest.raises(ValueError) as exc:
+            scrape_mod.load_searches(cfg)
+        msg = str(exc.value)
+        assert str(cfg) in msg
+        assert "SEARCH_CONFIG_B64" in msg
+        assert "search.example.yml" in msg
+
+    def test_empty_file_says_so(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("")
+        with pytest.raises(ValueError, match="parsed to nothing"):
+            scrape_mod.load_searches(cfg)
+
+    def test_comments_only_reads_as_empty_not_as_a_missing_key(self, tmp_path):
+        # yaml.safe_load can't tell these apart and neither should the message —
+        # this is the shape that walked past decode_secret's zero-byte check.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("# nothing here yet\n")
+        with pytest.raises(ValueError, match="only comments and whitespace"):
+            scrape_mod.load_searches(cfg)
+
+    def test_missing_key_lists_the_keys_that_are_there(self, tmp_path):
+        # The keys found are the diagnosis: a config with filter/screen but no
+        # searches is a truncated file or a wrong-file secret, not a typo.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("filter:\n  min_score: 5\nscreen:\n  liveness: true\n")
+        with pytest.raises(ValueError, match=r"top-level keys: filter, screen"):
+            scrape_mod.load_searches(cfg)
+
+    def test_top_level_list_is_reported_as_not_a_mapping(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("- name: pass 1\n  search_terms: [go]\n")
+        with pytest.raises(ValueError, match="top level is a list, not a mapping"):
+            scrape_mod.load_searches(cfg)
+
+    def test_top_level_string_is_not_substring_matched(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches are configured in the UI\n")
+        with pytest.raises(ValueError, match="top level is a string, not a mapping"):
+            scrape_mod.load_searches(cfg)
+
+    def test_null_searches_names_the_key(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches:\n")
+        with pytest.raises(ValueError, match=r"`searches:` is empty, not a list"):
+            scrape_mod.load_searches(cfg)
+
+    def test_searches_as_a_single_mapping_names_the_key(self, tmp_path):
+        # One pass written without its leading `- `.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches:\n  name: pass 1\n  search_terms: [go]\n")
+        with pytest.raises(ValueError, match=r"`searches:` is a mapping, not a list"):
+            scrape_mod.load_searches(cfg)
+
+    def test_scalar_entry_names_its_position(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches:\n  - name: pass 1\n  - python\n")
+        with pytest.raises(ValueError, match=r"`searches:` pass 2 is a string"):
+            scrape_mod.load_searches(cfg)
+
+    def test_legacy_scalar_search_is_refused_like_the_ui_refuses_it(self, tmp_path):
+        # pipeline/app/server.py's _search_entries 400s `search: python` at save
+        # time for this exact reason; the run must agree rather than crash later.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("search: python\n")
+        with pytest.raises(ValueError, match=r"`search:` is a string, not a mapping"):
+            scrape_mod.load_searches(cfg)
+
+    def test_legacy_null_search_is_refused(self, tmp_path):
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("search:\n")
+        with pytest.raises(ValueError, match=r"`search:` is empty, not a mapping"):
+            scrape_mod.load_searches(cfg)
+
+    def test_empty_searches_list_still_loads(self, tmp_path):
+        # NOT an error: zero passes is a config that scrapes nothing, which run()
+        # already handles as a clean no-op (truncates jobs.csv, says why). Only
+        # shapes the pipeline would CRASH on are refused here.
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches: []\n")
+        assert scrape_mod.load_searches(cfg) == []
+
+    def test_run_surfaces_the_message_instead_of_a_typeerror(self, tmp_path, monkeypatch):
+        # The regression that motivated this: a comments-only config reached
+        # run()'s comprehension and died as "argument of type 'NoneType' is not
+        # iterable", which names neither the file nor the secret it came from.
+        monkeypatch.setattr(scrape_mod, "OUTPUT_PATH", tmp_path / "jobs.csv")
+        monkeypatch.setattr(scrape_mod, "scrape_jobs", MagicMock())
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("# todo\n")
+        with pytest.raises(ValueError, match="SEARCH_CONFIG_B64"):
+            scrape_mod.run(cfg)
+
+
 class TestStripUnsupportedSites:
     """resolve_pass_sites, exercised through the RETIRED-BOARD rule.
 
