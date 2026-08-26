@@ -149,13 +149,126 @@ def resolve_pass_sites(searches: list[dict]) -> list[dict]:
     return result
 
 
+# The tail every malformed-config message ends with. Shared because the ways
+# this file can be wrong differ only in WHAT is wrong — the repair is one
+# repair, and its cloud half is the part a user cannot guess: in Actions there
+# is no config/search.yml to open, because the daily writes it on the runner by
+# decoding the SEARCH_CONFIG_B64 secret at the start of the run.
+_CONFIG_HELP = (
+    "A search config is a mapping with a `searches:` list of passes — see "
+    "config/search.example.yml. In the cloud there is no local file to open: "
+    "the daily writes this one by decoding the SEARCH_CONFIG_B64 secret, so "
+    "repair config/search.yml locally, re-encode it and update the secret."
+)
+
+# Python's names for these describe the parser, not the file. `NoneType` in
+# particular is what a key written with nothing under it parses to — the
+# likeliest mistake in a hand-indented config, and the last word its author
+# should have to translate.
+_YAML_KINDS = {
+    type(None): "empty",
+    dict: "a mapping",
+    list: "a list",
+    str: "a string",
+    bool: "a boolean",
+    int: "a number",
+    float: "a number",
+}
+
+
+def _kind(value) -> str:
+    return _YAML_KINDS.get(type(value), f"a {type(value).__name__}")
+
+
+def _config_error(path: Path, problem: str) -> ValueError:
+    """A malformed-config error naming the file, the problem and the repair."""
+    return ValueError(f"{path}: {problem}. {_CONFIG_HELP}")
+
+
 def load_searches(path: Path) -> list[dict]:
-    """Return a list of search configs. Supports `searches:` (list) and legacy `search:` (single)."""
+    """Return a list of search configs. Supports `searches:` (list) and legacy `search:` (single).
+
+    Anything that isn't one of those two shapes raises a ValueError naming the
+    file, what is wrong with it and how to repair it, rather than reaching run()
+    as a bare `TypeError: argument of type 'NoneType' is not iterable` one frame
+    up. The failures aren't hypothetical and the cloud is where they land:
+    config/search.yml is *written* on the runner from the SEARCH_CONFIG_B64
+    secret, so a mis-encoded or truncated secret becomes a file nobody authored
+    and nobody can look at. The daily's decode_secret guard already refuses a
+    secret that decodes to ZERO BYTES, by name — but a comments-only file is not
+    zero bytes, walks past that guard, parses to None here, and used to take the
+    whole day's run down with an exception naming neither the file nor the
+    secret. What follows is that same guard one layer further in, where the
+    shape rather than the byte count is finally visible.
+
+    ValueError rather than SystemExit, matching filter_passes below and
+    resume_text._extractor_for: this is a library function — tests/
+    test_example_config.py reads the shipped example through it — and a leaf
+    that exits the process takes the decision away from every caller. run() does
+    not catch it, so a broken config still stops the stage; what changes is what
+    the last line of the traceback says.
+    """
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+
+    # safe_load returns None for an empty file AND for one holding nothing but
+    # comments or whitespace. The second is the one that gets here, since the
+    # first is what decode_secret already catches upstream.
+    if raw is None:
+        raise _config_error(
+            path, "parsed to nothing — the file is empty, or holds only comments and whitespace"
+        )
+
+    # `"searches" in raw` is a KEY test only on a mapping. On a list it asks
+    # whether "searches" is an element, and on a string whether it is a
+    # substring — so passes written at the top level with the `searches:` key
+    # left off fell through to raw["search"] and raised KeyError, and a stray
+    # line of prose containing the word could answer yes and hand run() the
+    # characters of a string as if they were search passes.
+    if not isinstance(raw, dict):
+        raise _config_error(path, f"the top level is {_kind(raw)}, not a mapping")
+
     if "searches" in raw:
-        return raw["searches"]
-    return [raw["search"]]
+        key, entries = "searches", raw["searches"]
+        # `searches:` with nothing indented under it parses to None; one pass
+        # written without its leading `- ` parses to a mapping. Both used to be
+        # returned as the caller's list and blow up in run()'s comprehension.
+        if not isinstance(entries, list):
+            raise _config_error(
+                path, f"`searches:` is {_kind(entries)}, not a list of search passes"
+            )
+    elif "search" in raw:
+        key, entries = "search", [raw["search"]]
+    else:
+        found = ", ".join(str(k) for k in raw) or "none"
+        raise _config_error(
+            path,
+            "has neither a `searches:` list nor a legacy `search:` mapping "
+            f"(top-level keys: {found})",
+        )
+
+    # Deliberately not a check on len(entries). `searches: []` names zero passes
+    # rather than a broken one, and run() already treats that as a clean nothing
+    # to do — it truncates jobs.csv and says why, the same exit a user with no
+    # easy_apply pass takes under --easy-apply-only. The UI's save endpoint does
+    # refuse an empty list, and that divergence points the safe way: it is
+    # repairable while the config is on screen, and un-runnable is not
+    # un-loadable.
+    #
+    # The per-entry check is not optional in the same way. normalize_pass and
+    # every stage after it read dict fields off each pass, so a scalar or null
+    # entry is the None case again wearing a different type — and it is the only
+    # thing standing between a bare `search:` key and the identical crash the
+    # `searches:` branch above is guarded against. pipeline/app/server.py's
+    # _search_entries predicts exactly this at save time; now the run agrees.
+    for i, entry in enumerate(entries, 1):
+        if isinstance(entry, dict):
+            continue
+        where = "`search:`" if key == "search" else f"`searches:` pass {i}"
+        raise _config_error(
+            path, f"{where} is {_kind(entry)}, not a mapping of search options"
+        )
+    return entries
 
 
 def filter_passes(
