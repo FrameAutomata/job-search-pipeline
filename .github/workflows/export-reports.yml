@@ -27,6 +27,16 @@ name: Export Reports
 # to the cache — it restores and never saves — so unlike seed-reports it is safe
 # to run while a pipeline is in flight.
 #
+# That is why this is the one pipeline-state workflow with NO `concurrency:`
+# block. The three that save share the `pipeline-state` group so their
+# read-modify-writes can't overwrite each other (#135); a restore matches a
+# complete, immutable cache entry and can clobber nothing, so joining the group
+# would buy no safety and cost the thing this workflow is for — recovering the
+# report history would queue behind the very daily you were trying to recover
+# alongside, and could then be evicted by any writer dispatched after it.
+# tests/test_workflow_artifacts.py scopes the group rule to writers for exactly
+# this reason, and treats anything that isn't the restore half as a writer.
+#
 # Deliberately workflow_dispatch-only. A scheduled job uploading the full
 # history is precisely the bug (issue #129); a human asking for it once is
 # bounded by the asking. tests/test_workflow_artifacts.py enforces that

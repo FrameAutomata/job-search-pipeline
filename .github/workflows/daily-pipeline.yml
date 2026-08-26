@@ -41,8 +41,30 @@ on:
 permissions:
   contents: read
 
+# Serialized against every WRITER of the pipeline-state cache, not just against
+# another daily (issue #135). Each save writes a whole snapshot under
+# pipeline-state-v1-<run_id> and the next run restores by prefix, so two writers
+# overlapping means the later save wins outright and the earlier one's work is
+# gone — no merge, and nothing in either run's log mentions it. The critical
+# section is the WHOLE run, not the save step: this restores at the start and
+# saves at the end, so anything that saves in between is overwritten regardless
+# of how briefly it held the cache.
+#
+# edit-tracker.yml and seed-reports.yml are the other two writers and have
+# always been in this group; this file sat in a group of its own, which left the
+# hazard live and undocumented. export-reports.yml stays outside deliberately —
+# it restores and never saves. tests/test_workflow_artifacts.py enforces the
+# rule rather than trusting this comment.
+#
+# The cost, stated plainly: GitHub keeps at most ONE pending run per group, so
+# dispatching a second writer while one is already queued cancels the queued
+# one. Two UI Push presses during one long daily therefore lose the first one's
+# status overrides, and a scheduled daily that queues behind a manual writer can
+# itself be evicted by a second dispatch. Both are visible as a cancelled run in
+# the Actions tab; a clobbered cache is visible nowhere and takes a whole day's
+# evaluations, reports, scan-history rows and batch state with it.
 concurrency:
-  group: daily-pipeline
+  group: pipeline-state
   cancel-in-progress: false
 
 env:
