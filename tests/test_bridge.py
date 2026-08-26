@@ -618,3 +618,91 @@ class TestEasyApplyUrls:
         result = bridge_mod.run(career_ops_dir)
         assert result == []
         assert "https://job1.com" in bridge_mod.load_easy_apply_urls(career_ops_dir)
+
+
+class TestPipelineMdHeadings:
+    """career-ops writes the pending/processed headings in English now and reads
+    both spellings (scan.mjs PENDING_MARKERS, reconcile-pipeline.mjs PENDING_RE).
+    Matching only our Spanish one against a pipeline.md that scan.mjs created
+    finds nothing and appends a SECOND pending section, splitting the queue."""
+
+    OFFERS = [{"url": "https://x/j/9", "company": "Acme", "title": "SWE", "description": ""}]
+
+    def _headings(self, career_ops_dir, initial):
+        pipe = career_ops_dir / "data" / "pipeline.md"
+        pipe.parent.mkdir(parents=True, exist_ok=True)
+        if initial is not None:
+            pipe.write_text(initial, encoding="utf-8")
+        bridge_mod.append_to_pipeline(career_ops_dir, self.OFFERS)
+        text = pipe.read_text(encoding="utf-8")
+        return [l for l in text.splitlines() if l.startswith("## ")], text
+
+    def test_appends_into_an_english_pending_section(self, career_ops_dir):
+        heads, text = self._headings(
+            career_ops_dir,
+            "# Pipeline — Pending URLs\n\n## Pending\n\n"
+            "- [ ] https://x/j/1 | Old | Role\n\n## Processed\n")
+        assert heads == ["## Pending", "## Processed"], "must not add a 2nd pending section"
+        assert "j/9" in text
+
+    def test_appends_into_our_own_spanish_section(self, career_ops_dir):
+        heads, text = self._headings(
+            career_ops_dir, "# Pipeline\n\n## Pendientes\n\n- [ ] https://x/j/1 | Old | Role\n")
+        assert heads == ["## Pendientes"]
+        assert "j/9" in text
+
+    def test_creates_a_section_when_the_file_has_none(self, career_ops_dir):
+        heads, text = self._headings(career_ops_dir, "# Pipeline\n")
+        assert heads == ["## Pendientes"]
+        assert "j/9" in text
+
+    def test_creates_the_file_from_scratch(self, career_ops_dir):
+        heads, text = self._headings(career_ops_dir, None)
+        assert heads == ["## Pendientes"]
+        assert "j/9" in text
+
+
+class TestDedupAcrossTrackerLayouts:
+    """company::role dedup must key on the role, whichever tracker layout the
+    file uses — a Via column shifts Role right by one."""
+
+    ROW = "| 1 | 2026-08-25 | Acme | {} 4/5 | Applied | null | [1](reports/1.md) | n |\n"
+
+    def test_via_layout_keys_on_the_role(self):
+        md = ("| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|---|---|---|---|---|---|---|---|---|\n"
+              + self.ROW.format("Robert Half | SWE |"))
+        assert bridge_mod._parse_applications_md(md)[1] == {"acme::swe"}
+
+    def test_canonical_layout_unchanged(self):
+        md = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|---|---|---|---|---|---|---|---|\n"
+              + self.ROW.format("SWE |"))
+        assert bridge_mod._parse_applications_md(md)[1] == {"acme::swe"}
+
+    def test_headerless_table_falls_back_to_positions(self):
+        assert bridge_mod._parse_applications_md(
+            self.ROW.format("SWE |"))[1] == {"acme::swe"}
+
+
+class TestSectionHeadingVariants:
+    """Real pipeline.md headings carry counts and qualifiers. Matching the
+    heading as a whole line finds nothing and appends a SECOND pending section —
+    the split queue this lookup exists to avoid, and a regression on our own
+    Spanish spelling as well as career-ops' English one."""
+
+    OFFERS = [{"url": "https://x/j/9", "company": "Acme", "title": "SWE", "description": ""}]
+
+    @pytest.mark.parametrize("heading", [
+        "## Pendientes", "## Pending",
+        "## Pendientes (3)", "## Pending URLs",
+    ])
+    def test_appends_into_the_existing_section(self, career_ops_dir, heading):
+        pipe = career_ops_dir / "data" / "pipeline.md"
+        pipe.parent.mkdir(parents=True, exist_ok=True)
+        pipe.write_text(f"# Pipeline\n\n{heading}\n\n- [ ] https://x/j/1 | Old | Role\n",
+                        encoding="utf-8")
+        bridge_mod.append_to_pipeline(career_ops_dir, self.OFFERS)
+        text = pipe.read_text(encoding="utf-8")
+        assert [l for l in text.splitlines() if l.startswith("## ")] == [heading]
+        assert "j/9" in text

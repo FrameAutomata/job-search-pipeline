@@ -10,11 +10,15 @@ let selectedNum = null;
 let view = "table"; // "table" | "board"
 let pending = 0;
 
-// Canonical kanban columns — mirror of data.CANONICAL_STATES.
-const STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP"];
+// Kanban columns. A first-paint SEED, replaced at boot by the server's list
+// (/api/capabilities), which career-ops' templates/states.yml owns — so an
+// upstream state addition arrives on its own rather than needing an edit here.
+// The seed must still track data.CANONICAL_STATES (test-enforced): it is what
+// the board renders on before loadCaps() returns, and if that call fails.
+let STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP", "Hired"];
 
 // Statuses hidden by default: terminal/actioned states where no further action is needed.
-const ACTIONED_STATUSES = new Set(["Applied", "Rejected", "Discarded", "SKIP"]);
+const ACTIONED_STATUSES = new Set(["Applied", "Rejected", "Discarded", "SKIP", "Hired"]);
 let hideActioned = localStorage.getItem("hideActioned") !== "false";
 
 const els = {
@@ -136,11 +140,16 @@ function renderTable() {
 
 function renderBoard() {
   const rows = visibleRows();
-  // Bucket by canonical status; anything unrecognized goes under Evaluated.
+  // Bucket by canonical status.
   const buckets = Object.fromEntries(STATES.map((s) => [s, []]));
+  // Unknown statuses land in the first column. Not a hardcoded "Evaluated":
+  // STATES comes from the server now, and a localized or reordered vocabulary
+  // need not contain that label at all — indexing it blind would throw and take
+  // the whole board down.
+  const fallbackCol = STATES[0];
   for (const j of rows) {
-    const col = STATES.includes(j.status_canonical) ? j.status_canonical : "Evaluated";
-    buckets[col].push(j);
+    const col = STATES.includes(j.status_canonical) ? j.status_canonical : fallbackCol;
+    if (buckets[col]) buckets[col].push(j);
   }
   els.boardPane.innerHTML = "";
   for (const state of STATES) {
@@ -235,7 +244,7 @@ async function openReport(job) {
   resetSkillPanel();
   render();
   els.reportLink.href = extractUrl(job) || "#";
-  els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : "Evaluated";
+  els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : STATES[0];
   els.reportBody.innerHTML = "<p class='empty'>Loading…</p>";
   els.reportPane.hidden = false;
   try {
@@ -307,14 +316,20 @@ els.reportClose.addEventListener("click", () => {
 els.viewTable.addEventListener("click", () => { view = "table"; render(); });
 els.viewBoard.addEventListener("click", () => { view = "board"; render(); });
 
-// Populate the report-pane status select once, then wire its change event to
-// the same persistence path the kanban uses (optimistic update + pending push).
-for (const s of STATES) {
-  const opt = document.createElement("option");
-  opt.value = s;
-  opt.textContent = s;
-  els.reportStatus.appendChild(opt);
+// Populate the report-pane status select, then wire its change event to the
+// same persistence path the kanban uses (optimistic update + pending push).
+// Rebuilt when the server's state list lands, so the picker can't offer a
+// status /api/status would 400 — or omit one the tracker already uses.
+function buildStatusOptions() {
+  els.reportStatus.innerHTML = "";
+  for (const s of STATES) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    els.reportStatus.appendChild(opt);
+  }
 }
+buildStatusOptions();
 els.reportStatus.addEventListener("change", () => {
   if (!selectedJob) return;
   const newStatus = els.reportStatus.value;
@@ -825,6 +840,11 @@ let currentSkill = null;  // last skill run; used by Run-in-terminal's relaunch.
 async function loadCaps() {
   try {
     CAPS = await (await fetch("/api/capabilities")).json();
+    if (Array.isArray(CAPS.states) && CAPS.states.length) {
+      STATES = CAPS.states;
+      buildStatusOptions();
+      render();
+    }
   } catch { /* leave defaults; buttons explain the no-capability case */ }
   renderSkillActions();
 }

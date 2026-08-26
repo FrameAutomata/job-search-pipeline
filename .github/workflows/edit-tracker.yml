@@ -238,4 +238,6 @@ jobs:
           name: applications-md-${{ github.run_id }}
           path: career-ops/data/applications.md
           if-no-files-found: error
-          retention-days: 30
+          # A verification copy of the file just installed — useful for a few
+          # days, not a month. See the retention note in daily-pipeline.yml.
+          retention-days: 7

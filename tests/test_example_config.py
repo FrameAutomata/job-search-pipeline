@@ -129,3 +129,75 @@ def test_no_retired_board_is_described_as_having_a_mutex_rule():
         "config/search.example.yml describes a mutual-exclusion rule for a board "
         f"that has none in MUTEX_GROUPS: {offenders}"
     )
+
+
+class TestCareerOpsInstallFlags:
+    """career-ops ships a `postinstall` that runs
+    `npx playwright install chromium --with-deps`. Every place we install its
+    node deps must pass --ignore-scripts: setup installs Chromium deliberately
+    on its own terms (the Nix path needs a pinned driver, not whatever
+    postinstall fetches, and `--with-deps` shells out to the system package
+    manager, which needs root and aborts setup under `set -euo pipefail`), and
+    the daily workflow only ever runs merge-tracker.mjs, so it would pay minutes
+    of runner time for a browser nothing there launches.
+
+    Guards the rule rather than the copies, in the spirit of tests/test_stdio.py
+    — the flag lives in three host languages with no shared install step, so
+    nothing stops a fourth site being added by pasting an older line."""
+
+    # How far back to look for the career-ops context. setup.sh names the
+    # directory on the `npm install` line itself; setup.ps1 sets it with a
+    # Push-Location several lines earlier, so a line-local match sees only two
+    # of the three sites — which is exactly the silent gap this guards.
+    _CONTEXT_LINES = 6
+
+    # Every place the repo installs career-ops' node deps, by file. Two in
+    # setup.sh: the main install, and the NixOS Playwright pin — which also runs
+    # inside career-ops, so it triggers the same postinstall.
+    EXPECTED_SITES = ["setup.sh", "setup.sh", "setup.ps1", "daily-pipeline.yml"]
+
+    def _career_ops_installs(self, text):
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if "npm install" not in line or line.lstrip().startswith("#"):
+                continue
+            # Whichever directory was named MOST RECENTLY wins — setup.sh
+            # installs the pipeline's own deps a few lines after career-ops',
+            # and a plain "is career-ops anywhere above" test claims that one too.
+            for prev in reversed(lines[max(0, i - self._CONTEXT_LINES):i + 1]):
+                low = prev.lower()
+                if "careerops" in low or "career-ops" in low:
+                    yield i + 1, line.strip()
+                    break
+                if "$root" in low or "pop-location" in low:
+                    break
+
+    def test_career_ops_installs_ignore_scripts(self):
+        root = Path(__file__).resolve().parent.parent
+        sources = [root / "setup.sh", root / "setup.ps1"]
+        sources += sorted((root / ".github" / "workflows").glob("*.yml"))
+        found, offenders = [], []
+        for path in sources:
+            for lineno, line in self._career_ops_installs(path.read_text(encoding="utf-8")):
+                found.append(path.name)
+                if "--ignore-scripts" not in line:
+                    offenders.append(f"{path.name}:{lineno}: {line}")
+        # Assert the EXACT set, not a floor. `>= 3` passes when the scanner
+        # loses sight of a site (reformat setup.ps1 so Push-Location drifts out
+        # of the lookback window and it sees 3 of 4) — and the site it stopped
+        # seeing is precisely the one that could then regress unnoticed.
+        assert sorted(found) == sorted(self.EXPECTED_SITES), (
+            f"career-ops install sites changed: {sorted(found)}\n"
+            f"expected: {sorted(self.EXPECTED_SITES)}\n"
+            "If you added or moved one, update EXPECTED_SITES — that edit is the "
+            "point at which someone checks the new site carries --ignore-scripts."
+        )
+        assert not offenders, (
+            "npm install targeting career-ops without --ignore-scripts:\n  "
+            + "\n  ".join(offenders)
+        )
+
+    def test_guard_catches_a_missing_flag(self):
+        """The guard is only worth having if it fails on the thing it forbids."""
+        bad = 'Push-Location $careerOps\nnpm install\nPop-Location\n'
+        assert [l for _, l in self._career_ops_installs(bad) if "--ignore-scripts" not in l]

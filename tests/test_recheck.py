@@ -671,3 +671,31 @@ class TestRecheckDrain:
         assert len(fake_fetch["urls"]) == len(set(fake_fetch["urls"])) == 3   # no re-fetch
         keys = [k for batch in fake_fetch["indeed_batches"] for k in batch]
         assert keys == ["888"]                    # Indeed checked exactly once too
+
+
+class TestThrottleQueueRotation:
+    """`throttled` now covers a transient limiter AND permanent conditions (a
+    bot wall, a 5xx, an unreadable body). Leaving the last-checked timestamp
+    unset puts a role at the FRONT of the stalest-first queue — correct for the
+    limiter, ruinous for the rest, because once `budget` of them accumulate they
+    consume every run's whole allowance and nothing else is re-checked again."""
+
+    def test_transient_limiter_stays_at_the_front(self):
+        from pipeline import screen as screen_mod
+        result, reason = screen_mod.classify_liveness(429, "https://x/j/1", "")
+        assert screen_mod.transient_throttle(result, reason)
+
+    @pytest.mark.parametrize("status,body", [
+        (502, "<html>502 Bad Gateway</html>"),
+        (200, "<title>Just a moment...</title>Ray ID: 8f2a1b3c9d0e"),
+        (200, "<html></html>"),
+    ])
+    def test_persistent_throttles_rotate_into_the_normal_cadence(self, status, body):
+        from pipeline import screen as screen_mod
+        result, reason = screen_mod.classify_liveness(status, "https://x/j/1", body)
+        assert result == "throttled"
+        assert not screen_mod.transient_throttle(result, reason), (
+            "a permanently-unreadable role must be stamped so it leaves the "
+            "front of the queue — it is still never expired, just not ahead of "
+            "every other role forever"
+        )

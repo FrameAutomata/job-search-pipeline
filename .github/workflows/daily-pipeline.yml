@@ -111,7 +111,13 @@ jobs:
             https://github.com/FrameAutomata/career-ops career-ops
 
       - name: Install career-ops Node deps
-        run: npm install --prefix career-ops
+        # --ignore-scripts: career-ops' postinstall runs
+        # `npx playwright install chromium --with-deps`, downloading a browser
+        # and apt-installing its system libraries. The daily run only shells out
+        # to merge-tracker.mjs, which needs js-yaml and nothing else — so that
+        # is minutes of runner time and a sudo-dependent apt step, on every run,
+        # for a browser nothing here launches. A failure in it fails the step.
+        run: npm install --prefix career-ops --ignore-scripts
 
       - name: Decode setup secrets into place
         env:
@@ -242,4 +248,17 @@ jobs:
             career-ops/data/easy-apply-urls.txt
             career-ops/batch/tracker-additions/
           if-no-files-found: ignore
-          retention-days: 90
+          # 7, not 90. `career-ops/reports/` is restored from the state cache
+          # each run and ACCUMULATES — every artifact carries the whole report
+          # history to date, not just that day's. Ninety days of retention
+          # therefore keeps ninety copies of a monotonically growing directory,
+          # so the storage cost grows with the SQUARE of how long the pipeline
+          # has been running. That is what exhausted the account's Actions
+          # storage, and an exhausted quota stops GitHub creating workflow runs
+          # at all — including the Tests run on every pull request.
+          #
+          # A week is plenty for what this artifact is: the delivery mechanism
+          # for a DAILY job (see README — "download the pipeline-output-*
+          # artifact"). The durable copies live in the pipeline-state cache and
+          # in the user's local career-ops, neither of which this bounds.
+          retention-days: 7

@@ -12,7 +12,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS is deliberately absent. On a PRIVATE repo it bills at 10x
+        # (Windows 2x, Linux 1x), so on a ~2.2 min run it was 21.6 of the 28
+        # billable minutes each PR cost — 77% of the spend on the platform least
+        # likely to break. Every macOS-specific branch we have is already covered
+        # on any host by monkeypatching sys.platform (skills.py's Terminal.app
+        # launcher, notify.py's osascript), so what a macOS runner adds over
+        # Linux is only the environmental difference: a case-insensitive
+        # filesystem and BSD rather than GNU userland. Windows stays — it is the
+        # genuinely divergent platform here (path semantics, no fork) and costs
+        # a fifth as much.
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.12"]
 
     steps:

@@ -76,10 +76,82 @@ _EXPIRED_URL = re.compile(r"[?&]error=true|expired_jd_redirect", re.I)
 # resolve to `throttled` (couldn't read it), never active/expired.
 _THROTTLE_STATUSES = frozenset({403, 429, 999})
 
+# Anti-bot interstitials (Cloudflare "Just a moment...", hCaptcha walls) render
+# a short challenge page INSTEAD of the posting — and serve it with HTTP 200,
+# so the status check above never sees them. Without this the body is short and
+# carries no apply control, so it falls through to `insufficient content` and is
+# recorded `expired` — which screen writes to scan-history.tsv as
+# `screened-dead`, permanently filtering out a live job. Upstream's
+# liveness-core.mjs added the same guard for the same reason.
+#
+# These are matched against the WHOLE page, including a real JD's prose, so they
+# are spelled to be unambiguous: "Ray ID" needs Cloudflare's hex id after it (an
+# ML-infra JD can say "Ray" on its own), and the check runs only after the apply
+# control has had its say — a posting that says "it takes just a moment to
+# apply" is a live posting, and a challenge page never carries an apply control.
+# A false positive here is not free: `throttled` holds the row every run, so the
+# job is never evaluated at all.
+_BOT_CHALLENGE = [
+    re.compile(r"just a moment\s*(\.{3}|…|</title>)", re.I),
+    re.compile(r"performing security verification", re.I),
+    re.compile(r"checking your browser before", re.I),
+    re.compile(r"verify you are (a |not a )?human", re.I),
+    re.compile(r"enable javascript and cookies to continue", re.I),
+    re.compile(r"attention required.*cloudflare", re.I),
+    re.compile(r"\bray id:?\s*[0-9a-f]{8,}", re.I),
+    re.compile(r"\bcf-ray\b", re.I),
+    re.compile(r"please complete the security check", re.I),
+]
+
+# A server-side failure is the site being broken, not the posting being gone.
+# 5xx bodies are short error pages with no apply control, so they used to reach
+# the `insufficient content` branch and be recorded `expired` — the same
+# permanent, irreversible outcome as a real 404, for what is usually a blip.
+# Resolved `throttled` rather than `uncertain` for the same reason a wall is:
+# `uncertain` KEEPS the row, and the caller then mines the body it has for a
+# missing description — so an nginx error page would become the job description
+# and go to the evaluator as one. `throttled` holds the row for the next run.
+_SERVER_ERROR_MIN = 500
+
 # classify_each retries a throttled fetch this many times (a transient limit may
 # clear on a re-fetch) with linear backoff between attempts.
 _THROTTLE_RETRIES = 2
 _THROTTLE_BACKOFF = 1.5
+
+# The three `throttled` verdicts that will NOT clear on a prompt retry. Named
+# once and spliced into the reasons below, so the reason text and this list
+# cannot drift apart.
+_R_SERVER_ERROR = "server error"
+_R_BOT_CHALLENGE = "anti-bot challenge"
+_R_UNREADABLE = "insufficient content"
+_PERSISTENT_THROTTLES = (_R_SERVER_ERROR, _R_BOT_CHALLENGE, _R_UNREADABLE)
+
+
+def transient_throttle(result: str, reason: str) -> bool:
+    """True when a `throttled` verdict is worth hitting again soon.
+
+    `throttled` covers situations that behave nothing alike. A 403/429/999
+    limiter, or an upstream API outage, may well clear in seconds. An anti-bot
+    challenge, a 5xx, or a body too short to read will not: they persist for as
+    long as the site is in that state, and hammering a challenge deepens the
+    block we are already under.
+
+    A DENYLIST, not an allowlist of retryable reasons: every throttle that
+    predates the three named above behaved as transient, and an allowlist
+    silently reclassified them — the Indeed jobData outage among them, which is
+    as transient as a rate limit. Only the three verdicts that introduced
+    persistent throttling opt out.
+
+    Both consumers need the distinction. The scrape-time screen uses it to decide
+    whether to re-fetch within the run (retrying the persistent kind tripled the
+    burst into the very limiter RECHECK_BUDGET exists to cap). The tracker
+    re-check uses it to decide whether to leave the role's last-checked timestamp
+    unset — which puts it at the FRONT of the next run's stalest-first queue.
+    Right for something that may clear; ruinous for something that will not,
+    because that role then never leaves the front and, once enough accumulate,
+    they consume the whole per-run budget and nothing else is re-checked again."""
+    return result == "throttled" and not any(m in reason for m in _PERSISTENT_THROTTLES)
+
 
 _APPLY = [
     re.compile(r"\bapply\b", re.I),
@@ -232,7 +304,26 @@ def extract_description(html_body: str) -> str:
 def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]:
     """Return (result, reason): result is 'active', 'expired', 'throttled', or
     'uncertain'. `throttled` is a rate-limit/sign-in wall we couldn't read —
-    distinct from a confirmed-gone `expired` and from a transient `uncertain`."""
+    distinct from a confirmed-gone `expired` and from a transient `uncertain`.
+
+    **`expired` requires positive evidence.** Only a signal that says the posting
+    is GONE may produce it — a 404/410, an error redirect, a closure banner, or a
+    listing page we landed on instead of the posting. Everything else, including
+    a body too short to read, resolves to a non-fatal verdict.
+
+    That asymmetry is the whole design, because the two errors do not cost the
+    same: a wrong `throttled` costs one re-fetch next run, while a wrong
+    `expired` writes `screened-dead` into scan-history and deletes a live job
+    from every future run, permanently. This module is a hand port of career-ops'
+    liveness-core.mjs and it drifts every release — 5xx, 200-served bot walls and
+    upstream's `redirected_off_posting` were all the SAME failure reaching the
+    same fallthrough. Requiring positive evidence retires that whole class
+    instead of naming its members one at a time, so the next thing upstream
+    learns about costs us a re-fetch rather than a role.
+
+    The bound on holding is the scraper: a held URL never enters scan-history, so
+    it is re-checked only while the search still returns it — a genuinely dead
+    posting drops out of the results on its own."""
     if status in (404, 410):
         return "expired", f"HTTP {status}"
     # Status-based throttle decision comes BEFORE any body/URL inspection: a
@@ -240,6 +331,8 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     # the body here would misread a wall as active (or its emptiness as expired).
     if status in _THROTTLE_STATUSES:
         return "throttled", f"HTTP {status} (rate-limited / sign-in wall)"
+    if status >= _SERVER_ERROR_MIN:
+        return "throttled", f"HTTP {status} ({_R_SERVER_ERROR} — not a removed posting)"
     if _EXPIRED_URL.search(final_url):
         return "expired", f"error redirect: {final_url}"
     for pat in _HARD_EXPIRED:
@@ -247,11 +340,19 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
             return "expired", f"body: {pat.pattern}"
     if any(p.search(body) for p in _APPLY):
         return "active", "apply control visible"
+    # No apply control. Before reading that absence as "gone", rule out a
+    # 200-served anti-bot wall — its body is the challenge, not the posting.
+    for pat in _BOT_CHALLENGE:
+        if pat.search(body):
+            return "throttled", f"{_R_BOT_CHALLENGE}: {pat.pattern}"
     for pat in _LISTING_PAGE:
         if pat.search(body):
             return "expired", f"listing page: {pat.pattern}"
+    # Too short to be a posting AND no apply control — we did not read a page we
+    # can judge. That is not evidence of removal: it is equally an unrecognised
+    # challenge, a JS-rendered shell, or a truncated response. Hold and re-check.
     if len(body.strip()) < _MIN_CONTENT_CHARS:
-        return "expired", "insufficient content"
+        return "throttled", f"{_R_UNREADABLE} (unreadable, not confirmed gone)"
     return "uncertain", "content present, no apply control"
 
 
@@ -311,7 +412,8 @@ def classify_each(items, url_of, *, timeout: int = 8, max_workers: int = 8):
             # uncertain) and a conclusive result returns at once.
             for attempt in range(_THROTTLE_RETRIES + 1):
                 result, reason, body = fetch_and_classify(fetch_url, timeout)
-                if result != "throttled" or attempt == _THROTTLE_RETRIES:
+                retryable = transient_throttle(result, reason)
+                if not retryable or attempt == _THROTTLE_RETRIES:
                     return item, result, reason, body
                 time.sleep(_THROTTLE_BACKOFF * (attempt + 1))
         except Exception as exc:

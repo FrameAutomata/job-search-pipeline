@@ -27,7 +27,11 @@ if (-not (Test-Path $careerOps)) {
 
 Write-Host "==> Installing career-ops node deps"
 Push-Location $careerOps
-npm install
+# --ignore-scripts: career-ops ships a postinstall that runs
+# `npx playwright install chromium --with-deps`. Chromium is installed
+# deliberately below; `--with-deps` is a Linux package-manager step that has
+# nothing to do here.
+npm install --ignore-scripts
 Pop-Location
 
 Write-Host "==> Installing pipeline node deps (yaml, pdf-parse)"

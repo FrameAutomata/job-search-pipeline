@@ -16,6 +16,7 @@ from pathlib import Path
 
 from pipeline._batch_common import parse_date_posted, read_url_set
 from pipeline.rowio import read_rows
+from pipeline.tracker_layout import data_rows
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +36,18 @@ EASY_APPLY_URLS = "data/easy-apply-urls.txt"
 DESCRIPTION_PREVIEW_CHARS = 500
 
 
+def _find_section(text: str, markers: tuple[str, ...]) -> re.Match | None:
+    """The first of `markers` present in `text` as a heading, as a Match — so the
+    caller gets the heading's position from the same scan that found it.
+
+    Matches the heading as a PREFIX of its line, not the whole line: real files
+    carry counts and qualifiers ("## Pendientes (3)", "## Pending URLs"), and
+    requiring an exact line means finding nothing and appending a second pending
+    section — the split queue this lookup exists to avoid."""
+    return next(filter(None, (re.search(rf"^{re.escape(m)}\b.*$", text, re.MULTILINE)
+                              for m in markers)), None)
+
+
 def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     """Walk applications.md once. Return (urls, company::role pairs)."""
     urls: set[str] = set()
@@ -44,27 +57,14 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     # cheap regex the original code used.
     urls.update(re.findall(r"https?://[^\s|)]+", text))
 
-    for line in text.splitlines():
-        if not line.startswith("|"):
+    # Company and Role by name, through the shared walk — career-ops has two
+    # supported layouts and the Via one shifts Role right by one. The UI's parser
+    # uses the same walk, so the two can't disagree about a row's identity.
+    for columns, cols in data_rows(text):
+        company_idx, role_idx = columns.index("company"), columns.index("role")
+        if len(cols) <= role_idx:
             continue
-        # Markdown separator row: |---|---|...
-        if re.match(r"^\|[\s|:\-]+\|?\s*$", line):
-            continue
-        # Strip optional leading/trailing pipes before splitting so empty
-        # columns at the ends don't shift positions.
-        stripped = line.strip()
-        if stripped.startswith("|"):
-            stripped = stripped[1:]
-        if stripped.endswith("|"):
-            stripped = stripped[:-1]
-        cols = [c.strip() for c in stripped.split("|")]
-        # Expected layout: # | Date | Company | Role | URL | Status
-        if len(cols) < 4:
-            continue
-        company, role = cols[2].lower(), cols[3].lower()
-        # Skip header row
-        if company == "company" and role == "role":
-            continue
+        company, role = cols[company_idx].lower(), cols[role_idx].lower()
         if company and role:
             roles.add(f"{company}::{role}")
 
@@ -135,20 +135,24 @@ def append_to_pipeline(career_ops: Path, offers: list[dict]) -> None:
     block = "\n" + "\n".join(format_offer(o) for o in offers) + "\n"
 
     if not pipe.exists():
+        # Fresh file: our own heading. career-ops reads both spellings.
         pipe.write_text(f"# Pipeline\n\n## Pendientes\n{block}\n", encoding="utf-8")
         return
 
     text = pipe.read_text(encoding="utf-8")
-    marker = "## Pendientes"
-    idx = text.find(marker)
-    if idx == -1:
-        proc_idx = text.find("## Procesadas")
-        insert_at = proc_idx if proc_idx != -1 else len(text)
-        new_block = f"\n{marker}\n{block}\n"
-        text = text[:insert_at] + new_block + text[insert_at:]
+    # career-ops writes the pending/processed headings in English now and reads
+    # both spellings (scan.mjs `PENDING_MARKERS`, reconcile-pipeline.mjs
+    # `PENDING_RE`). Match the file's own heading rather than only our Spanish
+    # one: against a pipeline.md that scan.mjs created, looking for "Pendientes"
+    # alone finds nothing and appends a SECOND pending section, splitting the
+    # queue in two. Write ours only when the file has neither.
+    pending = _find_section(text, ("## Pendientes", "## Pending"))
+    if pending is None:
+        processed = _find_section(text, ("## Procesadas", "## Processed"))
+        insert_at = processed.start() if processed else len(text)
+        text = text[:insert_at] + f"\n## Pendientes\n{block}\n" + text[insert_at:]
     else:
-        after = idx + len(marker)
-        next_section = text.find("\n## ", after)
+        next_section = text.find("\n## ", pending.end())
         insert_at = next_section if next_section != -1 else len(text)
         text = text[:insert_at] + block + text[insert_at:]
 

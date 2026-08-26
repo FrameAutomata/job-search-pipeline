@@ -43,6 +43,7 @@ from pipeline._batch_common import (
     atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
 )
 from pipeline.app import data as _data
+from pipeline.tracker_layout import SEPARATOR_RE, split_row
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -446,8 +447,8 @@ def parse_job_log(text: str, known_companies: set[str] | None = None) -> list[Tr
         stripped = line.strip()
 
         # ── Markdown table rows ────────────────────────────────────────────
-        if stripped.startswith("|") and not _data._SEPARATOR_RE.match(stripped):
-            cols = _data._split_row(stripped)
+        if stripped.startswith("|") and not SEPARATOR_RE.match(stripped):
+            cols = split_row(stripped)
             if len(cols) >= 3 and cols[1].lower() != "company":
                 date = _DATE_RE.search(cols[0] or "")
                 date_str = date.group(1) if date else ""

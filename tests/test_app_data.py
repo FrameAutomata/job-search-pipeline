@@ -1,10 +1,20 @@
 """Tests for pipeline/app/data.py — applications.md parsing + report lookup."""
 
+import re
 from pathlib import Path
 
 import pytest
 
+from pipeline import tracker_layout
 from pipeline.app import data
+
+
+def _reset_contract_cache():
+    """Drop both career-ops contract caches — they key on (path, mtime), so a
+    test pointing CAREER_OPS_PATH at a fresh tmp dir must clear them to be seen."""
+    tracker_layout._contract_cache.clear()
+    tracker_layout._dir_cache.clear()
+
 
 
 SAMPLE_APPLICATIONS = """# Applications Tracker
@@ -497,3 +507,246 @@ class TestEasyApplyTag:
     def test_missing_file_all_false(self, tmp_path):
         apps = self._write(tmp_path, urls=None)
         assert all(r["easy_apply"] is False for r in data.parse_applications(apps))
+
+
+class TestReportLinkNormalization:
+    """merge-tracker.mjs now rewrites the Report link relative to the tracker
+    FILE, and the pipeline seeds the tracker at career-ops/data/applications.md
+    — so a link written as `reports/042-x.md` comes back as `../reports/042-x.md`.
+    Consumers resolve `report_path` as `career_ops / report_path`, which the
+    ascent escapes; `read_text` returns "" on the miss, so tailoring and cover
+    letters silently drop the evaluation report's proof points. Both shapes
+    coexist in one file, since the older merge-tracker copied the cell verbatim."""
+
+    def _tracker(self, tmp_path, link):
+        p = tmp_path / "applications.md"
+        p.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            f"| 1 | 2026-08-25 | Acme | SWE | 4.5/5 | Evaluated | null | {link} | n |\n",
+            encoding="utf-8")
+        return p
+
+    def test_ascent_is_stripped(self, tmp_path):
+        row = data.parse_applications(
+            self._tracker(tmp_path, "[001](../reports/001-acme.md)"))[0]
+        assert row["report_path"] == "reports/001-acme.md"
+        assert row["report_num"] == "001"
+
+    def test_plain_path_unchanged(self, tmp_path):
+        row = data.parse_applications(
+            self._tracker(tmp_path, "[001](reports/001-acme.md)"))[0]
+        assert row["report_path"] == "reports/001-acme.md"
+
+    def test_resolves_under_career_ops(self, tmp_path):
+        """The property that actually matters to the three consumers."""
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "reports").mkdir(parents=True)
+        (career_ops / "reports" / "001-acme.md").write_text("body", encoding="utf-8")
+        row = data.parse_applications(
+            self._tracker(tmp_path, "[001](../reports/001-acme.md)"))[0]
+        assert (career_ops / row["report_path"]).exists()
+
+
+class TestViaColumnLayout:
+    """career-ops supports an optional `Via` column (the agency a role comes
+    through) after Company, migrated in with `merge-tracker.mjs --migrate-via`.
+    Read positionally, the extra cell puts the agency where Role should be — and
+    company::role is the key bridge dedup, handoff's role_key, the résumé-base
+    picker and the tailored role all run on."""
+
+    VIA = (
+        "| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+        "|---|---|---|---|---|---|---|---|---|---|\n"
+        "| 1 | 2026-08-25 | Acme Corp | Robert Half | Senior Software Engineer "
+        "| 4.5/5 | Applied | null | [001](../reports/001-a.md) | fintech |\n"
+    )
+
+    def test_role_is_the_role_not_the_agency(self, tmp_path):
+        p = tmp_path / "applications.md"; p.write_text(self.VIA, encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert row["company"] == "Acme Corp"
+        assert row["role"] == "Senior Software Engineer"
+        assert row["via"] == "Robert Half"
+
+    def test_remaining_columns_still_land(self, tmp_path):
+        p = tmp_path / "applications.md"; p.write_text(self.VIA, encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert row["score"] == "4.5/5"
+        assert row["status_canonical"] == "Applied"
+        assert row["report_num"] == "001"
+        assert row["notes"] == "fintech"
+
+    def test_identity_lookup_reads_the_role_column(self, tmp_path):
+        assert data.resolve_num_by_identity(
+            self.VIA, "Acme Corp", "Senior Software Engineer") == "1"
+
+    def test_canonical_layout_is_unaffected(self, tmp_path):
+        p = tmp_path / "applications.md"
+        p.write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            "| 7 | 2026-08-25 | Initech | SRE | 4.0/5 | Evaluada | null "
+            "| [007](reports/007-i.md) | x |\n", encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert (row["company"], row["role"]) == ("Initech", "SRE")
+        assert row["status_canonical"] == "Evaluated"
+
+
+class TestHiredStatus:
+    """`Hired` is career-ops' 9th canonical state. An unrecognized status is not
+    inert in the UI: the board falls back to Evaluated, so a landed job rendered
+    in the Evaluated column and the report pane pre-selected Evaluated for it."""
+
+    def test_hired_is_canonical(self):
+        assert "Hired" in data.CANONICAL_STATES
+        assert data.canonical_status("Hired") == "Hired"
+
+    @pytest.mark.parametrize("alias,expected", [
+        ("accepted", "Hired"), ("contratado", "Hired"),
+        ("geo blocker", "SKIP"), ("reddedildi", "Rejected"),
+        ("mülakat", "Interview"), ("teklif", "Offer"),
+        ("evaluada", "Evaluated"),
+    ])
+    def test_states_yml_aliases(self, alias, expected):
+        assert data.canonical_status(alias) == expected
+
+    @staticmethod
+    def _js_list(name):
+        js = (Path(__file__).resolve().parent.parent
+              / "pipeline" / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        line = next(l for l in js.splitlines()
+                    if l.startswith(f"const {name}") or l.startswith(f"let {name}"))
+        return re.findall(r'"([^"]+)"', line)
+
+    def test_js_seed_matches_the_python_fallback(self):
+        """app.js's STATES is a first-paint SEED — /api/capabilities replaces it
+        at boot from career-ops' states.yml, so a new upstream state no longer
+        needs a code change. The seed must still match the Python fallback, or
+        the pre-boot board and the server disagree about what is draggable."""
+        assert self._js_list("STATES") == data.CANONICAL_STATES
+
+    def test_states_are_read_from_career_ops(self, tmp_path, monkeypatch):
+        """The vocabulary comes from the file career-ops ships, not a copy."""
+        (tmp_path / "templates").mkdir()
+        (tmp_path / "templates" / "states.yml").write_text(
+            "states:\n"
+            "  - id: evaluated\n    label: Evaluated\n    aliases: [evaluada]\n"
+            "  - id: shortlisted\n    label: Shortlisted\n    aliases: [preseleccionado]\n",
+            encoding="utf-8")
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path))
+        _reset_contract_cache()
+        try:
+            states = data.canonical_states()
+            # Upstream's labels lead...
+            assert states[:2] == ["Evaluated", "Shortlisted"]
+            assert data.canonical_status("preseleccionado") == "Shortlisted"
+            # ...but ours survive underneath. canonical_status can still return a
+            # baked label through a baked alias, and every consumer comparing
+            # against a literal ("Evaluated" in handoff, "Discarded" in the push)
+            # would otherwise be testing against a vocabulary this list no longer
+            # contains — server.py would 400 the status handoff itself writes.
+            assert set(data.CANONICAL_STATES) <= set(states)
+            assert data.canonical_status("monitor") in states
+        finally:
+            _reset_contract_cache()
+
+    def test_unreadable_states_file_falls_back(self, tmp_path, monkeypatch):
+        """career-ops is not always present — `run-ui.sh --data` points the UI at
+        an extracted artifact with no checkout. A missing or malformed file must
+        leave the baked vocabulary in force, never an empty one."""
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "nope"))
+        _reset_contract_cache()
+        try:
+            assert data.canonical_states() == data.CANONICAL_STATES
+            assert data.canonical_status("Hired") == "Hired"
+        finally:
+            _reset_contract_cache()
+
+    def test_actioned_statuses_are_all_canonical(self):
+        """The hide-by-default set is UI policy, not a mirror — it deliberately
+        omits Offer, which career-ops marks terminal but which still needs
+        action here. It must still name only states that exist, or it silently
+        hides nothing."""
+        assert set(self._js_list("ACTIONED_STATUSES")) <= set(data.CANONICAL_STATES)
+
+
+class TestLayoutEdgeCases:
+    """Cases the header-mapping rule got wrong when it first landed."""
+
+    VIA_HEADER = ("| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+                  "|---|---|---|---|---|---|---|---|---|---|\n"
+                  "| 1 | 2026-08-25 | Acme | Robert Half | SWE | 4.5/5 | Applied | null "
+                  "| [1](reports/1.md) | x |\n")
+
+    def test_header_found_below_an_unrelated_table(self, tmp_path):
+        """A tracker file may open with some other table. Judging only the first
+        table row met there falls back to the positional order, which against a
+        Via layout is the off-by-one the mapping exists to prevent."""
+        p = tmp_path / "applications.md"
+        p.write_text("# Tracker\n\n| Legend | Meaning |\n|---|---|\n| OK | done |\n\n"
+                     + self.VIA_HEADER, encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert (row["company"], row["role"]) == ("Acme", "SWE")
+
+    def test_layout_without_a_report_column_does_not_crash(self, tmp_path):
+        """detect_columns requires only num/company/role/score/status (career-ops'
+        own set), so a Report-less header is reachable — and _realign_cells
+        anchors on the Report cell. It must decline, not raise: the exception
+        took the whole parse down, blanking the UI board."""
+        p = tmp_path / "applications.md"
+        p.write_text("| # | Date | Company | Role | Score | Status |\n|---|---|---|---|---|---|\n"
+                     "| 1 | 2026-08-25 | Acme | Eng | Manager | 4.0/5 | Evaluated |\n",
+                     encoding="utf-8")
+        assert len(data.parse_applications(p)) == 1
+
+    def test_reconcile_emits_rows_in_the_cloud_layout(self):
+        """Local-only rows are appended to the CLOUD tracker, so they must match
+        its width. A canonical 9-cell row in a 10-column Via table is short, and
+        the next parse drops it — losing the offline evaluation entirely."""
+        cloud = self.VIA_HEADER
+        local = cloud + ("| 2 | 2026-08-25 | Initech | — | SRE | 4.0/5 | Evaluated | null "
+                         "| [2](reports/2.md) | y |\n")
+        merged, _ = data.reconcile_trackers(cloud, local, set(), set())
+        rows = data.parse_applications_text(merged)
+        assert [r["role"] for r in rows] == ["SWE", "SRE"]
+
+    def test_identity_lookup_returns_the_num_column(self):
+        """The returned value is dispatched to edit-tracker.yml as the cloud row
+        key, and detect_columns imposes no column ORDER — so cell 0 is not
+        necessarily `#`."""
+        md = ("| Date | # | Company | Role | Score | Status | Report |\n"
+              "|---|---|---|---|---|---|---|\n"
+              "| 2026-08-25 | 7 | Acme | SWE | 4.5/5 | Applied | [7](reports/7.md) |\n")
+        assert data.resolve_num_by_identity(md, "Acme", "SWE") == "7"
+
+
+class TestHeaderAliasesComeFromCareerOps:
+    """The alias table ships as data (tracker-aliases.json). A hand mirror of it
+    was wrong the day it was written — missing `location` and `materials`, and
+    inventing Spanish spellings career-ops never emits."""
+
+    def test_aliases_are_read_from_the_checkout(self, tmp_path, monkeypatch):
+        (tmp_path / "tracker-aliases.json").write_text(
+            '{"#": "num", "company": "company", "puesto": "role", '
+            '"score": "score", "estado": "status", "materials": "pdf"}',
+            encoding="utf-8")
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path))
+        _reset_contract_cache()
+        try:
+            aliases = tracker_layout.header_aliases()
+            assert aliases["materials"] == "pdf"
+            assert aliases["puesto"] == "role"
+            # Ours survives the union — the pipeline writes a url column
+            # upstream has no reason to name.
+            assert aliases["report"] == "report"
+        finally:
+            _reset_contract_cache()
+
+    def test_missing_checkout_falls_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "nope"))
+        _reset_contract_cache()
+        try:
+            assert tracker_layout.header_aliases()["#"] == "num"
+        finally:
+            _reset_contract_cache()
