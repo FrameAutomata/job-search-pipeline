@@ -281,7 +281,7 @@ The repo ships two scheduled workflows + four manual (`workflow_dispatch`) ones,
 | `seed-reports.yml` | Manual (`workflow_dispatch`) | The mirror: repairs the cache's `reports/` from past artifacts. Writes to the state cache — don't run it while a pipeline is in flight. |
 | `update-from-template.yml` | Manual (`workflow_dispatch`) | Merges the upstream template's latest `main` into your copy. |
 
-All runtime state (scan-history, applications.md, pipeline.md, batch state, and the accumulated `reports/`) lives in `actions/cache@v4`. Each run additionally uploads **its own** new reports plus the current tracker as an `actions/upload-artifact@v4` (7-day retention) — a per-run delta, not the whole history, so artifact storage stays bounded however long the pipeline has been running. To pull the whole history down once (new machine, or a long gap between Refreshes), run **Export Reports**. No user data is ever committed.
+All runtime state (scan-history, applications.md, pipeline.md, batch state, and the accumulated `reports/`) lives in `actions/cache`. Each run additionally uploads **its own** new reports plus the current tracker as an `actions/upload-artifact` (7-day retention) — a per-run delta, not the whole history, so artifact storage stays bounded however long the pipeline has been running. To pull the whole history down once (new machine, or a long gap between Refreshes), run **Export Reports**. No user data is ever committed.
 
 ---
 

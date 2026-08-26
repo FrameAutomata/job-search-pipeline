@@ -87,17 +87,32 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
+      # `node-version: 24`, not the 20 this pinned before. Node 20 is EOL, and
+      # this is the runtime career-ops' merge-tracker.mjs runs under here — so
+      # it tracks flake.nix's `nodejs_24`, and the cloud runs that script on the
+      # same major the dev shell does. (The "Node.js 20+" floor in README is
+      # about the user's own machine, is a different question, and is unchanged:
+      # 24 satisfies it.) Node 20 is also absent from the runner's tool cache,
+      # which 24 is in, so this stops paying for a tarball download every run.
+      #
+      # `package-manager-cache: false`: setup-node v5 turned caching ON by
+      # default when package.json names a package manager. Ours names none, so
+      # this is a no-op today — it is pinned off so that adding a
+      # `packageManager` field later can't silently start caching npm deps this
+      # job never installs (it only ever runs `npm install --prefix career-ops`,
+      # below).
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
+          package-manager-cache: false
 
       - name: Install Python deps
         run: |
@@ -179,7 +194,7 @@ jobs:
       # next run picks it up via the prefix.
       - name: Restore pipeline state cache
         id: cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             career-ops/data/scan-history.tsv
@@ -233,7 +248,7 @@ jobs:
 
       - name: Save pipeline state cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             career-ops/data/scan-history.tsv
@@ -292,7 +307,7 @@ jobs:
 
       - name: Upload this run's reports and tracker artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pipeline-output-${{ github.run_id }}
           path: ${{ runner.temp }}/pipeline-artifact

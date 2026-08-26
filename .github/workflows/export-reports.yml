@@ -72,7 +72,7 @@ jobs:
       # Restore only — no matching save step, so this cannot race a pipeline run
       # the way seed-reports.yml's save can.
       - name: Restore pipeline state cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             career-ops/data/applications.md
@@ -91,7 +91,7 @@ jobs:
           fi
 
       - name: Upload the full report history
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reports-export-${{ github.run_id }}
           path: career-ops
