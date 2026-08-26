@@ -10,8 +10,11 @@ let selectedNum = null;
 let view = "table"; // "table" | "board"
 let pending = 0;
 
-// Canonical kanban columns — mirror of data.CANONICAL_STATES.
-const STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP", "Hired"];
+// Kanban columns. Seeded for first paint, then REPLACED by the server's list at
+// boot (/api/capabilities), which career-ops' templates/states.yml owns. Editing
+// this array is not how a new upstream state reaches the board — it arrives on
+// its own. The seed only has to carry the app until loadCaps() returns.
+let STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP", "Hired"];
 
 // Statuses hidden by default: terminal/actioned states where no further action is needed.
 const ACTIONED_STATUSES = new Set(["Applied", "Rejected", "Discarded", "SKIP", "Hired"]);
@@ -307,14 +310,20 @@ els.reportClose.addEventListener("click", () => {
 els.viewTable.addEventListener("click", () => { view = "table"; render(); });
 els.viewBoard.addEventListener("click", () => { view = "board"; render(); });
 
-// Populate the report-pane status select once, then wire its change event to
-// the same persistence path the kanban uses (optimistic update + pending push).
-for (const s of STATES) {
-  const opt = document.createElement("option");
-  opt.value = s;
-  opt.textContent = s;
-  els.reportStatus.appendChild(opt);
+// Populate the report-pane status select, then wire its change event to the
+// same persistence path the kanban uses (optimistic update + pending push).
+// Rebuilt when the server's state list lands, so the picker can't offer a
+// status /api/status would 400 — or omit one the tracker already uses.
+function buildStatusOptions() {
+  els.reportStatus.innerHTML = "";
+  for (const s of STATES) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    els.reportStatus.appendChild(opt);
+  }
 }
+buildStatusOptions();
 els.reportStatus.addEventListener("change", () => {
   if (!selectedJob) return;
   const newStatus = els.reportStatus.value;
@@ -825,6 +834,11 @@ let currentSkill = null;  // last skill run; used by Run-in-terminal's relaunch.
 async function loadCaps() {
   try {
     CAPS = await (await fetch("/api/capabilities")).json();
+    if (Array.isArray(CAPS.states) && CAPS.states.length) {
+      STATES = CAPS.states;
+      buildStatusOptions();
+      render();
+    }
   } catch { /* leave defaults; buttons explain the no-capability case */ }
   renderSkillActions();
 }

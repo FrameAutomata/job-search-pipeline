@@ -259,10 +259,11 @@ def set_status(change: StatusChange) -> JSONResponse:
     """Record a pending status change (from a kanban drag). Doesn't touch any
     file or the cloud yet — that happens on push. Validates against the
     canonical states so a typo can't poison the tracker."""
-    if change.status not in data.CANONICAL_STATES:
+    states = data.canonical_states()
+    if change.status not in states:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown status {change.status!r}. Valid: {', '.join(data.CANONICAL_STATES)}",
+            detail=f"Unknown status {change.status!r}. Valid: {', '.join(states)}",
         )
     # Through the locked read/modify/write accessor so a concurrent push or
     # recheck discard can't lose this drag (or be lost by it).
@@ -743,7 +744,10 @@ def capabilities() -> JSONResponse:
     """Report which skill execution paths are available (agent CLI / API key),
     the user's preferred default, and the skill catalog, so the UI can render
     actions and route or prompt per skill."""
-    return JSONResponse(skills.capabilities())
+    # The status vocabulary rides along: the SPA keeps its own STATES list for
+    # first paint, and career-ops adding a 10th state must not require editing
+    # it. Board columns and the report pane's picker use this when it arrives.
+    return JSONResponse({**skills.capabilities(), "states": data.canonical_states()})
 
 
 @app.post("/api/skills/run")

@@ -170,9 +170,13 @@ class TestClassifyLiveness:
         result, reason = classify_liveness(200, "https://example.com", body)
         assert result == "active"
 
-    def test_short_body_expired(self):
+    def test_short_body_is_held_not_expired(self):
+        """`expired` requires positive evidence that the posting is GONE. A body
+        too short to judge is unread, not removed — it is equally an unrecognised
+        challenge, a JS shell, or a truncated response, and `expired` would write
+        it to scan-history as permanently dead."""
         result, reason = classify_liveness(200, "https://example.com", "Short page")
-        assert result == "expired"
+        assert result == "throttled"
         assert "insufficient content" in reason
 
     def test_content_without_apply_uncertain(self):
@@ -1240,3 +1244,38 @@ class TestThrottleRetryScope:
         """Derived, so the two can't drift apart."""
         import pipeline.screen as screen_mod
         assert len(screen_mod._RETRYABLE_REASONS) == len(screen_mod._THROTTLE_STATUSES)
+
+
+class TestExpiredRequiresPositiveEvidence:
+    """The invariant, not its instances: `expired` is the only verdict that
+    writes `screened-dead` — permanent, never re-checked — so it must be
+    reachable ONLY from a signal that says the posting is gone. Everything else
+    resolves non-fatally. Guards the rule so the next ported case can't quietly
+    re-open the fallthrough that 5xx, bot walls and redirect-off-posting all
+    reached."""
+
+    KILLS = {
+        "404": (404, "https://x/j/1", ""),
+        "410": (410, "https://x/j/1", ""),
+        "error redirect": (200, "https://x/jobs?error=true", "x" * 400),
+        "closure banner": (200, "https://x/j/1", "x " * 200 + "This job is no longer available"),
+        "listing page": (200, "https://x/j/1", "x " * 200 + "42 jobs found"),
+    }
+    SPARES = {
+        "live JD": (200, "https://x/j/1", "Great role. " * 40 + "<button>Apply</button>"),
+        "rate limiter": (429, "https://x/j/1", ""),
+        "server error": (502, "https://x/j/1", "<html>502 Bad Gateway</html>"),
+        "bot challenge": (200, "https://x/j/1",
+                          "<title>Just a moment...</title>Ray ID: 8f2a1b3c9d0e"),
+        "unreadable body": (200, "https://x/j/1", "<html></html>"),
+        "no apply control": (200, "https://x/j/1", "This is a job listing. " * 30),
+    }
+
+    @pytest.mark.parametrize("name", list(KILLS))
+    def test_positive_evidence_expires(self, name):
+        assert classify_liveness(*self.KILLS[name])[0] == "expired"
+
+    @pytest.mark.parametrize("name", list(SPARES))
+    def test_everything_else_is_non_fatal(self, name):
+        verdict = classify_liveness(*self.SPARES[name])[0]
+        assert verdict != "expired", f"{name} would be recorded permanently dead"

@@ -33,28 +33,74 @@ merge-seeded file and a hand-written one both keep working. It never guesses a
 rather than half-applied.
 """
 
+import json
+import os
 import re
+from pathlib import Path
 
 # The canonical layout, and the fallback for a table with no readable header.
 CANONICAL_COLUMNS = [
     "num", "date", "company", "role", "score", "status", "pdf", "report", "notes",
 ]
 
-# Header labels -> our column keys. Mirrors career-ops' tracker-aliases.json;
-# the Spanish spellings are the ones its localized modes emit.
-HEADER_ALIASES = {
-    "#": "num", "num": "num", "n": "num",
-    "date": "date", "fecha": "date",
-    "company": "company", "empresa": "company",
+# career-ops ships the alias table as DATA — tracker-aliases.json, which it calls
+# "the ONE shared table" and loads from both its Node and web readers. So read
+# it rather than keeping a copy: a hand-mirror of a file sitting on disk is
+# wrong the day it is written. This one was. It shipped missing seven aliases
+# career-ops actually emits (`location`, `materials`, `apply link`, the
+# follow-up spellings) and inventing eight Spanish ones it never emits.
+#
+# The baked map below is the FALLBACK, not the source: career-ops is not always
+# present (`run-ui.sh --data` points the UI at an extracted artifact with no
+# checkout), and a missing alias table must degrade to "read the canonical
+# layout positionally", never to a crash.
+_FALLBACK_ALIASES = {
+    "#": "num", "num": "num",
+    "date": "date",
+    "company": "company",
     "via": "via",
-    "role": "role", "puesto": "role", "rol": "role",
-    "score": "score", "puntuacion": "score", "puntuación": "score",
-    "status": "status", "estado": "status",
+    "role": "role",
+    "score": "score",
+    "status": "status",
     "pdf": "pdf",
-    "report": "report", "informe": "report",
-    "notes": "notes", "notas": "notes",
-    "url": "url",
+    "report": "report",
+    "notes": "notes",
 }
+
+_ALIAS_FILE = "tracker-aliases.json"
+_alias_cache: dict = {}
+
+
+def career_ops_dir() -> Path:
+    """The career-ops tree: CAREER_OPS_PATH, else the bundled ./career-ops."""
+    return Path(os.environ.get("CAREER_OPS_PATH") or
+                Path(__file__).resolve().parent.parent / "career-ops")
+
+
+def header_aliases() -> dict:
+    """career-ops' alias table when its checkout is readable, else the fallback.
+
+    Cached per (path, mtime) so a long-running UI picks up a career-ops update
+    without a restart, at the cost of one stat per parse."""
+    path = career_ops_dir() / _ALIAS_FILE
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return _FALLBACK_ALIASES
+    if _alias_cache.get("key") != key:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return _FALLBACK_ALIASES
+        if not isinstance(loaded, dict):
+            return _FALLBACK_ALIASES
+        # Union, not replacement: upstream's table is authoritative for what it
+        # covers, and ours keeps `url`, which the pipeline writes and upstream
+        # has no reason to name.
+        merged = {**_FALLBACK_ALIASES,
+                  **{str(k).lower(): str(v) for k, v in loaded.items()}}
+        _alias_cache.update(key=key, aliases=merged)
+    return _alias_cache["aliases"]
 
 # Columns a header must resolve before we will map by name. Deliberately the
 # same set as career-ops' REQUIRED_HEADER_FIELDS (tracker-parse.mjs): a row
@@ -84,9 +130,9 @@ def detect_columns(cells: list[str]) -> list[str] | None:
 
     An unrecognized header keeps its own lowercased label, so its slot still
     lines up for every column after it."""
-    keys = [HEADER_ALIASES.get(c.replace("*", "").strip().lower(),
-                               c.replace("*", "").strip().lower())
-            for c in cells]
+    aliases = header_aliases()
+    labels = [c.replace("*", "").strip().lower() for c in cells]
+    keys = [aliases.get(label, label) for label in labels]
     if not all(k in keys for k in _ESSENTIAL):
         return None
     return keys

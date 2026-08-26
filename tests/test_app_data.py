@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from pipeline import tracker_layout
 from pipeline.app import data
 
 
@@ -606,15 +607,44 @@ class TestHiredStatus:
     def _js_list(name):
         js = (Path(__file__).resolve().parent.parent
               / "pipeline" / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        line = next(l for l in js.splitlines() if l.startswith(f"const {name}"))
+        line = next(l for l in js.splitlines()
+                    if l.startswith(f"const {name}") or l.startswith(f"let {name}"))
         return re.findall(r'"([^"]+)"', line)
 
-    def test_kanban_mirror_is_in_sync(self):
-        """app.js keeps its own copy of the column list; drift between the two
-        put a Hired row in the Evaluated column. Checked BOTH ways: a state only
-        in app.js passes a Python-to-JS check, and then server.py 400s every
-        drag into that column because it validates against CANONICAL_STATES."""
+    def test_js_seed_matches_the_python_fallback(self):
+        """app.js's STATES is a first-paint SEED — /api/capabilities replaces it
+        at boot from career-ops' states.yml, so a new upstream state no longer
+        needs a code change. The seed must still match the Python fallback, or
+        the pre-boot board and the server disagree about what is draggable."""
         assert self._js_list("STATES") == data.CANONICAL_STATES
+
+    def test_states_are_read_from_career_ops(self, tmp_path, monkeypatch):
+        """The vocabulary comes from the file career-ops ships, not a copy."""
+        (tmp_path / "templates").mkdir()
+        (tmp_path / "templates" / "states.yml").write_text(
+            "states:\n"
+            "  - id: evaluated\n    label: Evaluated\n    aliases: [evaluada]\n"
+            "  - id: shortlisted\n    label: Shortlisted\n    aliases: [preseleccionado]\n",
+            encoding="utf-8")
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path))
+        data._states_cache.clear()
+        try:
+            assert data.canonical_states() == ["Evaluated", "Shortlisted"]
+            assert data.canonical_status("preseleccionado") == "Shortlisted"
+        finally:
+            data._states_cache.clear()
+
+    def test_unreadable_states_file_falls_back(self, tmp_path, monkeypatch):
+        """career-ops is not always present — `run-ui.sh --data` points the UI at
+        an extracted artifact with no checkout. A missing or malformed file must
+        leave the baked vocabulary in force, never an empty one."""
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "nope"))
+        data._states_cache.clear()
+        try:
+            assert data.canonical_states() == data.CANONICAL_STATES
+            assert data.canonical_status("Hired") == "Hired"
+        finally:
+            data._states_cache.clear()
 
     def test_actioned_statuses_are_all_canonical(self):
         """The hide-by-default set is UI policy, not a mirror — it deliberately
@@ -672,3 +702,34 @@ class TestLayoutEdgeCases:
               "|---|---|---|---|---|---|---|\n"
               "| 2026-08-25 | 7 | Acme | SWE | 4.5/5 | Applied | [7](reports/7.md) |\n")
         assert data.resolve_num_by_identity(md, "Acme", "SWE") == "7"
+
+
+class TestHeaderAliasesComeFromCareerOps:
+    """The alias table ships as data (tracker-aliases.json). A hand mirror of it
+    was wrong the day it was written — missing `location` and `materials`, and
+    inventing Spanish spellings career-ops never emits."""
+
+    def test_aliases_are_read_from_the_checkout(self, tmp_path, monkeypatch):
+        (tmp_path / "tracker-aliases.json").write_text(
+            '{"#": "num", "company": "company", "puesto": "role", '
+            '"score": "score", "estado": "status", "materials": "pdf"}',
+            encoding="utf-8")
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path))
+        tracker_layout._alias_cache.clear()
+        try:
+            aliases = tracker_layout.header_aliases()
+            assert aliases["materials"] == "pdf"
+            assert aliases["puesto"] == "role"
+            # Ours survives the union — the pipeline writes a url column
+            # upstream has no reason to name.
+            assert aliases["report"] == "report"
+        finally:
+            tracker_layout._alias_cache.clear()
+
+    def test_missing_checkout_falls_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "nope"))
+        tracker_layout._alias_cache.clear()
+        try:
+            assert tracker_layout.header_aliases()["#"] == "num"
+        finally:
+            tracker_layout._alias_cache.clear()

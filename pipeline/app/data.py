@@ -17,6 +17,7 @@ from pipeline._batch_common import (
     read_url_set,
     score_value,
 )
+from pipeline import tracker_layout
 from pipeline.tracker_layout import (
     CANONICAL_COLUMNS,
     SEPARATOR_RE as _SEPARATOR_RE,
@@ -313,15 +314,70 @@ _STATUS_ALIASES = {
 }
 
 
+# career-ops ships the status vocabulary as DATA — templates/states.yml, which
+# it calls the source of truth for "career-ops (writer) and dashboard (reader)".
+# Read it rather than keeping a copy: the constant above went stale the moment
+# upstream added `Hired`, and an unknown status is not inert — the board falls
+# back to Evaluated, so a landed job rendered in the wrong column and the report
+# pane was one save away from downgrading it.
+#
+# The constants above are the FALLBACK, not the source. career-ops is not always
+# present (`run-ui.sh --data` points the UI at an extracted artifact with no
+# checkout), and pyyaml — though a core requirement — is imported lazily so a
+# UI-only install missing it degrades to the baked list instead of failing to
+# start.
+_STATES_FILE = Path("templates") / "states.yml"
+_states_cache: dict = {}
+
+
+def _load_states() -> tuple[list[str], dict]:
+    """(labels, alias->label) from career-ops' states.yml, else the baked pair.
+
+    Cached per (path, mtime), so a career-ops update lands without a restart."""
+    path = tracker_layout.career_ops_dir() / _STATES_FILE
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return CANONICAL_STATES, _STATUS_ALIASES
+    if _states_cache.get("key") != key:
+        try:
+            import yaml
+            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            entries = doc.get("states") or []
+            labels = [str(e["label"]) for e in entries if e.get("label")]
+            aliases = {}
+            for e in entries:
+                label = str(e.get("label") or "")
+                for alias in (e.get("aliases") or []):
+                    aliases[str(alias).strip().lower()] = label
+            if not labels:
+                raise ValueError("no states")
+        except Exception:
+            # Any unreadable shape (absent pyyaml, malformed yaml, a schema
+            # change) falls back rather than leaving the UI with no vocabulary.
+            return CANONICAL_STATES, _STATUS_ALIASES
+        # Union with ours: upstream owns the vocabulary, but our alias map
+        # carries spellings its own file does not (merge-tracker's variants).
+        _states_cache.update(key=key, labels=labels,
+                             aliases={**_STATUS_ALIASES, **aliases})
+    return _states_cache["labels"], _states_cache["aliases"]
+
+
+def canonical_states() -> list[str]:
+    """The status vocabulary in force — career-ops' when readable, else ours."""
+    return _load_states()[0]
+
+
 def canonical_status(raw: str) -> str:
     """Map a raw status string to its canonical state. Unknown values pass
     through unchanged (so we never silently drop a status we don't recognize)."""
     clean = (raw or "").replace("*", "").strip()
     lower = clean.lower()
-    for s in CANONICAL_STATES:
+    states, aliases = _load_states()
+    for s in states:
         if s.lower() == lower:
             return s
-    return _STATUS_ALIASES.get(lower, clean)
+    return aliases.get(lower, clean)
 
 # Canonical applications.md column order (see career-ops AGENTS.md):
 #   | # | Date | Company | Role | Score | Status | PDF | Report | Notes |
@@ -406,7 +462,7 @@ def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[s
             status = next(
                 (v for v in before
                  if not _SCORE_CELL_RE.match(v)
-                 and canonical_status(v) in CANONICAL_STATES),
+                 and canonical_status(v) in canonical_states()),
                 "Evaluated",      # safe default — batch rows always start here
             )
             # Rebuild the middle from the table's OWN column names, so a layout

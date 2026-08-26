@@ -276,7 +276,26 @@ def extract_description(html_body: str) -> str:
 def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]:
     """Return (result, reason): result is 'active', 'expired', 'throttled', or
     'uncertain'. `throttled` is a rate-limit/sign-in wall we couldn't read —
-    distinct from a confirmed-gone `expired` and from a transient `uncertain`."""
+    distinct from a confirmed-gone `expired` and from a transient `uncertain`.
+
+    **`expired` requires positive evidence.** Only a signal that says the posting
+    is GONE may produce it — a 404/410, an error redirect, a closure banner, or a
+    listing page we landed on instead of the posting. Everything else, including
+    a body too short to read, resolves to a non-fatal verdict.
+
+    That asymmetry is the whole design, because the two errors do not cost the
+    same: a wrong `throttled` costs one re-fetch next run, while a wrong
+    `expired` writes `screened-dead` into scan-history and deletes a live job
+    from every future run, permanently. This module is a hand port of career-ops'
+    liveness-core.mjs and it drifts every release — 5xx, 200-served bot walls and
+    upstream's `redirected_off_posting` were all the SAME failure reaching the
+    same fallthrough. Requiring positive evidence retires that whole class
+    instead of naming its members one at a time, so the next thing upstream
+    learns about costs us a re-fetch rather than a role.
+
+    The bound on holding is the scraper: a held URL never enters scan-history, so
+    it is re-checked only while the search still returns it — a genuinely dead
+    posting drops out of the results on its own."""
     if status in (404, 410):
         return "expired", f"HTTP {status}"
     # Status-based throttle decision comes BEFORE any body/URL inspection: a
@@ -301,8 +320,11 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     for pat in _LISTING_PAGE:
         if pat.search(body):
             return "expired", f"listing page: {pat.pattern}"
+    # Too short to be a posting AND no apply control — we did not read a page we
+    # can judge. That is not evidence of removal: it is equally an unrecognised
+    # challenge, a JS-rendered shell, or a truncated response. Hold and re-check.
     if len(body.strip()) < _MIN_CONTENT_CHARS:
-        return "expired", "insufficient content"
+        return "throttled", "insufficient content (unreadable, not confirmed gone)"
     return "uncertain", "content present, no apply control"
 
 
