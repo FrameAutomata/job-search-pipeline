@@ -1,15 +1,23 @@
 name: Seed Reports Cache
 
 # Manual one-shot to backfill `career-ops/reports` in the pipeline state cache
-# with every report from past `pipeline-output-*` artifacts. Run this once
-# after enabling reports-in-cache if you have older reports that never made
-# it into the cache — they exist only in 90-day-retention artifacts until
-# this workflow merges them in. After running, every future pipeline artifact
-# will contain the full accumulated history, not just that run's new reports.
+# from past `pipeline-output-*` artifacts. Run it if reports exist only in
+# artifacts and never made it into the cache — the cache is what every later
+# run restores from, so a report missing there is missing from the pipeline's
+# view of its own history.
 #
 # Triggers no scrape/evaluate/LLM work. Pure data move: list past successful
 # pipeline runs, download each one's `pipeline-output-*` artifact, copy any
 # `*.md` files under `reports/` into the cached `career-ops/reports/`, save.
+#
+# What this can recover shrank on purpose (issue #129). Each artifact used to
+# carry the whole report history, so ONE of them re-seeded everything; now each
+# carries only the reports its own run minted, and retention keeps a week of
+# them. The union of the live artifacts is therefore about a week of reports,
+# not all of it. That is the trade that stops artifact storage growing without
+# bound, and it costs nothing that matters: the cache is the durable cloud copy
+# and your local `career-ops/` is the durable local one — this workflow is for
+# repairing the cache, not for being the backup.
 #
 # WARNING — concurrency:
 #   This writes to the same `pipeline-state-v1-*` cache that the scheduled

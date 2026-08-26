@@ -1,0 +1,167 @@
+name: GC Actions Storage
+
+# Weekly garbage collection for the two things that consume the ACCOUNT's
+# Actions storage quota: artifacts and workflow run logs.
+#
+# Why it exists (issue #129). The quota filled up, and an exhausted storage
+# quota stops GitHub creating workflow runs AT ALL — so the Tests workflow
+# silently stopped running on pull requests while its own file was perfectly
+# fine. Nothing in the Actions UI connects the two, which is what made it
+# expensive to diagnose.
+#
+# Three things now bound that storage, and each covers what the others cannot:
+#   1. daily-pipeline.yml uploads only what a run PRODUCED, not the whole
+#      restored report history (see its staging step) — bounds artifact SIZE.
+#   2. `retention-days: 7` on every upload — bounds how many are ALIVE.
+#      tests/test_workflow_artifacts.py keeps that true for new uploads.
+#   3. This workflow — belt-and-braces for artifacts that retention misses
+#      (anything uploaded before the ceiling landed, or by hand), and the only
+#      thing that touches RUN LOGS, which retention does not cover at all and
+#      which hundreds of runs of history quietly accumulate.
+#
+# Skipped in the upstream template repo so scheduled triggers consume zero
+# minutes there. Unlike daily-pipeline.yml there is no private-repo hard-stop:
+# that guard exists because RUNNING the pipeline exposes job-search activity in
+# a public repo's run history, and pruning your own storage exposes nothing. A
+# weekly workflow that fails by design would just be a red X every Sunday.
+
+on:
+  schedule:
+    - cron: '30 3 * * 0'    # Sundays, 03:30 UTC — off the daily's noon slot
+  workflow_dispatch:
+    inputs:
+      keep_artifacts:
+        description: 'Artifacts to keep per name (newest first)'
+        required: false
+        default: '20'
+      log_retention_days:
+        description: 'Delete run logs older than this many days'
+        required: false
+        default: '30'
+      dry_run:
+        description: 'List what would be deleted without deleting it'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  actions: write      # deleting artifacts and run logs both need this
+
+concurrency:
+  group: gc-actions-storage
+  cancel-in-progress: false
+
+jobs:
+  gc:
+    if: github.repository != 'FrameAutomata/job-search-pipeline'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      KEEP: ${{ inputs.keep_artifacts || '20' }}
+      LOG_DAYS: ${{ inputs.log_retention_days || '30' }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+      # Ceiling on log deletions per sweep, so a long-lived copy can't spend its
+      # whole API rate limit here. Only SUCCESSFUL deletions count against it —
+      # a run whose logs are already gone answers 404/410 and is free — so a
+      # backlog drains a slice per week instead of the sweep stalling on the
+      # oldest runs it already cleared.
+      MAX_LOG_DELETES: '400'
+    steps:
+      - name: Prune artifacts, keeping the newest per name
+        run: |
+          set -euo pipefail
+
+          # Group by artifact NAME with its run-id suffix stripped, and keep the
+          # newest KEEP of each group rather than KEEP overall: the groups here
+          # are `pipeline-output` (the daily's reports, what the UI's Refresh
+          # pulls) and `applications-md` (edit-tracker's verification copy). A
+          # flat top-N would let a burst of one evict every copy of the other.
+          gh api --paginate "/repos/$REPO/actions/artifacts" \
+            --jq '.artifacts[] | select(.expired == false)
+                  | [(.name | sub("-[0-9]+$"; "")), .created_at, (.id|tostring), (.size_in_bytes|tostring)]
+                  | @tsv' > all-artifacts.tsv || true
+
+          if [ ! -s all-artifacts.tsv ]; then
+            echo "No live artifacts."
+            exit 0
+          fi
+
+          # created_at is ISO-8601 UTC, so a reverse lexical sort is
+          # newest-first. Group ascending, then date descending within a group.
+          sort -t"$(printf '\t')" -k1,1 -k2,2r all-artifacts.tsv \
+            | awk -F'\t' -v keep="$KEEP" '
+                { seen[$1]++ }
+                seen[$1] > keep { print }
+              ' > doomed.tsv
+
+          total=$(wc -l < all-artifacts.tsv)
+          doomed=$(wc -l < doomed.tsv)
+          echo "Live artifacts: $total; over the keep-$KEEP-per-name limit: $doomed"
+
+          freed=0
+          while IFS=$'\t' read -r group created id size; do
+            echo "  $group  $created  id=$id  ${size}B"
+            if [ "$DRY_RUN" = "true" ]; then continue; fi
+            if gh api -X DELETE "/repos/$REPO/actions/artifacts/$id" --silent </dev/null; then
+              freed=$((freed + size))
+            else
+              # Expired or deleted between the listing and now. Not a failure —
+              # the goal is that it is gone, not that we were the one to do it.
+              echo "    (already gone)"
+            fi
+          done < doomed.tsv
+
+          echo "Freed approximately $((freed / 1024 / 1024)) MB of artifact storage."
+          if [ "$DRY_RUN" = "true" ]; then echo "DRY RUN — nothing was deleted."; fi
+
+      - name: Prune run logs older than the retention window
+        run: |
+          set -euo pipefail
+
+          CUTOFF=$(date -u -d "$LOG_DAYS days ago" +%Y-%m-%d)
+          echo "Deleting logs for completed runs created before $CUTOFF"
+
+          # Run logs count toward the same storage quota as artifacts and have
+          # no retention setting of their own — nothing else in this repo ever
+          # removes them. The runs themselves are left alone: the Actions tab's
+          # history is worth keeping, and it is the logs that hold the bytes.
+          gh api --paginate -X GET "/repos/$REPO/actions/runs" \
+            -f "created=<$CUTOFF" -f per_page=100 \
+            --jq '.workflow_runs[] | select(.status == "completed")
+                  | [(.id|tostring), .created_at, .name] | @tsv' > old-runs.tsv || true
+
+          if [ ! -s old-runs.tsv ]; then
+            echo "No completed runs older than $CUTOFF."
+            exit 0
+          fi
+
+          # Oldest first, so a capped sweep spends its budget on the runs that
+          # have been holding storage longest.
+          sort -t"$(printf '\t')" -k2,2 old-runs.tsv -o old-runs.tsv
+
+          deleted=0
+          already=0
+          while IFS=$'\t' read -r id created name; do
+            if [ "$deleted" -ge "$MAX_LOG_DELETES" ]; then
+              # Say so rather than stopping quietly: a capped sweep looks
+              # identical to a finished one in the log otherwise.
+              echo "Reached MAX_LOG_DELETES=$MAX_LOG_DELETES with $(wc -l < old-runs.tsv) runs listed."
+              echo "The remainder is picked up by next week's sweep, or run this workflow again now."
+              break
+            fi
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "  would delete logs: $created  id=$id  $name"
+              continue
+            fi
+            if gh api -X DELETE "/repos/$REPO/actions/runs/$id/logs" --silent </dev/null 2>/dev/null; then
+              deleted=$((deleted + 1))
+            else
+              # 404/410: already deleted, or expired on GitHub's own schedule.
+              already=$((already + 1))
+            fi
+          done < old-runs.tsv
+
+          echo "Deleted logs for $deleted run(s); $already had none left to delete."
+          if [ "$DRY_RUN" = "true" ]; then echo "DRY RUN — nothing was deleted."; fi

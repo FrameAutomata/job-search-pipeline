@@ -5,7 +5,9 @@ cloud wins for shared roles, local-only rows (offline `Run local` results) are
 preserved and renumbered to avoid colliding with cloud row/report numbers.
 
 New report numbers are assigned as max(used)+1 so they can't collide with cloud
-reports or with each other.
+reports or with each other. "Cloud reports" means every number the cloud tracker
+names, not just the ones whose files rode down in today's artifact — the daily
+artifact carries only that run's reports (issue #129).
 """
 
 from pipeline.app import data
@@ -81,6 +83,20 @@ class TestReconcileTrackers:
         assert by["Zeta"]["report_path"].startswith("reports/21-")
         assert by["Zeta"]["num"] == "3"              # cloud max row # (2) + 1
 
+    def test_cloud_row_reserves_its_number_without_the_file(self):
+        """The daily artifact is a per-run delta (issue #129), so a cloud report
+        from a Refresh the user missed — artifacts expire after a week — arrives
+        as a tracker row with no file beside it. Its number is still spoken for:
+        leaving it to a local-only row would point the cloud row's report link at
+        the local report."""
+        cloud = _tracker(_row(1, "Acme", "Eng", report="10"),
+                         _row(2, "Beta", "Dev", report="11"))
+        local = _tracker(_row(3, "Zeta", "Ops", report="11"))
+        # Only report 10 rode along in today's artifact; 11 is older.
+        merged, renames = data.reconcile_trackers(cloud, local, {"10"})
+        assert ("11", "12") in renames
+        assert _by_company(merged)["Zeta"]["report_num"] == "12"
+
     def test_local_only_report_no_collision_kept(self):
         cloud = _tracker(_row(1, "Acme", "Eng", report="10"))
         local = _tracker(_row(2, "Zeta", "Ops", report="55"))
@@ -146,6 +162,48 @@ class TestSyncPulledTracker:
         assert (loc / "reports" / "2-x.md").read_text(encoding="utf-8") == "cloudB"
         # pipeline.md synced from cloud.
         assert (loc / "data" / "pipeline.md").read_text(encoding="utf-8") == "cloud pipeline"
+
+    def test_rename_moves_only_the_local_only_row_s_report(self, tmp_path):
+        """A report number can name two files in a local reports dir: the cloud
+        report a past Refresh copied in, and a local-only one that happens to
+        share the number. Renaming by number prefix alone moves both.
+
+        That was invisible while the artifact carried every cloud report — step 3
+        copied the cloud one straight back. The artifact is now a per-run delta
+        (issue #129), so an older cloud report is not re-copied, and moving it
+        would leave its tracker row pointing at nothing. Slugs differ here
+        because that is what makes the two files distinguishable at all."""
+        cloud = _tracker(_row(1, "Acme", "Eng", report="1"),
+                         _row(2, "Globex", "Dev", report="2"))
+        # Spelled out rather than via _row(), which hardcodes the `-x` slug: the
+        # whole point is that Zeta's file is a DIFFERENT file from cloud report 2.
+        zeta = ("| 7 | 2026-06-20 | Zeta | Ops | 3.0/5 | Evaluated | null "
+                "| [2](reports/2-zeta.md) | x |\n")
+        local = _tracker(_row(1, "Acme", "Eng", report="1"), zeta)
+        art = tmp_path / "artifact"
+        (art / "data").mkdir(parents=True)
+        (art / "reports").mkdir()
+        (art / "data" / "applications.md").write_text(cloud, encoding="utf-8")
+        # Today's delta carries no report at all — both cloud reports are older.
+        loc = tmp_path / "career-ops"
+        (loc / "data").mkdir(parents=True)
+        (loc / "reports").mkdir()
+        (loc / "data" / "applications.md").write_text(local, encoding="utf-8")
+        for name, body in (("1-x.md", "cloudA"), ("2-x.md", "GLOBEX-CLOUD"),
+                           ("2-zeta.md", "ZETA-LOCAL")):
+            (loc / "reports" / name).write_text(body, encoding="utf-8")
+
+        data.sync_pulled_tracker(art, loc)
+
+        by = {r["company"]: r for r in data.parse_applications(loc / "data" / "applications.md")}
+        # The local-only row moved; the cloud row's file stayed where its link says.
+        assert by["Zeta"]["report_num"] == "3"
+        assert (loc / "reports" / "3-zeta.md").read_text(encoding="utf-8") == "ZETA-LOCAL"
+        assert by["Globex"]["report_path"] == "reports/2-x.md"
+        assert (loc / "reports" / "2-x.md").read_text(encoding="utf-8") == "GLOBEX-CLOUD"
+        # Every row the merged tracker holds resolves to a file that exists.
+        for row in by.values():
+            assert (loc / row["report_path"]).exists(), row
 
     def test_first_pull_into_empty_local(self, tmp_path):
         cloud = _tracker(_row(1, "Acme", "Eng", report="1"))

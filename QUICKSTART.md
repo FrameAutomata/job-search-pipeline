@@ -270,14 +270,15 @@ These flags are for ad-hoc local runs. The daily cloud workflow runs **every** p
 
 ## Cloud automation (GitHub Actions)
 
-The repo ships one scheduled workflow + one manual workflow. **They refuse to run unless your fork is private.** See the README's [Using this template](README.md#using-this-template) section for setup.
+The repo ships two scheduled workflows + one manual workflow. **They refuse to run unless your fork is private.** See the README's [Using this template](README.md#using-this-template) section for setup.
 
 | Workflow | Schedule | What it does |
 |---|---|---|
 | `daily-pipeline.yml` | Noon UTC | Runs **every** search pass (including any `easy_apply: true` pass) once a day. |
+| `gc-actions-storage.yml` | Sundays 03:30 UTC | Prunes old artifacts and workflow run logs, which share your account's Actions **storage** quota. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a base64 blob — for status edits without committing the file. |
 
-All runtime state (scan-history, applications.md, batch state) lives in `actions/cache@v4`. Reports and tracker snapshots are uploaded as `actions/upload-artifact@v4` (90-day retention). No user data is ever committed.
+All runtime state (scan-history, applications.md, batch state, and the accumulated `reports/`) lives in `actions/cache@v4`. Each run additionally uploads **its own** new reports plus the current tracker as an `actions/upload-artifact@v4` (7-day retention) — a per-run delta, not the whole history, so artifact storage stays bounded however long the pipeline has been running. No user data is ever committed.
 
 ---
 

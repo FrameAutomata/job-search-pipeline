@@ -195,6 +195,17 @@ jobs:
           restore-keys: |
             pipeline-state-v1-
 
+      # Everything the restore just put on disk is HISTORY, not this run's work.
+      # Record it now so the upload step below can tell the two apart. Must sit
+      # between the restore and the pipeline: earlier and it misses the restored
+      # reports (so they all look new), later and it misses this run's.
+      - name: Snapshot the restored reports
+        run: |
+          python -m pipeline.run_artifact snapshot \
+            --root career-ops \
+            --manifest "$RUNNER_TEMP/artifact-manifest.json" \
+            --delta reports
+
       - name: Run pipeline and evaluate
         env:
           BATCH_PROVIDER:    ${{ vars.BATCH_PROVIDER || '' }}
@@ -236,29 +247,47 @@ jobs:
             career-ops/reports
           key: pipeline-state-v1-${{ github.run_id }}
 
-      - name: Upload reports and tracker artifact
+      # `career-ops/reports/` accumulates across runs (it is restored from the
+      # state cache), so uploading it directly put the entire report history
+      # into every daily artifact — and retention keeps several alive at once,
+      # which made live storage grow with the SQUARE of how long the pipeline
+      # had been running. That exhausted the account's Actions storage, and an
+      # exhausted quota stops GitHub creating workflow runs at all, including
+      # the Tests run on every pull request (issue #129).
+      #
+      # So stage what THIS RUN produced and upload that: reports absent from the
+      # pre-run manifest, plus the small state files whose whole current value
+      # is the point (applications.md is the tracker the UI's Refresh merges; a
+      # diff of it would be useless). tracker-additions is not in the cache, so
+      # it is already per-run. The staged tree keeps career-ops' layout, which
+      # is what `gh.download_artifact` and `data.sync_pulled_tracker` expect.
+      #
+      # The full history is not this artifact's job — it lives in the
+      # pipeline-state cache and in the user's local career-ops/.
+      - name: Stage this run's output for upload
+        if: always()
+        run: |
+          python -m pipeline.run_artifact stage \
+            --root career-ops \
+            --manifest "$RUNNER_TEMP/artifact-manifest.json" \
+            --into "$RUNNER_TEMP/pipeline-artifact" \
+            --delta reports \
+            --whole data/applications.md \
+            --whole data/pipeline.md \
+            --whole data/easy-apply-urls.txt \
+            --whole batch/tracker-additions
+
+      - name: Upload this run's reports and tracker artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-output-${{ github.run_id }}
-          path: |
-            career-ops/reports/
-            career-ops/data/applications.md
-            career-ops/data/pipeline.md
-            career-ops/data/easy-apply-urls.txt
-            career-ops/batch/tracker-additions/
+          path: ${{ runner.temp }}/pipeline-artifact
           if-no-files-found: ignore
-          # 7, not 90. `career-ops/reports/` is restored from the state cache
-          # each run and ACCUMULATES — every artifact carries the whole report
-          # history to date, not just that day's. Ninety days of retention
-          # therefore keeps ninety copies of a monotonically growing directory,
-          # so the storage cost grows with the SQUARE of how long the pipeline
-          # has been running. That is what exhausted the account's Actions
-          # storage, and an exhausted quota stops GitHub creating workflow runs
-          # at all — including the Tests run on every pull request.
-          #
-          # A week is plenty for what this artifact is: the delivery mechanism
-          # for a DAILY job (see README — "download the pipeline-output-*
-          # artifact"). The durable copies live in the pipeline-state cache and
-          # in the user's local career-ops, neither of which this bounds.
+          # 7, not the 90 that nobody chose. Retention bounds how MANY artifacts
+          # are alive, never how big each one is — see the staging step above for
+          # the half that bounds the size. A week is plenty for what this is: the
+          # delivery mechanism for a DAILY job (README — "download the
+          # pipeline-output-* artifact"). tests/test_workflow_artifacts.py keeps
+          # every upload step in this repo under the ceiling.
           retention-days: 7
