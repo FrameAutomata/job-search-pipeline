@@ -1,6 +1,7 @@
 name: Export Reports
 
-# Manual one-shot: package the FULL accumulated `career-ops/reports/` from the
+# Manual one-shot: package the FULL accumulated `career-ops/reports/`, plus the
+# current `data/applications.md` the Report links point out of, from the
 # pipeline state cache as a downloadable artifact.
 #
 # Why this exists (issue #129). The daily artifact used to carry the whole
@@ -71,11 +72,27 @@ jobs:
     steps:
       # Restore only — no matching save step, so this cannot race a pipeline run
       # the way seed-reports.yml's save can.
+      #
+      # This names all nine cached paths although the export ships two of them,
+      # and that is not a preference. GitHub derives a cache's "version" from
+      # the path SET and matches a restore on key prefix AND version, so a
+      # two-path restore does not restore less — it matches nothing the daily
+      # ever wrote and restores NOTHING. (This shipped that way in #129, which
+      # is why the recovery path it added never worked.) Narrowing happens at
+      # the upload step below, the only place it can happen.
+      # tests/test_workflow_artifacts.py enforces this across every workflow.
       - name: Restore pipeline state cache
         uses: actions/cache/restore@v6
         with:
           path: |
+            career-ops/data/scan-history.tsv
             career-ops/data/applications.md
+            career-ops/data/pipeline.md
+            career-ops/data/recheck-state.tsv
+            career-ops/data/easy-apply-urls.txt
+            career-ops/batch/batch-input.tsv
+            career-ops/batch/batch-api-state.json
+            career-ops/batch/jds
             career-ops/reports
           key: pipeline-state-v1-
           restore-keys: |
@@ -84,7 +101,12 @@ jobs:
       - name: Report what was found
         run: |
           set -euo pipefail
-          count=$(find career-ops/reports -name '*.md' 2>/dev/null | wc -l)
+          # mkdir first: `find` on a missing directory exits 1, and under
+          # pipefail that aborts the step before the warning below can say WHY
+          # there is nothing to export — which is the one thing this step is
+          # for. A cache miss is the expected empty case here, not an error.
+          mkdir -p career-ops/reports
+          count=$(find career-ops/reports -name '*.md' | wc -l)
           echo "Reports in the cache: $count"
           if [ "$count" = 0 ]; then
             echo "::warning::No reports in the pipeline state cache. Either no run has produced any yet, or the cache was evicted (GitHub drops entries after 7 days of inactivity)."
@@ -94,7 +116,18 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: reports-export-${{ github.run_id }}
-          path: career-ops
+          # The two paths this export is FOR, not the whole restored tree. The
+          # restore above has to name all nine to match the cache version, and
+          # `path: career-ops` would sweep cached JDs and batch state into a
+          # download meant to be reports plus the tracker. upload-artifact roots
+          # the archive at the common ancestor of the paths it is GIVEN, so this
+          # still extracts over a local `career-ops/` as the header describes —
+          # but only while both entries are named. Drop the tracker and the
+          # ancestor becomes `career-ops/reports`, which extracts as loose *.md
+          # at the root and silently stops overlaying.
+          path: |
+            career-ops/reports
+            career-ops/data/applications.md
           if-no-files-found: warn
           # Same ceiling as every other upload here. It only has to survive long
           # enough to be downloaded once — re-run the workflow if it expires.

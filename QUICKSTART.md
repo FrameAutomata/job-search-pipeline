@@ -277,7 +277,7 @@ The repo ships two scheduled workflows + four manual (`workflow_dispatch`) ones,
 | `daily-pipeline.yml` | Noon UTC | Runs **every** search pass (including any `easy_apply: true` pass) once a day. |
 | `gc-actions-storage.yml` | Sundays 03:30 UTC | Prunes old artifacts and workflow run logs, which share your account's Actions **storage** quota. |
 | `edit-tracker.yml` | Manual (`workflow_dispatch`) | Replaces `applications.md` in the cache with a base64 blob — for status edits without committing the file. |
-| `export-reports.yml` | Manual (`workflow_dispatch`) | Packages the **full** report history from the cache as one download. Run it when setting up a new machine, or after going longer than the 7-day artifact retention without a Refresh. |
+| `export-reports.yml` | Manual (`workflow_dispatch`) | Packages the **full** report history, plus the current tracker, from the cache as one download. Run it when setting up a new machine, or after going longer than the 7-day artifact retention without a Refresh. |
 | `seed-reports.yml` | Manual (`workflow_dispatch`) | The mirror: repairs the cache's `reports/` from past artifacts. Writes to the state cache — don't run it while a pipeline is in flight. |
 | `update-from-template.yml` | Manual (`workflow_dispatch`) | Merges the upstream template's latest `main` into your copy. |
 

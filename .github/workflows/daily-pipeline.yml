@@ -192,6 +192,14 @@ jobs:
       # Cache holds all dynamic state. Restore the latest matching cache at the
       # start of the run; save a fresh one keyed by run_id at the end so the
       # next run picks it up via the prefix.
+      #
+      # This list is the canonical one: every other workflow that touches this
+      # cache copies it, and they all move together — the path set IS the cache
+      # version (hashed as written, so order counts too), and a list that drifts
+      # forks the lineage rather than restoring less. Adding a path here is an
+      # edit to every copy. tests/test_workflow_artifacts.py enforces that, and
+      # the same for the key prefix; it names the stragglers rather than
+      # counting them, which is why no count appears here.
       - name: Restore pipeline state cache
         id: cache-restore
         uses: actions/cache/restore@v6
