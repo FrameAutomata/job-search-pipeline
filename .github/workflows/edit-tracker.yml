@@ -100,7 +100,10 @@ jobs:
       # restore-keys only matches same-version caches — if the two lists drift, a
       # tracker installed here lands in a cache the daily can never restore (it
       # silently builds its own lineage instead). That exact drift once dropped
-      # recheck-state.tsv + easy-apply-urls.txt here and broke every push.
+      # recheck-state.tsv + easy-apply-urls.txt here and broke every push, and
+      # later cost export-reports and seed-reports the same way (#133) while
+      # this warning sat here in prose. tests/test_workflow_artifacts.py now
+      # enforces it across every workflow.
       - name: Restore pipeline state cache
         uses: actions/cache/restore@v6
         with:

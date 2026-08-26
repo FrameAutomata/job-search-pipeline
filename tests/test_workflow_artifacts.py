@@ -1,4 +1,4 @@
-"""Every artifact upload declares a retention, and none uploads accumulated state.
+"""The daily's artifacts stay bounded, and every workflow agrees on the cache.
 
 Issue #129: the account's Actions storage quota filled up, and an exhausted
 storage quota stops GitHub creating workflow runs *at all* — so the Tests
@@ -17,6 +17,17 @@ Two properties had to hold and neither was written down anywhere:
      the storage still grows without bound, just more slowly. Scheduled, not
      all: export-reports.yml exports the whole history on purpose, and a human
      asking for it once is bounded by the asking in a way a cron job is not.
+
+A third rule, from issue #133, is guarded here because it concerns the same
+cache and reuses the same table. Every workflow that restores or saves
+`pipeline-state-v1` must name the SAME path set. GitHub derives a cache's
+"version" from the paths and matches a restore on key prefix AND version, so a
+drifted list does not restore *less* — it matches nothing and silently starts
+its own lineage. export-reports.yml shipped naming two of the nine paths and so
+never restored anything, which made #129's recovery path dead on arrival;
+seed-reports.yml named seven and spent months repairing into a cache the daily
+never read. edit-tracker.yml carried a prose warning about precisely this,
+written after it had already caused one outage. Prose is not a guard.
 
 Guarding the rule rather than today's two upload steps, in the spirit of
 tests/test_stdio.py: the failure mode is a *new* upload added later by pasting
@@ -76,7 +87,7 @@ DAILY = "daily-pipeline.yml"
 CAREER_OPS = "career-ops"
 
 
-class Upload(NamedTuple):
+class Step(NamedTuple):
     workflow: str
     label: str          # "<workflow>:<job>:<step name>", pre-built for messages
     block: dict         # the step's `with:` mapping
@@ -117,6 +128,31 @@ def _path_entries(with_block: dict) -> list[str]:
             if ln.strip()]
 
 
+def _raw_path_lines(with_block: dict) -> list[str]:
+    """A step's `path:` exactly as GitHub reads it — trimmed lines, in order,
+    nothing normalized.
+
+    This is the shape the cache version is computed from: getCacheVersion does
+    `sha256(paths.join('|'))` over the list as given, with no sort and no
+    tidying of `./` or trailing slashes. So comparing normalized SETS would
+    green-light a reordering, or one list writing `career-ops/reports/`, both of
+    which change the hash and fork the lineage — the exact bug #133 was. The
+    workflow comments promise "byte-identical"; this is that promise."""
+    return [ln.strip() for ln in str(with_block.get("path") or "").splitlines()
+            if ln.strip()]
+
+
+def _common_root(entries: list[str]) -> str:
+    """The directory an upload-artifact archive roots at, given >1 search path:
+    the longest shared leading run of path segments."""
+    out = []
+    for seg in zip(*[_norm(e).split("/") for e in entries]):
+        if len(set(seg)) != 1:
+            break
+        out.append(seg[0])
+    return "/".join(out)
+
+
 def _covers(entry: str, target: str) -> bool:
     """Does uploading `entry` put `target` in the artifact?
 
@@ -152,9 +188,12 @@ def _stage_args() -> dict[str, list[str]]:
     return _run_artifact_args("stage")
 
 
-def _all_upload_steps() -> list[Upload]:
-    """Every actions/upload-artifact step across every workflow, pre-labelled
-    and tagged with whether its workflow runs on a schedule."""
+def _steps_using(action: str) -> list[Step]:
+    """Every step across every workflow whose `uses` names `action`, pre-labelled
+    and tagged with whether its workflow runs on a schedule.
+
+    One walker for both rules in this file, so the collection comment below
+    cannot end up attached to only one of them."""
     out = []
     # Both extensions: GitHub honours .yaml as readily as .yml, and a workflow
     # this scan cannot see is a workflow exempt from every rule in this file.
@@ -163,13 +202,61 @@ def _all_upload_steps() -> list[Upload]:
         scheduled = "schedule" in _triggers(doc)
         for job_name, job in (doc.get("jobs") or {}).items():
             for step in (job.get("steps") or []):
-                if str(step.get("uses") or "").startswith("actions/upload-artifact"):
-                    out.append(Upload(
+                if str(step.get("uses") or "").startswith(action):
+                    out.append(Step(
                         path.name,
                         f"{path.name}:{job_name}:{step.get('name', '?')}",
                         step.get("with") or {},
                         scheduled))
     return out
+
+
+def _all_upload_steps() -> list[Step]:
+    return _steps_using("actions/upload-artifact")
+
+
+def _daily_cache_step() -> dict:
+    """The daily's restore step — the reference every other cache step copies."""
+    steps = _steps(DAILY, "scrape-and-evaluate")
+    return steps[_step_index(
+        steps, lambda s: str(s.get("uses") or "").startswith(
+            "actions/cache/restore"))].get("with") or {}
+
+
+def _key_prefixes(block: dict) -> list[str]:
+    """Every literal cache-key prefix a step names — `key` plus each
+    `restore-keys` line, cut at the first ${{ }} expression.
+
+    Both, not just `key`. Every restore step here keys on `github.run_id`, which
+    by construction can never match an existing entry, so what a restore
+    actually finds is decided entirely by `restore-keys`. Checking `key` alone
+    would wave through a bump of the half that does the matching: the restore
+    then finds nothing and the paired save still writes under the OLD prefix,
+    handing the next daily a cache with one run's work in it."""
+    raw = [str(block.get("key") or ""),
+           *str(block.get("restore-keys") or "").splitlines()]
+    return [r.split("${{")[0].strip() for r in raw if r.strip()]
+
+
+def _all_cache_steps() -> list[Step]:
+    """Every actions/cache step that touches the shared pipeline state.
+
+    Matched on what it CACHES, not on the key it names. Keying the scan off the
+    key looks natural and is backwards: a step that drifts its key would drop
+    out of the scan entirely and so escape the very rules below, leaving a
+    hand-tuned "we expect N steps" count as the only thing standing between a
+    half-bumped key and a silently forked lineage. A cache of something
+    unrelated names none of these paths and is still free to key itself however
+    it likes.
+
+    Matched through _covers, so naming a PARENT counts too. Collapsing the nine
+    lines to the one directory that contains them (`path: career-ops`) is the
+    tempting simplification — it is the shape the upload comment in
+    export-reports.yml warns about — and on exact membership it would match none
+    of the nine and drop out of the scan, escaping both rules below."""
+    return [s for s in _steps_using("actions/cache")
+            if any(_covers(e, c)
+                   for e in _path_entries(s.block) for c in CACHED_PATHS)]
 
 
 class TestRetentionIsDeclaredAndBounded:
@@ -203,10 +290,7 @@ class TestNoUploadCarriesAccumulatedState:
         """CACHED_PATHS must name the daily's cache list exactly. A path added
         to the cache but not here would be unclassified — and so exempt from the
         check below, silently, which is the shape of the original bug."""
-        steps = _steps(DAILY, "scrape-and-evaluate")
-        restore = steps[_step_index(
-            steps, lambda s: str(s.get("uses") or "").startswith("actions/cache/restore"))]
-        assert sorted(_path_entries(restore.get("with") or {})) == sorted(CACHED_PATHS), (
+        assert sorted(_path_entries(_daily_cache_step())) == sorted(CACHED_PATHS), (
             "the daily's cached paths and CACHED_PATHS have diverged. Classify "
             "the new one as 'grows' (restored and never truncated — must not be "
             "uploaded whole) or 'whole' (small, current value is the point). "
@@ -294,6 +378,23 @@ class TestNoUploadCarriesAccumulatedState:
         assert "reports" in stage["delta"]
         assert "data/applications.md" in stage["whole"]
 
+    def test_the_export_artifact_extracts_over_career_ops(self):
+        """The manual export's half of the layout rule the daily already has
+        above. upload-artifact roots the archive at the common ancestor of the
+        paths it is GIVEN, and only when more than one is named — so dropping
+        `data/applications.md` re-roots it to career-ops/reports and it extracts
+        as loose *.md instead of overlaying a local career-ops/. Nothing about
+        that is visible in the diff that does it."""
+        upload = next(u for u in _all_upload_steps()
+                      if u.workflow == "export-reports.yml")
+        entries = _path_entries(upload.block)
+        assert len(entries) >= 2 and _common_root(entries) == CAREER_OPS, (
+            f"the export names {entries}, which roots its artifact at "
+            f"{_common_root(entries)!r} rather than {CAREER_OPS!r}. Extracting "
+            "it over a local career-ops/ is what the workflow header promises "
+            "and what run-ui.sh --data expects."
+        )
+
     def test_snapshot_and_stage_agree_on_what_the_manifest_covers(self):
         """Different --root or --delta between the two steps and the manifest's
         keys stop lining up: every restored report reads as new and the whole
@@ -306,13 +407,73 @@ class TestNoUploadCarriesAccumulatedState:
         assert snap["manifest"] == stage["manifest"], "same manifest file, too"
 
 
+class TestEveryCacheStepSharesOnePathSet:
+    """Issue #133. The path set IS the cache version, so this is not a style
+    rule about keeping files tidy — a workflow that names a different set is
+    talking to a different cache, and says nothing about it in its logs."""
+
+    def test_the_scan_finds_the_cache_steps(self):
+        """Same reason as the upload scan: a collector that returned [] would
+        make the rules below pass forever. Naming the workflows rather than
+        counting steps — a count says nothing about WHICH ones went missing, and
+        an empty scan fails this just as surely."""
+        found = {c.workflow for c in _all_cache_steps()}
+        want = {DAILY, "edit-tracker.yml", "seed-reports.yml", "export-reports.yml"}
+        assert found >= want, (
+            f"the cache-step scan missed {sorted(want - found)}. Either the "
+            "workflow stopped touching the pipeline-state cache (then drop it "
+            "from this list, deliberately) or the collector no longer sees it "
+            "— which would exempt it from every rule below."
+        )
+
+    def test_every_cache_step_names_the_same_path_set(self):
+        """Against the daily's own list rather than CACHED_PATHS, so this test
+        and test_every_cached_path_is_classified fail on disjoint causes: adding
+        a path to every workflow but not the table is that test's job, and its
+        message is the one worth reading for it."""
+        daily = _raw_path_lines(_daily_cache_step())
+        wrong = []
+        for c in _all_cache_steps():
+            entries = _raw_path_lines(c.block)
+            if entries != daily:
+                missing, extra = set(daily) - set(entries), set(entries) - set(daily)
+                why = (f"missing={sorted(missing)}, extra={sorted(extra)}"
+                       if (missing or extra) else "same paths, different ORDER")
+                wrong.append(f"{c.label} ({why})")
+        assert not wrong, (
+            "these cache steps name a different path set than the daily, so "
+            f"they restore from and save to a lineage of their own: {wrong}. "
+            "GitHub hashes the path list into the cache version and matches a "
+            "restore on key prefix AND version — a shorter list restores "
+            "NOTHING, it does not restore a subset. Narrow at the upload step "
+            "instead, the way export-reports.yml does. The list is hashed as "
+            "written, so order and trailing slashes count as much as contents."
+        )
+
+    def test_every_cache_step_shares_the_daily_key_prefix(self):
+        """The other half of "same cache". Paths decide the version; the key
+        prefix decides which entries a restore will even look at, and half a
+        key bump forks the lineage exactly as a path edit does."""
+        want = set(_key_prefixes(_daily_cache_step()))
+        assert len(want) == 1, f"the daily names more than one prefix: {want}"
+        wrong = [f"{c.label} (names {sorted(set(_key_prefixes(c.block)))})"
+                 for c in _all_cache_steps()
+                 if set(_key_prefixes(c.block)) != want]
+        assert not wrong, (
+            f"these cache steps do not share the daily's key prefix {want}: "
+            f"{wrong}. Bumping the cache lineage is a deliberate act — move "
+            "every step in the same commit, or the ones left behind keep "
+            "reading and writing the old entries."
+        )
+
+
 class TestTheGuardsCatchWhatTheyForbid:
     """A guard is only worth having if it fails on the thing it forbids."""
 
     def _fake(self, monkeypatch, with_block, *, scheduled=True):
         monkeypatch.setattr(
             "tests.test_workflow_artifacts._all_upload_steps",
-            lambda: [Upload("fake.yml", "fake.yml:job:Upload", with_block, scheduled)])
+            lambda: [Step("fake.yml", "fake.yml:job:Upload", with_block, scheduled)])
 
     def test_missing_retention_is_caught(self, monkeypatch):
         self._fake(monkeypatch, {"path": "out/"})
@@ -350,6 +511,81 @@ class TestTheGuardsCatchWhatTheyForbid:
         self._fake(monkeypatch, {"path": "career-ops", "retention-days": 7},
                    scheduled=False)
         TestNoUploadCarriesAccumulatedState().test_no_scheduled_upload_names_a_cached_path()
+
+    def _daily_paths(self) -> list[str]:
+        """The reference list, in the daily's own order — the fakes below have
+        to differ from it in exactly one way to test what they claim to."""
+        return _raw_path_lines(_daily_cache_step())
+
+    def _fake_cache(self, monkeypatch, path, key="pipeline-state-v1-${{ x }}",
+                    restore_keys="pipeline-state-v1-"):
+        monkeypatch.setattr(
+            "tests.test_workflow_artifacts._all_cache_steps",
+            lambda: [Step("fake.yml", "fake.yml:job:Restore",
+                          {"path": path, "key": key,
+                           "restore-keys": restore_keys}, False)])
+
+    def test_a_short_cache_path_list_is_caught(self, monkeypatch):
+        """export-reports.yml's actual bug: two of the nine paths, which reads
+        like "restore only what I need" and in fact restores nothing."""
+        self._fake_cache(
+            monkeypatch, "career-ops/data/applications.md\ncareer-ops/reports\n")
+        with pytest.raises(AssertionError, match="lineage of their own"):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_names_the_same_path_set()
+
+    def test_a_cache_path_list_with_an_extra_entry_is_caught(self, monkeypatch):
+        """Drift in the other direction changes the version just as much."""
+        self._fake_cache(
+            monkeypatch, "\n".join([*self._daily_paths(), "career-ops/data/extra.tsv"]))
+        with pytest.raises(AssertionError, match="extra="):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_names_the_same_path_set()
+
+    def test_a_reordered_cache_path_list_is_caught(self, monkeypatch):
+        """The same nine paths in a different order hash to a different version,
+        so this forks the lineage while looking identical to any comparison that
+        sorts or sets. It is also the most innocent-looking edit in the class."""
+        self._fake_cache(monkeypatch, "\n".join(reversed(self._daily_paths())))
+        with pytest.raises(AssertionError, match="different ORDER"):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_names_the_same_path_set()
+
+    def test_a_trailing_slash_is_caught(self, monkeypatch):
+        """Nothing normalizes the list before it is hashed, so `reports/` and
+        `reports` are two different caches."""
+        self._fake_cache(monkeypatch, "\n".join(e + "/" for e in self._daily_paths()))
+        with pytest.raises(AssertionError, match="lineage of their own"):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_names_the_same_path_set()
+
+    def test_a_bumped_restore_key_alone_is_caught(self, monkeypatch):
+        """restore-keys is what a restore actually matches on — every restore
+        here keys on github.run_id, which can never hit an existing entry. Bump
+        only this half and the restore finds nothing while the paired save still
+        writes under the old prefix, which is worse than the drift in #133."""
+        self._fake_cache(monkeypatch, "\n".join(self._daily_paths()),
+                         restore_keys="pipeline-state-v2-")
+        with pytest.raises(AssertionError, match="key prefix"):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_shares_the_daily_key_prefix()
+
+    def test_a_parent_directory_path_stays_in_the_scan(self, monkeypatch):
+        """Collapsing the nine lines to the directory that holds them is the
+        tempting simplification. On exact membership it matched none of the nine
+        and left the scan entirely — escaping both rules rather than failing."""
+        monkeypatch.setattr(
+            "tests.test_workflow_artifacts._steps_using",
+            lambda action: [Step("fake.yml", "fake.yml:job:Restore",
+                                 {"path": CAREER_OPS, "key": "pipeline-state-v1-"},
+                                 False)])
+        assert len(_all_cache_steps()) == 1, "a parent path escaped the scan"
+        with pytest.raises(AssertionError, match="lineage of their own"):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_names_the_same_path_set()
+
+    def test_a_half_bumped_cache_key_is_caught(self, monkeypatch):
+        """The path set can be perfect and the lineage still fork. Before this
+        check, such a step simply left the scan and nothing failed but a
+        hand-tuned count of how many steps we expected to find."""
+        self._fake_cache(monkeypatch, "\n".join(CACHED_PATHS),
+                         key="pipeline-state-v2-${{ x }}")
+        with pytest.raises(AssertionError, match="key prefix"):
+            TestEveryCacheStepSharesOnePathSet().test_every_cache_step_shares_the_daily_key_prefix()
 
     def test_an_unclassified_cache_path_is_caught(self, monkeypatch):
         """The exhaustiveness half: a path added to the cache with no entry in

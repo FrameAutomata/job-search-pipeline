@@ -73,6 +73,15 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v7
 
+      # Byte-identical to daily-pipeline.yml's list, and it has to be: GitHub
+      # derives a cache's "version" from the path SET, so a restore only matches
+      # an entry saved under the same set. This file used to name seven paths
+      # and therefore restored from — and saved into — a lineage the daily never
+      # read, which made every repair it performed invisible. Both lists here
+      # move together: widening only the save would write a cache with no
+      # recheck-state.tsv or easy-apply-urls.txt in it (the restore is what puts
+      # them on disk), which the next daily would then restore.
+      # tests/test_workflow_artifacts.py enforces this across every workflow.
       - name: Restore pipeline state cache
         uses: actions/cache/restore@v6
         with:
@@ -80,6 +89,8 @@ jobs:
             career-ops/data/scan-history.tsv
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/recheck-state.tsv
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
@@ -135,6 +146,8 @@ jobs:
             career-ops/data/scan-history.tsv
             career-ops/data/applications.md
             career-ops/data/pipeline.md
+            career-ops/data/recheck-state.tsv
+            career-ops/data/easy-apply-urls.txt
             career-ops/batch/batch-input.tsv
             career-ops/batch/batch-api-state.json
             career-ops/batch/jds
