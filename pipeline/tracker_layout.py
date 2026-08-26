@@ -94,11 +94,20 @@ def detect_columns(cells: list[str]) -> list[str] | None:
 
 def header_columns(text: str) -> list[str]:
     """The column layout of a tracker's markdown table — from its header row
-    when it has a readable one, else the canonical positional order."""
+    when it has a readable one, else the canonical positional order.
+
+    Scans for a mappable header rather than judging the first table row it
+    meets: a tracker file may open with some other table (a legend, a summary),
+    and giving up there would silently fall back to the positional order — which
+    against a Via-layout tracker is exactly the off-by-one this module exists to
+    prevent. Only a row that labels the whole schema qualifies, so an unrelated
+    table cannot be mistaken for the tracker's own header."""
     for line in text.splitlines():
         if not line.lstrip().startswith("|") or SEPARATOR_RE.match(line.strip()):
             continue
-        return detect_columns(split_row(line)) or list(CANONICAL_COLUMNS)
+        detected = detect_columns(split_row(line))
+        if detected:
+            return detected
     return list(CANONICAL_COLUMNS)
 
 

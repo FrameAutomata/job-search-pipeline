@@ -1217,3 +1217,26 @@ class TestLivenessNotPermanentlyDead:
         result, _ = classify_liveness(200, "https://x/j/1", body)
         assert result != "throttled"
 
+
+
+class TestThrottleRetryScope:
+    """`throttled` now covers three different situations, but only one of them
+    is worth re-fetching. Retrying the other two triples the burst into the
+    limiter the recheck budget exists to cap — and against an anti-bot wall it
+    deepens the block we are already under."""
+
+    def test_only_the_transient_limiter_is_retryable(self):
+        import pipeline.screen as screen_mod
+        limiter = classify_liveness(429, "https://x/j/1", "")[1]
+        server = classify_liveness(502, "https://x/j/1", "<html>502</html>")[1]
+        wall = classify_liveness(
+            200, "https://x/j/1",
+            "<html><title>Just a moment...</title>Ray ID: 8f2a1b3c9d0e</html>")[1]
+        assert limiter.startswith(screen_mod._RETRYABLE_REASONS)
+        assert not server.startswith(screen_mod._RETRYABLE_REASONS)
+        assert not wall.startswith(screen_mod._RETRYABLE_REASONS)
+
+    def test_retryable_set_tracks_the_throttle_statuses(self):
+        """Derived, so the two can't drift apart."""
+        import pipeline.screen as screen_mod
+        assert len(screen_mod._RETRYABLE_REASONS) == len(screen_mod._THROTTLE_STATUSES)

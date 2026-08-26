@@ -683,3 +683,26 @@ class TestDedupAcrossTrackerLayouts:
     def test_headerless_table_falls_back_to_positions(self):
         assert bridge_mod._parse_applications_md(
             self.ROW.format("SWE |"))[1] == {"acme::swe"}
+
+
+class TestSectionHeadingVariants:
+    """Real pipeline.md headings carry counts and qualifiers. Matching the
+    heading as a whole line finds nothing and appends a SECOND pending section —
+    the split queue this lookup exists to avoid, and a regression on our own
+    Spanish spelling as well as career-ops' English one."""
+
+    OFFERS = [{"url": "https://x/j/9", "company": "Acme", "title": "SWE", "description": ""}]
+
+    @pytest.mark.parametrize("heading", [
+        "## Pendientes", "## Pending",
+        "## Pendientes (3)", "## Pending URLs",
+    ])
+    def test_appends_into_the_existing_section(self, career_ops_dir, heading):
+        pipe = career_ops_dir / "data" / "pipeline.md"
+        pipe.parent.mkdir(parents=True, exist_ok=True)
+        pipe.write_text(f"# Pipeline\n\n{heading}\n\n- [ ] https://x/j/1 | Old | Role\n",
+                        encoding="utf-8")
+        bridge_mod.append_to_pipeline(career_ops_dir, self.OFFERS)
+        text = pipe.read_text(encoding="utf-8")
+        assert [l for l in text.splitlines() if l.startswith("## ")] == [heading]
+        assert "j/9" in text

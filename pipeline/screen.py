@@ -118,6 +118,13 @@ _SERVER_ERROR_MIN = 500
 _THROTTLE_RETRIES = 2
 _THROTTLE_BACKOFF = 1.5
 
+# ...but only for the per-request limiter it was written for. The other two
+# `throttled` verdicts must NOT be retried: an anti-bot challenge and a 5xx do
+# not clear in 1.5s, so retrying triples the fetch burst into the very limiter
+# RECHECK_BUDGET exists to cap — and against a challenge it deepens the block we
+# are already under. Derived from _THROTTLE_STATUSES so the two can't drift.
+_RETRYABLE_REASONS = tuple(f"HTTP {s}" for s in sorted(_THROTTLE_STATUSES))
+
 _APPLY = [
     re.compile(r"\bapply\b", re.I),
     re.compile(r"\bsolicitar\b", re.I),
@@ -355,7 +362,8 @@ def classify_each(items, url_of, *, timeout: int = 8, max_workers: int = 8):
             # uncertain) and a conclusive result returns at once.
             for attempt in range(_THROTTLE_RETRIES + 1):
                 result, reason, body = fetch_and_classify(fetch_url, timeout)
-                if result != "throttled" or attempt == _THROTTLE_RETRIES:
+                retryable = result == "throttled" and reason.startswith(_RETRYABLE_REASONS)
+                if not retryable or attempt == _THROTTLE_RETRIES:
                     return item, result, reason, body
                 time.sleep(_THROTTLE_BACKOFF * (attempt + 1))
         except Exception as exc:

@@ -1,5 +1,6 @@
 """Tests for pipeline/app/data.py — applications.md parsing + report lookup."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -601,11 +602,73 @@ class TestHiredStatus:
     def test_states_yml_aliases(self, alias, expected):
         assert data.canonical_status(alias) == expected
 
-    def test_kanban_mirror_is_in_sync(self):
-        """app.js keeps its own copy of the column list; drift between the two
-        is what put a Hired row in the Evaluated column."""
+    @staticmethod
+    def _js_list(name):
         js = (Path(__file__).resolve().parent.parent
               / "pipeline" / "app" / "static" / "app.js").read_text(encoding="utf-8")
-        line = next(l for l in js.splitlines() if l.startswith("const STATES"))
-        for state in data.CANONICAL_STATES:
-            assert f'"{state}"' in line, f"{state} missing from app.js STATES"
+        line = next(l for l in js.splitlines() if l.startswith(f"const {name}"))
+        return re.findall(r'"([^"]+)"', line)
+
+    def test_kanban_mirror_is_in_sync(self):
+        """app.js keeps its own copy of the column list; drift between the two
+        put a Hired row in the Evaluated column. Checked BOTH ways: a state only
+        in app.js passes a Python-to-JS check, and then server.py 400s every
+        drag into that column because it validates against CANONICAL_STATES."""
+        assert self._js_list("STATES") == data.CANONICAL_STATES
+
+    def test_actioned_statuses_are_all_canonical(self):
+        """The hide-by-default set is UI policy, not a mirror — it deliberately
+        omits Offer, which career-ops marks terminal but which still needs
+        action here. It must still name only states that exist, or it silently
+        hides nothing."""
+        assert set(self._js_list("ACTIONED_STATUSES")) <= set(data.CANONICAL_STATES)
+
+
+class TestLayoutEdgeCases:
+    """Cases the header-mapping rule got wrong when it first landed."""
+
+    VIA_HEADER = ("| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+                  "|---|---|---|---|---|---|---|---|---|---|\n"
+                  "| 1 | 2026-08-25 | Acme | Robert Half | SWE | 4.5/5 | Applied | null "
+                  "| [1](reports/1.md) | x |\n")
+
+    def test_header_found_below_an_unrelated_table(self, tmp_path):
+        """A tracker file may open with some other table. Judging only the first
+        table row met there falls back to the positional order, which against a
+        Via layout is the off-by-one the mapping exists to prevent."""
+        p = tmp_path / "applications.md"
+        p.write_text("# Tracker\n\n| Legend | Meaning |\n|---|---|\n| OK | done |\n\n"
+                     + self.VIA_HEADER, encoding="utf-8")
+        row = data.parse_applications(p)[0]
+        assert (row["company"], row["role"]) == ("Acme", "SWE")
+
+    def test_layout_without_a_report_column_does_not_crash(self, tmp_path):
+        """detect_columns requires only num/company/role/score/status (career-ops'
+        own set), so a Report-less header is reachable — and _realign_cells
+        anchors on the Report cell. It must decline, not raise: the exception
+        took the whole parse down, blanking the UI board."""
+        p = tmp_path / "applications.md"
+        p.write_text("| # | Date | Company | Role | Score | Status |\n|---|---|---|---|---|---|\n"
+                     "| 1 | 2026-08-25 | Acme | Eng | Manager | 4.0/5 | Evaluated |\n",
+                     encoding="utf-8")
+        assert len(data.parse_applications(p)) == 1
+
+    def test_reconcile_emits_rows_in_the_cloud_layout(self):
+        """Local-only rows are appended to the CLOUD tracker, so they must match
+        its width. A canonical 9-cell row in a 10-column Via table is short, and
+        the next parse drops it — losing the offline evaluation entirely."""
+        cloud = self.VIA_HEADER
+        local = cloud + ("| 2 | 2026-08-25 | Initech | — | SRE | 4.0/5 | Evaluated | null "
+                         "| [2](reports/2.md) | y |\n")
+        merged, _ = data.reconcile_trackers(cloud, local, set(), set())
+        rows = data.parse_applications_text(merged)
+        assert [r["role"] for r in rows] == ["SWE", "SRE"]
+
+    def test_identity_lookup_returns_the_num_column(self):
+        """The returned value is dispatched to edit-tracker.yml as the cloud row
+        key, and detect_columns imposes no column ORDER — so cell 0 is not
+        necessarily `#`."""
+        md = ("| Date | # | Company | Role | Score | Status | Report |\n"
+              "|---|---|---|---|---|---|---|\n"
+              "| 2026-08-25 | 7 | Acme | SWE | 4.5/5 | Applied | [7](reports/7.md) |\n")
+        assert data.resolve_num_by_identity(md, "Acme", "SWE") == "7"

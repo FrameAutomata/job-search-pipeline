@@ -366,9 +366,15 @@ def _strip_role_pipe(tracker_tsv: str) -> str:
 # Score cells merge-tracker.mjs accepts verbatim (tracker-parse.mjs's
 # `looksLikeScoreCell`), beyond the plain `N/5` / `N.N/5` form.
 _SCORE_SENTINELS = {"N/A", "DUP", "—", "-"}
-# The leading number of whatever a score cell holds: "4.2", "4.2/5",
-# "4.2 / 5.0", "**4/5**", "4,2/5" (comma decimal). Anything else has no score.
-_SCORE_LEAD_RE = re.compile(r"(\d+(?:[.,]\d+)?)")
+# The shape merge-tracker recognises as a score cell.
+_SCORE_CELL_RE = re.compile(r"^\d+(?:\.\d+)?/5$")
+# The number a score cell OPENS with: "4.2", "4.2/5", "4.2 / 5.0", "**4/5**",
+# "4,2/5" (comma decimal). Anchored deliberately — searching anywhere in the
+# cell turns prose into a score, and the invented value is plausible rather than
+# obviously wrong: "Top 5%" became 5/5, "not scored (4 blockers)" became 4/5.
+# A fabricated top score is the exact harm the out-of-range branch below refuses
+# to cause, since the handoff work-order ranks by score descending.
+_SCORE_LEAD_RE = re.compile(r"^(\d+(?:[.,]\d+)?)")
 
 
 def score_value(cell: str) -> float | None:
@@ -414,6 +420,14 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     if raw.upper() in _SCORE_SENTINELS:
         parts[5] = raw.upper()
         return "\t".join(parts)
+    # The model may have written the pair the other way round (status in col 6,
+    # score in col 5). merge-tracker resolves that on its own — it asks which
+    # ONE of the two looks like a score. Writing N/A here would make BOTH look
+    # like one, so its "exactly one" test fails and it refuses a row it would
+    # otherwise have merged correctly: the loss this function exists to prevent,
+    # caused by this function. Leave a swapped pair alone.
+    if _SCORE_CELL_RE.match(parts[4].replace("*", "").strip()):
+        return tracker_tsv
     value = score_value(raw)
     if value is None:
         # No number at all (empty, "unknown", a stray status). N/A is a shape
@@ -611,7 +625,7 @@ def run_merge_tracker(career_ops: Path) -> bool:
     r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
     if r.returncode == 0:
         print("[batch] tracker merged")
-        _warn_on_lost_additions(before, career_ops, tracker_dir)
+        _warn_on_lost_additions(before, career_ops, tracker_dir, r.stdout)
         return True
     print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
     _hint_missing_node_modules(r.stderr)
@@ -626,18 +640,21 @@ def _addition_key(company: str, role: str) -> str:
     return f"{normalize_company(company)}::{normalize_company(role)}"
 
 
-def _pending_addition_keys(tracker_dir: Path) -> dict[str, str]:
-    """{company::role: filename} for the un-merged addition TSVs (cols 3 and 4)."""
-    keys: dict[str, str] = {}
+def _pending_addition_keys(tracker_dir: Path) -> dict[str, list[str]]:
+    """{company::role: [filename, ...]} for the un-merged addition TSVs (cols 3
+    and 4). A list, not a single name: a re-evaluation of a role already queued
+    puts two TSVs under one key, and collapsing them would under-report the loss
+    and send the operator hunting for one report while another stays buried."""
+    keys: dict[str, list[str]] = {}
     for f in sorted(tracker_dir.glob("*.tsv")) if tracker_dir.exists() else []:
         cells = read_text(f).split("\t")
         if len(cells) >= 4:
-            keys[_addition_key(cells[2], cells[3])] = f.name
+            keys.setdefault(_addition_key(cells[2], cells[3]), []).append(f.name)
     return keys
 
 
-def _warn_on_lost_additions(before: dict[str, str], career_ops: Path,
-                            tracker_dir: Path) -> None:
+def _warn_on_lost_additions(before: dict[str, list[str]], career_ops: Path,
+                            tracker_dir: Path, merge_output: str = "") -> None:
     """Report evaluations that left tracker-additions/ without reaching the
     tracker.
 
@@ -657,17 +674,25 @@ def _warn_on_lost_additions(before: dict[str, str], career_ops: Path,
         return
     still_pending = set(_pending_addition_keys(tracker_dir))
     landed = _tracker_keys(career_ops / "data" / "applications.md")
-    lost = {key: name for key, name in before.items()
+    lost = {key: names for key, names in before.items()
             if key not in still_pending and key not in landed}
     if not lost:
         return
-    print(f"[batch] WARNING: {len(lost)} evaluation(s) left "
+    print(f"[batch] WARNING: {sum(len(n) for n in lost.values())} evaluation(s) left "
           "batch/tracker-additions/ without reaching applications.md — their "
           "reports are on disk but the roles are invisible to the UI and to the "
-          "handoff, and no later run retries them. merge-tracker's output above "
-          "says why; the TSVs are in batch/tracker-additions/merged/:")
-    for key, name in sorted(lost.items()):
-        print(f"[batch]   {name} ({key.replace('::', ' / ')})")
+          "handoff, and no later run retries them. The TSVs are in "
+          "batch/tracker-additions/merged/:")
+    for key, names in sorted(lost.items()):
+        print(f"[batch]   {', '.join(names)} ({key.replace('::', ' / ')})")
+    # merge-tracker's stdout is captured, so the one line saying WHY it refused
+    # each row would otherwise be unreachable — in a cloud run the log is all
+    # the operator has.
+    reasons = [l.strip() for l in merge_output.splitlines() if "Skipping" in l]
+    if reasons:
+        print("[batch] merge-tracker's reasons:")
+        for line in reasons:
+            print(f"[batch]   {line}")
 
 
 def _tracker_keys(applications_md: Path) -> set[str]:

@@ -40,8 +40,13 @@ DESCRIPTION_PREVIEW_CHARS = 500
 
 def _find_section(text: str, markers: tuple[str, ...]) -> re.Match | None:
     """The first of `markers` present in `text` as a heading, as a Match — so a
-    caller gets both "which spelling" and "where" from the one scan."""
-    return next(filter(None, (re.search(rf"^{re.escape(m)}[ \t]*$", text, re.MULTILINE)
+    caller gets both "which spelling" and "where" from the one scan.
+
+    Matches the heading as a PREFIX of its line, not the whole line: real files
+    carry counts and qualifiers ("## Pendientes (3)", "## Pending URLs"), and
+    requiring an exact line means finding nothing and appending a second pending
+    section — the split queue this lookup exists to avoid."""
+    return next(filter(None, (re.search(rf"^{re.escape(m)}\b.*$", text, re.MULTILINE)
                               for m in markers)), None)
 
 

@@ -222,7 +222,10 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str,
         if normalize_company(cells[company_idx]) == want_company and (
             not want_role or normalize_company(cells[role_idx]) == want_role
         ):
-            return cells[0].strip()
+            # The num by name too — detect_columns imposes no column ORDER, so
+            # cell 0 is not guaranteed to be `#`, and this value is dispatched
+            # to edit-tracker.yml as the cloud row key.
+            return cells[columns.index("num")].strip()
     return None
 
 
@@ -387,6 +390,13 @@ def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[s
     the Report anchor's expected slot both come from it, not from a hardcoded
     9-column assumption."""
     columns = columns or _COLUMNS
+    # The whole method is "anchor on the Report link, rebuild around it", so a
+    # layout with no Report column has nothing to anchor on. detect_columns only
+    # demands num/company/role/score/status (career-ops' own required set), so
+    # such a layout is reachable — bail out rather than raise and take the whole
+    # parse, and with it the UI's board, down with it.
+    if "report" not in columns or "role" not in columns:
+        return cells
     report_idx = columns.index("report")
     head = columns.index("role") + 1      # identity cells to keep verbatim
     for i, c in enumerate(cells):
@@ -399,10 +409,15 @@ def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[s
                  and canonical_status(v) in CANONICAL_STATES),
                 "Evaluated",      # safe default — batch rows always start here
             )
+            # Rebuild the middle from the table's OWN column names, so a layout
+            # that orders or omits them differently doesn't get the canonical
+            # score/status/pdf tail stamped onto it.
+            recovered = {"score": score, "status": status, "pdf": "null", "report": c}
+            middle = [recovered.get(k, "") for k in columns[head:report_idx + 1]]
             notes_parts = cells[i + 1:]
             return (
                 cells[:head]
-                + [score, status, "null", c]
+                + middle
                 + ([" | ".join(notes_parts)] if notes_parts else [""])
             )
     return cells
@@ -535,19 +550,28 @@ def reconcile_trackers(
                 | {r.get("report_num") for r in local_rows if r.get("report_num")})
     next_rep = max(_ints(reserved), default=0)
 
+    # Emit rows in the CLOUD table's own layout, not the canonical order: rows
+    # are appended to the cloud tracker, and a cloud tracker migrated to the Via
+    # layout is 10 columns wide. A 9-cell row there is short, so the very next
+    # parse drops it on the minimum-cell-count check — the local-only evaluation
+    # would vanish from the UI and the handoff while its report sat on disk.
+    columns = _header_columns(cloud_md)
+    num_idx = columns.index("num")
+    report_idx = columns.index("report") if "report" in columns else None
+
     renames: list[tuple[str, str]] = []
     new_lines: list[str] = []
     for row in local_only:
         next_num += 1
-        cells = [row.get(c, "") for c in _COLUMNS]
-        cells[_COLUMNS.index("num")] = str(next_num)
+        cells = [row.get(c, "") for c in columns]
+        cells[num_idx] = str(next_num)
 
         old_rep = row.get("report_num", "")
-        if old_rep and old_rep in cloud_report_nums:
+        if old_rep and old_rep in cloud_report_nums and report_idx is not None:
             next_rep += 1
             new_rep = str(next_rep)
             renames.append((old_rep, new_rep))
-            cells[_REPORT_COL_IDX] = _renumber_report_cell(cells[_REPORT_COL_IDX], old_rep, new_rep)
+            cells[report_idx] = _renumber_report_cell(cells[report_idx], old_rep, new_rep)
         new_lines.append("| " + " | ".join(cells) + " |")
 
     return _append_rows(cloud_md, new_lines), renames

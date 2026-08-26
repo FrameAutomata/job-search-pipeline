@@ -600,3 +600,33 @@ class TestNormalizeScoreCell:
                          reports, tracker, "2026-08-25")
         written = (tracker / "3.tsv").read_text(encoding="utf-8")
         assert written.split("\t")[5] == "4.2/5"
+
+
+class TestScoreNormalizationDoesNotInvent:
+    """The normalizer must never manufacture a score, and never turn a row
+    merge-tracker would accept into one it refuses."""
+
+    @staticmethod
+    def _row(score, status="Evaluated"):
+        return "\t".join(["3", "2026-08-25", "Initech", "SRE", status,
+                          score, "null", "[003](reports/003-x.md)", "note"])
+
+    @pytest.mark.parametrize("raw", [
+        "Top 5%",                 # -> 5/5: a fabricated TOP score, ranked first
+        "not scored (4 blockers)",
+        "see report 003",
+        "N/A - 3 red flags",
+    ])
+    def test_prose_does_not_become_a_score(self, raw):
+        """Searching anywhere in the cell turned prose into a plausible score.
+        The handoff work-order ranks by score descending, so an invented 5 puts
+        that role at the top of the queue."""
+        assert _normalize_score_cell(self._row(raw)).split("\t")[5] == "N/A"
+
+    def test_swapped_status_and_score_are_left_alone(self):
+        """When the model writes the pair the other way round, merge-tracker
+        resolves it — it asks which ONE of the two looks like a score. Writing
+        N/A into col 6 makes BOTH look like one, so it refuses a row it would
+        have merged: the loss this function exists to prevent, caused by it."""
+        swapped = self._row("Evaluated", status="4.2/5")
+        assert _normalize_score_cell(swapped) == swapped
