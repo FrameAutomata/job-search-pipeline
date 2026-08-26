@@ -240,7 +240,7 @@ Cloud automation workflows:
 
 - **Setup data** (CV, profile, search config) → repository **Secrets** (encrypted at rest, not visible to forkers)
 - **Runtime state** (scan-history, applications.md, pipeline.md, recheck-state, batch state, cached JDs) → **`actions/cache@v4`** keyed `pipeline-state-v1`. Per-fork, restored at workflow start, saved at workflow end. Invisible to anyone but the fork owner.
-- **Outputs** (reports, tracker snapshot) → **`actions/upload-artifact@v4`**. Downloadable from the Actions tab for 90 days.
+- **Outputs** (reports, tracker snapshot) → **`actions/upload-artifact@v4`**. Downloadable from the Actions tab for **7 days**. Short on purpose: `career-ops/reports/` is restored from the state cache each run and accumulates, so every artifact carries the whole report history to date — at 90 days' retention you keep 90 copies of a growing directory and the storage cost grows with the *square* of how long the pipeline has run. Exhausting the account's Actions storage stops GitHub creating workflow runs at all, including the Tests run on every PR, which is a confusing failure to diagnose. The durable copies are the cache and your local career-ops; the artifact is just the delivery mechanism for a daily job.
 
 **Pass selection flags** (mutually exclusive, for manual/local runs): `--only-pass "name1,name2"` (case-insensitive name match, errors on no match), `--easy-apply-only` (passes with `easy_apply: true`, no-ops if none), `--no-easy-apply` (passes without `easy_apply: true`). The daily cloud workflow runs **every** pass with no selection flag; these flags exist for ad-hoc local runs and route by the `easy_apply` field rather than name so user-renamed passes still work.
 
