@@ -93,7 +93,7 @@ jobs:
           fi
 
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # This path list MUST stay byte-for-byte identical to daily-pipeline.yml's
       # cache path list. GitHub derives the cache "version" from the path set, and
@@ -102,7 +102,7 @@ jobs:
       # silently builds its own lineage instead). That exact drift once dropped
       # recheck-state.tsv + easy-apply-urls.txt here and broke every push.
       - name: Restore pipeline state cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             career-ops/data/scan-history.tsv
@@ -217,7 +217,7 @@ jobs:
 
       - name: Save pipeline state cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             career-ops/data/scan-history.tsv
@@ -233,7 +233,7 @@ jobs:
 
       - name: Upload new applications.md as artifact (verification)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: applications-md-${{ github.run_id }}
           path: career-ops/data/applications.md

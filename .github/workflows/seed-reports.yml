@@ -71,10 +71,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Restore pipeline state cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             career-ops/data/scan-history.tsv
@@ -129,7 +129,7 @@ jobs:
 
       - name: Save pipeline state cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             career-ops/data/scan-history.tsv
