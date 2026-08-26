@@ -41,7 +41,19 @@ on:
 permissions:
   contents: read
 
-# Don't race a scheduled pipeline run that's also saving the same cache.
+# Don't race a scheduled pipeline run that's also saving the same cache. That
+# sentence has been the intent since this file was written and only became true
+# in #135: daily-pipeline.yml saved the same cache from a group of its own, so a
+# Push dispatched at 12:05 UTC could silently revert the noon daily, or be
+# silently reverted by it. Every writer now shares this group and a Push during
+# a daily queues behind it.
+#
+# The residual cost is one pending run per group: dispatch a second writer while
+# this one is queued and this one is CANCELLED. That matters more here than
+# elsewhere, because /api/push-status clears a pending override as soon as the
+# dispatch is accepted — so an evicted Push loses those status edits from the
+# cloud rather than deferring them, and pressing Push again sends nothing. If a
+# queued Edit Tracker run shows up cancelled, re-drag the affected cards.
 concurrency:
   group: pipeline-state
   cancel-in-progress: false

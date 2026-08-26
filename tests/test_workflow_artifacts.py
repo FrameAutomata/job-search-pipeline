@@ -29,6 +29,15 @@ seed-reports.yml named seven and spent months repairing into a cache the daily
 never read. edit-tracker.yml carried a prose warning about precisely this,
 written after it had already caused one outage. Prose is not a guard.
 
+A fourth, from issue #135, is the same rule seen from the other side. Agreeing
+on WHICH cache to write is worthless if two runs write it at the same time: a
+save is a whole snapshot, not a merge, so the later one wins and takes the
+other's work with it. The three workflows that save must therefore share one
+concurrency group, and daily-pipeline.yml sat in a group of its own — so the
+UI's Push button could silently revert the noon daily, or be reverted by it,
+for as long as the daily's whole runtime. Fixing #133 is what made the
+equivalent hazard in seed-reports live; this is the half that makes it safe.
+
 Guarding the rule rather than today's two upload steps, in the spirit of
 tests/test_stdio.py: the failure mode is a *new* upload added later by pasting
 an older one, and both halves of the rule are invisible in the paste.
@@ -86,12 +95,26 @@ CACHED_PATHS = {
 DAILY = "daily-pipeline.yml"
 CAREER_OPS = "career-ops"
 
+# The one concurrency group every WRITER of the pipeline-state cache runs under.
+# A save writes a whole snapshot keyed pipeline-state-v1-<run_id> and the next
+# run restores by prefix, so two writers overlapping means the later save wins
+# outright — there is no merge and no log line anywhere that says so. And the
+# critical section is a writer's whole run, not its save step: each one restores
+# at the start and saves at the end, so a save landing anywhere in between is
+# overwritten. Serialization is the only thing that makes that read-modify-write
+# safe. A literal rather than "whatever the daily says", because unlike the path
+# set there is no reference copy here — any of the three could be the drifted
+# one, and the failure message should name it rather than assume. Issue #135.
+STATE_GROUP = "pipeline-state"
+
 
 class Step(NamedTuple):
     workflow: str
     label: str          # "<workflow>:<job>:<step name>", pre-built for messages
     block: dict         # the step's `with:` mapping
     scheduled: bool     # does its workflow have a `schedule:` trigger?
+    uses: str = ""      # the action ref, for rules that care which variant
+    job: str = ""       # the containing job, for job-level `concurrency:`
 
 
 def _doc(name: str) -> dict:
@@ -202,12 +225,15 @@ def _steps_using(action: str) -> list[Step]:
         scheduled = "schedule" in _triggers(doc)
         for job_name, job in (doc.get("jobs") or {}).items():
             for step in (job.get("steps") or []):
-                if str(step.get("uses") or "").startswith(action):
+                uses = str(step.get("uses") or "")
+                if uses.startswith(action):
                     out.append(Step(
                         path.name,
                         f"{path.name}:{job_name}:{step.get('name', '?')}",
                         step.get("with") or {},
-                        scheduled))
+                        scheduled,
+                        uses,
+                        job_name))
     return out
 
 
@@ -257,6 +283,63 @@ def _all_cache_steps() -> list[Step]:
     return [s for s in _steps_using("actions/cache")
             if any(_covers(e, c)
                    for e in _path_entries(s.block) for c in CACHED_PATHS)]
+
+
+def _cache_writing_steps() -> list[Step]:
+    """The cache steps that SAVE — everything under `actions/cache` that is not
+    explicitly the restore half.
+
+    Fail-closed, and that is the whole design of it. `actions/cache@v6` (the
+    combined action) saves as well as restores, and so would any future variant;
+    an action this predicate didn't recognize but counted as a reader would be
+    exempted from the group rule in silence, which is the failure this file
+    exists to catch. Listing the savers instead would have to be edited by the
+    person adding the thing it is meant to catch.
+
+    Restore-only steps are out of scope deliberately, not by oversight: a
+    restore matches a complete, immutable entry and can clobber nothing.
+    export-reports.yml is the one that relies on this — it has no group so that
+    recovering the report history never queues behind, or is evicted by, the
+    writers it is being used to recover from."""
+    return [s for s in _all_cache_steps()
+            if not s.uses.startswith("actions/cache/restore")]
+
+
+def _concurrency_group(block) -> str | None:
+    """The group name out of a `concurrency:` value, in either shape GitHub
+    accepts.
+
+    The trap here mirrors `_triggers`' one a level down. There, PyYAML mangles
+    the KEY; here it is the VALUE that has two forms — `concurrency: my-group`
+    is the documented shorthand for `concurrency: {group: my-group}`, so
+    `doc["concurrency"]["group"]` raises TypeError on a perfectly legal
+    workflow. A guard that crashes on the shorthand teaches people to avoid the
+    shorthand, which is not a rule anyone chose."""
+    if isinstance(block, str):
+        return block or None
+    if isinstance(block, dict):
+        group = block.get("group")
+        return str(group) if group else None
+    return None
+
+
+def _concurrency_blocks(step: Step) -> list:
+    """The `concurrency:` values in force while `step` runs: its workflow's and
+    its own job's.
+
+    Both, because GitHub honours both and either alone serializes the save.
+    Reading only the workflow level would report "no group" for a file that
+    moved its group down onto the cache-writing job — a refactor that keeps the
+    invariant while failing the test, which is how a guard gets deleted instead
+    of fixed."""
+    doc = _doc(step.workflow)
+    job = (doc.get("jobs") or {}).get(step.job) or {}
+    return [b for b in (doc.get("concurrency"), job.get("concurrency"))
+            if b is not None]
+
+
+def _groups_in_force(step: Step) -> set[str]:
+    return {g for g in map(_concurrency_group, _concurrency_blocks(step)) if g}
 
 
 class TestRetentionIsDeclaredAndBounded:
@@ -467,6 +550,68 @@ class TestEveryCacheStepSharesOnePathSet:
         )
 
 
+class TestEveryCacheWriterSharesOneConcurrencyGroup:
+    """Issue #135, and the other half of the rule above. Agreeing on which cache
+    to write buys nothing if two runs write it at once — a save is a whole
+    snapshot, so the later one wins and the earlier one's work is gone with no
+    merge and no warning. Scoped to WRITERS, because that is what the hazard is
+    about; a restore reads a complete, immutable entry and is safe alongside
+    anything."""
+
+    def test_the_scan_finds_the_writers(self):
+        """Same reason as the two scans above: a collector that returned []
+        would make the rules below pass forever. Named, not counted — a count
+        cannot say which writer went missing."""
+        found = {c.workflow for c in _cache_writing_steps()}
+        want = {DAILY, "edit-tracker.yml", "seed-reports.yml"}
+        assert found >= want, (
+            f"the cache-writer scan missed {sorted(want - found)}. Either the "
+            "workflow stopped saving the pipeline-state cache (then drop it "
+            "from this list, deliberately) or the collector no longer sees it "
+            "— which would exempt it from the rules below."
+        )
+
+    def test_every_cache_writer_runs_under_the_state_group(self):
+        wrong = []
+        for c in _cache_writing_steps():
+            groups = _groups_in_force(c)
+            if STATE_GROUP not in groups:
+                wrong.append(
+                    f"{c.label} (runs under {sorted(groups) or 'no group at all'})")
+        assert not wrong, (
+            f"these steps save the pipeline-state cache from outside the "
+            f"{STATE_GROUP!r} concurrency group: {wrong}. Nothing then stops "
+            "their run overlapping another writer's, and which one loses is "
+            "decided by whose save happens to land last — a whole snapshot "
+            "each time, so the other run's evaluations, reports, scan-history "
+            "rows and batch state are simply gone. The window is a writer's "
+            "WHOLE run, not its save step: it restores at the start and saves "
+            "at the end. Give the workflow `concurrency:` with `group: "
+            f"{STATE_GROUP}` and `cancel-in-progress: false`. If the step only "
+            "ever reads, use actions/cache/restore and it is exempt."
+        )
+
+    def test_no_cache_writer_cancels_a_run_in_progress(self):
+        """The group serializes; `cancel-in-progress: true` would instead make
+        each dispatch kill whatever is running. That is strictly worse than the
+        race it looks like it solves, because every save step here is
+        `if: always()` — and always() is true for a CANCELLED run — so a daily
+        cancelled at minute 30 still writes its half-evaluated batch state and
+        partially-merged tracker over the good snapshot."""
+        wrong = [f"{c.label} ({block.get('cancel-in-progress')!r})"
+                 for c in _cache_writing_steps()
+                 for block in _concurrency_blocks(c)
+                 if isinstance(block, dict)
+                 and block.get("cancel-in-progress", False) is not False]
+        assert not wrong, (
+            "these cache writers may cancel a run already in progress: "
+            f"{wrong}. Every save step here is `if: always()`, which fires on "
+            "cancellation too, so the victim doesn't merely stop — it saves "
+            "its partial state over the complete snapshot on its way out. "
+            "cancel-in-progress must be false (or absent) for this group."
+        )
+
+
 class TestTheGuardsCatchWhatTheyForbid:
     """A guard is only worth having if it fails on the thing it forbids."""
 
@@ -586,6 +731,92 @@ class TestTheGuardsCatchWhatTheyForbid:
                          key="pipeline-state-v2-${{ x }}")
         with pytest.raises(AssertionError, match="key prefix"):
             TestEveryCacheStepSharesOnePathSet().test_every_cache_step_shares_the_daily_key_prefix()
+
+    def _fake_writer(self, monkeypatch, workflow, *, job="job",
+                     uses="actions/cache/save@v6"):
+        """Point the cache-step scan at one step in a NAMED REAL workflow.
+
+        The `with:`-block fakes above can be invented wholesale, but a group is
+        read back out of the file on disk — so the honest way to fake a wrong
+        one is to name a workflow that really has it. gc-actions-storage.yml and
+        export-reports.yml stand in below, which means the read path under test
+        is the one that runs against the real files."""
+        monkeypatch.setattr(
+            "tests.test_workflow_artifacts._all_cache_steps",
+            lambda: [Step(workflow, f"{workflow}:{job}:Save", {}, False,
+                          uses, job)])
+
+    def test_a_writer_outside_the_state_group_is_caught(self, monkeypatch):
+        """The bug itself: daily-pipeline.yml saved this cache from a group of
+        its own for as long as the workflow has existed. gc-actions-storage.yml
+        stands in — a real file whose real group is a real different one."""
+        self._fake_writer(monkeypatch, "gc-actions-storage.yml", job="gc")
+        with pytest.raises(AssertionError, match="outside the"):
+            TestEveryCacheWriterSharesOneConcurrencyGroup().test_every_cache_writer_runs_under_the_state_group()
+
+    def test_a_writer_with_no_group_at_all_is_caught(self, monkeypatch):
+        """A new manual writer pasted from export-reports.yml, which has no
+        `concurrency:` block because it never saves. Copying the file is how
+        that would actually arrive."""
+        self._fake_writer(monkeypatch, "export-reports.yml", job="export")
+        with pytest.raises(AssertionError, match="no group at all"):
+            TestEveryCacheWriterSharesOneConcurrencyGroup().test_every_cache_writer_runs_under_the_state_group()
+
+    def test_the_bare_cache_action_counts_as_a_writer(self, monkeypatch):
+        """`actions/cache@v6` restores AND saves. Anything that is not
+        explicitly the restore half has to count as a writer, or one paste of
+        the combined action walks out of the rule instead of failing it."""
+        self._fake_writer(monkeypatch, "export-reports.yml", job="export",
+                          uses="actions/cache@v6")
+        assert len(_cache_writing_steps()) == 1, "the combined action escaped"
+        with pytest.raises(AssertionError, match="no group at all"):
+            TestEveryCacheWriterSharesOneConcurrencyGroup().test_every_cache_writer_runs_under_the_state_group()
+
+    def test_a_restore_only_step_is_exempt(self, monkeypatch):
+        """The rule is about saving, not about the cache. export-reports.yml
+        restores this exact cache from no group on purpose — queueing the
+        recovery path behind the writers you are recovering from is the thing
+        its header rejects — and must not trip the guard."""
+        self._fake_writer(monkeypatch, "export-reports.yml", job="export",
+                          uses="actions/cache/restore@v6")
+        assert _cache_writing_steps() == []
+        TestEveryCacheWriterSharesOneConcurrencyGroup().test_every_cache_writer_runs_under_the_state_group()
+
+    def _fake_doc(self, monkeypatch, doc):
+        monkeypatch.setattr("tests.test_workflow_artifacts._doc", lambda name: doc)
+
+    def test_a_group_named_only_on_the_job_still_counts(self, monkeypatch):
+        """`concurrency:` is legal at job level and serializes the save just as
+        well. No workflow here writes it that way, so this is the one fake with
+        no real stand-in — and the point is that the guard must PASS, not fail:
+        a rule that rejects a valid arrangement gets deleted rather than met."""
+        self._fake_writer(monkeypatch, "fake.yml")
+        self._fake_doc(monkeypatch,
+                       {"jobs": {"job": {"concurrency": {"group": STATE_GROUP}}}})
+        TestEveryCacheWriterSharesOneConcurrencyGroup().test_every_cache_writer_runs_under_the_state_group()
+
+    def test_the_string_shorthand_for_a_group_is_read(self, monkeypatch):
+        """`concurrency: pipeline-state` is GitHub's documented shorthand for
+        `concurrency: {group: pipeline-state}`. Read as a mapping it raises
+        TypeError, which fails the run for a reason that has nothing to do with
+        the rule — the `on`-resolves-to-True trap one level down."""
+        assert _concurrency_group(STATE_GROUP) == STATE_GROUP
+        assert _concurrency_group({"group": STATE_GROUP}) == STATE_GROUP
+        assert _concurrency_group(None) is None
+        self._fake_writer(monkeypatch, "fake.yml")
+        self._fake_doc(monkeypatch, {"concurrency": STATE_GROUP, "jobs": {"job": {}}})
+        TestEveryCacheWriterSharesOneConcurrencyGroup().test_every_cache_writer_runs_under_the_state_group()
+
+    def test_cancelling_a_run_in_progress_is_caught(self, monkeypatch):
+        """Reaching for cancel-in-progress to "resolve" the contention is the
+        plausible wrong fix, and the save steps' `if: always()` makes it lose
+        MORE than the race did."""
+        self._fake_writer(monkeypatch, "fake.yml")
+        self._fake_doc(monkeypatch, {
+            "concurrency": {"group": STATE_GROUP, "cancel-in-progress": True},
+            "jobs": {"job": {}}})
+        with pytest.raises(AssertionError, match="cancel a run already"):
+            TestEveryCacheWriterSharesOneConcurrencyGroup().test_no_cache_writer_cancels_a_run_in_progress()
 
     def test_an_unclassified_cache_path_is_caught(self, monkeypatch):
         """The exhaustiveness half: a path added to the cache with no entry in

@@ -19,14 +19,19 @@ name: Seed Reports Cache
 # and your local `career-ops/` is the durable local one — this workflow is for
 # repairing the cache, not for being the backup.
 #
-# WARNING — concurrency:
-#   This writes to the same `pipeline-state-v1-*` cache that the scheduled
-#   pipelines use. The save step here doesn't know about evaluations that a
-#   daily / easy-apply run completed in parallel, so triggering it while
-#   another pipeline run is in flight can cause its updates to be overwritten.
-#   Wait until the Actions tab shows no running pipeline before clicking
-#   "Run workflow". The concurrency group below serializes against
-#   edit-tracker but NOT against daily/easy-apply (they use different groups).
+# CONCURRENCY — the platform now waits for you (issue #135):
+#   This writes the same `pipeline-state-v1-*` cache the daily writes, and each
+#   save is a whole snapshot rather than a merge, so two writers overlapping
+#   means the later one wins and the earlier one's work is gone unannounced.
+#   Every writer of that cache — this file, edit-tracker.yml and, since #135,
+#   daily-pipeline.yml — now shares the `pipeline-state` group below, so
+#   dispatching this during a daily QUEUES it behind the daily instead of
+#   racing it. You no longer have to check the Actions tab first; the older
+#   instruction to do so is gone because the platform enforces it.
+#   What to watch for instead: GitHub keeps only ONE pending run per group, so
+#   dispatching a second writer (another seed, or the UI's Push) while this one
+#   is still queued CANCELS this one. A queued run that turns up "cancelled"
+#   was superseded, not broken — dispatch it again once the group is clear.
 
 on:
   workflow_dispatch:
