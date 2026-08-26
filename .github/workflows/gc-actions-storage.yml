@@ -62,16 +62,30 @@ jobs:
       KEEP: ${{ inputs.keep_artifacts || '20' }}
       LOG_DAYS: ${{ inputs.log_retention_days || '30' }}
       DRY_RUN: ${{ inputs.dry_run || 'false' }}
-      # Ceiling on log deletions per sweep, so a long-lived copy can't spend its
-      # whole API rate limit here. Only SUCCESSFUL deletions count against it —
-      # a run whose logs are already gone answers 404/410 and is free — so a
-      # backlog drains a slice per week instead of the sweep stalling on the
-      # oldest runs it already cleared.
-      MAX_LOG_DELETES: '400'
+      # Ceiling on API calls the log sweep may spend, so a long-lived copy can't
+      # burn its whole rate limit here (GITHUB_TOKEN gets 1,000 requests/hour
+      # per repository). ATTEMPTS, not successes: runs are never deleted, only
+      # their logs, so a run already cleared stays in the listing forever and
+      # re-answers 404 every week. Counting only successes would let those
+      # no-ops grow without bound and silently crowd out the real work.
+      MAX_LOG_ATTEMPTS: '400'
+      # How far back the monthly walk starts. Three years covers any copy of
+      # this template; windows with no runs cost one cheap listing each.
+      LOOKBACK_MONTHS: '36'
     steps:
       - name: Prune artifacts, keeping the newest per name
         run: |
           set -euo pipefail
+
+          # awk's `>` falls back to STRING comparison when either side is not a
+          # number, and "1" < "ten" lexically — so a typo'd input would delete
+          # nothing while the step exited 0 and reported a successful prune.
+          case "$KEEP" in
+            ''|*[!0-9]*) echo "::error::keep_artifacts must be a whole number, got '$KEEP'"; exit 1 ;;
+          esac
+          case "$LOG_DAYS" in
+            ''|*[!0-9]*) echo "::error::log_retention_days must be a whole number, got '$LOG_DAYS'"; exit 1 ;;
+          esac
 
           # Group by artifact NAME with its run-id suffix stripped, and keep the
           # newest KEEP of each group rather than KEEP overall: the groups here
@@ -130,41 +144,72 @@ jobs:
           # no retention setting of their own — nothing else in this repo ever
           # removes them. The runs themselves are left alone: the Actions tab's
           # history is worth keeping, and it is the logs that hold the bytes.
-          gh api --paginate -X GET "/repos/$REPO/actions/runs" \
-            -f "created=<$CUTOFF" -f per_page=100 \
-            --jq '.workflow_runs[] | select(.status == "completed")
-                  | [(.id|tostring), .created_at, .name] | @tsv' > old-runs.tsv || true
-
-          if [ ! -s old-runs.tsv ]; then
-            echo "No completed runs older than $CUTOFF."
-            exit 0
-          fi
-
-          # Oldest first, so a capped sweep spends its budget on the runs that
-          # have been holding storage longest.
-          sort -t"$(printf '\t')" -k2,2 old-runs.tsv -o old-runs.tsv
-
+          #
+          # Walked in MONTHLY windows, oldest first, rather than one
+          # `created=<CUTOFF` query. /actions/runs returns newest-first and caps
+          # pagination, so a single query on a long-lived copy returns the
+          # NEWEST slice of the pre-cutoff set and the genuinely oldest runs —
+          # the ones holding storage longest, and the whole point of an
+          # oldest-first sweep — are never listed at all. Each month window is
+          # far under the cap, so every run is reachable.
+          attempts=0
           deleted=0
           already=0
-          while IFS=$'\t' read -r id created name; do
-            if [ "$deleted" -ge "$MAX_LOG_DELETES" ]; then
-              # Say so rather than stopping quietly: a capped sweep looks
-              # identical to a finished one in the log otherwise.
-              echo "Reached MAX_LOG_DELETES=$MAX_LOG_DELETES with $(wc -l < old-runs.tsv) runs listed."
-              echo "The remainder is picked up by next week's sweep, or run this workflow again now."
-              break
-            fi
-            if [ "$DRY_RUN" = "true" ]; then
-              echo "  would delete logs: $created  id=$id  $name"
-              continue
-            fi
-            if gh api -X DELETE "/repos/$REPO/actions/runs/$id/logs" --silent </dev/null 2>/dev/null; then
-              deleted=$((deleted + 1))
-            else
-              # 404/410: already deleted, or expired on GitHub's own schedule.
-              already=$((already + 1))
-            fi
-          done < old-runs.tsv
+          errors=0
+          capped=""
 
-          echo "Deleted logs for $deleted run(s); $already had none left to delete."
+          month=$(date -u -d "$LOOKBACK_MONTHS months ago" +%Y-%m-01)
+          while [[ "$month" < "$CUTOFF" ]]; do
+            next=$(date -u -d "$month +1 month" +%Y-%m-01)
+            # Clamp the last window to the cutoff so nothing newer is touched.
+            hi="$next"
+            if [[ "$hi" > "$CUTOFF" ]]; then hi="$CUTOFF"; fi
+
+            gh api --paginate -X GET "/repos/$REPO/actions/runs" \
+              -f "created=$month..$hi" -f status=completed -f per_page=100 \
+              --jq '.workflow_runs[] | [(.id|tostring), .created_at, .name] | @tsv' \
+              > window.tsv || true
+
+            while IFS=$'\t' read -r id created name; do
+              [ -n "$id" ] || continue
+              if [ "$attempts" -ge "$MAX_LOG_ATTEMPTS" ]; then
+                capped=yes
+                break
+              fi
+              if [ "$DRY_RUN" = "true" ]; then
+                attempts=$((attempts + 1))
+                echo "  would delete logs: $created  id=$id  $name"
+                continue
+              fi
+              attempts=$((attempts + 1))
+              # One call, and its stderr decides the bucket. gh prints
+              # `gh: <message> (HTTP <code>)` on a non-2xx. 404/410 is "already
+              # gone", the steady state once a backlog has drained; anything
+              # else (403 rate limit above all) is counted apart, because a
+              # throttled sweep that deleted nothing must not read as a
+              # finished one.
+              if err=$(gh api -X DELETE "/repos/$REPO/actions/runs/$id/logs" \
+                         --silent </dev/null 2>&1); then
+                deleted=$((deleted + 1))
+              elif printf '%s' "$err" | grep -qE 'HTTP (404|410)'; then
+                already=$((already + 1))
+              else
+                errors=$((errors + 1))
+                [ "$errors" = 1 ] && echo "  first failure on run $id: $err"
+              fi
+            done < window.tsv
+
+            [ -n "$capped" ] && break
+            month="$next"
+          done
+
+          echo "Attempted $attempts; deleted $deleted; $already had none left; $errors other failures."
+          if [ -n "$capped" ]; then
+            # Say so rather than stopping quietly: a capped sweep looks
+            # identical to a finished one in the log otherwise.
+            echo "::notice::Stopped at MAX_LOG_ATTEMPTS=$MAX_LOG_ATTEMPTS. Next week's sweep continues where this left off, or run this workflow again now."
+          fi
+          if [ "$errors" -gt 0 ]; then
+            echo "::warning::$errors log deletions failed for reasons other than 'already gone' — most likely the API rate limit. Re-run later; this sweep did not finish."
+          fi
           if [ "$DRY_RUN" = "true" ]; then echo "DRY RUN — nothing was deleted."; fi

@@ -101,6 +101,34 @@ class TestReconcileTrackers:
         assert ("11-x.md", "12-x.md") in renames
         assert _by_company(merged)["Zeta"]["report_num"] == "12"
 
+    def test_slugless_report_filename_is_renumbered_too(self):
+        """`NNN.md` is a shape _REPORT_FILE_RE accepts and reports/ can hold.
+
+        The rename pair is read back out of the cell this rewrites, so a path
+        left untouched yields a (same, same) self-rename — the file never moves
+        and the cloud copy overwrites the local-only report the renumber exists
+        to protect, with both rows then linking to the same file."""
+        cloud = _tracker(_row(1, "Acme", "Eng", report="5").replace(
+            "reports/5-x.md", "reports/5.md"))
+        local = _tracker(_row(9, "Zeta", "Ops", report="5").replace(
+            "reports/5-x.md", "reports/5.md"))
+        merged, renames = data.reconcile_trackers(cloud, local, {"5"})
+        assert renames == [("5.md", "6.md")]
+        assert _by_company(merged)["Zeta"]["report_path"] == "reports/6.md"
+
+    def test_collision_is_tested_on_the_number_not_its_spelling(self):
+        """The pipeline mints report numbers zero-padded (`f"{n:03d}"`) while a
+        renumber here emits `str(n)`, so a merge can hand out `43` against a
+        cloud holding `042`. Compared as strings, the next merge reads that `43`
+        as unclaimed when the cloud mints `043` — two live reports for one
+        number, and find_report_file (which int-normalizes) picks by glob order."""
+        cloud = _tracker(_row(1, "Acme", "Eng", report="042"),
+                         _row(2, "Beta", "Dev", report="043"))
+        local = _tracker(_row(9, "Zeta", "Ops", report="43"))
+        merged, renames = data.reconcile_trackers(cloud, local, {"042", "043"})
+        assert renames == [("43-x.md", "44-x.md")]
+        assert _by_company(merged)["Zeta"]["report_num"] == "44"
+
     def test_local_only_report_no_collision_kept(self):
         cloud = _tracker(_row(1, "Acme", "Eng", report="10"))
         local = _tracker(_row(2, "Zeta", "Ops", report="55"))

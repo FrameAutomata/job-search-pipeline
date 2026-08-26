@@ -127,21 +127,42 @@ def stage(
     return staged_delta, staged_whole
 
 
-def _read_manifest(path: Path) -> dict[str, Stat]:
+def _read_manifest(path: Path, root: Path, deltas: list[str]) -> dict[str, Stat]:
     """Load the pre-run manifest, or fail loudly.
 
     Not "treat a missing manifest as empty": that silently restores the
     unbounded upload this module exists to prevent, and would do it on the path
     where nobody is looking. The snapshot step runs before the pipeline does, so
     a manifest missing at staging time means the run never got as far as writing
-    a report — there is nothing to lose by refusing."""
+    a report — there is nothing to lose by refusing.
+
+    A manifest of the WRONG thing fails the same way and for the same reason.
+    The two workflow steps have to agree on --root and --delta or the keys don't
+    line up, every restored report reads as new, and the whole history goes back
+    into the artifact — the exact outcome refusing a missing manifest prevents.
+    So the manifest records its own scope and this checks it, rather than
+    leaving the agreement to two argument lists that happen to match today."""
     if not path.is_file():
         raise SystemExit(
             f"run_artifact: no manifest at {path}. The snapshot step must run "
             "after the cache restore and before the pipeline — without it there "
             "is no way to tell this run's reports from the whole restored history."
         )
-    return json.loads(path.read_text(encoding="utf-8"))
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    scope, want = doc.get("scope"), _scope(root, deltas)
+    if scope != want:
+        raise SystemExit(
+            f"run_artifact: manifest at {path} was taken of {scope}, but staging "
+            f"asked for {want}. The snapshot and stage steps must pass the same "
+            "--root and --delta; mismatched, every restored file reads as new "
+            "and the artifact carries the whole history again."
+        )
+    return doc["files"]
+
+
+def _scope(root: Path, deltas: list[str]) -> dict:
+    """What a manifest is a manifest OF. Compared verbatim between the two steps."""
+    return {"root": Path(root).as_posix(), "delta": sorted(deltas)}
 
 
 def _main(argv: list[str]) -> int:
@@ -162,19 +183,24 @@ def _main(argv: list[str]) -> int:
     if args.mode == "snapshot":
         manifest = scan(args.root, args.delta)
         args.manifest.parent.mkdir(parents=True, exist_ok=True)
-        args.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        args.manifest.write_text(
+            json.dumps({"scope": _scope(args.root, args.delta), "files": manifest}),
+            encoding="utf-8")
         print(f"[artifact] snapshot: {len(manifest)} file(s) already present in "
               f"{', '.join(args.delta) or '(nothing)'}")
         return 0
 
     if args.into is None:
         ap.error("stage requires --into")
+    # Read the manifest BEFORE touching --into: both failures above are fatal,
+    # and wiping an already-staged tree on the way to erroring would destroy the
+    # only copy of work a re-run was meant to inspect.
+    manifest = _read_manifest(args.manifest, args.root, args.delta)
     # Fresh every time: a leftover tree from a re-run of the step would upload
     # files this run neither produced nor knows about.
     if args.into.exists():
         shutil.rmtree(args.into)
-    delta, whole = stage(args.root, args.into, _read_manifest(args.manifest),
-                         args.delta, args.whole)
+    delta, whole = stage(args.root, args.into, manifest, args.delta, args.whole)
     print(f"[artifact] staged {len(delta)} new file(s) from this run "
           f"+ {len(whole)} whole path(s) into {args.into}")
     for key in delta:

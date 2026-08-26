@@ -537,9 +537,28 @@ def _row_identity(row: dict) -> str:
     return f"{normalize_company(row.get('company', ''))}::{normalize_company(row.get('role', ''))}"
 
 
-def _row_report_nums(rows: list[dict]) -> set[str]:
+def _report_int(value) -> int | None:
+    """A report number as an int, or None if it isn't one."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_ints(values) -> set[int]:
+    """Report numbers as a set of ints, dropping anything non-numeric.
+
+    Numbers, not strings, because the pipeline mints them zero-padded
+    (`f"{n:03d}"` in assign_job_numbers) while a renumber here emits `str(n)`.
+    A string membership test therefore reads "43" as unclaimed against a cloud
+    that holds "043" — so the very number this function's callers assign would
+    be invisible to the next merge's collision check."""
+    return {n for n in (_report_int(v) for v in values) if n is not None}
+
+
+def _row_report_nums(rows: list[dict]) -> set[int]:
     """The report numbers a set of tracker rows link to."""
-    return {r["report_num"] for r in rows if r.get("report_num")}
+    return _report_ints(r["report_num"] for r in rows if r.get("report_num"))
 
 
 def reconcile_trackers(
@@ -579,24 +598,15 @@ def reconcile_trackers(
     # local-only row holding that number would keep it — leaving the cloud row's
     # `[42](reports/42-….md)` link pointing at the local report. The cloud
     # tracker names every number it has ever used, so ask it too.
-    cloud_claimed = set(cloud_report_nums) | _row_report_nums(cloud_rows)
+    cloud_claimed = _report_ints(cloud_report_nums) | _row_report_nums(cloud_rows)
 
-    def _ints(vals):
-        out = []
-        for v in vals:
-            try:
-                out.append(int(str(v).strip()))
-            except (TypeError, ValueError):
-                pass
-        return out
-
-    next_num = max(_ints(r.get("num") for r in cloud_rows), default=0)
+    next_num = max(_report_ints(r.get("num") for r in cloud_rows), default=0)
     # A renumbered report must avoid every number already in use: cloud reports
     # (about to be copied in), every report referenced by a local row, and every
     # report file on local disk (orphans included). Seed the running max from all
     # three so an assigned number can't collide with any of them.
-    reserved = cloud_claimed | set(local_report_nums) | _row_report_nums(local_rows)
-    next_rep = max(_ints(reserved), default=0)
+    reserved = cloud_claimed | _report_ints(local_report_nums) | _row_report_nums(local_rows)
+    next_rep = max(reserved, default=0)
 
     # Emit rows in the CLOUD table's own layout, not the canonical order: rows
     # are appended to the cloud tracker, and a cloud tracker migrated to the Via
@@ -615,7 +625,7 @@ def reconcile_trackers(
         cells[num_idx] = str(next_num)
 
         old_rep = row.get("report_num", "")
-        if old_rep and old_rep in cloud_claimed and report_idx is not None:
+        if _report_int(old_rep) in cloud_claimed and report_idx is not None:
             next_rep += 1
             new_rep = str(next_rep)
             cells[report_idx] = _renumber_report_cell(cells[report_idx], old_rep, new_rep)
@@ -638,7 +648,12 @@ def _renumber_report_cell(cell: str, old: str, new: str) -> str:
         text, path = m.group(1).strip(), m.group(2).strip()
         if text == old:
             text = new
-        path = re.sub(rf"(^|/){re.escape(old)}-", rf"\g<1>{new}-", path)
+        # Both filename shapes _REPORT_FILE_RE accepts: `NNN-slug.md` and the
+        # slug-less `NNN.md`. Missing the second one is not cosmetic — the
+        # rename pair is read back out of this cell, so a path left un-rewritten
+        # produces a (same, same) self-rename and the incoming cloud file
+        # overwrites the local-only report the renumber existed to protect.
+        path = re.sub(rf"(^|/){re.escape(old)}(-|\.md$)", rf"\g<1>{new}\g<2>", path)
         return f"[{text}]({path})"
     return _REPORT_LINK_RE.sub(repl, cell)
 

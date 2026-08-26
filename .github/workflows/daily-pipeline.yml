@@ -256,14 +256,29 @@ jobs:
       # the Tests run on every pull request (issue #129).
       #
       # So stage what THIS RUN produced and upload that: reports absent from the
-      # pre-run manifest, plus the small state files whose whole current value
-      # is the point (applications.md is the tracker the UI's Refresh merges; a
-      # diff of it would be useless). tracker-additions is not in the cache, so
-      # it is already per-run. The staged tree keeps career-ops' layout, which
-      # is what `gh.download_artifact` and `data.sync_pulled_tracker` expect.
+      # pre-run manifest, plus applications.md, which must ship entire because
+      # the UI's Refresh MERGES it — a diff of a tracker is useless. That row
+      # growth is irreducible and small (~200 bytes per evaluated role, against
+      # ~4KB per report), and it is the only accumulating thing left here.
+      #
+      # data/pipeline.md and data/easy-apply-urls.txt used to ride along and no
+      # longer do. Both are append-only, both are restored from the cache, and
+      # pipeline.md carries a 500-char JD preview for EVERY bridged offer — far
+      # more offers than evaluated roles — so together they reproduced the same
+      # unbounded shape at a smaller constant. Nothing consumed them from the
+      # artifact either: `data.sync_pulled_tracker` reads applications.md,
+      # reports/ and pipeline.md, and the cloud runs --evaluate-batch, which
+      # never drains pipeline.md, so its copy is a write-only log. Anything the
+      # local dedup needs from a cloud run arrives in applications.md, which the
+      # same run writes.
+      #
+      # tracker-additions is not in the cache, so it is already per-run. The
+      # staged tree keeps career-ops' layout, which is what
+      # `gh.download_artifact` and `data.sync_pulled_tracker` expect.
       #
       # The full history is not this artifact's job — it lives in the
-      # pipeline-state cache and in the user's local career-ops/.
+      # pipeline-state cache and in the user's local career-ops/. Recovering it
+      # onto a fresh machine is what .github/workflows/export-reports.yml is for.
       - name: Stage this run's output for upload
         if: always()
         run: |
@@ -273,8 +288,6 @@ jobs:
             --into "$RUNNER_TEMP/pipeline-artifact" \
             --delta reports \
             --whole data/applications.md \
-            --whole data/pipeline.md \
-            --whole data/easy-apply-urls.txt \
             --whole batch/tracker-additions
 
       - name: Upload this run's reports and tracker artifact

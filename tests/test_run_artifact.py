@@ -149,8 +149,26 @@ class TestManifestIsRequired:
         """Degrading to "no manifest means nothing was there" would restore the
         unbounded upload silently, on the one path nobody watches."""
         with pytest.raises(SystemExit) as exc:
-            run_artifact._read_manifest(tmp_path / "absent.json")
+            run_artifact._read_manifest(tmp_path / "absent.json", tmp_path, ["reports"])
         assert "snapshot step" in str(exc.value)
+
+    def test_a_manifest_of_the_wrong_thing_refuses_too(self, tmp_path):
+        """Same failure, same reason: keys that don't line up make every restored
+        file read as new, which is the unbounded artifact again."""
+        m = tmp_path / "manifest.json"
+        m.write_text(json.dumps(
+            {"scope": run_artifact._scope(tmp_path, ["reports"]), "files": {}}),
+            encoding="utf-8")
+        with pytest.raises(SystemExit) as exc:
+            run_artifact._read_manifest(m, tmp_path, ["batch/jds"])
+        assert "same" in str(exc.value) and "--delta" in str(exc.value)
+
+    def test_a_matching_scope_is_accepted(self, tmp_path):
+        m = tmp_path / "manifest.json"
+        m.write_text(json.dumps(
+            {"scope": run_artifact._scope(tmp_path, ["reports"]), "files": {"a": [1, 2]}}),
+            encoding="utf-8")
+        assert run_artifact._read_manifest(m, tmp_path, ["reports"]) == {"a": [1, 2]}
 
 
 class TestCli:
@@ -167,7 +185,7 @@ class TestCli:
         snap = self._run("snapshot", "--root", career_ops, "--manifest", manifest,
                          "--delta", "reports")
         assert snap.returncode == 0, snap.stderr
-        assert len(json.loads(manifest.read_text(encoding="utf-8"))) == 2
+        assert len(json.loads(manifest.read_text(encoding="utf-8"))["files"]) == 2
 
         _write(career_ops / "reports" / "003-initech-2026-06-03.md", "today\n")
 
@@ -186,13 +204,15 @@ class TestCli:
         out = self._run("snapshot", "--root", tmp_path / "nothing-here",
                         "--manifest", manifest, "--delta", "reports")
         assert out.returncode == 0, out.stderr
-        assert json.loads(manifest.read_text(encoding="utf-8")) == {}
+        assert json.loads(manifest.read_text(encoding="utf-8"))["files"] == {}
 
     def test_stage_rebuilds_the_target_tree(self, career_ops, tmp_path):
         """A leftover tree from a re-run of the step would upload files this run
         neither produced nor knows about."""
         manifest = tmp_path / "manifest.json"
-        manifest.write_text("{}", encoding="utf-8")
+        manifest.write_text(json.dumps(
+            {"scope": run_artifact._scope(career_ops, ["reports"]), "files": {}}),
+            encoding="utf-8")
         into = tmp_path / "artifact"
         _write(into / "reports" / "stale-from-a-previous-attempt.md", "x")
 
@@ -200,6 +220,19 @@ class TestCli:
                         "--delta", "reports", "--into", into)
         assert out.returncode == 0, out.stderr
         assert not (into / "reports" / "stale-from-a-previous-attempt.md").exists()
+
+    def test_a_refused_stage_leaves_the_target_tree_alone(self, career_ops, tmp_path):
+        """Both refusals above are fatal, so wiping --into on the way to one
+        would destroy the only copy of what a re-run was meant to inspect."""
+        into = tmp_path / "artifact"
+        _write(into / "reports" / "staged-earlier.md", "keep me")
+
+        out = self._run("stage", "--root", career_ops,
+                        "--manifest", tmp_path / "absent.json",
+                        "--delta", "reports", "--into", into)
+        assert out.returncode != 0
+        assert (into / "reports" / "staged-earlier.md").read_text(encoding="utf-8") \
+            == "keep me"
 
     def test_stage_without_a_manifest_exits_nonzero(self, career_ops, tmp_path):
         out = self._run("stage", "--root", career_ops,
