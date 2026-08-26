@@ -227,9 +227,18 @@ def run(
     ):
         checked += 1
         if result == "throttled":
-            # No real read — leave the timestamp untouched so this role is
-            # re-tried (front of the queue) next run rather than marked done.
             throttled += 1
+            # No real read, so never marked done. But WHICH kind of throttle
+            # decides where it sits next run. A transient limiter keeps its
+            # timestamp unset and returns to the front of the stalest-first
+            # queue, which is the point. A persistent one — an anti-bot wall, a
+            # 5xx, a body too short to judge — would sit at the front FOREVER,
+            # and once `budget` of those accumulate they consume every run's
+            # whole allowance and no other role is re-checked again. Stamping it
+            # rotates it back into the normal cadence: still never expired,
+            # still re-checked, just not ahead of everything else.
+            if not screen.transient_throttle(result, reason):
+                new_state[job.url] = now
         else:
             new_state[job.url] = now   # conclusive read → record last-checked
             if result == "expired":

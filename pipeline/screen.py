@@ -118,12 +118,40 @@ _SERVER_ERROR_MIN = 500
 _THROTTLE_RETRIES = 2
 _THROTTLE_BACKOFF = 1.5
 
-# ...but only for the per-request limiter it was written for. The other two
-# `throttled` verdicts must NOT be retried: an anti-bot challenge and a 5xx do
-# not clear in 1.5s, so retrying triples the fetch burst into the very limiter
-# RECHECK_BUDGET exists to cap — and against a challenge it deepens the block we
-# are already under. Derived from _THROTTLE_STATUSES so the two can't drift.
-_RETRYABLE_REASONS = tuple(f"HTTP {s}" for s in sorted(_THROTTLE_STATUSES))
+# The three `throttled` verdicts that will NOT clear on a prompt retry. Named
+# once and spliced into the reasons below, so the reason text and this list
+# cannot drift apart.
+_R_SERVER_ERROR = "server error"
+_R_BOT_CHALLENGE = "anti-bot challenge"
+_R_UNREADABLE = "insufficient content"
+_PERSISTENT_THROTTLES = (_R_SERVER_ERROR, _R_BOT_CHALLENGE, _R_UNREADABLE)
+
+
+def transient_throttle(result: str, reason: str) -> bool:
+    """True when a `throttled` verdict is worth hitting again soon.
+
+    `throttled` covers situations that behave nothing alike. A 403/429/999
+    limiter, or an upstream API outage, may well clear in seconds. An anti-bot
+    challenge, a 5xx, or a body too short to read will not: they persist for as
+    long as the site is in that state, and hammering a challenge deepens the
+    block we are already under.
+
+    A DENYLIST, not an allowlist of retryable reasons: every throttle that
+    predates the three named above behaved as transient, and an allowlist
+    silently reclassified them — the Indeed jobData outage among them, which is
+    as transient as a rate limit. Only the three verdicts that introduced
+    persistent throttling opt out.
+
+    Both consumers need the distinction. The scrape-time screen uses it to decide
+    whether to re-fetch within the run (retrying the persistent kind tripled the
+    burst into the very limiter RECHECK_BUDGET exists to cap). The tracker
+    re-check uses it to decide whether to leave the role's last-checked timestamp
+    unset — which puts it at the FRONT of the next run's stalest-first queue.
+    Right for something that may clear; ruinous for something that will not,
+    because that role then never leaves the front and, once enough accumulate,
+    they consume the whole per-run budget and nothing else is re-checked again."""
+    return result == "throttled" and not any(m in reason for m in _PERSISTENT_THROTTLES)
+
 
 _APPLY = [
     re.compile(r"\bapply\b", re.I),
@@ -304,7 +332,7 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     if status in _THROTTLE_STATUSES:
         return "throttled", f"HTTP {status} (rate-limited / sign-in wall)"
     if status >= _SERVER_ERROR_MIN:
-        return "throttled", f"HTTP {status} (server error — not a removed posting)"
+        return "throttled", f"HTTP {status} ({_R_SERVER_ERROR} — not a removed posting)"
     if _EXPIRED_URL.search(final_url):
         return "expired", f"error redirect: {final_url}"
     for pat in _HARD_EXPIRED:
@@ -316,7 +344,7 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     # 200-served anti-bot wall — its body is the challenge, not the posting.
     for pat in _BOT_CHALLENGE:
         if pat.search(body):
-            return "throttled", f"anti-bot challenge: {pat.pattern}"
+            return "throttled", f"{_R_BOT_CHALLENGE}: {pat.pattern}"
     for pat in _LISTING_PAGE:
         if pat.search(body):
             return "expired", f"listing page: {pat.pattern}"
@@ -324,7 +352,7 @@ def classify_liveness(status: int, final_url: str, body: str) -> tuple[str, str]
     # can judge. That is not evidence of removal: it is equally an unrecognised
     # challenge, a JS-rendered shell, or a truncated response. Hold and re-check.
     if len(body.strip()) < _MIN_CONTENT_CHARS:
-        return "throttled", "insufficient content (unreadable, not confirmed gone)"
+        return "throttled", f"{_R_UNREADABLE} (unreadable, not confirmed gone)"
     return "uncertain", "content present, no apply control"
 
 
@@ -384,7 +412,7 @@ def classify_each(items, url_of, *, timeout: int = 8, max_workers: int = 8):
             # uncertain) and a conclusive result returns at once.
             for attempt in range(_THROTTLE_RETRIES + 1):
                 result, reason, body = fetch_and_classify(fetch_url, timeout)
-                retryable = result == "throttled" and reason.startswith(_RETRYABLE_REASONS)
+                retryable = transient_throttle(result, reason)
                 if not retryable or attempt == _THROTTLE_RETRIES:
                     return item, result, reason, body
                 time.sleep(_THROTTLE_BACKOFF * (attempt + 1))

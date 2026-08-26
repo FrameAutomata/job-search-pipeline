@@ -1228,24 +1228,35 @@ class TestLivenessNotPermanentlyDead:
 
 
 class TestThrottleRetryScope:
-    """`throttled` now covers three different situations, but only one of them
-    is worth re-fetching. Retrying the other two triples the burst into the
+    """`throttled` covers situations that behave nothing alike, and only some are
+    worth hitting again soon. Retrying the rest triples the burst into the
     limiter the recheck budget exists to cap — and against an anti-bot wall it
     deepens the block we are already under."""
 
-    def test_only_the_transient_limiter_is_retryable(self):
-        import pipeline.screen as screen_mod
-        limiter = classify_liveness(429, "https://x/j/1", "")[1]
-        server = classify_liveness(502, "https://x/j/1", "<html>502</html>")[1]
-        wall = classify_liveness(200, "https://x/j/1", CLOUDFLARE_WALL)[1]
-        assert limiter.startswith(screen_mod._RETRYABLE_REASONS)
-        assert not server.startswith(screen_mod._RETRYABLE_REASONS)
-        assert not wall.startswith(screen_mod._RETRYABLE_REASONS)
+    @pytest.mark.parametrize("status,body", [(403, ""), (429, ""), (999, "")])
+    def test_rate_limiter_is_transient(self, status, body):
+        result, reason = classify_liveness(status, "https://x/j/1", body)
+        assert screen_mod.transient_throttle(result, reason)
 
-    def test_retryable_set_tracks_the_throttle_statuses(self):
-        """Derived, so the two can't drift apart."""
-        import pipeline.screen as screen_mod
-        assert len(screen_mod._RETRYABLE_REASONS) == len(screen_mod._THROTTLE_STATUSES)
+    def test_upstream_api_outage_is_transient(self):
+        """Classified by the Indeed jobData path, not classify_liveness — and as
+        transient as a rate limit. An ALLOWLIST of retryable reasons silently
+        reclassified it, which is why the predicate is a denylist."""
+        assert screen_mod.transient_throttle("throttled", "jobData request failed: api down")
+
+    @pytest.mark.parametrize("status,body", [
+        (502, "<html>502 Bad Gateway</html>"),
+        (200, CLOUDFLARE_WALL),
+        (200, "<html></html>"),
+    ])
+    def test_persistent_conditions_are_not(self, status, body):
+        result, reason = classify_liveness(status, "https://x/j/1", body)
+        assert result == "throttled"
+        assert not screen_mod.transient_throttle(result, reason)
+
+    def test_only_a_throttle_can_be_transient(self):
+        for verdict in ("active", "expired", "uncertain"):
+            assert not screen_mod.transient_throttle(verdict, "anything")
 
 
 class TestExpiredRequiresPositiveEvidence:
