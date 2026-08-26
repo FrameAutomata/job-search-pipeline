@@ -78,7 +78,10 @@ jobs:
           # are `pipeline-output` (the daily's reports, what the UI's Refresh
           # pulls) and `applications-md` (edit-tracker's verification copy). A
           # flat top-N would let a burst of one evict every copy of the other.
-          gh api --paginate "/repos/$REPO/actions/artifacts" \
+          # per_page explicitly: --paginate follows Link headers at whatever
+          # size the FIRST request used, and the REST default is 30.
+          gh api --paginate -X GET "/repos/$REPO/actions/artifacts" \
+            -f per_page=100 \
             --jq '.artifacts[] | select(.expired == false)
                   | [(.name | sub("-[0-9]+$"; "")), .created_at, (.id|tostring), (.size_in_bytes|tostring)]
                   | @tsv' > all-artifacts.tsv || true

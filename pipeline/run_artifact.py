@@ -62,11 +62,6 @@ from pipeline.stdio import line_buffer_stdout
 Stat = list[int]
 
 
-def _stat_of(path: Path) -> Stat:
-    st = path.stat()
-    return [st.st_size, st.st_mtime_ns]
-
-
 def scan(root: Path, rels: list[str]) -> dict[str, Stat]:
     """Manifest of every file under each `root/rel`, keyed by path relative to
     `root` so one manifest can cover several directories.
@@ -79,9 +74,10 @@ def scan(root: Path, rels: list[str]) -> dict[str, Stat]:
         base = root / rel
         if not base.is_dir():
             continue
-        for f in sorted(base.rglob("*")):
+        for f in base.rglob("*"):
             if f.is_file():
-                out[f.relative_to(root).as_posix()] = _stat_of(f)
+                st = f.stat()
+                out[f.relative_to(root).as_posix()] = [st.st_size, st.st_mtime_ns]
     return out
 
 

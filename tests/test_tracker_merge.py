@@ -8,6 +8,10 @@ New report numbers are assigned as max(used)+1 so they can't collide with cloud
 reports or with each other. "Cloud reports" means every number the cloud tracker
 names, not just the ones whose files rode down in today's artifact — the daily
 artifact carries only that run's reports (issue #129).
+
+A rename is a (old filename, new filename) pair, read out of the row's own
+Report link: a number can match two files in a local reports dir, and only the
+renumbered row's own file is meant to move.
 """
 
 from pipeline.app import data
@@ -77,7 +81,7 @@ class TestReconcileTrackers:
         local = _tracker(_row(1, "Acme", "Eng", report="10"),
                          _row(3, "Zeta", "Ops", report="10"))  # report 10 collides
         merged, renames = data.reconcile_trackers(cloud, local, {"10", "20"})
-        assert ("10", "21") in renames               # max(10,20)+1
+        assert ("10-x.md", "21-x.md") in renames     # max(10,20)+1
         by = _by_company(merged)
         assert by["Zeta"]["report_num"] == "21"
         assert by["Zeta"]["report_path"].startswith("reports/21-")
@@ -94,7 +98,7 @@ class TestReconcileTrackers:
         local = _tracker(_row(3, "Zeta", "Ops", report="11"))
         # Only report 10 rode along in today's artifact; 11 is older.
         merged, renames = data.reconcile_trackers(cloud, local, {"10"})
-        assert ("11", "12") in renames
+        assert ("11-x.md", "12-x.md") in renames
         assert _by_company(merged)["Zeta"]["report_num"] == "12"
 
     def test_local_only_report_no_collision_kept(self):
@@ -116,7 +120,7 @@ class TestReconcileTrackers:
         # Yota keeps 50; Zeta's collision -> max(used incl. kept 50)+1 = 51
         assert by["Yota"]["report_num"] == "50"
         assert by["Zeta"]["report_num"] == "51"
-        assert ("10", "51") in renames
+        assert ("10-x.md", "51-x.md") in renames
 
 
 class TestSyncPulledTracker:
