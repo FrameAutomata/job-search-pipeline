@@ -541,6 +541,12 @@ class TestEvalSystemPrompt:
         assert "EVALUATION FRAMEWORK" in result
 
 
+def _tracker_row(score, status="Evaluated"):
+    """One nine-field tracker-additions row, the shape write_job_result emits."""
+    return "\t".join(["3", "2026-08-25", "Initech", "SRE", status,
+                      score, "null", "[003](reports/003-x.md)", "note"])
+
+
 class TestNormalizeScoreCell:
     """merge-tracker.mjs decides which of columns 5-6 is the score by asking
     whether exactly one of them matches `N/5` (or an N/A / DUP / dash sentinel).
@@ -556,7 +562,7 @@ class TestNormalizeScoreCell:
                           score, "null", "[003](reports/003-x.md)", "note"])
 
     def _score_of(self, raw):
-        return _normalize_score_cell(self._row(raw)).split("\t")[5]
+        return _normalize_score_cell(_tracker_row(raw)).split("\t")[5]
 
     @pytest.mark.parametrize("raw,expected", [
         ("4.2/5", "4.2/5"),      # already correct — untouched
@@ -595,7 +601,7 @@ class TestNormalizeScoreCell:
         """The normalization has to be on the write path, not just available."""
         reports, tracker = tmp_path / "reports", tmp_path / "tsv"
         reports.mkdir(); tracker.mkdir()
-        response = TestWriteJobResult()._make_response(tracker=self._row("4.2"))
+        response = TestWriteJobResult()._make_response(tracker=_tracker_row("4.2"))
         write_job_result(response, {"id": 3, "url": "https://x/j/3"},
                          reports, tracker, "2026-08-25")
         written = (tracker / "3.tsv").read_text(encoding="utf-8")
@@ -621,12 +627,36 @@ class TestScoreNormalizationDoesNotInvent:
         """Searching anywhere in the cell turned prose into a plausible score.
         The handoff work-order ranks by score descending, so an invented 5 puts
         that role at the top of the queue."""
-        assert _normalize_score_cell(self._row(raw)).split("\t")[5] == "N/A"
+        assert _normalize_score_cell(_tracker_row(raw)).split("\t")[5] == "N/A"
 
     def test_swapped_status_and_score_are_left_alone(self):
         """When the model writes the pair the other way round, merge-tracker
         resolves it — it asks which ONE of the two looks like a score. Writing
         N/A into col 6 makes BOTH look like one, so it refuses a row it would
         have merged: the loss this function exists to prevent, caused by it."""
-        swapped = self._row("Evaluated", status="4.2/5")
+        swapped = _tracker_row("Evaluated", status="4.2/5")
         assert _normalize_score_cell(swapped) == swapped
+
+
+class TestEmptyTrailingCell:
+    """A row whose Notes cell is empty arrives one field short — `extract_tag`
+    strips the tag body, taking the trailing tab with it. Every sanitizer then
+    no-ops on its 9-column guard, so the score is never normalized and
+    merge-tracker refuses the row: the row that arrives short is exactly the row
+    the chain exists to save."""
+
+    def test_short_row_is_restored_and_normalized(self, tmp_path):
+        reports, tracker = tmp_path / "reports", tmp_path / "tsv"
+        reports.mkdir(); tracker.mkdir()
+        response = (
+            "<report>body</report><tracker_tsv>"
+            "3\t2026-08-25\tInitech\tSRE | Remote\tEvaluada\t4.2\tnull\t[003](reports/003-x.md)\t"
+            "</tracker_tsv><summary>{\"company\": \"Initech\"}</summary>"
+        )
+        write_job_result(response, {"id": 3, "url": "https://x/j/3"},
+                         reports, tracker, "2026-08-25")
+        cells = (tracker / "3.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
+        assert len(cells) == 9
+        assert cells[3] == "SRE"          # role pipe stripped
+        assert cells[5] == "4.2/5"        # score normalized to the mergeable shape
+        assert cells[8].startswith("https://x/j/3")   # url spliced into notes

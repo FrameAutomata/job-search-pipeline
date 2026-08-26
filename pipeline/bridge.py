@@ -16,9 +16,7 @@ from pathlib import Path
 
 from pipeline._batch_common import parse_date_posted, read_url_set
 from pipeline.rowio import read_rows
-from pipeline.tracker_layout import (
-    SEPARATOR_RE, header_columns, is_header_row, split_row,
-)
+from pipeline.tracker_layout import data_rows
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,8 +37,8 @@ DESCRIPTION_PREVIEW_CHARS = 500
 
 
 def _find_section(text: str, markers: tuple[str, ...]) -> re.Match | None:
-    """The first of `markers` present in `text` as a heading, as a Match — so a
-    caller gets both "which spelling" and "where" from the one scan.
+    """The first of `markers` present in `text` as a heading, as a Match — so the
+    caller gets the heading's position from the same scan that found it.
 
     Matches the heading as a PREFIX of its line, not the whole line: real files
     carry counts and qualifiers ("## Pendientes (3)", "## Pending URLs"), and
@@ -59,18 +57,12 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     # cheap regex the original code used.
     urls.update(re.findall(r"https?://[^\s|)]+", text))
 
-    # Which cells hold Company and Role — from the table's own header, since
-    # career-ops has two supported layouts and the Via one shifts Role right by
-    # one. Shared with the UI's parser so the two can't disagree about a row's
-    # identity; see pipeline/tracker_layout.py.
-    columns = header_columns(text)
-    company_idx, role_idx = columns.index("company"), columns.index("role")
-
-    for line in text.splitlines():
-        if not line.lstrip().startswith("|") or SEPARATOR_RE.match(line.strip()):
-            continue
-        cols = split_row(line)
-        if len(cols) <= role_idx or is_header_row(cols):
+    # Company and Role by name, through the shared walk — career-ops has two
+    # supported layouts and the Via one shifts Role right by one. The UI's parser
+    # uses the same walk, so the two can't disagree about a row's identity.
+    for columns, cols in data_rows(text):
+        company_idx, role_idx = columns.index("company"), columns.index("role")
+        if len(cols) <= role_idx:
             continue
         company, role = cols[company_idx].lower(), cols[role_idx].lower()
         if company and role:

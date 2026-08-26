@@ -21,9 +21,8 @@ from pipeline import tracker_layout
 from pipeline.tracker_layout import (
     CANONICAL_COLUMNS,
     SEPARATOR_RE as _SEPARATOR_RE,
+    is_score_cell,
     header_columns as _header_columns,
-    is_header_row as _is_header_row,
-    split_row as _split_row,
 )
 
 # The UI's pending-status-changes channel: {row key: status-or-record}. Kanban
@@ -198,9 +197,10 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str,
                             columns: list[str] | None = None) -> str | None:
     """Find the tracker row matching company (+ role when given) and return its
     num. Used to re-anchor an identity-carrying override onto the correct row of
-    whatever tracker it's being applied to. Matches on the first four cells
-    (num, date, company, role), which are stable even when a stray pipe in the
-    role shifts later columns. Returns None when no row matches."""
+    whatever tracker it's being applied to. Matches Company and Role through the
+    table's own header mapping, and returns the num from its own column — the
+    value is dispatched to edit-tracker.yml as the cloud row key, and
+    detect_columns imposes no column ORDER. Returns None when no row matches."""
     want_company = normalize_company(company)
     if not want_company:
         return None
@@ -208,17 +208,9 @@ def resolve_num_by_identity(applications_md_text: str, company: str, role: str,
     # Read Company/Role by name, not by slot — a tracker migrated to the Via
     # layout puts the agency where Role used to sit. `columns` lets a caller
     # resolving many identities against one tracker derive the layout once.
-    columns = columns or _header_columns(applications_md_text)
-    company_idx, role_idx = columns.index("company"), columns.index("role")
-    for line in applications_md_text.splitlines():
-        if not line.lstrip().startswith("|"):
-            continue
-        if _SEPARATOR_RE.match(line.strip()):
-            continue
-        cells = _split_row(line)
+    for columns, cells in tracker_layout.data_rows(applications_md_text):
+        company_idx, role_idx = columns.index("company"), columns.index("role")
         if len(cells) < len(columns):
-            continue
-        if _is_header_row(cells):
             continue
         if normalize_company(cells[company_idx]) == want_company and (
             not want_role or normalize_company(cells[role_idx]) == want_role
@@ -326,41 +318,25 @@ _STATUS_ALIASES = {
 # checkout), and pyyaml — though a core requirement — is imported lazily so a
 # UI-only install missing it degrades to the baked list instead of failing to
 # start.
-_STATES_FILE = Path("templates") / "states.yml"
-_states_cache: dict = {}
+_STATES_FILE = "templates/states.yml"
 
 
-def _load_states() -> tuple[list[str], dict]:
-    """(labels, alias->label) from career-ops' states.yml, else the baked pair.
-
-    Cached per (path, mtime), so a career-ops update lands without a restart."""
-    path = tracker_layout.career_ops_dir() / _STATES_FILE
-    try:
-        key = (str(path), path.stat().st_mtime_ns)
-    except OSError:
-        return CANONICAL_STATES, _STATUS_ALIASES
-    if _states_cache.get("key") != key:
-        try:
-            import yaml
-            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            entries = doc.get("states") or []
-            labels = [str(e["label"]) for e in entries if e.get("label")]
-            aliases = {}
-            for e in entries:
-                label = str(e.get("label") or "")
-                for alias in (e.get("aliases") or []):
-                    aliases[str(alias).strip().lower()] = label
-            if not labels:
-                raise ValueError("no states")
-        except Exception:
-            # Any unreadable shape (absent pyyaml, malformed yaml, a schema
-            # change) falls back rather than leaving the UI with no vocabulary.
-            return CANONICAL_STATES, _STATUS_ALIASES
-        # Union with ours: upstream owns the vocabulary, but our alias map
-        # carries spellings its own file does not (merge-tracker's variants).
-        _states_cache.update(key=key, labels=labels,
-                             aliases={**_STATUS_ALIASES, **aliases})
-    return _states_cache["labels"], _states_cache["aliases"]
+def _parse_states(text: str):
+    """(labels, alias->label) from states.yml, or None to decline the file."""
+    import yaml   # lazy: a UI-only install without it degrades to the fallback
+    entries = (yaml.safe_load(text) or {}).get("states") or []
+    labels = [str(e["label"]) for e in entries if e.get("label")]
+    if not labels:
+        return None
+    aliases = {str(a).strip().lower(): str(e.get("label") or "")
+               for e in entries for a in (e.get("aliases") or [])}
+    # Union both halves. Our alias map carries merge-tracker spellings the yaml
+    # does not, and our labels must survive too: `canonical_status` can return a
+    # baked label through a baked alias, and every consumer that compares against
+    # a literal ("Evaluated" in handoff, "Discarded" in the push) would then be
+    # testing against a vocabulary `canonical_states()` no longer contains.
+    return ([*labels, *(s for s in CANONICAL_STATES if s not in labels)],
+            {**_STATUS_ALIASES, **aliases})
 
 
 def canonical_states() -> list[str]:
@@ -368,12 +344,24 @@ def canonical_states() -> list[str]:
     return _load_states()[0]
 
 
-def canonical_status(raw: str) -> str:
+def _load_states() -> tuple[list[str], dict]:
+    """career-ops ships the status vocabulary as DATA (templates/states.yml,
+    "the source of truth for career-ops (writer) and dashboard (reader)"), so
+    read it. The constants above are the fallback for an absent or unreadable
+    checkout — see tracker_layout.load_contract, which owns that whole policy."""
+    return tracker_layout.load_contract(
+        _STATES_FILE, _parse_states, (CANONICAL_STATES, _STATUS_ALIASES))
+
+
+def canonical_status(raw: str, vocabulary: tuple | None = None) -> str:
     """Map a raw status string to its canonical state. Unknown values pass
     through unchanged (so we never silently drop a status we don't recognize)."""
     clean = (raw or "").replace("*", "").strip()
     lower = clean.lower()
-    states, aliases = _load_states()
+    # `vocabulary` lets a caller walking many rows resolve the contract once
+    # instead of per row — the same hoist tracker_layout.data_rows does for the
+    # column layout and the alias table.
+    states, aliases = vocabulary if vocabulary is not None else _load_states()
     for s in states:
         if s.lower() == lower:
             return s
@@ -418,15 +406,9 @@ def _report_link(cell: str) -> tuple[str, str]:
 # Report link cell: [num](path). Used to re-anchor columns when extra cells
 # shift the layout (e.g. LLM writes "Role | Remote" and the pipe splits the cell).
 _REPORT_CELL_RE = re.compile(r"^\[[\w\d]+\]\([^)]+\)$")
-# 0-indexed Report slot in the canonical layout. Used where the pipeline
-# *emits* rows (the merge writes canonical 9-column rows), not where it reads
-# them — reads go through the detected layout instead.
-_REPORT_COL_IDX = _COLUMNS.index("report")  # 7
-# Score cell: X.X/5
-_SCORE_CELL_RE = re.compile(r"^\d+\.?\d*/5$")
 
 
-def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[str]:
+def _realign_cells(cells: list[str], columns: list[str]) -> list[str]:
     """Recover correct column mapping when a row has extra cells.
 
     The LLM occasionally appends context to a role title with a bare pipe
@@ -445,24 +427,24 @@ def _realign_cells(cells: list[str], columns: list[str] | None = None) -> list[s
     column keeps its leading identity cells intact — the head to preserve and
     the Report anchor's expected slot both come from it, not from a hardcoded
     9-column assumption."""
-    columns = columns or _COLUMNS
     # The whole method is "anchor on the Report link, rebuild around it", so a
     # layout with no Report column has nothing to anchor on. detect_columns only
     # demands num/company/role/score/status (career-ops' own required set), so
     # such a layout is reachable — bail out rather than raise and take the whole
     # parse, and with it the UI's board, down with it.
-    if "report" not in columns or "role" not in columns:
+    if "report" not in columns:
         return cells
     report_idx = columns.index("report")
     head = columns.index("role") + 1      # identity cells to keep verbatim
     for i, c in enumerate(cells):
         if _REPORT_CELL_RE.match(c) and i > report_idx:
             before = cells[head:i]   # cells between role and report
-            score = next((v for v in before if _SCORE_CELL_RE.match(v)), "")
+            score = next((v for v in before if is_score_cell(v)), "")
+            known = canonical_states()
             status = next(
                 (v for v in before
-                 if not _SCORE_CELL_RE.match(v)
-                 and canonical_status(v) in canonical_states()),
+                 if not is_score_cell(v)
+                 and canonical_status(v) in known),
                 "Evaluated",      # safe default — batch rows always start here
             )
             # Rebuild the middle from the table's OWN column names, so a layout
@@ -525,18 +507,10 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
     local trackers without a file. `easy_apply_urls` tags the easy_apply flag;
     omitted for callers (like the merge) that don't need it."""
     easy_apply_urls = easy_apply_urls or set()
-    columns = _header_columns(text)
+    vocabulary = _load_states()
     rows: list[dict] = []
-    for line in text.splitlines():
-        if not line.lstrip().startswith("|"):
-            continue
-        if _SEPARATOR_RE.match(line.strip()):
-            continue
-        cells = _split_row(line)
+    for columns, cells in tracker_layout.data_rows(text):
         if len(cells) < len(columns):
-            continue
-        # Skip the header row.
-        if _is_header_row(cells):
             continue
         if len(cells) > len(columns):
             cells = _realign_cells(cells, columns)
@@ -547,8 +521,8 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
         row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
 
         # Parse the leading float out of "4.2/5" → 4.2 for sorting.
-        row["score_value"] = _parse_score(row.get("score", ""))
-        row["status_canonical"] = canonical_status(row.get("status", ""))
+        row["score_value"] = score_value(row.get("score", ""))
+        row["status_canonical"] = canonical_status(row.get("status", ""), vocabulary)
         row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
 
         rows.append(row)
@@ -763,7 +737,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
                 continue
             row = dict(zip(_TRACKER_COLUMNS, [c.strip() for c in cells]))
             row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
-            row["score_value"] = _parse_score(row.get("score", ""))
+            row["score_value"] = score_value(row.get("score", ""))
             row["status_canonical"] = canonical_status(row.get("status", ""))
             row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
             rows.append(row)
@@ -786,8 +760,20 @@ def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> 
     byte untouched. This avoids re-serializing the whole table (which could
     mangle notes containing special chars) and makes the change a minimal diff.
 
+    The row and its Status cell are located through the table's OWN header, the
+    same mapping every read path uses. This is the single MUTATING path, and it
+    was the last one reading fixed slots: `resolve_num_by_identity` hands it a
+    num it found by header name, so against a table whose `#` is not first the
+    lookup succeeded and the write then matched nothing — the local edit silently
+    no-opped while the cloud push still fired, leaving the two diverged.
+
     Returns the text unchanged if the row isn't found."""
     want = str(num).strip()
+    columns = _header_columns(applications_md_text)
+    # +1 because splitting on "|" puts an empty cell before the leading pipe.
+    num_idx = columns.index("num") + 1
+    status_idx_default = columns.index("status") + 1
+    report_idx = columns.index("report") + 1 if "report" in columns else None
     out_lines = []
     changed = False
     for line in applications_md_text.splitlines():
@@ -795,18 +781,19 @@ def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> 
             # Split preserving structure: leading/trailing pipes produce empty
             # edge cells we must keep so indices stay aligned on re-join.
             parts = line.split("|")
-            # parts[0] is "" (before leading pipe). Data cells start at parts[1].
             cells = [p.strip() for p in parts]
-            if len(parts) >= 10 and cells[1] == want and cells[1] not in ("#", ""):
-                # Locate the Status cell by anchoring on the Report link, which
-                # is always [num](path). Status sits 2 positions before it
-                # (…|score|status|pdf|report|…), regardless of extra cells the
-                # LLM may have injected (e.g. "Role | Remote").
-                status_idx = 6  # fallback: correct for normal 9-cell rows
-                for pi, p in enumerate(parts):
-                    if _REPORT_CELL_RE.match(p.strip()):
-                        status_idx = pi - 2
-                        break
+            if (len(parts) > max(num_idx, status_idx_default)
+                    and cells[num_idx] == want and cells[num_idx] not in ("#", "")):
+                # Anchor on the Report link where the layout has one: it is
+                # always [num](path), so it survives extra cells the LLM may have
+                # injected (e.g. "Role | Remote") shifting everything right.
+                status_idx = status_idx_default
+                if report_idx is not None:
+                    offset = report_idx - status_idx_default
+                    for pi, p in enumerate(parts):
+                        if _REPORT_CELL_RE.match(p.strip()):
+                            status_idx = pi - offset
+                            break
                 parts[status_idx] = f" {new_status} "
                 line = "|".join(parts)
                 changed = True
@@ -834,10 +821,6 @@ def load_jobs(career_ops: Path) -> dict:
         return {"rows": rows, "source": "tracker-additions"}
 
     return {"rows": [], "source": "none"}
-
-
-def _parse_score(score_cell: str) -> float | None:
-    return score_value(score_cell)
 
 
 def find_report_file(reports_dir: Path, report_num: str) -> Path | None:

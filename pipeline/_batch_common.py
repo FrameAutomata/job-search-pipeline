@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pipeline.tracker_layout import (
-    SEPARATOR_RE, header_columns, is_header_row, split_row,
+    SCORE_SENTINELS, data_rows, header_columns, is_score_cell, split_row,
 )
 
 MAX_TOKENS = 8192
@@ -293,14 +293,16 @@ def max_report_num(reports_dir: Path, state: dict) -> int:
 def max_tracker_num(applications_md: Path, state: dict) -> int:
     max_num = 0
     if applications_md.exists():
-        for line in applications_md.read_text(encoding="utf-8").splitlines():
-            if line.startswith("|"):
-                cols = [c.strip() for c in line.split("|")]
-                if len(cols) >= 2:
-                    try:
-                        max_num = max(max_num, int(cols[1]))
-                    except ValueError:
-                        pass
+        # Through the shared walk: the `#` is not guaranteed to be the first
+        # cell (detect_columns imposes no column order), and a header or a
+        # separator row must not be read as data.
+        for columns, cells in data_rows(applications_md.read_text(encoding="utf-8")):
+            num_idx = columns.index("num")
+            if len(cells) > num_idx:
+                try:
+                    max_num = max(max_num, int(cells[num_idx]))
+                except ValueError:
+                    pass
     for job in state.get("jobs", {}).values():
         try:
             max_num = max(max_num, int(job.get("tracker_num", 0)))
@@ -348,6 +350,26 @@ def parse_json_loose(text: str) -> dict | None:
 _TRACKER_TSV_COLUMNS = 9
 
 
+def _restore_trailing_cells(tracker_tsv: str) -> str:
+    """Pad a row back to the full column count when trailing cells were empty.
+
+    An empty Notes cell is a trailing TAB, and every strip between the model and
+    here eats it — `extract_tag` strips the tag body before we ever see the row.
+    The row then has 8 fields, and each sanitizer below no-ops on its 9-column
+    guard: the score is left unnormalized, merge-tracker cannot tell it from the
+    status, and it refuses the row and archives it. So the row that arrives one
+    cell short is exactly the row this chain exists to save.
+
+    Exactly ONE cell, deliberately. Notes is the last column, so a lost trailing
+    tab can only ever cost one. A row short by more is genuinely malformed, and
+    padding it would manufacture a well-formed-looking row out of garbage —
+    the sanitizers' column guards are the right answer there, and stay in force."""
+    parts = tracker_tsv.strip("\r\n").split("\t")
+    if len(parts) == _TRACKER_TSV_COLUMNS - 1:
+        parts.append("")
+    return "\t".join(parts)
+
+
 def _strip_role_pipe(tracker_tsv: str) -> str:
     """Remove any '| <suffix>' the LLM appends to the role column.
 
@@ -356,8 +378,12 @@ def _strip_role_pipe(tracker_tsv: str) -> str:
     a tab-delimited TSV but merge-tracker.mjs copies it verbatim into a
     markdown table row where it splits the cell, shifting every subsequent
     column (score ends up as status, report link ends up in notes, etc.)."""
-    line = tracker_tsv.strip()
-    parts = line.split("\t")
+    # rstrip("\n") not strip(): a trailing TAB is an empty Notes cell, and
+    # stripping it drops the row to 8 fields — after which the two sanitizers
+    # below both no-op on their 9-column guard, leaving the unnormalized score
+    # merge-tracker then refuses. The row this chain exists to save was the one
+    # it skipped.
+    parts = tracker_tsv.strip("\r\n").split("\t")
     if len(parts) >= 4:
         parts[3] = re.sub(r"\s*\|.*$", "", parts[3]).strip()
     return "\t".join(parts)
@@ -365,16 +391,21 @@ def _strip_role_pipe(tracker_tsv: str) -> str:
 
 # Score cells merge-tracker.mjs accepts verbatim (tracker-parse.mjs's
 # `looksLikeScoreCell`), beyond the plain `N/5` / `N.N/5` form.
-_SCORE_SENTINELS = {"N/A", "DUP", "—", "-"}
-# The shape merge-tracker recognises as a score cell.
-_SCORE_CELL_RE = re.compile(r"^\d+(?:\.\d+)?/5$")
-# The number a score cell OPENS with: "4.2", "4.2/5", "4.2 / 5.0", "**4/5**",
-# "4,2/5" (comma decimal). Anchored deliberately — searching anywhere in the
-# cell turns prose into a score, and the invented value is plausible rather than
-# obviously wrong: "Top 5%" became 5/5, "not scored (4 blockers)" became 4/5.
-# A fabricated top score is the exact harm the out-of-range branch below refuses
-# to cause, since the handoff work-order ranks by score descending.
-_SCORE_LEAD_RE = re.compile(r"^(\d+(?:[.,]\d+)?)")
+_SCORE_SENTINELS = SCORE_SENTINELS
+# Two ways to read a score out of a cell, tried in order.
+#
+# An explicit "N/5" is unambiguous wherever it sits, so decoration around it is
+# harmless: "(4.5/5)", "~4.5/5", "Score: 4.5/5" all mean 4.5. Tracker rows in the
+# wild carry all of these, and they are what the READ side sorts by.
+#
+# Failing that, the cell must OPEN with the number. Searching anywhere turns
+# prose into a score, and the invented value is plausible rather than obviously
+# wrong — "Top 5%" became 5/5, "not scored (4 blockers)" became 4/5. A fabricated
+# top score is the exact harm the out-of-range branch below refuses to cause,
+# since the handoff work-order ranks by score descending. Leading punctuation is
+# allowed; a leading LETTER is not, because that is what prose looks like.
+_SCORE_OVER_FIVE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*5\b")
+_SCORE_LEAD_RE = re.compile(r"^[^0-9A-Za-z]*(\d+(?:[.,]\d+)?)")
 
 
 def score_value(cell: str) -> float | None:
@@ -382,7 +413,8 @@ def score_value(cell: str) -> float | None:
     side normalizes what the model emitted, the read side sorts the tracker by
     it, and they used to disagree — "4,2/5" parsed as 4.0 where the writer meant
     4.2."""
-    m = _SCORE_LEAD_RE.search((cell or "").replace("*", ""))
+    text = (cell or "").replace("*", "")
+    m = _SCORE_OVER_FIVE_RE.search(text) or _SCORE_LEAD_RE.match(text)
     if not m:
         return None
     try:
@@ -412,8 +444,7 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     prompt rule is not something a local Ollama/Groq/DeepSeek model reliably
     honours. This is the one place we own the value, so normalize it here
     rather than depend on model compliance."""
-    line = tracker_tsv.strip()
-    parts = line.split("\t")
+    parts = tracker_tsv.strip("\r\n").split("\t")
     if len(parts) != _TRACKER_TSV_COLUMNS:
         return tracker_tsv
     raw = parts[5].replace("*", "").strip()
@@ -426,7 +457,7 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     # like one, so its "exactly one" test fails and it refuses a row it would
     # otherwise have merged correctly: the loss this function exists to prevent,
     # caused by this function. Leave a swapped pair alone.
-    if _SCORE_CELL_RE.match(parts[4].replace("*", "").strip()):
+    if is_score_cell(parts[4]):
         return tracker_tsv
     value = score_value(raw)
     if value is None:
@@ -460,8 +491,8 @@ def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     than corrupt the row."""
     if not url:
         return tracker_tsv
-    line = tracker_tsv.strip()
-    if not line:
+    line = tracker_tsv.strip("\r\n")
+    if not line.strip():
         return tracker_tsv
     parts = line.split("\t")
     if len(parts) != _TRACKER_TSV_COLUMNS:
@@ -494,6 +525,7 @@ def write_job_result(
     if report_content:
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
     if tracker_tsv:
+        tracker_tsv = _restore_trailing_cells(tracker_tsv)
         tracker_tsv = _strip_role_pipe(tracker_tsv)
         tracker_tsv = _normalize_score_cell(tracker_tsv)
         tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
@@ -699,15 +731,10 @@ def _tracker_keys(applications_md: Path) -> set[str]:
     """The company::role identity of every data row in the tracker."""
     if not applications_md.exists():
         return set()
-    text = read_text(applications_md)
-    columns = header_columns(text)
-    company_idx, role_idx = columns.index("company"), columns.index("role")
     keys = set()
-    for line in text.splitlines():
-        if not line.lstrip().startswith("|") or SEPARATOR_RE.match(line.strip()):
-            continue
-        cells = split_row(line)
-        if len(cells) > role_idx and not is_header_row(cells):
+    for columns, cells in data_rows(read_text(applications_md)):
+        company_idx, role_idx = columns.index("company"), columns.index("role")
+        if len(cells) > role_idx:
             keys.add(_addition_key(cells[company_idx], cells[role_idx]))
     return keys
 

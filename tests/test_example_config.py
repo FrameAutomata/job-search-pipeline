@@ -151,6 +151,11 @@ class TestCareerOpsInstallFlags:
     # of the three sites — which is exactly the silent gap this guards.
     _CONTEXT_LINES = 6
 
+    # Every place the repo installs career-ops' node deps, by file. Two in
+    # setup.sh: the main install, and the NixOS Playwright pin — which also runs
+    # inside career-ops, so it triggers the same postinstall.
+    EXPECTED_SITES = ["setup.sh", "setup.sh", "setup.ps1", "daily-pipeline.yml"]
+
     def _career_ops_installs(self, text):
         lines = text.splitlines()
         for i, line in enumerate(lines):
@@ -171,14 +176,22 @@ class TestCareerOpsInstallFlags:
         root = Path(__file__).resolve().parent.parent
         sources = [root / "setup.sh", root / "setup.ps1"]
         sources += sorted((root / ".github" / "workflows").glob("*.yml"))
-        seen, offenders = 0, []
+        found, offenders = [], []
         for path in sources:
             for lineno, line in self._career_ops_installs(path.read_text(encoding="utf-8")):
-                seen += 1
+                found.append(path.name)
                 if "--ignore-scripts" not in line:
                     offenders.append(f"{path.name}:{lineno}: {line}")
-        # A guard that matches nothing would pass forever.
-        assert seen >= 3, f"expected to find the career-ops installs, saw {seen}"
+        # Assert the EXACT set, not a floor. `>= 3` passes when the scanner
+        # loses sight of a site (reformat setup.ps1 so Push-Location drifts out
+        # of the lookback window and it sees 3 of 4) — and the site it stopped
+        # seeing is precisely the one that could then regress unnoticed.
+        assert sorted(found) == sorted(self.EXPECTED_SITES), (
+            f"career-ops install sites changed: {sorted(found)}\n"
+            f"expected: {sorted(self.EXPECTED_SITES)}\n"
+            "If you added or moved one, update EXPECTED_SITES — that edit is the "
+            "point at which someone checks the new site carries --ignore-scripts."
+        )
         assert not offenders, (
             "npm install targeting career-ops without --ignore-scripts:\n  "
             + "\n  ".join(offenders)

@@ -13,6 +13,14 @@ from pipeline.screen import (
     run,
 )
 
+# A Cloudflare interstitial: HTTP 200, short body, no apply control. The shape
+# every "unreadable, not gone" case in this file is about.
+CLOUDFLARE_WALL = (
+    "<html><head><title>Just a moment...</title></head><body>"
+    "Enable JavaScript and cookies to continue. Ray ID: 8f2a1b3c9d0e"
+    "</body></html>"
+)
+
 
 class TestLinkedInGuestUrl:
     """Test the LinkedIn /jobs/view/ → guest job-posting endpoint mapping.
@@ -1181,11 +1189,7 @@ class TestLivenessNotPermanentlyDead:
     that used to reach `expired` through the "insufficient content" fallthrough
     despite carrying no evidence the posting was gone."""
 
-    CLOUDFLARE = (
-        "<html><head><title>Just a moment...</title></head><body>"
-        "Enable JavaScript and cookies to continue. Ray ID: 8f2a1b3c9d0e"
-        "</body></html>"
-    )
+    CLOUDFLARE = CLOUDFLARE_WALL
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 520])
     def test_server_error_holds_rather_than_expires(self, status):
@@ -1233,9 +1237,7 @@ class TestThrottleRetryScope:
         import pipeline.screen as screen_mod
         limiter = classify_liveness(429, "https://x/j/1", "")[1]
         server = classify_liveness(502, "https://x/j/1", "<html>502</html>")[1]
-        wall = classify_liveness(
-            200, "https://x/j/1",
-            "<html><title>Just a moment...</title>Ray ID: 8f2a1b3c9d0e</html>")[1]
+        wall = classify_liveness(200, "https://x/j/1", CLOUDFLARE_WALL)[1]
         assert limiter.startswith(screen_mod._RETRYABLE_REASONS)
         assert not server.startswith(screen_mod._RETRYABLE_REASONS)
         assert not wall.startswith(screen_mod._RETRYABLE_REASONS)
@@ -1265,8 +1267,7 @@ class TestExpiredRequiresPositiveEvidence:
         "live JD": (200, "https://x/j/1", "Great role. " * 40 + "<button>Apply</button>"),
         "rate limiter": (429, "https://x/j/1", ""),
         "server error": (502, "https://x/j/1", "<html>502 Bad Gateway</html>"),
-        "bot challenge": (200, "https://x/j/1",
-                          "<title>Just a moment...</title>Ray ID: 8f2a1b3c9d0e"),
+        "bot challenge": (200, "https://x/j/1", CLOUDFLARE_WALL),
         "unreadable body": (200, "https://x/j/1", "<html></html>"),
         "no apply control": (200, "https://x/j/1", "This is a job listing. " * 30),
     }

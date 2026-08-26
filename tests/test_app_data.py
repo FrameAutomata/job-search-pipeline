@@ -9,6 +9,14 @@ from pipeline import tracker_layout
 from pipeline.app import data
 
 
+def _reset_contract_cache():
+    """Drop both career-ops contract caches — they key on (path, mtime), so a
+    test pointing CAREER_OPS_PATH at a fresh tmp dir must clear them to be seen."""
+    tracker_layout._contract_cache.clear()
+    tracker_layout._dir_cache.clear()
+
+
+
 SAMPLE_APPLICATIONS = """# Applications Tracker
 
 | # | Date | Company | Role | Score | Status | PDF | Report | Notes |
@@ -627,24 +635,33 @@ class TestHiredStatus:
             "  - id: shortlisted\n    label: Shortlisted\n    aliases: [preseleccionado]\n",
             encoding="utf-8")
         monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path))
-        data._states_cache.clear()
+        _reset_contract_cache()
         try:
-            assert data.canonical_states() == ["Evaluated", "Shortlisted"]
+            states = data.canonical_states()
+            # Upstream's labels lead...
+            assert states[:2] == ["Evaluated", "Shortlisted"]
             assert data.canonical_status("preseleccionado") == "Shortlisted"
+            # ...but ours survive underneath. canonical_status can still return a
+            # baked label through a baked alias, and every consumer comparing
+            # against a literal ("Evaluated" in handoff, "Discarded" in the push)
+            # would otherwise be testing against a vocabulary this list no longer
+            # contains — server.py would 400 the status handoff itself writes.
+            assert set(data.CANONICAL_STATES) <= set(states)
+            assert data.canonical_status("monitor") in states
         finally:
-            data._states_cache.clear()
+            _reset_contract_cache()
 
     def test_unreadable_states_file_falls_back(self, tmp_path, monkeypatch):
         """career-ops is not always present — `run-ui.sh --data` points the UI at
         an extracted artifact with no checkout. A missing or malformed file must
         leave the baked vocabulary in force, never an empty one."""
         monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "nope"))
-        data._states_cache.clear()
+        _reset_contract_cache()
         try:
             assert data.canonical_states() == data.CANONICAL_STATES
             assert data.canonical_status("Hired") == "Hired"
         finally:
-            data._states_cache.clear()
+            _reset_contract_cache()
 
     def test_actioned_statuses_are_all_canonical(self):
         """The hide-by-default set is UI policy, not a mirror — it deliberately
@@ -715,7 +732,7 @@ class TestHeaderAliasesComeFromCareerOps:
             '"score": "score", "estado": "status", "materials": "pdf"}',
             encoding="utf-8")
         monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path))
-        tracker_layout._alias_cache.clear()
+        _reset_contract_cache()
         try:
             aliases = tracker_layout.header_aliases()
             assert aliases["materials"] == "pdf"
@@ -724,12 +741,12 @@ class TestHeaderAliasesComeFromCareerOps:
             # upstream has no reason to name.
             assert aliases["report"] == "report"
         finally:
-            tracker_layout._alias_cache.clear()
+            _reset_contract_cache()
 
     def test_missing_checkout_falls_back(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CAREER_OPS_PATH", str(tmp_path / "nope"))
-        tracker_layout._alias_cache.clear()
+        _reset_contract_cache()
         try:
             assert tracker_layout.header_aliases()["#"] == "num"
         finally:
-            tracker_layout._alias_cache.clear()
+            _reset_contract_cache()

@@ -10,10 +10,11 @@ let selectedNum = null;
 let view = "table"; // "table" | "board"
 let pending = 0;
 
-// Kanban columns. Seeded for first paint, then REPLACED by the server's list at
-// boot (/api/capabilities), which career-ops' templates/states.yml owns. Editing
-// this array is not how a new upstream state reaches the board — it arrives on
-// its own. The seed only has to carry the app until loadCaps() returns.
+// Kanban columns. A first-paint SEED, replaced at boot by the server's list
+// (/api/capabilities), which career-ops' templates/states.yml owns — so an
+// upstream state addition arrives on its own rather than needing an edit here.
+// The seed must still track data.CANONICAL_STATES (test-enforced): it is what
+// the board renders on before loadCaps() returns, and if that call fails.
 let STATES = ["Evaluated", "Applied", "Responded", "Interview", "Offer", "Rejected", "Discarded", "SKIP", "Hired"];
 
 // Statuses hidden by default: terminal/actioned states where no further action is needed.
@@ -139,11 +140,16 @@ function renderTable() {
 
 function renderBoard() {
   const rows = visibleRows();
-  // Bucket by canonical status; anything unrecognized goes under Evaluated.
+  // Bucket by canonical status.
   const buckets = Object.fromEntries(STATES.map((s) => [s, []]));
+  // Unknown statuses land in the first column. Not a hardcoded "Evaluated":
+  // STATES comes from the server now, and a localized or reordered vocabulary
+  // need not contain that label at all — indexing it blind would throw and take
+  // the whole board down.
+  const fallbackCol = STATES[0];
   for (const j of rows) {
-    const col = STATES.includes(j.status_canonical) ? j.status_canonical : "Evaluated";
-    buckets[col].push(j);
+    const col = STATES.includes(j.status_canonical) ? j.status_canonical : fallbackCol;
+    if (buckets[col]) buckets[col].push(j);
   }
   els.boardPane.innerHTML = "";
   for (const state of STATES) {
@@ -238,7 +244,7 @@ async function openReport(job) {
   resetSkillPanel();
   render();
   els.reportLink.href = extractUrl(job) || "#";
-  els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : "Evaluated";
+  els.reportStatus.value = STATES.includes(job.status_canonical) ? job.status_canonical : STATES[0];
   els.reportBody.innerHTML = "<p class='empty'>Loading…</p>";
   els.reportPane.hidden = false;
   try {
