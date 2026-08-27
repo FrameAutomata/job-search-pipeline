@@ -461,7 +461,26 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
                                       disable_thinking=disable_thinking)
     # Gemini free-tier conforming: pace each call to the (lead) model's RPM. No-op
     # unless GEMINI_FREE_TIER is set and the lead model is a known free-tier model.
-    return gemini_limits.paced_caller(caller, models[0] if models else model)
+    lead = models[0] if models else model
+    # Warn HERE rather than at the eval stage, because this is where the no-op
+    # happens: every caller in the repo is built through this function
+    # (resume_tailor, cover_letters, article_digest and handoff's --handoff-tailor
+    # all reach it via resolve_caller), so warning at one caller's stage left the
+    # other four silently unpaced — the same silence, one layer up.
+    #
+    # Gated on the provider, not just the model name: GEMINI_FREE_TIER is a
+    # global flag, so a cross-provider split (evaluate on Gemini, TAILOR_PROVIDER
+    # =anthropic) would otherwise reach this with a Claude model and advise
+    # looking it up in AI Studio, which has no row for it.
+    #
+    # Passed the whole SPEC, not `lead`: unknown_members is spec-shaped and
+    # cap_to_rpd already sums across the chain, so an unknown non-lead member is
+    # exactly the unpaced-but-silent case this exists to end.
+    if provider == "gemini":
+        unconformable = gemini_limits.format_unconformable_warning(model)
+        if unconformable:
+            print(unconformable, file=sys.stderr)
+    return gemini_limits.paced_caller(caller, lead)
 
 
 def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:
@@ -728,6 +747,10 @@ def _run_eval(
         warning = gemini_limits.format_free_tier_warning(model, total)
         if warning:
             print(warning, file=sys.stderr)
+
+    # The "conforming is on but this model's limits are unknown" warning is not
+    # printed here — _build_caller emits it, so every caller-building path gets
+    # it rather than just this stage.
 
     print(f"[batch-eval] {len(pending)} job(s) | provider={provider} | model={model} | workers={concurrency}")
 

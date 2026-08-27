@@ -290,9 +290,29 @@
             <input type="checkbox" id="gemini-free-tier" />
             I'm on Gemini's free tier — pace requests and cap each run to the daily limit
           </label>
-          <p class="hint">When on, evaluation and résumé tailoring stay within the free-tier RPM/RPD
-            (e.g. ~20 jobs/day on <code>gemini-2.5-flash</code>; the rest defer to the next run).
-            Use <code>gemma-4-26b-a4b-it</code> for ~1,500/day.</p>
+          <p class="hint" id="gemini-free-tier-hint">When on, evaluation and résumé tailoring stay
+            within the model's RPM/RPD; work past the daily cap defers to the next run.</p>
+
+          <div id="gemini-limits-box" style="margin-top:8px">
+            <p class="hint" id="gemini-limits-status"></p>
+            <p class="hint">Google changes these, and they differ per tier — so the built-in
+              numbers are only a fallback. Read your project's real values at
+              <a href="https://aistudio.google.com/rate-limit" target="_blank"
+                 rel="noopener">aistudio.google.com/rate-limit</a> and enter them here; they
+              override the built-in table for this model.</p>
+            <span style="display:flex; gap:6px; align-items:flex-end; flex-wrap:wrap">
+              <label style="flex:1; min-width:90px">RPM
+                <input id="gemini-rpm" type="number" min="1" step="1" placeholder="e.g. 15" />
+              </label>
+              <label style="flex:1; min-width:90px">TPM <span class="muted">(blank = unlimited)</span>
+                <input id="gemini-tpm" type="number" min="1" step="1" placeholder="e.g. 250000" />
+              </label>
+              <label style="flex:1; min-width:90px">RPD
+                <input id="gemini-rpd" type="number" min="1" step="1" placeholder="e.g. 1000" />
+              </label>
+            </span>
+            <p class="hint">Leave all three blank to keep using the built-in numbers.</p>
+          </div>
         </div>
 
         <label style="margin-top:10px">Browser-agent handoff folder <span class="muted">(optional)</span>

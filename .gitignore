@@ -21,6 +21,9 @@ result-*
 config/search.yml
 # Local-only search override — diverges local runs from the cloud-shared config
 config/search.local.yml
+# Your project's own Gemini rate limits, read off AI Studio. Per-key and
+# per-tier, so it is yours, not the template's.
+config/gemini-limits.json
 
 # Pipeline outputs
 output/

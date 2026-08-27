@@ -916,3 +916,34 @@ class TestEvalUsesSharedPromptBuilder:
             eval_mod._run_eval(career_ops, provider="anthropic")
         # subscript, not .get: a dropped eval_system_prompt call → KeyError → fail
         assert captured["career_ops"] == career_ops
+
+
+class TestUnconformableWarningAtBuildCaller:
+    """The 'conforming is on but this model has no known limits' warning is
+    emitted where the no-op happens — _build_caller — so every path that builds
+    a caller (eval, résumé tailoring, cover letters, article digest) gets it."""
+
+    def _build(self, monkeypatch, capsys, provider, model):
+        import pipeline.batch_evaluate as be
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        monkeypatch.setattr(be, "_build_single_caller", lambda *a, **k: (lambda *x, **y: "R"))
+        monkeypatch.setattr(be, "_build_failover_caller", lambda *a, **k: (lambda *x, **y: "R"))
+        be._build_caller(provider, model)
+        return capsys.readouterr().err
+
+    def test_warns_for_unknown_gemini_model(self, monkeypatch, capsys):
+        assert "will NOT be paced" in self._build(monkeypatch, capsys, "gemini", "gemini-99-new")
+
+    def test_silent_for_known_gemini_model(self, monkeypatch, capsys):
+        assert self._build(monkeypatch, capsys, "gemini", "gemini-2.5-flash") == ""
+
+    def test_silent_for_other_providers(self, monkeypatch, capsys):
+        # GEMINI_FREE_TIER is global, so a cross-provider tailor split must not
+        # be told to look a Claude model up in Google AI Studio.
+        assert self._build(monkeypatch, capsys, "anthropic", "claude-sonnet-4-6") == ""
+
+    def test_warns_for_unknown_NON_lead_chain_member(self, monkeypatch, capsys):
+        # cap_to_rpd sums across the chain, so a silent unknown member is exactly
+        # the unpaced-but-looks-fine case the warning exists for.
+        err = self._build(monkeypatch, capsys, "gemini", "gemini-2.5-flash,gemini-99-new")
+        assert "gemini-99-new" in err

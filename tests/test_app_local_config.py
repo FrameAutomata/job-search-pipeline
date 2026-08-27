@@ -133,3 +133,63 @@ class TestHandoffOutDir:
         assert r.status_code == 200
         assert r.json().get("warning")                                # reported, not swallowed
         assert dotenv_values(root / ".env")["HANDOFF_OUT_DIR"] == str(badfile)
+
+
+class TestGeminiLimits:
+    """The user's own AI Studio numbers, saved from the wizard.
+
+    These go to a JSON file rather than .env because the shape is a per-model
+    table; flattening it would need one env var per model per dimension. The
+    endpoint validates through the same parser a run reads by, so the wizard
+    can't persist a row that would be silently declined later.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _limits_file(self, tmp_path, monkeypatch):
+        from pipeline import gemini_limits
+        monkeypatch.setenv("GEMINI_LIMITS_FILE", str(tmp_path / "gl.json"))
+        gemini_limits._override_cache.clear()
+        yield
+        gemini_limits._override_cache.clear()
+
+    def test_saves_and_reports_back(self, env):
+        client, root, server = env
+        r = _post(client, batch_provider="gemini", gemini_free_tier=True,
+                  gemini_limits={"gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 1000}})
+        assert r.status_code == 200
+        assert "GEMINI_LIMITS" in r.json()["updated"]
+        # The run-time view now carries the user's number, not the baked 500.
+        from pipeline import gemini_limits
+        assert gemini_limits.effective_limits()["gemini-3.1-flash-lite"]["rpd"] == 1000
+        # And the wizard reads it back as the user's own.
+        got = client.get("/api/onboard/providers").json()["current"]
+        assert got["gemini_limits_user"]["gemini-3.1-flash-lite"]["rpd"] == 1000
+        assert got["gemini_limits"]["gemini-3.1-flash-lite"]["rpd"] == 1000
+
+    def test_absent_field_leaves_saved_limits_alone(self, env):
+        client, root, server = env
+        _post(client, batch_provider="gemini", gemini_limits={"m": {"rpm": 1, "rpd": 9}})
+        # A later save that doesn't mention limits (e.g. the user only changed the
+        # CLI) must not wipe them — omission is "no opinion", not "clear".
+        r = _post(client, batch_provider="gemini")
+        assert r.status_code == 200
+        assert "GEMINI_LIMITS" not in r.json()["updated"]
+        from pipeline import gemini_limits
+        assert gemini_limits.user_limits()["m"]["rpd"] == 9
+
+    def test_null_row_clears(self, env):
+        client, root, server = env
+        _post(client, batch_provider="gemini", gemini_limits={"m": {"rpm": 1, "rpd": 9}})
+        r = _post(client, batch_provider="gemini", gemini_limits={"m": None})
+        assert r.status_code == 200
+        from pipeline import gemini_limits
+        assert gemini_limits.user_limits() == {}
+
+    def test_invalid_row_is_a_400_not_a_silent_drop(self, env):
+        client, root, server = env
+        r = _post(client, batch_provider="gemini",
+                  gemini_limits={"m": {"rpm": 0, "rpd": 10}})
+        assert r.status_code == 400
+        assert "rpm and rpd" in r.json()["detail"]
+        from pipeline import gemini_limits
+        assert gemini_limits.user_limits() == {}

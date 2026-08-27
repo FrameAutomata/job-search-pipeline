@@ -111,20 +111,16 @@ def _http_get(url, *, headers=None, params=None) -> dict:
 def _fetch_gemini(get, key) -> set[str]:
     """Gemini's catalog, following nextPageToken. The key goes in the
     x-goog-api-key HEADER (not the URL), so it can't leak via a request URL in
-    any exception/log."""
-    ids: set[str] = set()
-    headers = {"x-goog-api-key": key}
-    token = None
-    while True:
-        params = {"pageSize": 1000}
-        if token:
-            params["pageToken"] = token
-        data = get("https://generativelanguage.googleapis.com/v1beta/models",
-                   headers=headers, params=params)
-        ids |= {m.get("name", "").split("/")[-1] for m in data.get("models", [])}
-        token = data.get("nextPageToken")
-        if not token:
-            return ids
+    any exception/log.
+
+    Delegates to gemini_limits, which needs the same catalog for its
+    --check-models table diff: two hand-written copies of Google's pagination
+    contract would drift exactly the way the hardcoded tables that feature
+    exists to police do. The whole catalog, not just generateContent models —
+    this checks IDs a user may have configured for any purpose."""
+    from pipeline import gemini_limits
+
+    return set(gemini_limits.fetch_model_ids(key, get=get, generate_content_only=False))
 
 
 def _fetch_anthropic(get, key) -> set[str]:
