@@ -267,8 +267,14 @@ class TestUserOverrides:
     def test_cache_follows_mtime(self, tmp_path, monkeypatch):
         f = self._point_at(tmp_path, monkeypatch, '{"m": {"rpm": 1, "rpd": 10}}')
         assert gl.effective_limits()["m"]["rpd"] == 10
-        os.utime(f, (0, 0))                       # force a distinct mtime
         f.write_text('{"m": {"rpm": 1, "rpd": 20}}', encoding="utf-8")
+        # Stamp AFTER the write, not before. The write sets mtime to "now", and
+        # Windows' system-clock granularity (~15.6ms) is coarse enough that
+        # "now" can equal the mtime the first read already cached — so the
+        # second read hits a stale entry and this asserts 10 == 20. Stamping
+        # afterwards makes the invalidation deterministic instead of a race
+        # against the clock that only Linux happens to win.
+        os.utime(f, (1, 1))
         assert gl.effective_limits()["m"]["rpd"] == 20
 
 
