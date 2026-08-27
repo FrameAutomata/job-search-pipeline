@@ -131,6 +131,51 @@ class TestFindReportFile:
     def test_missing_dir_returns_none(self, tmp_path):
         assert data.find_report_file(tmp_path / "nope", "001") is None
 
+    def test_reserved_lock_never_shadows_a_real_report(self, tmp_path):
+        """A lock sorts before the real report, so a first-match glob returned
+        it and the pane rendered JSON. See find_report_file's comment."""
+        d = self._make_reports(tmp_path)
+        (d / "003-RESERVED.md").write_text(
+            '{"pid":405455,"token":"109541c8","created_at":"2026-08-27T03:10:07Z"}',
+            encoding="utf-8",
+        )
+        (d / "003-tenet-healthcare-2026-08-26.md").write_text("# Tenet", encoding="utf-8")
+
+        f = data.find_report_file(d, "003")
+        assert f is not None and f.name == "003-tenet-healthcare-2026-08-26.md"
+
+    def test_reserved_lock_alone_is_not_a_report(self, tmp_path):
+        """A number with only a lock has no report yet — that is None, not a
+        file full of JSON."""
+        d = self._make_reports(tmp_path)
+        (d / "007-RESERVED.md").write_text('{"pid":1,"token":"x"}', encoding="utf-8")
+        assert data.find_report_file(d, "007") is None
+
+    def test_sorted_tie_break_is_stable(self, tmp_path):
+        """Two REAL reports can share a number (`_rename_report_file`: "a number
+        matches two files"). Nothing here knows which the row meant, so pin the
+        tie-break — otherwise the sort has no guard and a later tidy could drop
+        it, silently making the pane's choice vary between requests."""
+        d = self._make_reports(tmp_path)
+        (d / "055-alpha-2026-01-01.md").write_text("# A", encoding="utf-8")
+        (d / "055-zulu-2026-01-01.md").write_text("# Z", encoding="utf-8")
+        assert data.find_report_file(d, "055").name == "055-alpha-2026-01-01.md"
+        assert data.find_report_file(d, "055").name == "055-alpha-2026-01-01.md"
+
+
+class TestReportNumbersCountLocks:
+    """The MIRROR of find_report_file's rule, and the reason it is dangerous to
+    "make them consistent": these ask whether a number is TAKEN, and a lock
+    takes it. Guarding it here so a future tidy that propagates the skip fails
+    loudly instead of handing out a reserved number."""
+
+    def test_report_numbers_counts_a_reserved_lock(self, tmp_path):
+        d = tmp_path / "reports"
+        d.mkdir()
+        (d / "009-RESERVED.md").write_text('{"pid":1}', encoding="utf-8")
+        assert "009" in {n.lstrip("0").zfill(3) for n in data._report_numbers(d)} or \
+               9 in {int(n) for n in data._report_numbers(d)}
+
 
 SAMPLE_TSV = (
     "2920\t2026-05-27\tTential Solutions\tFullstack Developer\tEvaluada\t4.0/5\tnull\t"

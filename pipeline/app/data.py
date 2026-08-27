@@ -863,18 +863,39 @@ def load_jobs(career_ops: Path) -> dict:
     return {"rows": [], "source": "none"}
 
 
+# `NNN-RESERVED.md` is career-ops' report-number LOCK, not a report: a JSON body
+# ({"pid","token","created_at"}) dropped to claim a number, which survives any
+# run killed before the real report replaces it. It carries the `NNN-` prefix
+# this resolver keys on, so a first-match glob handed the UI the lock and the
+# report pane rendered raw JSON where the evaluation belongs — silently, reading
+# as a corrupt report rather than the wrong file.
+#
+# Only this resolver skips locks. The other readers of a report number ask
+# "is this number taken?" and must keep counting them — see the note on
+# `_batch_common.max_report_num`.
+_RESERVED_REPORT_SUFFIX = "-RESERVED.md"
+
+
 def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
     """Locate a report file by its number. Reports are named
     `{num}-{company-slug}-{date}.md`; the tracker stores the zero-padded num
     (e.g. "042"). Match on the leading numeric segment, tolerating padding
-    differences (42 vs 042)."""
-    if not report_num or not reports_dir.exists():
+    differences (42 vs 042). Reservation locks are skipped (see above).
+
+    Iterated in sorted order so that a number matching two REAL reports resolves
+    to the same one on every request — `_rename_report_file` records when that
+    happens ("a number matches two files"). That is stability, not correctness:
+    the tie is decided by filename, and nothing here knows which report the row
+    meant. Every caller looks up by NUMBER (server.py deliberately: "not the
+    link target — tolerant of report renames"), so there is no authority to
+    defer to; resolving the ambiguity properly would mean passing the row's own
+    Report link down."""
+    wanted = _report_int(report_num)
+    if wanted is None or not reports_dir.exists():
         return None
-    try:
-        wanted = int(report_num)
-    except ValueError:
-        return None
-    for f in reports_dir.glob("*.md"):
+    for f in sorted(reports_dir.glob("*.md")):
+        if f.name.endswith(_RESERVED_REPORT_SUFFIX):
+            continue
         m = re.match(r"^(\d+)-", f.name)
         if m and int(m.group(1)) == wanted:
             return f

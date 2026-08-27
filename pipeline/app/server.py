@@ -910,12 +910,27 @@ def onboard_status() -> JSONResponse:
 def onboard_load_config() -> JSONResponse:
     """Return the last-submitted onboarding form (minus api_key) so the wizard
     can prefill every field on a revisit. Returns {"form": null, "has_resume":
-    false} on a first-time setup so the UI knows it's not in edit mode."""
+    false} on a first-time setup so the UI knows it's not in edit mode.
+
+    `has_state` answers a different question: is there job-search RESULT data to
+    wipe? It gates the Danger zone, which must not face a first-time user (there
+    is nothing to reset) but must reach anyone who has results (they are the
+    only people who want it). Neither `form` nor `has_resume` answers it — a
+    copy set up from the CLI has no sidecar, a hand-dropped resume predates any
+    run, and `run-ui.sh --data` can point at a full tracker with no local
+    resume at all. So ask the data."""
     from pipeline.resume_text import IMPORT_SUFFIXES
     resume_present = any((ROOT / "resumes" / f"resume{s}").exists() for s in IMPORT_SUFFIXES)
+    co = _career_ops()
+    has_state = any((
+        (co / "data" / "applications.md").exists(),
+        (co / "data" / "scan-history.tsv").exists(),
+        any((co / "reports").glob("*.md")) if (co / "reports").is_dir() else False,
+    ))
     return JSONResponse({
         "form": onboard.load_sidecar(ROOT),
         "has_resume": resume_present,
+        "has_state": has_state,
     })
 
 

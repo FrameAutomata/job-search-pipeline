@@ -660,3 +660,21 @@ class TestEmptyTrailingCell:
         assert cells[3] == "SRE"          # role pipe stripped
         assert cells[5] == "4.2/5"        # score normalized to the mergeable shape
         assert cells[8].startswith("https://x/j/3")   # url spliced into notes
+
+
+class TestMaxReportNumCountsLocks:
+    """`max_report_num` must COUNT a `NNN-RESERVED.md` lock, which is the exact
+    opposite of `data.find_report_file`'s rule — see the docstrings on both.
+    Guarded because the tempting refactor is to make them agree: a reader who
+    finds the skip in one and propagates it here would break nothing visible in
+    the suite, while `server.py`'s Add-Job and `batch_evaluate` would start
+    handing out a number career-ops has already reserved, so two writers race
+    for the same `NNN-` and one evaluation overwrites the other."""
+
+    def test_reserved_lock_claims_its_number(self, tmp_path):
+        from pipeline._batch_common import max_report_num
+        reports = tmp_path / "reports"
+        reports.mkdir()
+        (reports / "004-acme-2026-01-01.md").write_text("# real", encoding="utf-8")
+        (reports / "011-RESERVED.md").write_text('{"pid":1,"token":"x"}', encoding="utf-8")
+        assert max_report_num(reports, {}) == 11, "a lock must reserve its number"
