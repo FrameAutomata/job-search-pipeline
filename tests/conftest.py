@@ -246,6 +246,29 @@ def _isolate_handoff_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_resume_env(monkeypatch):
+    """Keep resume resolution hermetic. RESUME_PATH leaks from the developer's
+    .env the same way (see _isolate_provider_env), and resolve_resume_path
+    honours it *verbatim* — it outranks the resumes/resume.{pdf,docx,odt} probe
+    and is returned even when missing. So a copy that sets it (i.e. every
+    configured one) resolves a tmp_path probe to a file that isn't there, and
+    tests asserting "a resume is on disk" fail on exactly the installs the
+    feature exists for, while staying green wherever .env leaves it commented
+    out. Clear it before every test; tests that need it set it explicitly via
+    monkeypatch.setenv, as test_filter.py's do.
+
+    Does NOT survive a fixture that reloads pipeline.app.server: its module-level
+    load_dotenv(override=False) re-adds whatever this deleted. Tests taking the
+    `client` fixture must still clear RESUME_PATH themselves, after the reload —
+    which is why test_app_server.py's five hand-clears are load-bearing, not
+    redundant with this fixture. The other modules whose client fixture reloads
+    the server (test_app_skills, test_app_handoff, test_app_local_run,
+    test_app_local_search, test_recheck_server) have no RESUME_PATH-dependent
+    assertion today; one added there needs its own clear after the reload."""
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+
+
 @pytest.fixture
 def patch_bridge_paths(monkeypatch, tmp_path):
     """Patch bridge.FILTERED_PATH to tmp_path and return the path."""
