@@ -154,6 +154,60 @@ Java
         # Should match competencies header and return non-empty result
         assert len(result) > 0
 
+    def test_find_skills_qualified_header(self):
+        """'CORE SKILLS' — a qualifier in front of the noun. The old flat
+        alternation listed 'core competencies' but not 'core skills', and
+        anchored the noun to the start of the line, so this missed silently:
+        the section came back empty and the weight-2 boost never reached the
+        resume's most discriminating terms (EMR names, tools, certifications)."""
+        text = ("CORE SKILLS\n"
+                "Systems & Compliance:  Cerner (Oracle Health)  \u2022  eClinicalWorks\n"
+                "\nPROFESSIONAL EXPERIENCE\nStuff")
+        result = filter_mod.find_skills_section(text)
+        assert "Cerner" in result
+        assert "PROFESSIONAL EXPERIENCE" not in result
+
+    def test_find_skills_conjoined_header(self):
+        """'CERTIFICATIONS & TRAINING' — a conjoined tail. '&' appeared only in
+        the next-header lookahead, never in the header pattern itself."""
+        text = ("CERTIFICATIONS & TRAINING\n"
+                "Basic Life Support (BLS) \u2014 Certified  \u2022  HIPAA Privacy\n"
+                "\nEDUCATION\nStuff")
+        result = filter_mod.find_skills_section(text)
+        assert "BLS" in result
+        assert "EDUCATION" not in result
+
+    def test_find_skills_header_variants(self):
+        """The qualifier/tail shapes resumes actually use."""
+        for header in ("KEY SKILLS", "AREAS OF EXPERTISE", "SKILLS AND ABILITIES",
+                       "Technical Skills:", "Proficiencies", "Additional Skills"):
+            text = f"{header}\nTools:  Docker  \u2022  Terraform\n\nEXPERIENCE\nStuff"
+            result = filter_mod.find_skills_section(text)
+            assert "Docker" in result, f"missed {header!r}"
+
+    def test_skills_header_does_not_match_prose_or_compounds(self):
+        """The pattern matches a whole line, so it must not fire on a sentence
+        that merely starts with the word, nor on a compound like SKILLSET."""
+        for line in ("Skills learned on the job", "SKILLSET",
+                     "PROFESSIONAL EXPERIENCE", "EDUCATION"):
+            text = f"SUMMARY\nx\n\n{line}\nTools:  Docker\n"
+            assert filter_mod.find_skills_section(text) == "", f"matched {line!r}"
+
+    @pytest.mark.xfail(
+        reason="Pre-existing: the next-header probe r'\\n[A-Z][A-Za-z &/]{3,40}\\n' "
+               "matches any bare capitalized line, so a skills section whose "
+               "first entry is a single capitalized word ('Cerner', 'Python') "
+               "truncates to just the header and yields no tokens. Real resumes "
+               "usually escape this by using ':'/'\u2022' delimiters, which the "
+               "probe's character class excludes. Distinct from the header-"
+               "matching fix; changing the probe risks over-extending a section "
+               "into Experience, so it needs its own decision.",
+        strict=True,
+    )
+    def test_bare_capitalized_entry_does_not_truncate_section(self):
+        text = "CORE SKILLS\nCerner\neClinicalWorks\n\nPROFESSIONAL EXPERIENCE\nStuff"
+        assert "Cerner" in filter_mod.find_skills_section(text)
+
 
 class TestExtractSkillsSectionTokens:
     """Test filter.extract_skills_section_tokens function."""

@@ -40,9 +40,25 @@ SEARCH_FIELDS = ["title", "description", "skills"]
 
 # Section headers commonly used to flag "claimed competencies". Terms inside
 # this section get a 2x weight bump.
+# Matched against a whole line, so this only ever fires on a standalone header.
+# Two shapes the flat alternation used to miss, both common enough to have cost
+# real resumes their skills boost:
+#   - a qualifier in front ("CORE SKILLS" — the old list had core competencies
+#     but not core skills, and `^\s*(skills?...)` required the line to START
+#     with the noun);
+#   - a conjoined tail ("CERTIFICATIONS & TRAINING" — `&` appears only in the
+#     next-header lookahead below, never in the header itself).
+# A miss is silent: find_skills_section returns "", the weight-2 boost quietly
+# never applies, and the resume's most discriminating terms (EMR names, tools,
+# certifications) score the same as prose.
 SKILLS_HEADER_RE = re.compile(
-    r"^\s*(skills?|technical\s+skills|core\s+competencies|competencies|"
-    r"certifications?|qualifications?|expertise)\b\s*:?\s*$",
+    r"^\s*"
+    r"(?:(?:core|key|technical|professional|relevant|additional|other)\s+"
+    r"|areas\s+of\s+)?"
+    r"(?:skills?|competencies|certifications?|qualifications?|expertise"
+    r"|proficiencies)"
+    r"(?:\s*(?:&|/|and)\s*[A-Za-z]+)*"
+    r"\s*:?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 

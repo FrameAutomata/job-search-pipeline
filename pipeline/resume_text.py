@@ -25,10 +25,56 @@ from pipeline.stdio import line_buffer_stdout
 IMPORT_SUFFIXES = (".pdf", ".docx", ".odt")
 
 
+# pdfplumber inserts a space between two glyphs when the gap between them
+# exceeds x_tolerance, which defaults to 3 (points). A PDF whose kerning is
+# tighter than that emits no spaces at all — "Managedhigh-volumeinboundcalls" —
+# and nothing raises. YAKE then extracts keywords like "microsoftoffice" that
+# match no job description ever, every job scores ~0, and the run presents as
+# "nothing matched" — which is what a bad search config and a rate-limited
+# scrape also look like. So detect that signature and retry tighter.
+_PDF_RETRY_X_TOLERANCE = 1.5
+
+# A run-together line yields tokens many times longer than any English word.
+# The threshold sits well above the longest tokens a real resume produces
+# (URLs, emails, "telecommunications") so a normal PDF never triggers a retry.
+_RUNON_TOKEN_LEN = 25
+_RUNON_TOKEN_SHARE = 0.05
+
+
+def _looks_run_together(text: str) -> bool:
+    """True when extraction produced implausibly long whitespace-separated
+    tokens — the signature of glyph gaps falling under x_tolerance."""
+    tokens = text.split()
+    if len(tokens) < 20:
+        # Too little text to judge. A near-empty extraction is its own problem
+        # and callers already surface it; guessing at spacing from a handful of
+        # tokens would only add a second failure mode.
+        return False
+    runon = sum(1 for t in tokens if len(t) > _RUNON_TOKEN_LEN)
+    return runon / len(tokens) > _RUNON_TOKEN_SHARE
+
+
 def _from_pdf(path: Path) -> str:
     import pdfplumber
     with pdfplumber.open(path) as pdf:
-        return "\n".join((p.extract_text() or "") for p in pdf.pages)
+        pages = list(pdf.pages)
+        text = "\n".join((p.extract_text() or "") for p in pages)
+        if not _looks_run_together(text):
+            return text
+        retry = "\n".join(
+            (p.extract_text(x_tolerance=_PDF_RETRY_X_TOLERANCE) or "")
+            for p in pages
+        )
+        # Keep the retry only if it actually resolved the run-together text. A
+        # tighter tolerance can split words that were fine, so a retry that
+        # still looks wrong is no evidence it helped — prefer the default.
+        if _looks_run_together(retry):
+            return text
+        print(
+            f"[resume] {path.name}: words ran together at pdfplumber's default "
+            f"spacing; re-extracted at x_tolerance={_PDF_RETRY_X_TOLERANCE}."
+        )
+        return retry
 
 
 def _from_docx(path: Path) -> str:

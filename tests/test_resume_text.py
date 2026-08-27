@@ -2,10 +2,12 @@
 
 The module is the single source of truth for turning a resume file (PDF / DOCX /
 ODT / TXT) into plain text, used by both the keyword-scoring filter and the UI
-onboarding upload. PDF behavior is unchanged from the old filter.extract_resume_text;
-these tests pin the new DOCX/ODT/TXT branches and the dispatch contract.
+onboarding upload. These tests pin the DOCX/ODT/TXT branches, the dispatch
+contract, and the PDF run-together retry.
 """
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -116,3 +118,101 @@ class TestSupportedSuffixes:
     def test_advertises_the_three_import_formats_plus_txt(self):
         s = set(resume_text.SUPPORTED_SUFFIXES)
         assert {".pdf", ".docx", ".odt", ".txt"} <= s
+
+
+# Enough tokens to clear _looks_run_together's 20-token floor.
+_CLEAN = " ".join(
+    ["Managed", "high-volume", "inbound", "patient", "calls", "and", "explained",
+     "insurance", "benefits", "while", "coordinating", "appointment",
+     "scheduling", "with", "provider", "offices", "to", "verify", "network",
+     "eligibility", "for", "seamless", "care", "coordination", "standards"]
+)
+# The same prose as one glyph run per line — what pdfplumber emits when the
+# PDF's kerning is tighter than the default x_tolerance.
+_RUNON = "\n".join(
+    ["Managedhigh-volumeinboundpatientcallsandexplainedinsurancebenefits",
+     "whilecoordinatingappointmentschedulingwithprovideroffices",
+     "toverifynetworkeligibilityforseamlesscarecoordinationstandards"] * 9
+)
+
+
+class _FakePage:
+    """Returns different text per x_tolerance, recording what it was asked for."""
+
+    def __init__(self, by_tolerance, calls):
+        self._by_tolerance = by_tolerance
+        self._calls = calls
+
+    def extract_text(self, **kwargs):
+        tol = kwargs.get("x_tolerance")
+        self._calls.append(tol)
+        return self._by_tolerance[tol]
+
+
+class _FakePDF:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_pdfplumber(monkeypatch, by_tolerance):
+    """Install a stub pdfplumber and return the list of x_tolerance values it
+    was called with. _from_pdf imports pdfplumber lazily inside the function,
+    so patching sys.modules is what reaches it."""
+    calls = []
+    page = _FakePage(by_tolerance, calls)
+    monkeypatch.setitem(
+        sys.modules, "pdfplumber",
+        types.SimpleNamespace(open=lambda path: _FakePDF([page])),
+    )
+    return calls
+
+
+class TestLooksRunTogether:
+    """The heuristic gating the retry."""
+
+    def test_clean_prose_is_not_run_together(self):
+        assert resume_text._looks_run_together(_CLEAN) is False
+
+    def test_glyph_run_is_run_together(self):
+        assert resume_text._looks_run_together(_RUNON) is True
+
+    def test_short_text_is_never_judged(self):
+        """Under the token floor we decline to guess — a near-empty extraction
+        is a different problem, and guessing would add a second failure mode."""
+        assert resume_text._looks_run_together("Averyveryverylongsingletoken") is False
+
+
+class TestFromPdfRetry:
+    def test_clean_pdf_is_not_retried(self, monkeypatch):
+        """A PDF that extracts fine must not be re-extracted — a tighter
+        tolerance can split words that were already correct."""
+        calls = _fake_pdfplumber(monkeypatch, {None: _CLEAN})
+        assert resume_text._from_pdf(Path("x.pdf")) == _CLEAN
+        assert calls == [None], "retry attempted on a clean extraction"
+
+    def test_retry_used_when_it_resolves_the_run(self, monkeypatch, capsys):
+        """The bug this exists for: at default spacing the text has no word
+        boundaries, so the tighter re-extraction is what callers get."""
+        calls = _fake_pdfplumber(
+            monkeypatch,
+            {None: _RUNON, resume_text._PDF_RETRY_X_TOLERANCE: _CLEAN},
+        )
+        assert resume_text._from_pdf(Path("resume.pdf")) == _CLEAN
+        assert calls == [None, resume_text._PDF_RETRY_X_TOLERANCE]
+        assert "ran together" in capsys.readouterr().out
+
+    def test_retry_discarded_when_it_does_not_help(self, monkeypatch, capsys):
+        """A tighter tolerance that still yields run-together text is no
+        evidence it helped, so keep pdfplumber's default output."""
+        _fake_pdfplumber(
+            monkeypatch,
+            {None: _RUNON, resume_text._PDF_RETRY_X_TOLERANCE: _RUNON},
+        )
+        assert resume_text._from_pdf(Path("resume.pdf")) == _RUNON
+        assert "ran together" not in capsys.readouterr().out
