@@ -6,6 +6,19 @@
 
 const STEP_TITLES = ["Resume", "About", "Roles", "Search", "Narrative", "Provider", "Local settings", "Review"];
 
+// BATCH_MODEL may be a comma-separated failover chain (tried in order on
+// overload). Python's gemini_limits._spec_models is the same split; these two
+// read the field in the prefill and the save handler, which had drifted into
+// separate copies of the same expression.
+const leadModel = (spec) => (spec || "").split(",")[0].trim();
+const isChain = (spec) => (spec || "").split(",").filter((m) => m.trim()).length > 1;
+
+// The model an empty BATCH_MODEL box resolves to. Set when /api/onboard/providers
+// loads, and read by BOTH the limits prefill and the save handler — they used to
+// apply this fallback in only one of the two places, so limits typed against the
+// shown default were dropped while the UI still reported "Saved".
+let geminiDefaultModel = "";
+
 const form = document.getElementById("wizard");
 const steps = [...document.querySelectorAll(".step")];
 const stepper = document.getElementById("steps");
@@ -387,6 +400,56 @@ async function loadLocalProviders() {
     const freeTierRow = document.getElementById("gemini-free-tier-row");
     if (freeTierCb) freeTierCb.checked = !!d.current.gemini_free_tier;
 
+    // Rate limits for whichever model is in the box. Re-read on every model
+    // change: the numbers are per-model, so fields left showing the previous
+    // model's values would be saved against the new one.
+    const limitEls = {
+      rpm: document.getElementById("gemini-rpm"),
+      tpm: document.getElementById("gemini-tpm"),
+      rpd: document.getElementById("gemini-rpd"),
+    };
+    const limitStatus = document.getElementById("gemini-limits-status");
+    geminiDefaultModel = d.provider_defaults.gemini || "";
+
+    function showLimits() {
+      if (!limitEls.rpm) return;
+      const m = leadModel(modelInput.value || geminiDefaultModel);
+      const mine = (d.current.gemini_limits_user || {})[m];
+      const eff = (d.current.gemini_limits || {})[m];
+      // VALUES come only from the user's own row; the baked numbers are shown as
+      // PLACEHOLDERS. Prefilling them as values made "just press Save" write a
+      // frozen copy of the built-in table into the override file — which then
+      // shadows every future template update to those numbers, silently, and
+      // made onboard.html's "leave all three blank" instruction unreachable.
+      limitEls.rpm.value = mine?.rpm ?? "";
+      limitEls.tpm.value = mine?.tpm ?? "";
+      limitEls.rpd.value = mine?.rpd ?? "";
+      limitEls.rpm.placeholder = eff?.rpm ?? "e.g. 15";
+      limitEls.tpm.placeholder = eff?.tpm ?? "e.g. 250000";
+      limitEls.rpd.placeholder = eff?.rpd ?? "e.g. 1000";
+      if (!limitStatus) return;
+      if (!m) {
+        limitStatus.textContent = "Pick a model to set its limits.";
+      } else if (mine) {
+        limitStatus.textContent = `${m}: using your saved numbers.`;
+      } else if (eff) {
+        limitStatus.textContent = `${m}: using the built-in fallback — override it below.`;
+      } else {
+        limitStatus.textContent =
+          `${m} has no known limits, so pacing and the daily cap can't apply. Enter them below.`;
+      }
+      // BATCH_MODEL accepts a comma-separated failover chain whose daily
+      // capacity is the SUM across members, but these three fields edit one
+      // model. Say so, rather than let a chain user think they've covered it.
+      if (isChain(modelInput.value)) {
+        limitStatus.textContent +=
+          " (Chain detected — these fields edit the first model only; add the others"
+          + " to config/gemini-limits.json by hand.)";
+      }
+    }
+    showLimits();
+    modelInput.addEventListener("input", showLimits);
+
     // Update model hint + the Gemini-only free-tier checkbox when provider changes.
     function updateModelHint() {
       const pName = select.value;
@@ -437,6 +500,35 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   const tailorModel    = document.getElementById("local-tailor-model")?.value.trim() || "";
   const tailorKey      = document.getElementById("local-tailor-key")?.value || "";
   const handoffDir     = document.getElementById("local-handoff-dir")?.value.trim() || "";
+
+  // Gemini rate limits for the lead model. Sent only when the row is complete
+  // (rpm + rpd) or explicitly cleared — a half-filled row is neither saved nor
+  // silently dropped, it's an error the user can see. Omitting the field
+  // entirely leaves any previously-saved limits alone.
+  let geminiLimits;
+  // Same empty-box fallback the prefill uses — see geminiDefaultModel.
+  const limitsModel = geminiFreeTier ? leadModel(model || geminiDefaultModel) : "";
+  if (limitsModel) {
+    const num = (id) => {
+      const raw = document.getElementById(id)?.value.trim();
+      return raw === "" || raw === undefined ? null : Number(raw);
+    };
+    const rpm = num("gemini-rpm"), tpm = num("gemini-tpm"), rpd = num("gemini-rpd");
+    if (rpm === null && tpm === null && rpd === null) {
+      geminiLimits = { [limitsModel]: null };          // cleared → back to the built-in table
+    } else if (rpm === null || rpd === null) {
+      // Returns before the button is disabled below, so there's nothing to
+      // re-enable here — the form stays live for the user to complete the row.
+      msgEl.hidden = false;
+      // className too, or this validation error inherits the previous save's
+      // green "ok" styling and reads as a success.
+      msgEl.className = "action-msg error";
+      msgEl.textContent = "Enter both RPM and RPD (TPM may be blank for unlimited).";
+      return;
+    } else {
+      geminiLimits = { [limitsModel]: { rpm, tpm, rpd } };
+    }
+  }
   btn.disabled = true;
   msgEl.hidden = true;
   try {
@@ -446,6 +538,7 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
       body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
                              api_key: apiKey,
                              gemini_free_tier: geminiFreeTier,
+                             gemini_limits: geminiLimits,
                              tailor_provider: tailorProvider, tailor_model: tailorModel,
                              tailor_api_key: tailorKey,
                              handoff_out_dir: handoffDir }),

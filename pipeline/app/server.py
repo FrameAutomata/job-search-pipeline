@@ -986,6 +986,12 @@ def get_providers() -> JSONResponse:
             "batch_model": os.environ.get("BATCH_MODEL", ""),
             "batch_cli": os.environ.get("BATCH_CLI", "claude"),
             "gemini_free_tier": gemini_limits.conforming_enabled(),
+            # The effective limits (baked table + this user's overrides), so the
+            # wizard's hint quotes real numbers instead of a fourth hand-copy of
+            # them, and can prefill the fields for the model already configured.
+            "gemini_limits": gemini_limits.effective_limits(),
+            "gemini_limits_user": gemini_limits.user_limits(),
+            "gemini_limits_path": str(gemini_limits.override_path()),
             # Tailoring model/provider (blank = inherit the eval model/provider).
             "tailor_provider": os.environ.get("TAILOR_PROVIDER", ""),
             "tailor_model": os.environ.get("TAILOR_MODEL", ""),
@@ -1001,6 +1007,10 @@ class LocalConfigRequest(BaseModel):
     batch_cli: str = ""
     api_key: str = ""   # optional — write the provider's API key to .env too
     gemini_free_tier: bool = False   # conform eval/tailoring to Gemini free-tier limits
+    # The user's own AI Studio numbers: {model_id: {rpm, tpm, rpd}}, or a model
+    # mapped to null to clear it. None (absent) leaves the file untouched — an
+    # omitted field must not wipe limits saved by an earlier visit to the wizard.
+    gemini_limits: dict | None = None
     # Resume tailoring can use a different (usually stronger) model — and even a
     # different provider — than bulk evaluation. Blank tailor_* = inherit the eval
     # model/provider. tailor_api_key (optional) is the tailor provider's key.
@@ -1082,6 +1092,21 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
     # Opt into Gemini free-tier conforming (RPM pacing + RPD capping).
     _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
+
+    # The user's own rate limits. These go to a JSON file rather than .env: the
+    # shape is a per-model table, and flattening it into env vars would need one
+    # var per model per dimension. Validated through the same parser a run reads
+    # by, so a row the wizard accepts is a row that actually takes effect.
+    if req.gemini_limits is not None:
+        try:
+            gemini_limits.save_user_limits(req.gemini_limits)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Could not write {gemini_limits.override_path()}: {exc}"
+            ) from exc
+        updated.append("GEMINI_LIMITS")
 
     # Tailoring model/provider (blank = inherit the eval model/provider). Write the
     # tailor provider's API key too when given, so a cross-provider tailor (e.g.
