@@ -342,9 +342,16 @@
         résumés, search config) is kept. A snapshot is saved under <code>.ui-cache/backups/</code>
         first. With the box checked, this also clears your cloud state cache (irreversible) so a
         Refresh can't pull the old history back.</p>
-      <!-- Unchecked by default: deleting the cloud cache is irreversible, so
-           opting in should be the deliberate act. -->
-      <label class="check"><input type="checkbox" id="reset-clear-cloud" />
+      <!-- Checked by default, deliberately, even though it is the irreversible
+           half. reset.py: "otherwise the offline-first Refresh would merge the
+           old cloud history straight back into the freshly-reset local
+           tracker" — so a reset WITHOUT this silently undoes itself on the next
+           Refresh or daily run. Unchecking it by default made the safe-looking
+           path the one that does not work. The exposure it was meant to guard
+           is handled properly instead: the panel is hidden until there is state
+           to wipe, and the button needs RESET typed. Mirrors
+           ResetRequest.clear_cloud's default in server.py. -->
+      <label class="check"><input type="checkbox" id="reset-clear-cloud" checked />
         Also reset the cloud (delete the GitHub Actions state cache)</label>
       <button type="button" id="reset-btn" class="danger-btn">Reset my job search</button>
       <div id="reset-msg" class="action-msg" hidden></div>

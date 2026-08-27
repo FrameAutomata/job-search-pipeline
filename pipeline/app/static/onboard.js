@@ -284,20 +284,28 @@ async function loadStatus() {
 // If the user has onboarded before, prefill every form field from the saved
 // payload so they only have to touch the knob they want to change. Sidecar
 // excludes the API key (it lives in GitHub Secrets, write-only).
+// Fail OPEN on anything unexpected. Before the panel was hidden by default a
+// broken endpoint could not remove it; now a 500, a non-JSON body or a thrown
+// fetch would leave the user with no path to Reset and no error saying why.
+// Showing it costs nothing — the button still needs RESET typed — while hiding
+// it wrongly is unrecoverable from the UI.
+function revealDangerZone(hasState) {
+  const danger = document.getElementById("danger-zone");
+  if (danger && hasState !== false) danger.hidden = false;
+}
+
 async function loadSavedConfig() {
   try {
     const resp = await fetch("/api/onboard/load-config");
-    const { form: saved, has_resume } = await resp.json();
+    const { form: saved, has_resume, has_state } = await resp.json();
 
-    // Reveal the reset panel for anyone who has used this before. Gate on
-    // `has_resume` as well as `saved`, NOT on enterEditMode: load-config
-    // returns {form: null, has_resume: true} for a copy that was set up from
-    // the CLI rather than this wizard, and such a copy can still hold a full
-    // tracker, reports and a populated evaluation queue — exactly the state
-    // reset exists to wipe. Gating on the saved FORM would hide the button
-    // from the only people with a reason to press it.
-    const danger = document.getElementById("danger-zone");
-    if (danger && (saved || has_resume)) danger.hidden = false;
+    // Gate the reset panel on has_state — job-search RESULTS exist — not on
+    // setup. `saved` misses a CLI-set-up copy, and `has_resume` both
+    // false-reveals (a hand-dropped resume before the first run: nothing to
+    // reset, which is the exposure this gate exists to prevent) and
+    // false-hides (`run-ui.sh --data` against an extracted artifact: a full
+    // tracker with no local resume).
+    revealDangerZone(has_state);
 
     if (!saved) return;
     prefillForm(saved);
@@ -308,7 +316,9 @@ async function loadSavedConfig() {
       "✓ Editing your existing config. Change what you need and click " +
       "Save changes — leave resume / API key blank to keep them as they are.";
   } catch {
-    /* first-time setup: no sidecar, leave the wizard in its default state */
+    // Not necessarily first-time setup any more — the panel's default state is
+    // now "absent", so a failed probe must not read as "nothing to reset".
+    revealDangerZone(undefined);
   }
 }
 
@@ -479,16 +489,20 @@ document.getElementById("local-handoff-browse")?.addEventListener("click", async
 // and the cloud-cache deletion is irreversible.
 const resetBtn = document.getElementById("reset-btn");
 resetBtn.addEventListener("click", async () => {
-  // Read the checkbox BEFORE prompting: the cloud clause is the only
-  // irreversible part, and it is now opt-in, so warning about it unconditionally
-  // would cry wolf on the default path — and the one warning that matters gets
-  // clicked through.
+  // Read the checkbox BEFORE prompting, and warn on BOTH paths — they fail in
+  // opposite directions. Checked: the cloud cache deletion cannot be undone.
+  // Unchecked: the cloud keeps its copy, so the next Refresh or daily run
+  // merges this history straight back and the reset undoes itself (see
+  // reset.py). A prompt that only covered one of those left the other silent.
   const clearCloud = document.getElementById("reset-clear-cloud").checked;
   const typed = prompt(
     "This wipes your job-search results (tracker, history, reports, queue, PDFs). " +
-    "Your setup is kept and a snapshot is saved first." +
-    (clearCloud ? " The cloud cache deletion is IRREVERSIBLE." : "") +
-    "\nType RESET to confirm:");
+    "Your setup is kept and a snapshot is saved first.\n\n" +
+    (clearCloud
+      ? "The cloud state cache is also deleted — that part is IRREVERSIBLE."
+      : "The cloud keeps its copy: the next Refresh or daily run will pull this " +
+        "history back into the tracker.") +
+    "\n\nType RESET to confirm:");
   if (typed !== "RESET") return;
   const msg = document.getElementById("reset-msg");
   const show = (text, kind) => { msg.hidden = false; msg.textContent = text; msg.className = "action-msg" + (kind ? " " + kind : ""); };

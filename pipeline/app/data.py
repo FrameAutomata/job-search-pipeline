@@ -885,7 +885,11 @@ def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
     Iterated in sorted order so that a number matching two REAL reports resolves
     to the same one on every request — `_rename_report_file` records when that
     happens ("a number matches two files"). That is stability, not correctness:
-    the caller-supplied report path is the authority when one is available."""
+    the tie is decided by filename, and nothing here knows which report the row
+    meant. Every caller looks up by NUMBER (server.py deliberately: "not the
+    link target — tolerant of report renames"), so there is no authority to
+    defer to; resolving the ambiguity properly would mean passing the row's own
+    Report link down."""
     wanted = _report_int(report_num)
     if wanted is None or not reports_dir.exists():
         return None

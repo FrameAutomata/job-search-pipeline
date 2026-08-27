@@ -64,15 +64,21 @@ header h1 { margin: 0 0 12px; font-size: 18px; }
   font-size: 14px;
   cursor: pointer;
 }
-/* :not(.active) is load-bearing. These generic hover rules sit at (0,3,1) and
-   outrank the (0,2,1) rules that give a SELECTED control its filled look, so
-   without the carve-out hovering a filled button repaints its label
-   var(--accent) on a var(--accent) background — 1:1 contrast, label gone. Not a
-   corner case: the pointer rests on the button just clicked. Excluding filled
-   variants here (rather than giving each one a :hover twin) means any state
-   class added later wins by construction. Filled buttons still get feedback
-   from their own :hover rules (opacity/border). */
-.toolbar button:hover:not(:disabled):not(.active) { border-color: var(--accent); color: var(--accent); }
+/* Hover recolours the BORDER only, never `color`.
+   These generic rules sit at (0,3,1) and outrank the (0,2,1) rules that give a
+   selected/primary control its filled look, so while they set `color:
+   var(--accent)` they repainted a filled button's label var(--accent) on a
+   var(--accent) background — 1:1 contrast, label gone. Two were live: the
+   active view toggle and #add-job-submit; #submit-btn escaped only because an
+   ID outranks a class, which is luck, not policy.
+   Carving out each filled variant by selector was tried and does not hold: it
+   needs a different token per rule (.active here, [type=submit] elsewhere),
+   misses a <button> in a form with no explicit type — a submit button to the
+   browser — and leaves the carved-out controls with no hover affordance at all.
+   Dropping `color` from the declaration fixes every case at once and keeps
+   feedback for filled and unfilled buttons alike, so a state class added later
+   is safe by construction. */
+.toolbar button:hover:not(:disabled) { border-color: var(--accent); }
 .toolbar button:disabled { opacity: 0.5; cursor: default; }
 
 #setup-link {
@@ -113,6 +119,7 @@ main { display: flex; height: calc(100vh - 78px); }
   padding: 7px 12px; font-size: 14px; cursor: pointer;
 }
 .viewtoggle button.active { background: var(--accent); color: #fff; }
+.viewtoggle button.active:hover { opacity: 0.85; }
 
 /* ── Kanban board ──────────────────────────────────────────────────────── */
 #board-pane { flex: 1; overflow: auto; display: flex; gap: 12px; padding: 14px; align-items: flex-start; }
@@ -187,9 +194,10 @@ fieldset.workauth legend { font-size: 14px; padding: 0 6px; }
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 8px 14px; font-size: 14px; cursor: pointer; text-decoration: none;
 }
-.wizard-nav button:hover:not(:disabled):not([type="submit"]), .wizard-nav .linkbtn:hover { border-color: var(--accent); color: var(--accent); }
+.wizard-nav button:hover:not(:disabled), .wizard-nav .linkbtn:hover { border-color: var(--accent); }
 .wizard-nav button:disabled { opacity: 0.5; cursor: default; }
 #submit-btn { background: var(--accent); color: #fff; border-color: var(--accent); }
+#submit-btn:hover:not(:disabled) { opacity: 0.85; }
 .banner.ok-banner { background: rgba(63,185,80,0.12); border-color: rgba(63,185,80,0.4); color: var(--good); }
 #review { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; white-space: pre-wrap; }
 
@@ -403,7 +411,7 @@ tbody tr.selected { background: #233047; }
   background: var(--panel);
   color: var(--text);
 }
-.modal-actions button:hover:not(:disabled):not([type="submit"]) { border-color: var(--accent); color: var(--accent); }
+.modal-actions button:hover:not(:disabled) { border-color: var(--accent); }
 .modal-actions button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 .modal-actions button[type="submit"]:hover:not(:disabled) { opacity: 0.85; }
 .modal-actions button:disabled { opacity: 0.5; cursor: default; }
