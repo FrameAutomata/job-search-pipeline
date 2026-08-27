@@ -5,9 +5,27 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from pipeline import gemini_limits as gemini_limits_mod
 from pipeline import scrape as scrape_mod
 from pipeline import filter as filter_mod
 from pipeline import bridge as bridge_mod
+
+
+@pytest.fixture(autouse=True)
+def _reset_gemini_pacers():
+    """Drop the per-model rate limiter + token budget between tests.
+
+    gemini_limits._pacers is process-global and deliberately has no production
+    reset — one pace per model for the life of a run is the point. A test that
+    builds a paced caller therefore leaves a limiter wound to REAL time behind
+    it, and the next test to touch that model inherits it: test_batch_evaluate's
+    pacing test alone would make a following call sleep 12 real seconds. Global
+    because the leak is global — scoping this to the module that owns the
+    registry is what let it reach the other one.
+    """
+    gemini_limits_mod._pacers.clear()
+    yield
+    gemini_limits_mod._pacers.clear()
 
 
 # Synthetic resume used by filter tests. Includes a Skills section so

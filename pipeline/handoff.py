@@ -930,11 +930,13 @@ def _make_tailor_fn(career_ops: Path, out_dir=None):
     handoff dir). Lazy imports so the handoff stage itself never needs python-docx
     unless --tailor is used.
 
-    All rows share ONE caller: gemini_limits' free-tier pacer lives inside the
-    caller instance, so per-row resolution would give every pool worker its own
-    rate limiter (429 storms — review bug). Resolution is deferred to the first
-    actual LLM invocation, so a fully cached run still works with no provider
-    key configured."""
+    All rows share ONE caller. The pacing reason this started as no longer
+    applies — gemini_limits keys its limiter and budget on the MODEL now
+    (`_pacer_for`), precisely so a caller built per row (or per UI request)
+    can't hand each one its own full budget. What sharing still buys is the
+    resolution itself: one provider/key check and one client, rather than one
+    per row. Resolution is deferred to the first actual LLM invocation, so a
+    fully cached run still works with no provider key configured."""
     import threading
     from pipeline import resume_content
     from pipeline import resume_tailor as rt

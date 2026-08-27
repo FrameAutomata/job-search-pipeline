@@ -26,8 +26,15 @@ unchanged. Ticking "I'm on the free tier" bought silence, not conformance. So
 an unknown model is now something the run SAYS (`format_unconformable_warning`),
 pointing at the file that fixes it.
 
-The binding constraint for batch evaluation is RPD (requests per day ≈ jobs per
-day); RPM only paces within a run.
+All three published limits are conformed to, and they bind in different places.
+RPD is a quota — exceed it and the day's remaining requests are refused — so
+`cap_to_rpd` slices the run to it. RPM and TPM are both rates, so both pace
+within a run (`paced_caller`), and the LOWER of the two is what a run actually
+achieves: a model granting 30 RPM against 16,000 TPM cannot start 30 evaluations
+in a minute when each one costs ~8,000 tokens. That gap is why an honest daily
+capacity is the lowest of all three limits put in one unit — `_capacity_terms`
+spends each rate over a day's 1,440 minutes — rather than the RPD alone. That is
+what the warning quotes and what `batch_recommendation` ranks by.
 """
 
 import json
@@ -65,14 +72,37 @@ GEMINI_FREE_TIER_LIMITS: dict[str, dict] = {
     # The Gemma pair was wrong in all three dimensions before this refresh
     # (15 / unlimited / 1500). TPM is the correction that bites: 16K is not
     # "unlimited", and at a realistic ~8K-token evaluation prompt it caps you
-    # near 2 requests/minute — far below the 30 RPM the same row grants. Nothing
-    # here paces on TPM yet, so the high RPD is not reachable in practice.
+    # near 2 requests/minute — far below the 30 RPM the same row grants, and far
+    # below what the 14,400 RPD implies. This is the only row where TPM binds,
+    # which is why nothing paced on it until #143; the Flash rows' 250K against
+    # 5-15 RPM is slack no evaluation prompt can use up.
     "gemma-4-26b-a4b-it":     {"rpm": 30, "tpm": 16_000,  "rpd": 14_400},
     "gemma-4-31b-it":         {"rpm": 30, "tpm": 16_000,  "rpd": 14_400},
 }
 
-# The highest free-tier RPD model — what we steer batch users toward.
-BATCH_RECOMMENDATION = "gemma-4-26b-a4b-it"
+# What one job evaluation costs in PROMPT tokens: a full JD plus PROFILE.md.
+# A nominal, deliberately — the real figure varies per job by a factor of two or
+# more, and there is no honest way to know it before the run. Every message
+# derived from it therefore SAYS it is nominal and prints the number, so a
+# reader whose prompts are twice this size can halve the answer themselves.
+# Used only for REPORTING (capacity, the recommendation ranking). The pacer
+# itself never guesses: it measures each prompt as it goes.
+NOMINAL_PROMPT_TOKENS = 8_000
+
+# What a response is charged. TPM counts tokens in BOTH directions, so a call
+# costs its prompt plus whatever comes back — and only the prompt is knowable
+# before the call, which is what this number is for. MAX_TOKENS (8,192) is the
+# ceiling a caller allows, not what an evaluation returns (~1-2K); reserving the
+# ceiling would more than halve every run's throughput to insure against a size
+# responses don't reach. So reserve a realistic figure and correct upward
+# afterwards — `paced_caller` charges the overrun once the real response is in
+# hand. That correction lands after the call that overran, so it can't un-spend
+# those tokens; what it prevents is the error compounding across a run.
+#
+# `_row_capacity` adds it too, so the capacity a message quotes is costed the
+# same way the pacer costs a call. Counting the prompt alone there would have
+# reported a throughput the pacer then declined to deliver.
+_RESERVED_OUTPUT_TOKENS = 1_500
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_OVERRIDE_FILE = "config/gemini-limits.json"
@@ -112,8 +142,9 @@ def _clean_entry(model: str, raw: object) -> dict | None:
     partial override ({"rpd": 1000}) keeps the rpm/tpm it didn't mention.
 
     Returns None to decline the row. rpm and rpd must end up present and
-    numeric, because they are what pacing and capping read; tpm is advisory
-    here and may be null ("unlimited")."""
+    numeric, because they are what pacing and capping read; tpm may be null,
+    which is "unlimited" — a real answer for most rows, and the reason it can't
+    just be required alongside the other two."""
     if not isinstance(raw, dict):
         return None
     merged = {**GEMINI_FREE_TIER_LIMITS.get(model, {}), **raw}
@@ -193,25 +224,30 @@ def effective_limits() -> dict[str, dict]:
 
 
 def save_user_limits(rows: dict) -> dict:
-    """Write the user's limits file and return what was stored.
+    """Merge `rows` into the user's limits file and return the whole stored table.
 
-    Validates through parse_overrides — the same path a run reads by — so the UI
+    Validates through _clean_entry — the same path a run reads by — so the UI
     cannot persist a row the loader would silently decline, which would look
     saved and do nothing. Raises ValueError on a row that doesn't validate, so
     the caller can 400 rather than write junk.
 
-    A row mapping to None deletes it, and an empty result removes the file
-    entirely rather than leaving `{}` behind, so "clear my overrides" returns to
-    the baked table exactly as if the file had never existed."""
+    MERGED, not replaced. The wizard edits ONE model at a time and posts exactly
+    that row (`onboard.js`), and it tells a failover-chain user to add the other
+    members to the file by hand — so replacing the file would delete every row
+    the user was not looking at, including the ones it had just told them to
+    write. Silently, and back onto baked numbers that are wrong for a paid
+    project by construction. Deleting a row is therefore something you have to
+    ASK for: a row mapping to None removes it, and an empty result removes the
+    file rather than leaving `{}` behind, so "clear my overrides" returns to the
+    baked table exactly as if the file had never existed."""
     # Validate through _clean_entry directly rather than round-tripping the dict
     # through json.dumps/parse_overrides: same validator, one pass, and it yields
     # the rejected keys instead of recovering them from a set difference.
-    cleaned, bad = {}, []
+    cleaned, bad, dropped = {}, [], []
     for model, raw in rows.items():
         if raw is None:
-            continue                                  # explicit delete
-        entry = _clean_entry(model, raw)
-        if entry is None:
+            dropped.append(model)                     # explicit delete
+        elif (entry := _clean_entry(model, raw)) is None:
             bad.append(model)
         else:
             cleaned[model] = entry
@@ -220,9 +256,12 @@ def save_user_limits(rows: dict) -> dict:
             f"Invalid limits for {', '.join(sorted(bad))}: rpm and rpd must be "
             f"positive integers; tpm must be a positive integer or null (unlimited)."
         )
+    stored = {**_load_overrides(), **cleaned}
+    for model in dropped:
+        stored.pop(model, None)
     path = override_path()
     _override_cache.pop(str(path), None)
-    if not cleaned:
+    if not stored:
         path.unlink(missing_ok=True)
         return {}
     # Atomic: _load_overrides mtime-caches this file, so a reader landing
@@ -231,8 +270,8 @@ def save_user_limits(rows: dict) -> dict:
     # common import path (which the UI venv takes) off _batch_common.
     from pipeline._batch_common import atomic_write_text
 
-    atomic_write_text(path, json.dumps(cleaned, indent=2, sort_keys=True) + "\n")
-    return cleaned
+    atomic_write_text(path, json.dumps(stored, indent=2, sort_keys=True) + "\n")
+    return stored
 
 
 def _spec_models(model: str) -> list[str]:
@@ -244,7 +283,7 @@ def _spec_models(model: str) -> list[str]:
 def _spec_rpd(model: str) -> int | None:
     """Summed RPD across the spec's known members. A failover chain's daily
     capacity is the SUM — when one member is exhausted (429) the call falls over
-    to the next — so a `flash,gemma` chain does ~20 then ~1,500 = 1,520/day.
+    to the next — so a `flash,gemma` chain does ~20 then ~14,400 = 14,420/day.
     None if no member has known limits (paid / non-Gemini / unknown).
 
     Reads effective_limits(), so a user's own AI Studio numbers set the cap when
@@ -252,6 +291,70 @@ def _spec_rpd(model: str) -> int | None:
     limits = effective_limits()
     caps = [limits[m]["rpd"] for m in _spec_models(model) if m in limits]
     return sum(caps) if caps else None
+
+
+def _capacity_terms(row: dict) -> dict[str, int]:
+    """Each of the model's three published limits expressed in one unit —
+    evaluations per day — so they can be compared at all.
+
+    RPD is already in it. RPM and TPM are rates, so they are spent over a day's
+    1,440 minutes: `rpm * 1440`, and `tpm * 1440 / per-call cost`. Continuous
+    running is an upper bound nobody reaches, and that is deliberate — a figure
+    that overstates even the best case is unambiguously wrong, whereas modelling
+    a session length would stack a second guess on top of prompt size.
+
+    Ordered rpd, rpm, tpm so `_row_bound`'s tie goes to RPD: a model whose quota
+    and rates agree is not something to report as rate-bound."""
+    terms = {"rpd": row["rpd"], "rpm": row["rpm"] * 1440}
+    tpm = row.get("tpm")
+    if tpm:                                           # null/0 = unlimited
+        terms["tpm"] = int(tpm * 1440 / (NOMINAL_PROMPT_TOKENS + _RESERVED_OUTPUT_TOKENS))
+    return terms
+
+
+def _row_capacity(row: dict) -> int:
+    """One model's honest evaluations/day: the lowest of its three limits.
+
+    All three — not RPD alone, and not RPD-versus-TPM either. Whichever binds
+    first is what the model delivers, and on the baked table that is always RPD
+    (every row's RPM and TPM buy thousands a day), which is why "highest RPD" was
+    a serviceable ranking until a 16K TPM row arrived. That is also why the fix
+    has to be the general rule rather than a TPM special case: a user's own
+    numbers reach combinations the table never had, and a 1 RPM row is 1,440
+    evaluations a day however large the quota beside it. Ranking that on RPD
+    would recommend it as the best model available.
+
+    On Gemma, TPM gives ~2,425 against an RPD of 14,400 — the advertised cap
+    overstates the model 5x. For every Flash row the rate terms are enormous
+    (250K TPM ≈ 37,000/day) and RPD wins."""
+    return min(_capacity_terms(row).values())
+
+
+def _row_bound(row: dict) -> str:
+    """Which published limit is the one the model actually delivers on — the
+    reason a capacity sits below the RPD, for the message that quotes it."""
+    terms = _capacity_terms(row)
+    return min(terms, key=terms.get)
+
+
+def batch_recommendation() -> str | None:
+    """The model to steer batch runs toward: the highest honest daily capacity.
+
+    Computed rather than baked, because the constant this replaced ranked by RPD
+    alone and so recommended a model whose advertised 14,400/day is unreachable.
+    The ranking has to use the same metric the warning quotes, or the two
+    disagree inside the one message that carries both. Computing it also means a
+    user who supplied their own AI Studio numbers gets a recommendation for THEIR
+    project rather than for a free tier they may not be on.
+
+    The key ends in the model id, which makes it a total order: `min` therefore
+    returns the same answer whatever order the table is in. Ranking on capacity
+    alone would break ties on dict insertion order, and advice that reshuffles
+    when a row is added above it reads as a change of advice."""
+    limits = effective_limits()
+    if not limits:
+        return None
+    return min(limits, key=lambda m: (-_row_capacity(limits[m]), -limits[m]["rpd"], m))
 
 
 def unknown_members(model: str) -> list[str]:
@@ -265,35 +368,85 @@ def free_tier_viability(model: str, pending_jobs: int) -> dict | None:
     """Whether `pending_jobs` fits the model spec's free-tier daily capacity.
 
     Returns None for a spec with no known free-tier member (paid / non-Gemini /
-    unknown). Otherwise {"rpd", "exceeds": pending > rpd[, "suggestion"]} —
-    `suggestion` is the recommended higher-cap model, present only when the run
-    exceeds the cap AND that model isn't already in the spec. Chain-aware: rpd is
-    the sum across members (see _spec_rpd)."""
-    rpd = _spec_rpd(model)
-    if rpd is None:
+    unknown). Otherwise {"rpd", "capacity", "exceeds", "bounds"[, "suggestion",
+    "suggestion_capacity"]} — `suggestion` is the better model to switch to,
+    present only when the run exceeds capacity AND that model isn't already in
+    the spec. Chain-aware: both figures sum across the spec's known members,
+    because a chain fails over member-to-member (see _spec_rpd).
+
+    `exceeds` compares against `capacity`, not `rpd`, and the difference is the
+    whole of #143: on a TPM-bound model the quota is reachable only in theory, so
+    answering "will these fit in a day?" with RPD tells a user their 5,000
+    pending jobs are fine when the token budget will get through ~2,425 of them.
+    `cap_to_rpd` still slices on `rpd` — a quota refuses requests, a rate merely
+    slows them, and only the first is a reason to defer work to tomorrow.
+
+    The recommendation is ranked only when the run actually overflows: it sorts
+    the whole table, and every batch run calls this whether or not there is
+    anything to say."""
+    members = _spec_models(model)
+    limits = effective_limits()
+    rows = [limits[m] for m in members if m in limits]
+    if not rows:
         return None
-    result = {"rpd": rpd, "exceeds": pending_jobs > rpd}
-    if result["exceeds"] and BATCH_RECOMMENDATION not in _spec_models(model):
-        result["suggestion"] = BATCH_RECOMMENDATION
+    capacity = sum(_row_capacity(r) for r in rows)
+    result = {"rpd": sum(r["rpd"] for r in rows), "capacity": capacity,
+              "exceeds": pending_jobs > capacity,
+              # Which limits cost the spec its RPD, across the members that lost
+              # any — so the message names the one that did, rather than assuming
+              # TPM, which is only the reason on the rows the table happens to
+              # carry today.
+              "bounds": sorted({_row_bound(r) for r in rows
+                                if _row_capacity(r) < r["rpd"]})}
+    if result["exceeds"]:
+        best = batch_recommendation()
+        best_capacity = _row_capacity(limits[best]) if best else 0
+        # Better, not merely different. "Not already in the spec" alone advised
+        # swapping gemma-4-31b-it for its identical twin — and the message now
+        # quotes both capacities, so it refuted itself in one line.
+        if best and best not in members and best_capacity > capacity:
+            result["suggestion"] = best
+            # Carried, not re-derived at the print site: this is the number the
+            # ranking above chose `best` FOR, and the two disagreeing is how the
+            # line came to advertise an RPD it had not ranked by.
+            result["suggestion_capacity"] = best_capacity
     return result
 
 
 def format_free_tier_warning(model: str, pending_jobs: int) -> str | None:
-    """A one-line warning when the run will exceed the free-tier daily cap, else
-    None. Callers print it before starting a batch run."""
+    """A one-line warning when the run won't get through its queue today, else
+    None. Callers print it before starting a batch run.
+
+    The number quoted is the honest capacity, not the RPD — the message exists to
+    set an expectation, and one that promises 14,400 evaluations from a model
+    that can deliver ~2,425 is worse than no message. When the two differ, TPM is
+    why, so the message says so rather than leaving the user to wonder which of
+    the three published numbers moved.
+
+    It deliberately makes NO claim about what happens to the overflow: with
+    conforming on it is deferred by `cap_to_rpd` (whose own line says so), with
+    conforming off a quota overflow fails and a rate overflow just runs into
+    tomorrow. Three outcomes, one sentence — the old flat "the rest will hit the
+    daily cap and fail" was right for one of them."""
     v = free_tier_viability(model, pending_jobs)
     if not v or not v["exceeds"]:
         return None
-    msg = (f"[batch] ⚠ Gemini free tier on {model} allows ~{v['rpd']} "
-           f"evaluations/day; you have {pending_jobs} pending — the rest will "
-           f"hit the daily cap and fail.")
+    bound = ""
+    if v["capacity"] < v["rpd"]:
+        if v["bounds"] == ["tpm"]:
+            label, why = "TPM-bound", (
+                f"a nominal {NOMINAL_PROMPT_TOKENS:,}-token prompt and its response "
+                f"against its tokens/minute")
+        elif v["bounds"] == ["rpm"]:
+            label, why = "RPM-bound", "its requests/minute spent over a day"
+        else:
+            label, why = "rate-bound", "its per-minute limits"
+        bound = f" ({label}: {why} — not the {v['rpd']:,} its RPD implies)"
+    msg = (f"[batch] ⚠ Gemini free tier on {model} gets through ~{v['capacity']:,} "
+           f"evaluations/day{bound}; you have {pending_jobs:,} pending.")
     if v.get("suggestion"):
-        # Read the suggestion's cap rather than restating it: this line claimed a
-        # flat "1,500/day" while the number it came from sat two screens up, and
-        # a user override can change it per project.
-        cap = effective_limits().get(v["suggestion"], {}).get("rpd")
-        cap_note = f" ({cap:,}/day)" if cap else ""
-        msg += f" Set BATCH_MODEL={v['suggestion']}{cap_note} for batch runs."
+        msg += (f" Set BATCH_MODEL={v['suggestion']} "
+                f"(~{v['suggestion_capacity']:,}/day) for batch runs.")
     return msg
 
 
@@ -318,9 +471,10 @@ def format_unconformable_warning(model: str) -> str | None:
 
 # ── Conforming mode ──────────────────────────────────────────────────────────
 # When the user opts into "I'm on Gemini's free tier" (GEMINI_FREE_TIER=true),
-# the LLM stages actively CONFORM to the limits rather than just warning: requests
-# are paced to the model's RPM, and the eval run caps to the model's RPD (the rest
-# is deferred to the next run). Both are no-ops for paid models / other providers.
+# the LLM stages actively CONFORM to the limits rather than just warning:
+# requests are paced to the model's RPM *and* its TPM, and the eval run caps to
+# the model's RPD (the rest is deferred to the next run). All three are no-ops
+# for paid models / other providers.
 
 def conforming_enabled() -> bool:
     """Whether the user opted into Gemini free-tier conforming (GEMINI_FREE_TIER)."""
@@ -338,11 +492,133 @@ def rpd_cap(model: str) -> int | None:
 def cap_to_rpd(items: list, model: str) -> tuple[list, int]:
     """Slice a job list to the model's free-tier daily cap. Returns (kept,
     deferred_count). No-op (returns the list unchanged) when not conforming or the
-    model has no known cap."""
+    model has no known cap.
+
+    RPD only, deliberately — not the TPM-aware capacity the warning quotes.
+    Exceeding the quota gets the day's remaining requests refused, which is a
+    reason to defer them to tomorrow. Exceeding what the token budget can pace
+    doesn't: the run just goes on for as long as it is left running (at
+    TPM-bound rates that can be days, not hours), and whatever it doesn't reach
+    stays pending for the next run anyway. Slicing on capacity would defer the
+    same jobs to a tomorrow with no more tokens per minute than today, which
+    buys the user nothing and costs them the ones this run would have done."""
     cap = rpd_cap(model)
     if cap is None or len(items) <= cap:
         return items, 0
     return items[:cap], len(items) - cap
+
+
+# ~4 characters per token is Google's own rule of thumb for English, and it is
+# what we have: the SDK's count_tokens is a network round trip per call, which
+# would add latency and its own quota to the very path being paced.
+_CHARS_PER_TOKEN = 4
+
+# The window both pacers work in. RPM and TPM are per-MINUTE limits, so this is
+# not a knob — a second value here wouldn't be a shorter window, it would be a
+# different limit.
+_MINUTE = 60.0
+
+
+def estimate_tokens(text: str) -> int:
+    """Approximate token count for a string, rounded up.
+
+    Approximate is the honest word: the budget below is therefore soft, and a
+    429 remains possible on a prompt this under-counts. That is acceptable
+    because the fallback is intact — `_call_with_retry` backs off on a 429 — and
+    the alternative (an exact count per call) costs a round trip on every request
+    to a path whose entire purpose is spending fewer of them."""
+    return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+
+class TokenBudget:
+    """Thread-safe rolling-window token pacer: holds the tokens spent in any
+    60-second window to `tpm`, delaying a call that would break it.
+
+    A different shape from RateLimiter, because the cost of a request is not
+    fixed: RPM is one min-interval between starts, while TPM is a budget that a
+    single 8K-token call can consume half of. So this keeps the charges that are
+    still inside the window and schedules the next one at the first instant the
+    oldest of them has aged out far enough to make room.
+
+    Charges are scheduled in non-decreasing order (`_floor`), which buys two
+    things. It is FIFO — a cheap call can't jump the queue ahead of an expensive
+    one already waiting, the same fairness `RateLimiter._next` gives. And it
+    makes the check sufficient: a window is only ever tested at the moment a
+    charge lands, so with a monotonic schedule every future window is tested by
+    the charge that opens it. Without it, placing a small charge *before* an
+    already-scheduled larger one would leave the window they share unchecked.
+
+    `tpm <= 0` (or None — "unlimited") means no budget: every method is a no-op,
+    so callers don't branch. `monotonic`/`sleep` are injectable for tests, as on
+    RateLimiter."""
+
+    def __init__(self, tpm: int | None, *, monotonic=time.monotonic, sleep=time.sleep):
+        self._tpm = tpm if tpm and tpm > 0 else 0
+        self._monotonic = monotonic
+        self._sleep = sleep
+        # [(scheduled_at, tokens)], ascending by scheduled_at. Bounded by the
+        # calls that fit in one window — tens of entries, so a list is cheaper
+        # than the deque a "log" shape suggests, and it can be indexed.
+        self._charges: list[tuple[float, int]] = []
+        self._lock = threading.Lock()
+
+    def _prune(self, upto: float) -> None:
+        """Drop the charges that can no longer affect a window ending at `upto`
+        or later. Every charge is scheduled at or after the `upto` its caller
+        passes, so nothing still needed is dropped."""
+        cutoff = upto - _MINUTE
+        i = 0
+        while i < len(self._charges) and self._charges[i][0] <= cutoff:
+            i += 1
+        del self._charges[:i]
+
+    def _floor(self, now: float) -> float:
+        return max(now, self._charges[-1][0]) if self._charges else now
+
+    def acquire(self, tokens: int) -> None:
+        """Wait until `tokens` fits, then charge them. No-op when unlimited."""
+        if not self._tpm or tokens <= 0:
+            return
+        with self._lock:
+            now = self._monotonic()
+            # Prune at the earliest start this charge could take, not at `now`:
+            # what survives is then exactly the window that start competes with,
+            # so the cutoff is walked once instead of once per meaning.
+            start = self._floor(now)
+            self._prune(start)
+            live = sum(t for _, t in self._charges)
+            i = 0
+            # If they leave no room, advance to the moment the oldest of them
+            # ages out, repeatedly. Each step drops exactly one charge, so this
+            # terminates in at most len(self._charges) iterations.
+            while live + tokens > self._tpm and i < len(self._charges):
+                start = self._charges[i][0] + _MINUTE
+                live -= self._charges[i][1]
+                i += 1
+            # Falling out with the window empty means this single call costs more
+            # than the whole per-minute budget — a prompt larger than TPM. It runs
+            # anyway, alone in an empty window: waiting for room that can never
+            # exist would hang the run instead of letting the provider answer
+            # (and a 429 is recoverable; a hang is not).
+            self._charges.append((start, tokens))
+            wait = start - now
+        if wait > 0:
+            self._sleep(wait)
+
+    def charge(self, tokens: int) -> None:
+        """Record tokens already spent, without waiting — the response
+        reconciliation.
+
+        Landed at `now`, or with the last scheduled charge when one is already
+        booked ahead of it, which keeps the list ordered. That errs toward
+        counting the overrun for longer than it was live rather than for less,
+        which is the safe direction for a budget."""
+        if not self._tpm or tokens <= 0:
+            return
+        with self._lock:
+            at = self._floor(self._monotonic())
+            self._prune(at)
+            self._charges.append((at, tokens))
 
 
 class RateLimiter:
@@ -351,7 +627,7 @@ class RateLimiter:
     injectable for tests. rpm <= 0 means no pacing."""
 
     def __init__(self, rpm: int, *, monotonic=time.monotonic, sleep=time.sleep):
-        self._interval = 60.0 / rpm if rpm > 0 else 0.0
+        self._interval = _MINUTE / rpm if rpm > 0 else 0.0
         self._monotonic = monotonic
         self._sleep = sleep
         self._next = 0.0
@@ -367,19 +643,76 @@ class RateLimiter:
             self._sleep(wait)
 
 
+# The pacers, keyed on the model rather than held per caller. See _pacer_for.
+_pacers: dict[tuple, tuple] = {}
+_pacers_lock = threading.Lock()
+
+
+def _pacer_for(model: str, row: dict):
+    """The (limiter, budget) pair every caller on `model` shares this process.
+
+    Process-wide rather than per caller instance, because the quota is per API
+    key and the callers are not: the UI builds a fresh caller per Add-Job
+    request thread (`server.py`) and per résumé-tailoring call (`skills.py`), so
+    per-caller state hands each of them the model's FULL budget. Under RPM alone
+    that was close to invisible — one extra request against 30 RPM is noise —
+    but the eval path is *designed* to saturate a 16K TPM budget, so a second
+    in-process caller is a doubling, which is the 429 this exists to prevent.
+
+    `handoff.py`'s `_make_tailor_fn` already carries the rule as a comment ("all
+    rows share ONE caller … per-row resolution would give every pool worker its
+    own rate limiter"). Keying the state on the model makes it a property of
+    this module instead of something five call sites have to remember.
+
+    The limits are part of the key, so an override file edited mid-process
+    (which the UI can do) yields a pacer built from the new numbers rather than
+    one still pacing to the old ones."""
+    key = (model, row["rpm"], row["tpm"])
+    with _pacers_lock:
+        pacer = _pacers.get(key)
+        if pacer is None:
+            pacer = (RateLimiter(row["rpm"]), TokenBudget(row["tpm"]))
+            _pacers[key] = pacer
+        return pacer
+
+
 def paced_caller(caller, model: str):
-    """Wrap an LLM caller so each call is paced to the model's free-tier RPM —
-    only when conforming is on AND the model is in the free-tier table. Otherwise
-    returns `caller` unchanged. One limiter is shared across the wrapper, so
-    parallel eval workers sharing this caller share the pace."""
+    """Wrap an LLM caller so each call is paced to the model's free-tier RPM AND
+    TPM — only when conforming is on AND the model is in the free-tier table.
+    Otherwise returns `caller` unchanged. The limiter and budget come from
+    `_pacer_for`, so every caller on this model in this process shares one pace,
+    however many of them get built.
+
+    The prompt is measured here rather than passed in, which is what made TPM
+    pacing cheap: every caller in the repo has the signature `(system, user)`, so
+    the wrapper already holds the whole prompt. Summing the string arguments
+    costs one `len()` each — `len` on a str is O(1) whatever its size — and reads
+    the prompt without depending on which position it arrives in.
+
+    TPM is acquired BEFORE the RPM slot. When the token budget is the binding
+    limit — the case this exists for — that wait is the long one, and taking it
+    first means the RPM spacing is measured between calls that actually happen
+    rather than between slots reserved and then sat on."""
     limits = effective_limits()
     if not conforming_enabled() or model not in limits:
         return caller
-    limiter = RateLimiter(limits[model]["rpm"])
+    limiter, budget = _pacer_for(model, limits[model])
 
     def wrapped(*args, **kwargs):
+        prompt = sum(estimate_tokens(v) for v in (*args, *kwargs.values())
+                     if isinstance(v, str))
+        budget.acquire(prompt + _RESERVED_OUTPUT_TOKENS)
         limiter.acquire()
-        return caller(*args, **kwargs)
+        result = caller(*args, **kwargs)
+        # Reconcile the reservation upward when the response was bigger than it.
+        # Only upward: a smaller response leaves the window slightly conservative,
+        # which costs a little throughput, while refunding an over-estimate would
+        # have the pacer act on a number it already knows is approximate.
+        overrun = (estimate_tokens(result) - _RESERVED_OUTPUT_TOKENS
+                   if isinstance(result, str) else 0)
+        if overrun > 0:
+            budget.charge(overrun)
+        return result
 
     return wrapped
 
@@ -481,10 +814,20 @@ def _main(argv: list[str]) -> int:
         path = override_path()
         print(f"[limits] overrides: {path}"
               f"{'' if path.exists() else '  (not present — using baked table only)'}")
-        for model, v in sorted({**GEMINI_FREE_TIER_LIMITS, **overrides}.items()):
+        print(f"[limits] recommended for batch runs: {batch_recommendation()}")
+        for model, v in sorted(effective_limits().items()):
             src = "yours" if model in overrides else "baked"
             tpm = "unlimited" if v["tpm"] is None else f"{v['tpm']:,}"
-            print(f"  {model:26} rpm={v['rpm']:<4} tpm={tpm:<10} rpd={v['rpd']:<6} [{src}]")
+            # Where a rate binds, the row's own RPD is not what the model
+            # delivers. Printing the three numbers without saying so is how the
+            # table read as "14,400/day" for a year (#143).
+            cap, note = _row_capacity(v), ""
+            if cap < v["rpd"]:
+                bound = _row_bound(v)
+                why = (f" at a nominal {NOMINAL_PROMPT_TOKENS:,}-token prompt + response"
+                       if bound == "tpm" else "")
+                note = f"  ← {bound.upper()}-bound: ~{cap:,}/day{why}"
+            print(f"  {model:26} rpm={v['rpm']:<4} tpm={tpm:<10} rpd={v['rpd']:<6} [{src}]{note}")
 
     if args.check_models:
         key = os.environ.get("GEMINI_API_KEY", "").strip()

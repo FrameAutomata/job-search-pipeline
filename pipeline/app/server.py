@@ -1124,7 +1124,7 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     api_key = req.api_key.strip()
     if api_key and provider and provider in onboard.PROVIDER_SECRETS:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
-    # Opt into Gemini free-tier conforming (RPM pacing + RPD capping).
+    # Opt into Gemini free-tier conforming (RPM + TPM pacing, RPD capping).
     _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
 
     # The user's own rate limits. These go to a JSON file rather than .env: the

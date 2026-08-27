@@ -296,7 +296,9 @@
             I'm on Gemini's free tier — pace requests and cap each run to the daily limit
           </label>
           <p class="hint" id="gemini-free-tier-hint">When on, evaluation and résumé tailoring stay
-            within the model's RPM/RPD; work past the daily cap defers to the next run.</p>
+            within the model's RPM, TPM and RPD; work past the daily cap defers to the next run.
+            On a low-TPM model (the Gemma rows) the token budget, not the request rate, is what
+            sets the pace — so runs are slower than the RPM suggests.</p>
 
           <div id="gemini-limits-box" style="margin-top:8px">
             <p class="hint" id="gemini-limits-status"></p>
@@ -304,12 +306,14 @@
               numbers are only a fallback. Read your project's real values at
               <a href="https://aistudio.google.com/rate-limit" target="_blank"
                  rel="noopener">aistudio.google.com/rate-limit</a> and enter them here; they
-              override the built-in table for this model.</p>
+              override the built-in table for this model. Worth copying TPM too: on a
+              low-TPM model it is the limit that actually paces a run, and a blank box
+              leaves the built-in number in charge.</p>
             <span style="display:flex; gap:6px; align-items:flex-end; flex-wrap:wrap">
               <label style="flex:1; min-width:90px">RPM
                 <input id="gemini-rpm" type="number" min="1" step="1" placeholder="e.g. 15" />
               </label>
-              <label style="flex:1; min-width:90px">TPM <span class="muted">(blank = unlimited)</span>
+              <label style="flex:1; min-width:90px">TPM <span class="muted">(blank = keep built-in)</span>
                 <input id="gemini-tpm" type="number" min="1" step="1" placeholder="e.g. 250000" />
               </label>
               <label style="flex:1; min-width:90px">RPD

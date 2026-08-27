@@ -855,7 +855,12 @@ class TestFreeTierPacing:
 
         n = eval_mod._run_eval(co, provider="gemini", model="gemini-2.5-flash", dry_run=True)
         assert n == 20                                   # capped from 50 (RPD)
-        assert "30 deferred" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "30 deferred" in err
+        # The capacity warning prints even when the cap fires. It used to be the
+        # else-branch of the deferral message, so the biggest queue — the one
+        # most in need of the number — was the only case that never heard it.
+        assert "gets through ~20 evaluations/day" in err
 
     def test_run_eval_no_cap_when_not_conforming(self, tmp_path, monkeypatch):
         co = tmp_path / "career-ops"
