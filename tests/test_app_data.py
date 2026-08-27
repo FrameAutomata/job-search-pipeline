@@ -131,6 +131,30 @@ class TestFindReportFile:
     def test_missing_dir_returns_none(self, tmp_path):
         assert data.find_report_file(tmp_path / "nope", "001") is None
 
+    def test_reserved_lock_never_shadows_a_real_report(self, tmp_path):
+        """career-ops' reserve-report-num.mjs drops `NNN-RESERVED.md` to claim a
+        number, and it survives any run killed before the real report replaces
+        it. It shares the `NNN-` prefix this matches on and sorts FIRST, so a
+        first-match glob returned the lock — and the report pane rendered its
+        JSON body ({"pid","token","created_at"}) where the evaluation belongs,
+        silently, looking like a corrupt report rather than the wrong file."""
+        d = self._make_reports(tmp_path)
+        (d / "003-RESERVED.md").write_text(
+            '{"pid":405455,"token":"109541c8","created_at":"2026-08-27T03:10:07Z"}',
+            encoding="utf-8",
+        )
+        (d / "003-tenet-healthcare-2026-08-26.md").write_text("# Tenet", encoding="utf-8")
+
+        f = data.find_report_file(d, "003")
+        assert f is not None and f.name == "003-tenet-healthcare-2026-08-26.md"
+
+    def test_reserved_lock_alone_is_not_a_report(self, tmp_path):
+        """A number with only a lock has no report yet — that is None, not a
+        file full of JSON."""
+        d = self._make_reports(tmp_path)
+        (d / "007-RESERVED.md").write_text('{"pid":1,"token":"x"}', encoding="utf-8")
+        assert data.find_report_file(d, "007") is None
+
 
 SAMPLE_TSV = (
     "2920\t2026-05-27\tTential Solutions\tFullstack Developer\tEvaluada\t4.0/5\tnull\t"

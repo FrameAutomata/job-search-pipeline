@@ -863,18 +863,33 @@ def load_jobs(career_ops: Path) -> dict:
     return {"rows": [], "source": "none"}
 
 
+# `NNN-RESERVED.md` is career-ops' report-number LOCK, not a report: a small
+# JSON body ({"pid", "token", "created_at"}) that reserve-report-num.mjs drops
+# to claim a number, and that survives any run killed before it is replaced.
+# It shares the `NNN-` prefix every match here keys on, and sorts before a real
+# `NNN-company-date.md`, so a first-match glob hands the UI the lock file and
+# the report pane renders raw JSON where the evaluation should be — silently,
+# looking like a corrupt report rather than the wrong file.
+_RESERVED_REPORT_RE = re.compile(r"^\d+-RESERVED\.md$")
+
+
 def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
     """Locate a report file by its number. Reports are named
     `{num}-{company-slug}-{date}.md`; the tracker stores the zero-padded num
     (e.g. "042"). Match on the leading numeric segment, tolerating padding
-    differences (42 vs 042)."""
+    differences (42 vs 042). RESERVED locks are skipped (see above), and a real
+    report wins over one even if the lock is seen first — `_rename_report_file`
+    already records why a number is not a safe unique key: "a number matches two
+    files"."""
     if not report_num or not reports_dir.exists():
         return None
     try:
         wanted = int(report_num)
     except ValueError:
         return None
-    for f in reports_dir.glob("*.md"):
+    for f in sorted(reports_dir.glob("*.md")):
+        if _RESERVED_REPORT_RE.match(f.name):
+            continue
         m = re.match(r"^(\d+)-", f.name)
         if m and int(m.group(1)) == wanted:
             return f

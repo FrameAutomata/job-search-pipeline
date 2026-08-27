@@ -104,7 +104,15 @@ main { display: flex; height: calc(100vh - 78px); }
   background: var(--panel); border: none; color: var(--muted);
   padding: 7px 12px; font-size: 14px; cursor: pointer;
 }
-.viewtoggle button.active { background: var(--accent); color: #fff; }
+/* :hover is listed too, and it is load-bearing. The generic
+   `.toolbar button:hover:not(:disabled)` rule above sets `color: var(--accent)`
+   at (0,3,1) specificity, which outranks a bare `.viewtoggle button.active`
+   at (0,2,1) — so hovering the ACTIVE toggle repainted its label in --accent
+   on an --accent background: a 1:1 contrast ratio, label invisible. That is
+   not a corner case; the pointer is resting on the button the user just
+   clicked, so the selected view's own name disappears every time. */
+.viewtoggle button.active,
+.viewtoggle button.active:hover { background: var(--accent); color: #fff; }
 
 /* ── Kanban board ──────────────────────────────────────────────────────── */
 #board-pane { flex: 1; overflow: auto; display: flex; gap: 12px; padding: 14px; align-items: flex-start; }

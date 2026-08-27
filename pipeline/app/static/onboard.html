@@ -337,7 +337,12 @@
         résumés, search config) is kept. A snapshot is saved under <code>.ui-cache/backups/</code>
         first. With the box checked, this also clears your cloud state cache (irreversible) so a
         Refresh can't pull the old history back.</p>
-      <label class="check"><input type="checkbox" id="reset-clear-cloud" checked />
+      <!-- Deliberately NOT checked by default: this deletes the cloud state cache
+           irreversibly, and #danger-zone sits outside the wizard form, so it is on
+           screen during step 1 of a FIRST-time setup. An irreversible default on a
+           panel a new user meets while uploading their resume is the wrong way
+           round — opting in should be the deliberate act. -->
+      <label class="check"><input type="checkbox" id="reset-clear-cloud" />
         Also reset the cloud (delete the GitHub Actions state cache)</label>
       <button type="button" id="reset-btn" class="danger-btn">Reset my job search</button>
       <div id="reset-msg" class="action-msg" hidden></div>
