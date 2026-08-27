@@ -83,11 +83,24 @@ def apply_update(repo_root: Path, template_url: str = TEMPLATE_URL) -> dict:
     if fetched.returncode != 0:
         return {"ok": False, "error": f"fetch from template failed: {fetched.stderr.strip()}"}
 
-    merged = git("merge", "--no-edit", "FETCH_HEAD")
+    # --allow-unrelated-histories is required, not defensive. Copies are made
+    # with "Use this template", which starts a fresh root commit — so a copy and
+    # the template share no ancestor and `git merge` refuses outright with
+    # "refusing to merge unrelated histories". That is EVERY copy's first
+    # update, not an edge case, and it made this button (and the
+    # update-from-template workflow) unable to do the one thing they exist for.
+    # After the first merge a shared ancestor exists and the flag is a no-op.
+    merged = git("merge", "--no-edit", "--allow-unrelated-histories", "FETCH_HEAD")
     if merged.returncode != 0:
         git("merge", "--abort")
+        # Carry git's own last line. Without it every failure read "merge
+        # conflict — resolve it manually", which is what sent the unrelated-
+        # histories refusal above to users as a conflict they could not find.
+        detail = (merged.stderr or merged.stdout or "").strip().splitlines()
+        reason = detail[-1].strip() if detail else ""
+        msg = "merge conflict — resolve it manually, then push"
         return {"ok": False, "conflict": True,
-                "error": "merge conflict — resolve it manually, then push"}
+                "error": f"{msg} ({reason})" if reason else msg}
     if "Already up to date" in (merged.stdout + merged.stderr):
         return {"ok": True, "updated": False}
 
