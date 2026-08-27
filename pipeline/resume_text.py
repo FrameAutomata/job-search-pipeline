@@ -10,8 +10,8 @@ DOCX/ODT are preferred over PDF for import: resume tailoring
 cleaner text than a PDF's reconstructed layout. All four formats work for scoring.
 
 Per-format libraries are imported lazily inside each extractor so importing this
-module stays cheap (the UI's onboard module imports it at the top) and a missing
-optional dep only bites the user who actually hands us that format.
+module stays cheap, and a missing optional dep only bites the user who actually
+hands us that format.
 """
 
 import sys
@@ -23,6 +23,41 @@ from pipeline.stdio import line_buffer_stdout
 # What the setup/UI offer as importable resume formats (no .txt — that's the
 # generated sidecar, not something a user uploads).
 IMPORT_SUFFIXES = (".pdf", ".docx", ".odt")
+
+# Files probed under resumes/ when RESUME_PATH is unset — derived from the import
+# formats (IMPORT_SUFFIXES starts with .pdf, preserving the historical default)
+# so adding a format can't leave this probe list behind.
+PROBE_NAMES = tuple(f"resume{s}" for s in IMPORT_SUFFIXES)
+
+
+def resolve_resume_path(resume_env: str, root) -> Path:
+    """Pick the resume file to read.
+
+    An explicit RESUME_PATH (absolute or repo-relative) is honored verbatim —
+    returned even if missing, so the caller's not-found error names exactly what
+    the user pointed at rather than silently falling back. Only when RESUME_PATH
+    is unset/empty do we probe resumes/ for resume.pdf, then resume.docx, then
+    resume.odt, so a user can drop a DOCX or ODT without editing .env. Falls back
+    to resumes/resume.pdf (the historical default) when nothing is found.
+
+    Lives here rather than in pipeline.filter because the UI asks the same
+    question — "is there a resume on this copy?" — and cannot import the filter
+    (it pulls yake and pandas, which the UI venv doesn't install). Answering it
+    by matching the fixed names alone is what made a RESUME_PATH resume read as
+    absent in the setup wizard while the filter stage was happily scoring
+    against it (#145).
+    """
+    env = (resume_env or "").strip()
+    if env:
+        p = Path(env)
+        if not p.is_absolute():
+            p = (Path(root) / p).resolve()
+        return p
+    for name in PROBE_NAMES:
+        candidate = (Path(root) / "resumes" / name).resolve()
+        if candidate.exists():
+            return candidate
+    return (Path(root) / "resumes" / "resume.pdf").resolve()
 
 
 # pdfplumber inserts a space between two glyphs when the gap between them

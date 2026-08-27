@@ -1389,10 +1389,13 @@ def _career_ops_dir(career_ops=None) -> Path:
 
 def _read_or_empty(path) -> str:
     """read_text, but also swallow a non-FileNotFound OSError (an unreadable or
-    directory path) so best-effort seeding degrades to a scaffold, never a crash."""
+    directory path) and a non-UTF-8 body, so best-effort seeding degrades to a
+    scaffold, never a crash. UnicodeDecodeError is a ValueError, not an OSError,
+    so it used to escape this on the one input a user is most likely to have
+    hand-edited in the wrong encoding."""
     try:
         return read_text(path)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
 
 

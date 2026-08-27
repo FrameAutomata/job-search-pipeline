@@ -216,3 +216,53 @@ class TestFromPdfRetry:
         )
         assert resume_text._from_pdf(Path("resume.pdf")) == _RUNON
         assert "ran together" not in capsys.readouterr().out
+
+
+class TestResolveResumePath:
+    """Which file counts as "the resume". Lives here rather than with the filter
+    because the UI's setup wizard asks the same question through the same
+    function and cannot import pipeline.filter (yake, pandas) — answering it
+    twice is what let a RESUME_PATH resume read as absent in the wizard while
+    the filter was scoring against it (#145)."""
+
+    def _resumes_dir(self, tmp_path):
+        d = tmp_path / "resumes"
+        d.mkdir()
+        return d
+
+    def test_prefers_explicit_existing_path(self, tmp_path):
+        d = self._resumes_dir(tmp_path)
+        (d / "custom.docx").write_bytes(b"x")
+        chosen = resume_text.resolve_resume_path(str(d / "custom.docx"), tmp_path)
+        assert chosen == (d / "custom.docx")
+
+    def test_explicit_path_is_honored_even_when_missing(self, tmp_path):
+        """So the caller's not-found error names what the user pointed at,
+        rather than silently falling back to a different resume."""
+        chosen = resume_text.resolve_resume_path("docs/nope.docx", tmp_path)
+        assert chosen == (tmp_path / "docs" / "nope.docx")
+
+    def test_discovers_dropped_docx_when_unset(self, tmp_path):
+        d = self._resumes_dir(tmp_path)
+        (d / "resume.docx").write_bytes(b"x")
+        chosen = resume_text.resolve_resume_path("", tmp_path)
+        assert chosen == (d / "resume.docx")
+
+    def test_discovers_dropped_odt_when_unset(self, tmp_path):
+        d = self._resumes_dir(tmp_path)
+        (d / "resume.odt").write_bytes(b"x")
+        chosen = resume_text.resolve_resume_path("", tmp_path)
+        assert chosen == (d / "resume.odt")
+
+    def test_pdf_wins_over_docx_when_both_present(self, tmp_path):
+        """Deterministic precedence — pdf first, matching the historical default."""
+        d = self._resumes_dir(tmp_path)
+        (d / "resume.pdf").write_bytes(b"x")
+        (d / "resume.docx").write_bytes(b"x")
+        chosen = resume_text.resolve_resume_path("", tmp_path)
+        assert chosen == (d / "resume.pdf")
+
+    def test_probe_names_track_the_import_formats(self):
+        """Derived, not restated — adding a format can't leave the probe behind."""
+        assert resume_text.PROBE_NAMES == tuple(
+            f"resume{s}" for s in resume_text.IMPORT_SUFFIXES)

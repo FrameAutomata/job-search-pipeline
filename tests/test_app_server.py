@@ -4,6 +4,8 @@ Skips entirely if FastAPI isn't installed (it's an optional UI dependency in
 requirements-ui.txt, not part of the core pipeline deps)."""
 
 import importlib
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -429,6 +431,10 @@ def test_onboard_status_reports_readiness(client, mocker):
     body = r.json()
     assert body["repo"] == "me/private"
     assert body["ready"] is True
+    # What makes the wizard's API-key field optional. Edit mode used to imply
+    # it; now any configured copy enters edit mode, including one that has
+    # never written a secret, so the wizard has to be told (#145).
+    assert body["has_provider"] is True
 
 
 def test_onboard_status_not_ready_without_provider(client, mocker):
@@ -438,16 +444,18 @@ def test_onboard_status_not_ready_without_provider(client, mocker):
     mocker.patch.object(server.gh, "list_secret_names", return_value=[
         "SEARCH_CONFIG_B64", "RESUME_TXT_B64", "CV_MD_B64", "PROFILE_YML_B64",
     ])
-    assert client.get("/api/onboard/status").json()["ready"] is False
+    body = client.get("/api/onboard/status").json()
+    assert body["ready"] is False
+    assert body["has_provider"] is False
 
 
-def _onboard_post(client, form):
+def _onboard_post(client, form, with_resume=True):
+    """POST the wizard. `with_resume=False` is the edit-mode path, where the
+    wizard attaches nothing and the server keeps whatever is on disk."""
     import json as _json
-    return client.post(
-        "/api/onboard",
-        files={"resume": ("resume.pdf", b"%PDF-1.4 fake", "application/pdf")},
-        data={"form": _json.dumps(form)},
-    )
+    files = ({"resume": ("resume.pdf", b"%PDF-1.4 fake", "application/pdf")}
+             if with_resume else None)
+    return client.post("/api/onboard", files=files, data={"form": _json.dumps(form)})
 
 
 def test_onboard_writes_secrets_on_private_repo(client, tmp_path, mocker):
@@ -542,6 +550,45 @@ def test_onboard_reupload_retires_stale_sibling_formats(client, tmp_path, mocker
     assert not (tmp_path / "resumes" / "resume.pdf").exists()   # stale sibling retired
 
 
+def test_onboard_extracts_the_on_disk_resume_when_no_txt_sidecar(
+        client, tmp_path, mocker, monkeypatch):
+    """The submit-side half of the step-0 gate fix (#145): a copy set up outside
+    the wizard has resumes/resume.docx but no resume.txt, so edit mode would let
+    it reach Submit and then 400. Extract what the filter stage already scores
+    against instead of demanding a re-upload of a file we can read."""
+    from pipeline.app import server
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.gh, "set_secret")
+    mocker.patch.object(server.gh, "set_variable")
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={})
+    gen = mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    from pipeline import resume_text as rt
+    mocker.patch.object(rt, "extract_resume_text", return_value="Jane Dev\nEngineer")
+
+    (tmp_path / "resumes").mkdir()
+    (tmp_path / "resumes" / "resume.docx").write_bytes(b"PK fake")
+
+    r = _onboard_post(client, {"name": "Jane"}, with_resume=False)
+    assert r.status_code == 200, r.json()
+    # resume.txt is what RESUME_TXT_B64 ships, so it has to exist afterwards.
+    assert (tmp_path / "resumes" / "resume.txt").read_text(encoding="utf-8").startswith("Jane Dev")
+    assert gen.call_args[0][1]["resumeText"].startswith("Jane Dev")
+
+
+def test_onboard_still_refuses_when_no_resume_exists_anywhere(
+        client, tmp_path, mocker, monkeypatch):
+    from pipeline.app import server
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    r = _onboard_post(client, {"name": "Jane"}, with_resume=False)
+    assert r.status_code == 400
+    assert "No resume on file" in r.json()["detail"]
+
+
 def test_onboard_refuses_public_repo(client, tmp_path, mocker):
     from pipeline.app import server
     mocker.patch.object(server, "ROOT", tmp_path)
@@ -604,22 +651,89 @@ def test_onboard_parse_resume_rejects_unreadable_pdf(client, mocker):
 
 
 def test_onboard_load_config_returns_null_when_no_sidecar(client, tmp_path, mocker):
-    # First-time setup: no sidecar, no persisted resume. UI should treat this
+    # First-time setup: nothing configured, no resume. UI should treat this
     # as "fresh wizard, nothing to prefill".
     from pipeline.app import server
     mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server, "_career_ops", return_value=tmp_path / "career-ops")
     r = client.get("/api/onboard/load-config")
     assert r.status_code == 200
     body = r.json()
     assert body["form"] is None
+    assert body["configured"] is False
     assert body["has_resume"] is False
 
 
-def test_onboard_load_config_returns_saved_payload(client, tmp_path, mocker):
+def test_onboard_load_config_reads_a_copy_configured_without_the_wizard(
+        client, tmp_path, mocker, monkeypatch):
+    # The bug this endpoint carried (#145): a copy set up by setup-profile.mjs
+    # or by hand has no sidecar, so it read as first-time forever — every field
+    # blank, and a step-0 resume gate nothing could satisfy.
+    from pipeline.app import server
+    co = tmp_path / "career-ops"
+    (co / "config").mkdir(parents=True)
+    (co / "config" / "profile.yml").write_text(
+        "candidate:\n  full_name: Jane Dev\n", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "search.yml").write_text(
+        "searches:\n  - location: Dallas, TX\n    results_wanted: 40\n", encoding="utf-8")
+    (tmp_path / "resumes").mkdir()
+    (tmp_path / "resumes" / "resume.docx").write_bytes(b"PK fake")
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server, "_career_ops", return_value=co)
+
+    body = client.get("/api/onboard/load-config").json()
+    assert body["configured"] is True
+    assert body["has_resume"] is True
+    assert body["form"]["name"] == "Jane Dev"
+    assert body["form"]["locations"] == "Dallas, TX"
+    assert body["form"]["results_wanted"] == "40"
+
+
+def test_onboard_load_config_does_not_prefill_an_unconfigured_copy(
+        client, tmp_path, mocker, monkeypatch):
+    """setup.sh copies search.example.yml to config/search.yml before the user
+    has answered anything. Deriving from it unconditionally showed a first-time
+    user the demo's Toronto passes and "senior, manager" roles-to-avoid as their
+    own answers — with no edit-mode banner, since nothing is configured — and a
+    Save would have written a search they never asked for."""
+    from pipeline.app import server
+    repo = Path(__file__).resolve().parent.parent
+    monkeypatch.delenv("RESUME_PATH", raising=False)
+    (tmp_path / "config").mkdir()
+    shutil.copy(repo / "config" / "search.example.yml", tmp_path / "config" / "search.yml")
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server, "_career_ops", return_value=tmp_path / "career-ops")
+
+    body = client.get("/api/onboard/load-config").json()
+    assert body["configured"] is False
+    assert body["form"] is None
+    assert body["search_detail_at_risk"] == []
+
+
+def test_onboard_load_config_has_resume_honours_resume_path(
+        client, tmp_path, mocker, monkeypatch):
+    # A resume under a non-default name with RESUME_PATH pointing at it is what
+    # the filter stage scores against, so the wizard must not call it absent.
+    from pipeline.app import server
+    odd = tmp_path / "docs" / "cv.pdf"
+    odd.parent.mkdir(parents=True)
+    odd.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setenv("RESUME_PATH", "docs/cv.pdf")
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server, "_career_ops", return_value=tmp_path / "career-ops")
+    assert client.get("/api/onboard/load-config").json()["has_resume"] is True
+
+
+def test_onboard_load_config_returns_saved_payload(client, tmp_path, mocker, monkeypatch):
     # After a successful onboard, the sidecar is written and load returns it
-    # so the wizard can prefill. has_resume reflects the persisted PDF.
+    # so the wizard can prefill. has_resume reflects the persisted PDF —
+    # RESUME_PATH is cleared because it outranks the probe and a developer's own
+    # .env would otherwise decide the answer.
     from pipeline.app import server
     import json as _json
+    monkeypatch.delenv("RESUME_PATH", raising=False)
     mocker.patch.object(server, "ROOT", tmp_path)
     (tmp_path / ".ui-cache").mkdir()
     (tmp_path / ".ui-cache" / "onboarding.json").write_text(

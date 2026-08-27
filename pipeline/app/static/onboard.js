@@ -34,11 +34,27 @@ const reviewEl = document.getElementById("review");
 const reviewRepo = document.getElementById("review-repo");
 
 let current = 0;
-// "Edit" when /api/onboard/load-config returned a saved payload — the user
-// has already onboarded once and is just tweaking config. We relax the
-// "resume required" and "api_key required" rules, and the submit button
-// reads "Save changes" instead of "Write secrets".
+// Three flags, because the wizard used to ask one question (is there a sidecar?)
+// where it needed three, and answered all of them "no" for any copy set up
+// outside this wizard — no prefill, and a step-0 resume gate nothing could
+// satisfy, which walled off every later step (#145).
+//
+// "Edit" when this copy is configured BY ANY ROUTE (/api/onboard/load-config's
+// `configured`): prefill, an "already set up" banner, and "Save changes" on the
+// submit button instead of "Write secrets".
 let editMode = false;
+// A resume is already on disk, so step 0's upload is optional. Real state, not
+// a proxy for it: a CLI-configured copy has one and the pipeline uses it.
+let resumeOnFile = false;
+// A provider key is already a GitHub secret, so the API-key field is optional.
+// `null` = we couldn't ask (gh missing or unauthenticated) — see apiKeyRequired.
+let providerKeyOnFile = null;
+// Per-pass settings in the current search.yml that Save would drop, since it
+// rewrites `searches:` from the Search step's fields. Empty for any config this
+// wizard wrote; non-empty only for a hand-written one, which could not reach
+// this screen before. Shown on Search AND on Review — Review is the last thing
+// between the user and the flattening.
+let searchDetailAtRisk = [];
 
 // Build the step indicator.
 STEP_TITLES.forEach((t, i) => {
@@ -74,6 +90,22 @@ function showAction(text, kind) {
   actionMsg.hidden = false;
 }
 
+// Two banners compete for the one slot, written by loaders that race. The
+// PUBLIC-repo warning wins and is sticky: onboarding refuses to write secrets to
+// a public repo, so burying it under "✓ Editing your existing config" leaves
+// nothing on screen to explain the refusal when Save fails. The race was
+// theoretical while edit mode meant "has submitted this wizard before"; every
+// configured copy enters it now (#145).
+let publicRepoWarned = false;
+
+function showBanner(text, kind) {
+  if (publicRepoWarned && kind !== "warn") return;
+  if (kind === "warn") publicRepoWarned = true;
+  statusBanner.textContent = text;
+  statusBanner.classList.toggle("ok-banner", kind === "ok");
+  statusBanner.hidden = false;
+}
+
 // Voluntary self-ID (EEO) consent toggles — serialized as explicit "yes"/"no"
 // (a bare checkbox is absent when unchecked, which collides with consent's
 // default-on), and restored by .checked rather than .value.
@@ -95,11 +127,50 @@ function collectForm() {
   return obj;
 }
 
+// Is the API key still required? Optional once one is on the repo — but when we
+// couldn't read the repo's secrets at all, fall back to the old rule (a
+// configured copy keeps whatever it has) rather than force a re-paste over a
+// question we were unable to ask.
+function apiKeyRequired() {
+  return providerKeyOnFile === null ? !editMode : !providerKeyOnFile;
+}
+
+// Placeholder + review copy follow whichever of the two answers is in effect.
+// Called from both loaders, so it doesn't matter which resolves first.
+function refreshApiKeyHint() {
+  const el = form.querySelector('input[name="api_key"]');
+  if (el) {
+    el.placeholder = apiKeyRequired()
+      ? "paste your key"
+      : "leave blank to keep your saved key";
+  }
+}
+
+// Name what Save would drop, beside the fields that would do the dropping.
+function showSearchDetailWarning(items) {
+  searchDetailAtRisk = items;
+  const el = document.getElementById("search-detail-warning");
+  if (!el || !items.length) return;
+  el.hidden = false;
+  el.textContent =
+    "⚠ Your config/search.yml sets things these fields can't hold: " +
+    items.join("; ") + ". Saving rewrites the search passes from this step, " +
+    "so those would be lost — edit search.yml directly to keep them.";
+}
+
 function renderReview() {
   const f = collectForm();
   const file = resumeInput.files[0];
+  // Hoisted: the alignment padding in the template strings below is load-bearing
+  // (the review renders as monospace textContent), so branching logic doesn't
+  // belong interleaved with it.
+  const resumeLabel = file ? file.name
+    : resumeOnFile ? "(keeping the one on file)" : "(none selected!)";
+  const keyLabel = f.api_key
+    ? "•".repeat(Math.min(12, f.api_key.length)) + " (will be written)"
+    : apiKeyRequired() ? "(none — required)" : "(keeping your saved key)";
   const lines = [
-    `Resume:        ${file ? file.name : "(none selected!)"}`,
+    `Resume:        ${resumeLabel}`,
     `Name:          ${f.name || "(default)"}`,
     `Contact:       ${[f.email, f.phone, f.location].filter(Boolean).join(" · ") || "(none)"}`,
     `Links:         ${[f.linkedin, f.github, f.website].filter(Boolean).join(" · ") || "(none)"}`,
@@ -112,16 +183,22 @@ function renderReview() {
     `Boards:        ${(f.sites || []).join(", ") || "(default)"}`,
     `Easy Apply:    ${f.include_easy_apply ? "yes" : "no"}`,
     `Provider:      ${f.provider}${f.batch_model ? " · " + f.batch_model : ""}`,
-    `API key:       ${f.api_key ? "•".repeat(Math.min(12, f.api_key.length)) + " (will be written)" : "(none — required)"}`,
+    `API key:       ${keyLabel}`,
   ];
+  // Review is the last screen before Save rewrites `searches:`, so the warning
+  // has to be here too — not only on a step the user may never open.
+  if (searchDetailAtRisk.length) {
+    lines.push("", "⚠ Saving replaces your search passes, dropping: "
+                   + searchDetailAtRisk.join("; "));
+  }
   reviewEl.textContent = lines.join("\n");
 }
 
 // Light per-step validation before advancing.
 function validateStep(i) {
-  // Resume is required for first-time setup. In edit mode the prior resume
-  // already lives on disk and a re-upload is optional, so skip the guard.
-  if (i === 0 && !resumeInput.files[0] && !editMode) {
+  // A resume is required only when there isn't one already — asked of the disk,
+  // not of whether this wizard has been submitted before.
+  if (i === 0 && !resumeInput.files[0] && !resumeOnFile) {
     showAction("Please choose a resume (DOCX, ODT, or PDF) to continue.", "error");
     return false;
   }
@@ -129,9 +206,15 @@ function validateStep(i) {
   return true;
 }
 
-// Prefill every field from a previously-submitted onboarding payload.
-// Scalar inputs / selects: set .value. sites: tick matching checkboxes,
-// untick the rest. include_easy_apply: set .checked.
+// Prefill from what this copy is configured with (the server merges the wizard's
+// sidecar under the real config files). Scalar inputs / selects: set .value.
+// sites: tick matching checkboxes, untick the rest. include_easy_apply: .checked.
+//
+// The two group fields are applied only when the payload carries them. The
+// source used to be a whole form submit, which always did; a prefill assembled
+// from the files may cover profile.yml's half and not search.yml's, and
+// "absent" must leave the HTML defaults (both boards ticked) rather than clear
+// every board.
 function prefillForm(saved) {
   for (const [k, v] of Object.entries(saved)) {
     if (k === "sites" || k === "include_easy_apply") continue;
@@ -140,12 +223,13 @@ function prefillForm(saved) {
     const el = form.querySelector(`[name="${k}"]`);
     if (el && el.tagName !== "FIELDSET") el.value = v;
   }
-  const savedSites = saved.sites || [];
-  form.querySelectorAll('input[name="sites"]').forEach((cb) => {
-    cb.checked = savedSites.includes(cb.value);
-  });
+  if (Array.isArray(saved.sites)) {
+    form.querySelectorAll('input[name="sites"]').forEach((cb) => {
+      cb.checked = saved.sites.includes(cb.value);
+    });
+  }
   const easyCb = form.querySelector('input[name="include_easy_apply"]');
-  if (easyCb) easyCb.checked = !!saved.include_easy_apply;
+  if (easyCb && "include_easy_apply" in saved) easyCb.checked = !!saved.include_easy_apply;
   // Consent toggles: saved as "yes"/"no"; default consent on, save/share off.
   CONSENT_TOGGLES.forEach((name) => {
     const cb = form.querySelector(`input[name="${name}"]`);
@@ -153,20 +237,21 @@ function prefillForm(saved) {
   });
 }
 
-function enterEditMode(hasResume) {
-  editMode = true;
-  // Resume optional: drop required, swap the hint, restate intent.
+// A resume is already on disk: drop `required`, swap the hint, and let step 0
+// be walked past. Separate from edit mode because the disk answers it — the
+// wizard's own history doesn't.
+function allowExistingResume() {
+  resumeOnFile = true;
   resumeInput.removeAttribute("required");
   const resumeHint = document.querySelector('[data-step="0"] .hint');
-  if (resumeHint && hasResume) {
+  if (resumeHint) {
     resumeHint.textContent =
       "Resume already on file. Upload a new DOCX, ODT, or PDF to replace it, or skip this step to keep the existing one.";
   }
-  // API key optional: same idea — placeholder explains.
-  const apiKeyEl = form.querySelector('input[name="api_key"]');
-  if (apiKeyEl) {
-    apiKeyEl.placeholder = "leave blank to keep your saved key";
-  }
+}
+
+function enterEditMode() {
+  editMode = true;
   // Submit button copy: "Save changes" reads better than "Write secrets"
   // for an edit, and signals this isn't a full re-onboarding.
   submitBtn.textContent = "Save changes";
@@ -181,7 +266,7 @@ nextBtn.addEventListener("click", async () => {
     const cloudProvider = form.querySelector('[name="provider"]')?.value;
     const cloudModel    = form.querySelector('[name="batch_model"]')?.value;
     const apiKey        = form.querySelector('[name="api_key"]')?.value?.trim();
-    const hasKey        = !!apiKey || editMode;
+    const hasKey        = !!apiKey || !apiKeyRequired();
     if (cloudProvider && hasKey) {
       await fetch("/api/onboard/local-config", {
         method: "POST",
@@ -237,12 +322,12 @@ resumeInput.addEventListener("change", async () => {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = collectForm();
-  // In edit mode, both fields are optional — the server reuses the existing
-  // resume.pdf on disk and the existing provider secret in GitHub.
-  if (!editMode && !resumeInput.files[0]) {
-    showAction("Resume PDF is required.", "error"); showStep(0); return;
+  // Each field is optional exactly when the thing it supplies already exists —
+  // a resume on disk (the server extracts it), a provider secret on the repo.
+  if (!resumeOnFile && !resumeInput.files[0]) {
+    showAction("A resume is required (DOCX, ODT, or PDF).", "error"); showStep(0); return;
   }
-  if (!editMode && !f.api_key) {
+  if (apiKeyRequired() && !f.api_key) {
     showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return;
   }
 
@@ -280,11 +365,12 @@ async function loadStatus() {
     if (!resp.ok) throw new Error(s.detail || "could not read repo status");
     repoLine.textContent = `Target repo: ${s.repo} (${s.visibility})`;
     reviewRepo.textContent = s.repo;
+    providerKeyOnFile = !!s.has_provider;
+    refreshApiKeyHint();
     if (s.visibility === "PUBLIC") {
-      statusBanner.hidden = false;
-      statusBanner.textContent =
+      showBanner(
         "⚠ This repo is PUBLIC. Make your fork private before onboarding — " +
-        "onboarding will refuse to write secrets to a public repo.";
+        "onboarding will refuse to write secrets to a public repo.", "warn");
     }
     // Note: the "already configured" banner is set inside loadSavedConfig
     // (it knows whether we entered edit mode) so we don't double up here.
@@ -294,9 +380,9 @@ async function loadStatus() {
   }
 }
 
-// If the user has onboarded before, prefill every form field from the saved
-// payload so they only have to touch the knob they want to change. Sidecar
-// excludes the API key (it lives in GitHub Secrets, write-only).
+// If this copy is already configured, prefill every form field from what it is
+// configured WITH so the user only has to touch the knob they want to change.
+// The API key is never prefilled (it lives in GitHub Secrets, write-only).
 // Fail OPEN on anything unexpected. Before the panel was hidden by default a
 // broken endpoint could not remove it; now a 500, a non-JSON body or a thrown
 // fetch would leave the user with no path to Reset and no error saying why.
@@ -310,7 +396,8 @@ function revealDangerZone(hasState) {
 async function loadSavedConfig() {
   try {
     const resp = await fetch("/api/onboard/load-config");
-    const { form: saved, has_resume, has_state } = await resp.json();
+    const { form: saved, configured, has_resume, has_state,
+            search_detail_at_risk } = await resp.json();
 
     // Gate the reset panel on has_state — job-search RESULTS exist — not on
     // setup. `saved` misses a CLI-set-up copy, and `has_resume` both
@@ -320,14 +407,28 @@ async function loadSavedConfig() {
     // tracker with no local resume).
     revealDangerZone(has_state);
 
-    if (!saved) return;
-    prefillForm(saved);
-    enterEditMode(!!has_resume);
-    statusBanner.hidden = false;
-    statusBanner.classList.add("ok-banner");
-    statusBanner.textContent =
-      "✓ Editing your existing config. Change what you need and click " +
-      "Save changes — leave resume / API key blank to keep them as they are.";
+    // Each of these answers its own question, so each is applied on its own
+    // terms — a resume with no config still opens step 0, and a config with no
+    // resume still prefills. Nothing configured means nothing to prefill: the
+    // server sends form: null there (config/search.yml is the example until the
+    // user answers), and the early return keeps the banner off too.
+    if (has_resume) allowExistingResume();
+    if (!configured) return;
+    if (saved) prefillForm(saved);
+    showSearchDetailWarning(search_detail_at_risk || []);
+    enterEditMode();
+    refreshApiKeyHint();
+    // The banner is a CLAIM about the fields, so it has to match them. This copy
+    // is set up, but if nothing could be read back — an unparseable profile.yml,
+    // say — the form is blank, and "the fields show what's in effect now" over a
+    // blank form is the #145 screenshot with a banner denying it.
+    showBanner(saved
+      ? "✓ Editing your existing config — the fields show what's in effect now. " +
+        "Change what you need and click Save changes; leave resume / API key " +
+        "blank to keep them as they are."
+      : "✓ This copy is already set up, but none of its settings could be read " +
+        "back — check config/search.yml and career-ops/config/profile.yml. The " +
+        "fields below are blank and will be saved as shown.", "ok");
   } catch {
     // Not necessarily first-time setup any more — the panel's default state is
     // now "absent", so a failed probe must not read as "nothing to reset".

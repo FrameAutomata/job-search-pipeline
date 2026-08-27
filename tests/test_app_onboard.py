@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from pipeline.app import onboard
 from pipeline.sites import SUPPORTED_SITES
@@ -235,6 +236,53 @@ class TestNodeRoundTrip:
         assert wa["eligible_countries"] == ["Canada", "United States"]
         assert wa["work_permit_type"] == "Needs sponsorship"
 
+    def test_derive_form_reads_back_what_the_generator_wrote(self, tmp_path):
+        """The drift guard for derive_form.
+
+        derive_form is a hand-written INVERSE of setup-profile.mjs's YAML
+        authorship, and nothing else ties the two together — `generateProfile`
+        renaming `candidate.portfolio_url` would leave the whole suite green
+        while prefill silently returned nothing for that field. Which is
+        invisible: "the box is empty" is the #145 symptom, not an error.
+
+        A unit fixture can't catch that (it would be a third hand-written copy
+        of the same shape). Running the REAL generator and reading its output
+        back can. Asserted over the keys the input actually set — Node fills
+        defaults the form left blank, and those are not drift.
+        """
+        repo = Path(__file__).resolve().parent.parent
+        work = tmp_path
+        (work / "config").mkdir()
+        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
+        (work / "career-ops" / "config").mkdir(parents=True)
+        (work / "career-ops" / "modes").mkdir(parents=True)
+
+        form = {
+            "name": "Jane Dev", "email": "jane@example.com", "phone": "+1 (555) 123-4567",
+            "location": "Dallas, TX", "linkedin": "linkedin.com/in/janedev",
+            "github": "github.com/janedev", "website": "janedev.dev",
+            "street": "1 Main St", "state": "TX", "postal_code": "75201",
+            "tailoring_instructions": "Lead with impact.",
+            "target_roles": "Backend Engineer, Platform Engineer",
+            "negative_roles": "Intern, Director",
+            "comp_target": "$150K-190K", "comp_min": "$130K",
+            "location_flexibility": "Remote preferred",
+            "citizenship": "Canadian", "requires_sponsorship": "yes",
+            "work_auth_regions": "Canada", "eligible_countries": "Canada, United States",
+            "work_permit_type": "Needs sponsorship",
+            "eeo_gender": "Female", "eeo_race": "Asian",
+            "data_processing_consent": "no", "save_answers": "yes", "share_answers": "no",
+            "locations": "US Remote, Dallas, TX", "sites": ["indeed"],
+            "hours_old": "48", "results_wanted": "75", "distance": "25",
+            "include_easy_apply": True,
+        }
+        onboard.run_generation(work, onboard.build_onboarding_json(form, "Jane Dev\nSKILLS\nPython"))
+
+        derived = onboard.derive_form(work, work / "career-ops")
+        for key, sent in form.items():
+            assert key in derived, f"{key} was written but derive_form doesn't read it back"
+            assert derived[key] == sent, f"{key} did not survive the round trip"
+
 
 class TestExtractResumeText:
     """onboard.extract_resume_text(bytes, filename) dispatches by the uploaded
@@ -305,6 +353,415 @@ class TestSidecar:
                      side_effect=OSError("read-only"))
         # No exception:
         onboard.save_sidecar(tmp_path, {"name": "Jane"})
+
+
+class TestConfiguredState:
+    """`is_configured` answers "has this copy been set up", which the wizard used
+    to ask as "is there a sidecar" — i.e. "did someone submit THIS WIZARD" —
+    leaving every other setup route looking first-time forever (#145)."""
+
+    def test_bare_checkout_is_not_configured(self, tmp_path):
+        assert onboard.is_configured(tmp_path, tmp_path / "career-ops") is False
+
+    def test_search_yml_alone_is_not_evidence(self, tmp_path):
+        # setup.sh copies search.example.yml here before the user has answered
+        # anything, so its existence says only that setup ran.
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "search.yml").write_text("searches: []", encoding="utf-8")
+        assert onboard.is_configured(tmp_path, tmp_path / "career-ops") is False
+
+    @pytest.mark.parametrize("rel", ["config/profile.yml", "cv.md"])
+    def test_cli_generated_artifacts_count(self, tmp_path, rel):
+        co = tmp_path / "career-ops"
+        target = co / rel
+        target.parent.mkdir(parents=True)
+        target.write_text("x", encoding="utf-8")
+        assert onboard.is_configured(tmp_path, co) is True
+
+    def test_sidecar_still_counts(self, tmp_path):
+        onboard.save_sidecar(tmp_path, {"name": "Jane"})
+        assert onboard.is_configured(tmp_path, tmp_path / "career-ops") is True
+
+
+class TestResumeOnFile:
+    """The step-0 gate asks the disk, in the order onboard_submit falls back
+    through — so the gate and the submit behind it can't disagree."""
+
+    def test_absent_when_nothing_on_disk(self, tmp_path):
+        assert onboard.resume_on_file(tmp_path) is False
+
+    def test_probes_the_import_formats(self, tmp_path):
+        (tmp_path / "resumes").mkdir()
+        (tmp_path / "resumes" / "resume.docx").write_bytes(b"x")
+        assert onboard.resume_on_file(tmp_path) is True
+
+    def test_honours_resume_path(self, tmp_path, monkeypatch):
+        # .env.example documents RESUME_PATH and extract_resume_text() honours
+        # it, so a resume under any other name is present as far as the pipeline
+        # is concerned. Matching the fixed names alone read it as absent.
+        odd = tmp_path / "docs" / "my-cv-2026.docx"
+        odd.parent.mkdir(parents=True)
+        odd.write_bytes(b"x")
+        monkeypatch.setenv("RESUME_PATH", "docs/my-cv-2026.docx")
+        assert onboard.resume_on_file(tmp_path) is True
+
+    def test_txt_sidecar_counts(self, tmp_path, monkeypatch):
+        # What a previous submit left; onboard_submit reuses it verbatim.
+        monkeypatch.delenv("RESUME_PATH", raising=False)
+        (tmp_path / "resumes").mkdir()
+        (tmp_path / "resumes" / "resume.txt").write_text("Jane Dev", encoding="utf-8")
+        assert onboard.resume_on_file(tmp_path) is True
+
+
+PROFILE_YML = """
+candidate:
+  full_name: Jane Dev
+  email: jane@example.com
+  phone: ""
+  location: Dallas, TX
+  linkedin: linkedin.com/in/janedev
+  github: ""
+  portfolio_url: janedev.dev
+target_roles:
+  primary:
+    - Senior Backend Engineer
+    - Platform Engineer
+  archetypes:
+    - {name: Senior Backend Engineer, level: senior, fit: primary}
+    - {name: Platform Engineer, level: senior, fit: secondary}
+    - {name: Staff Engineer, level: senior, fit: secondary}
+compensation:
+  target_range: $150K-190K
+  minimum: $130K
+  location_flexibility: Remote preferred
+location:
+  street: 1 Main St
+  state: TX
+  postal_code: "75201"
+tailoring:
+  instructions: Lead with impact.
+work_authorization:
+  citizenship: US
+  legally_authorized_to_work_in: [United States, Canada]
+  requires_sponsorship: false
+  work_permit_type: Citizen
+  eligible_countries: [United States]
+voluntary_disclosures:
+  gender: ""
+  race_ethnicity: Asian
+  veteran_status: ""
+  disability_status: ""
+  data_processing_consent: true
+  save_answers: false
+  share_answers: false
+"""
+
+
+@pytest.fixture
+def profile():
+    """PROFILE_YML parsed — a fresh dict per test, since some mutate it."""
+    return yaml.safe_load(PROFILE_YML)
+
+
+@pytest.fixture
+def search():
+    """SEARCH_YML parsed — fresh per test, as above."""
+    return yaml.safe_load(SEARCH_YML)
+
+
+class TestDeriveFromProfile:
+    """Prefill reads the files a RUN uses, so a copy configured any way at all
+    shows what is currently in effect before the wizard overwrites it."""
+
+    @pytest.fixture
+    def derived(self, profile):
+        return onboard.derive_from_profile(profile)
+
+    def test_maps_contact_and_address_fields(self, derived):
+        assert derived["name"] == "Jane Dev"
+        assert derived["email"] == "jane@example.com"
+        assert derived["location"] == "Dallas, TX"
+        assert derived["linkedin"] == "linkedin.com/in/janedev"
+        assert derived["website"] == "janedev.dev"
+        assert derived["street"] == "1 Main St"
+        assert derived["postal_code"] == "75201"
+        assert derived["tailoring_instructions"] == "Lead with impact."
+
+    def test_blank_file_values_are_omitted(self, derived):
+        # A blank in the file is a field the setup route never filled, not an
+        # answer. Emitting "" would win the merge below and render as an empty
+        # box — the exact symptom this exists to fix.
+        assert "phone" not in derived
+        assert "github" not in derived
+        assert "eeo_gender" not in derived
+
+    def test_target_roles_come_from_archetypes_not_primary(self, derived):
+        # `primary` is the same list truncated to two, so reading it would drop
+        # roles 3+ on the next save.
+        assert derived["target_roles"] == "Senior Backend Engineer, Platform Engineer, Staff Engineer"
+
+    def test_falls_back_to_primary_without_archetypes(self, profile):
+        del profile["target_roles"]["archetypes"]
+        assert onboard.derive_from_profile(profile)["target_roles"] == (
+            "Senior Backend Engineer, Platform Engineer")
+
+    def test_lists_render_as_the_csv_the_form_uses(self, derived):
+        assert derived["work_auth_regions"] == "United States, Canada"
+        assert derived["eligible_countries"] == "United States"
+
+    def test_booleans_keep_both_answers(self, derived):
+        # Keyed on the key being present, not the value being non-blank: `false`
+        # is an answer, and it serializes the way the form's select/checkbox do.
+        assert derived["requires_sponsorship"] == "no"
+        assert derived["data_processing_consent"] == "yes"
+        assert derived["save_answers"] == "no"
+
+    def test_missing_booleans_are_omitted(self):
+        assert "requires_sponsorship" not in onboard.derive_from_profile({})
+
+    @pytest.mark.parametrize("written,expected", [
+        (False, "no"), ("false", "no"), ("no", "no"), ("No", "no"),
+        (True, "yes"), ("true", "yes"), ("yes", "yes"),
+    ])
+    def test_quoted_yes_no_is_not_read_as_truthiness(self, written, expected):
+        # YAML leaves `requires_sponsorship: "false"` a truthy Python string, so
+        # plain truthiness would prefill "yes" — and the next Save would write
+        # that inversion back into profile.yml. Hand-edited copies are exactly
+        # the population this feature is for.
+        derived = onboard.derive_from_profile(
+            {"work_authorization": {"requires_sponsorship": written}})
+        assert derived["requires_sponsorship"] == expected
+
+    def test_unreadable_boolean_falls_through_to_the_sidecar(self):
+        # "maybe" is not an answer; guessing either way would be worse than
+        # letting the last submitted value stand.
+        derived = onboard.derive_from_profile(
+            {"work_authorization": {"requires_sponsorship": "maybe"}})
+        assert "requires_sponsorship" not in derived
+
+    def test_garbage_shapes_do_not_raise(self):
+        # A half-written profile.yml must degrade to "nothing to prefill".
+        assert onboard.derive_from_profile({"candidate": "not a mapping"}) == {}
+        assert onboard.derive_from_profile({}) == {}
+
+
+SEARCH_YML = """
+searches:
+  - name: US Remote
+    sites: [indeed, linkedin]
+    results_wanted: 100
+    location: United States
+    country_indeed: USA
+    is_remote: true
+  - name: Dallas, TX
+    sites: [linkedin]
+    results_wanted: 100
+    location: Dallas, TX
+    country_indeed: USA
+    hours_old: 24
+    distance: 25
+  - name: easy apply
+    sites: [indeed]
+    results_wanted: 100
+    location: Dallas, TX
+    country_indeed: USA
+    easy_apply: "true"
+filter:
+  negative_titles: [intern, director]
+"""
+
+
+class TestDeriveFromSearch:
+    @pytest.fixture
+    def derived(self, search):
+        return onboard.derive_from_search(search)
+
+    def test_locations_round_trip_through_the_form(self, derived):
+        # The wizard's `locations` field is re-read by parse_locations and
+        # rebuilt by build_onboarding_json, so what we derive has to survive
+        # that trip and land on the same passes.
+        assert derived["locations"] == "US Remote, Dallas, TX"
+        entries = onboard.build_onboarding_json(
+            {**derived, "distance": derived["distance"]}, "text",
+        )["searchSettings"]["locations"]
+        assert entries[0] == {"raw": "US Remote", "isRemote": True,
+                              "country": "USA", "location": "United States"}
+        assert entries[1] == {"raw": "Dallas, TX", "isRemote": False,
+                              "country": "USA", "location": "Dallas, TX",
+                              "distance": 25}
+
+    def test_pass_name_is_preferred_when_it_still_describes_the_pass(self, derived):
+        # setup-profile.mjs writes `name: loc.raw` — the text the user typed. A
+        # wizard user who typed "US Remote" must not have it rewritten to the
+        # equivalent "Remote United States"; the banner promises the fields show
+        # what's in effect, not a restatement of it.
+        assert derived["locations"].startswith("US Remote")
+
+    def test_stale_pass_name_loses_to_what_the_pass_searches(self):
+        # A hand-edited config whose name no longer matches: the name is a label
+        # ("recent local" in the shipped example), not a location, so rebuilding
+        # from the fields is the only honest answer.
+        derived = onboard.derive_from_search({"searches": [
+            {"name": "recent local", "location": "Dallas, TX", "hours_old": 24}]})
+        assert derived["locations"] == "Dallas, TX"
+
+    def test_remote_prefix_survives_a_comma_bearing_location(self):
+        # "Remote (Dallas, TX)" would split — parse_locations rejoins "City, ST"
+        # pairs and "TX)" is not a state code — so the prefix spelling is the
+        # one that holds when there's no usable name to fall back on.
+        derived = onboard.derive_from_search(
+            {"searches": [{"location": "Dallas, TX", "is_remote": True}]})
+        assert onboard.parse_locations(derived["locations"]) == ["Remote Dallas, TX"]
+
+    def test_easy_apply_pass_is_a_flag_not_a_location(self, derived):
+        assert derived["include_easy_apply"] is True
+        assert "easy apply" not in derived["locations"]
+
+    def test_easy_apply_false_when_no_such_pass(self):
+        derived = onboard.derive_from_search(
+            {"searches": [{"location": "Dallas, TX", "hours_old": 24}]})
+        assert derived["include_easy_apply"] is False
+
+    def test_easy_apply_read_the_way_jobspy_reads_it(self):
+        # normalize_pass first: `easy_apply: false` sends no filter, so it is
+        # not an easy-apply pass however present the key is.
+        derived = onboard.derive_from_search(
+            {"searches": [{"location": "Dallas, TX", "easy_apply": False}]})
+        assert derived["include_easy_apply"] is False
+
+    def test_numbers_and_boards_and_negative_titles(self, derived):
+        assert derived["results_wanted"] == "100"
+        assert derived["hours_old"] == "24"
+        assert derived["distance"] == "25"
+        assert derived["sites"] == ["indeed", "linkedin"]
+        assert derived["negative_roles"] == "intern, director"
+
+    def test_missing_sites_inherits_the_supported_boards(self):
+        # resolve_sites' rule, not a second reading of it: an omitted `sites`
+        # scrapes every supported board.
+        derived = onboard.derive_from_search({"searches": [{"location": "Dallas, TX"}]})
+        assert derived["sites"] == list(SUPPORTED_SITES)
+
+    def test_legacy_single_search_mapping(self):
+        derived = onboard.derive_from_search(
+            {"search": {"location": "Dallas, TX", "results_wanted": 40}})
+        assert derived["locations"] == "Dallas, TX"
+        assert derived["results_wanted"] == "40"
+
+    def test_no_passes_yields_no_search_fields(self):
+        derived = onboard.derive_from_search({"filter": {"negative_titles": ["intern"]}})
+        assert derived == {"negative_roles": "intern"}
+
+
+class TestSearchDetailAtRisk:
+    """Saving rewrites `searches:` wholesale from six form fields. That cost
+    nothing while only wizard-written configs reached the wizard; hand-written
+    ones now do, so what a Save would take away has to be said out loud."""
+
+    def _cfg(self, tmp_path, text):
+        p = tmp_path / "search.yml"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_silent_for_a_wizard_written_config(self, tmp_path):
+        # The warning has to be precise or it is wallpaper: every field here is
+        # one the wizard writes and reads back.
+        assert onboard.search_detail_at_risk(self._cfg(tmp_path, SEARCH_YML)) == []
+
+    def test_silent_for_the_shipped_example(self, tmp_path):
+        example = Path(__file__).resolve().parent.parent / "config" / "search.example.yml"
+        assert onboard.search_detail_at_risk(example) == []
+
+    def test_names_pass_keys_the_wizard_cannot_express(self, tmp_path):
+        risk = onboard.search_detail_at_risk(self._cfg(tmp_path, """
+searches:
+  - name: Dallas
+    location: "Dallas, TX"
+    hours_old: 24
+    job_type: fulltime
+    linkedin_company_ids: [1441]
+    offset: 25
+"""))
+        assert "job_type" in risk and "linkedin_company_ids" in risk and "offset" in risk
+
+    def test_names_a_location_the_locations_field_would_split(self, tmp_path):
+        # parse_locations rejoins only "City, ST" pairs, so this one pass comes
+        # back as two ("Berlin" and "Germany"), each re-targeted to the USA.
+        risk = onboard.search_detail_at_risk(self._cfg(tmp_path, """
+searches:
+  - {name: Berlin, location: "Berlin, Germany", country_indeed: Germany, hours_old: 24}
+"""))
+        assert any("Berlin, Germany" in r for r in risk)
+
+    def test_names_a_country_the_wizard_would_re_infer_differently(self, tmp_path):
+        risk = onboard.search_detail_at_risk(self._cfg(tmp_path, """
+searches:
+  - {name: Springfield, location: Springfield, country_indeed: Canada, hours_old: 24}
+"""))
+        assert any("country_indeed" in r for r in risk)
+
+    def test_missing_config_is_not_a_warning(self, tmp_path):
+        assert onboard.search_detail_at_risk(tmp_path / "nope.yml") == []
+
+
+class TestPrefillMerge:
+    """Real files win where they have a home; the sidecar keeps the rest."""
+
+    def _write(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "config").mkdir(parents=True)
+        (co / "config" / "profile.yml").write_text(PROFILE_YML, encoding="utf-8")
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "search.yml").write_text(SEARCH_YML, encoding="utf-8")
+        return co
+
+    def test_files_win_over_a_stale_sidecar(self, tmp_path):
+        co = self._write(tmp_path)
+        onboard.save_sidecar(tmp_path, {"name": "Old Name", "results_wanted": "5"})
+        merged = onboard.prefill_form(tmp_path, co)
+        assert merged["name"] == "Jane Dev"
+        assert merged["results_wanted"] == "100"
+
+    def test_sidecar_supplies_what_the_files_have_no_home_for(self, tmp_path):
+        # The Narrative step lands in _profile.md as prose under headings the
+        # user is invited to rewrite, so it is read back from the sidecar alone.
+        co = self._write(tmp_path)
+        onboard.save_sidecar(tmp_path, {"exit_story": "Moving to platform work.",
+                                        "deal_breakers": "On-site 5 days"})
+        merged = onboard.prefill_form(tmp_path, co)
+        assert merged["exit_story"] == "Moving to platform work."
+        assert merged["deal_breakers"] == "On-site 5 days"
+
+    def test_cli_configured_copy_prefills_with_no_sidecar_at_all(self, tmp_path):
+        merged = onboard.prefill_form(tmp_path, self._write(tmp_path))
+        assert merged["name"] == "Jane Dev"
+        assert merged["locations"] == "US Remote, Dallas, TX"
+
+    def test_bare_checkout_prefills_nothing(self, tmp_path):
+        assert onboard.prefill_form(tmp_path, tmp_path / "career-ops") == {}
+
+    def test_every_derived_key_names_a_real_form_field(self, html, profile, search):
+        # prefillForm looks each key up as `[name="<key>"]`, so a derived key
+        # that doesn't name a field is prefill that silently does nothing —
+        # which is the symptom (blank fields), not an error anyone would see.
+        # Guards a rename on either side, over EVERY key the two derivations can
+        # emit (the blank-omitting rule would otherwise hide the EEO fields).
+        profile["voluntary_disclosures"].update(
+            gender="Female", veteran_status="No", disability_status="No")
+        keys = set(onboard.derive_from_profile(profile))
+        keys |= set(onboard.derive_from_search(search))
+        assert len(keys) > 20, "fixtures should exercise most of the form"
+        for key in keys:
+            assert re.search(rf'name="{re.escape(key)}"', html), \
+                f"derive_form emits {key!r}, which no onboard.html field is named"
+
+    def test_unreadable_yaml_degrades_to_the_sidecar(self, tmp_path):
+        co = self._write(tmp_path)
+        (co / "config" / "profile.yml").write_text("{ not: [valid", encoding="utf-8")
+        onboard.save_sidecar(tmp_path, {"name": "Jane"})
+        merged = onboard.prefill_form(tmp_path, co)
+        assert merged["name"] == "Jane"
+        assert merged["locations"] == "US Remote, Dallas, TX"
 
 
 class TestArticleDigestSecretWiring:

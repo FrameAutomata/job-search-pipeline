@@ -161,6 +161,11 @@
       <!-- 4. Search settings -->
       <section class="step" data-step="3" hidden>
         <h2>Search settings</h2>
+        <!-- Saving rewrites config/search.yml's `searches:` wholesale from the
+             fields below, which costs nothing for a config this wizard wrote but
+             flattens a hand-written one. onboard.js fills this in when the
+             current config carries per-pass settings these fields can't hold. -->
+        <div id="search-detail-warning" class="banner" hidden></div>
         <label>Locations (comma-separated; "City, ST" pairs stay together)
           <input name="locations" placeholder="US Remote, Dallas, TX, Fort Worth, TX" />
         </label>
