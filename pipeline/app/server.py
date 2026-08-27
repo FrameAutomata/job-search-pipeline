@@ -536,21 +536,16 @@ class LocalSearchConfig(BaseModel):
 
 def _search_entries(parsed) -> list | None:
     """The per-search mappings pipeline.scrape.load_searches would yield, or None
-    if the shape is invalid. Mirrors load_searches (a `searches:` list, or the
-    legacy single `search:`) but additionally requires at least one entry and
-    every entry to be a mapping — the pipeline reads dict fields off each, so a
-    scalar/null entry or an empty list would crash the next run, not no-op."""
-    if not isinstance(parsed, dict):
-        return None
-    if "searches" in parsed:
-        entries = parsed["searches"]
-    elif "search" in parsed:
-        entries = [parsed["search"]]
-    else:
-        return None
-    if not isinstance(entries, list) or not entries:
-        return None
-    if not all(isinstance(e, dict) for e in entries):
+    if the shape is invalid.
+
+    Which key holds them (a `searches:` list, or the legacy single `search:`) is
+    onboard.search_entries — the one app-side mirror of load_searches, which is
+    itself unimportable here (jobspy). This adds only the VALIDITY rule the save
+    endpoint needs on top: at least one entry, every entry a mapping. The
+    pipeline reads dict fields off each, so a scalar/null entry or an empty list
+    would crash the next run, not no-op."""
+    entries = onboard.search_entries(parsed)
+    if not entries or not all(isinstance(e, dict) for e in entries):
         return None
     return entries
 
@@ -902,35 +897,74 @@ def onboard_status() -> JSONResponse:
         "repo": repo,
         "visibility": visibility,
         "secrets_present": sorted(present),
+        # Whether an LLM key is already on the repo, which is what makes the
+        # wizard's API-key field optional. Edit mode used to imply it — you only
+        # got there by having submitted a key — but edit mode is now entered by
+        # any configured copy, including one set up from the CLI that has never
+        # written a secret. Reported rather than inferred (#145).
+        "has_provider": has_provider,
         "ready": ready,
     })
 
 
 @app.get("/api/onboard/load-config")
 def onboard_load_config() -> JSONResponse:
-    """Return the last-submitted onboarding form (minus api_key) so the wizard
-    can prefill every field on a revisit. Returns {"form": null, "has_resume":
-    false} on a first-time setup so the UI knows it's not in edit mode.
+    """What the wizard should prefill, and the state that gates it.
 
-    `has_state` answers a different question: is there job-search RESULT data to
+    Three independent questions, answered separately because they have
+    independent answers (#145):
+
+    `form` — what to show in the fields. The last-submitted sidecar (minus
+    api_key) MERGED UNDER what config/search.yml and career-ops/config/profile.yml
+    currently say, so a copy configured by `setup-profile.mjs` or by hand
+    prefills too, and a hand edit made since the last submit is what you see
+    before the wizard offers to overwrite it. Null when neither source has
+    anything. See onboard.prefill_form for which source wins where.
+
+    `configured` — has this copy been set up at all, by any route? Gates edit
+    mode. This used to be "is there a sidecar", i.e. "did someone submit THIS
+    WIZARD before" — false forever for every other setup route, which left those
+    copies with no prefill and a resume gate nothing could satisfy.
+
+    `has_resume` — is a resume already on disk? Gates step 0's upload
+    requirement, and resolves it the way the submit path and the filter stage do
+    (RESUME_PATH, else the resumes/resume.* probe, else the resume.txt sidecar).
+    Matching the fixed filenames alone made a RESUME_PATH resume read as absent
+    here while the filter was scoring against it.
+
+    `has_state` answers a fourth question: is there job-search RESULT data to
     wipe? It gates the Danger zone, which must not face a first-time user (there
     is nothing to reset) but must reach anyone who has results (they are the
-    only people who want it). Neither `form` nor `has_resume` answers it — a
-    copy set up from the CLI has no sidecar, a hand-dropped resume predates any
-    run, and `run-ui.sh --data` can point at a full tracker with no local
-    resume at all. So ask the data."""
-    from pipeline.resume_text import IMPORT_SUFFIXES
-    resume_present = any((ROOT / "resumes" / f"resume{s}").exists() for s in IMPORT_SUFFIXES)
+    only people who want it). None of the above answers it — a copy set up from
+    the CLI has no sidecar, a hand-dropped resume predates any run, and
+    `run-ui.sh --data` can point at a full tracker with no local resume at all.
+    So ask the data."""
     co = _career_ops()
     has_state = any((
         (co / "data" / "applications.md").exists(),
         (co / "data" / "scan-history.tsv").exists(),
         any((co / "reports").glob("*.md")) if (co / "reports").is_dir() else False,
     ))
+    configured = onboard.is_configured(ROOT, co)
     return JSONResponse({
-        "form": onboard.load_sidecar(ROOT),
-        "has_resume": resume_present,
+        # Prefill only a copy that IS configured. config/search.yml exists from
+        # the moment setup runs — it is a copy of search.example.yml — so
+        # deriving from it unconditionally showed a FIRST-TIME user the demo's
+        # Toronto passes, its "senior, manager" roles-to-avoid and its easy-apply
+        # pass as though they were their own answers, with no edit-mode banner to
+        # say otherwise; submitting without noticing wrote a search they never
+        # asked for. `is_configured` already refuses to read search.yml as
+        # evidence for exactly this reason, and prefill has to refuse it too.
+        "form": (onboard.prefill_form(ROOT, co) or None) if configured else None,
+        "configured": configured,
+        "has_resume": onboard.resume_on_file(ROOT),
         "has_state": has_state,
+        # Per-pass settings this wizard cannot express, which a Save would drop —
+        # only reachable now that hand-written configs get this far. Empty for
+        # anything the wizard itself wrote.
+        "search_detail_at_risk": (
+            onboard.search_detail_at_risk(ROOT / "config" / "search.yml") if configured else []
+        ),
     })
 
 
@@ -1251,11 +1285,36 @@ async def onboard_submit(
     elif txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
     else:
-        raise HTTPException(
-            status_code=400,
-            detail=("No resume on file — upload a PDF, DOCX, or ODT on the first "
-                    "onboarding step before submitting."),
-        )
+        # No upload and no extracted sidecar — but a copy set up outside this
+        # wizard still has the resume the filter stage scores against, under
+        # RESUME_PATH or resumes/. Extract it rather than demand a re-upload of
+        # a file we can already read; resume.txt is what RESUME_TXT_B64 ships,
+        # so it has to exist by collect_secret_blobs either way. This is the
+        # submit-side half of the step-0 gate fix — without it, edit mode would
+        # let a CLI-configured copy reach Submit and then 400 (#145).
+        from pipeline import resume_text as _rt
+
+        existing = _rt.resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)
+        if not existing.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=("No resume on file — upload a PDF, DOCX, or ODT on the first "
+                        "onboarding step before submitting."),
+            )
+        try:
+            resume_text = _rt.extract_resume_text(existing)
+        except ValueError as e:  # unsupported format
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"could not read {existing.name}: {e}")
+        if not resume_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"No text found in {existing.name} (is it a scanned image or empty?).",
+            )
+        resumes_dir.mkdir(parents=True, exist_ok=True)
+        txt_path.write_text(resume_text, encoding="utf-8")
 
     # Generate artifacts via the shared node generator, then collect base64.
     try:

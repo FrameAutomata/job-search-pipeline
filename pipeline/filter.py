@@ -23,11 +23,6 @@ from pipeline.stdio import line_buffer_stdout
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-# Resume files probed under resumes/ when RESUME_PATH is unset — derived from
-# the import formats (IMPORT_SUFFIXES starts with .pdf, preserving the
-# historical default) so adding a format can't leave this probe list behind.
-_RESUME_PROBE_NAMES = tuple(f"resume{s}" for s in _resume_text.IMPORT_SUFFIXES)
-
 JOBS_PATH = ROOT / "output" / "jobs.csv"
 OUTPUT_PATH = ROOT / "output" / "filtered_jobs.csv"
 KEYWORDS_CACHE_PATH = ROOT / "output" / "_keywords.json"
@@ -96,26 +91,6 @@ def extract_resume_text(resume_path: Path) -> str:
     return _resume_text.extract_resume_text(resume_path)
 
 
-def _resolve_resume_path(resume_env: str, root: Path) -> Path:
-    """Pick the resume file to score from.
-
-    An explicit RESUME_PATH (absolute or repo-relative) is honored verbatim —
-    returned even if missing, so the caller's not-found error names exactly what
-    the user pointed at rather than silently falling back. Only when RESUME_PATH
-    is unset/empty do we probe resumes/ for resume.pdf, then resume.docx, then
-    resume.odt, so a user can drop a DOCX or ODT without editing .env. Falls back
-    to resumes/resume.pdf (the historical default) when nothing is found."""
-    env = (resume_env or "").strip()
-    if env:
-        p = Path(env)
-        if not p.is_absolute():
-            p = (root / p).resolve()
-        return p
-    for name in _RESUME_PROBE_NAMES:
-        candidate = (root / "resumes" / name).resolve()
-        if candidate.exists():
-            return candidate
-    return (root / "resumes" / "resume.pdf").resolve()
 
 
 def find_skills_section(text: str) -> str:
@@ -408,11 +383,13 @@ def run(config_path: Path) -> Path:
             f"({ineligible} ineligible, {too_old} too old)"
         )
 
-    # Resolve via _resolve_resume_path so an unset RESUME_PATH still discovers a
-    # dropped resume.docx/resume.odt, not just resume.pdf. An explicitly empty
-    # RESUME_PATH (e.g. a workflow `${{ vars.X || '' }}` pattern) is treated the
-    # same as unset.
-    resume_path = _resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)
+    # Resolved in pipeline.resume_text so an unset RESUME_PATH still discovers a
+    # dropped resume.docx/resume.odt, not just resume.pdf — and so the setup
+    # wizard, which cannot import this module (yake, pandas), answers "is there a
+    # resume?" the same way rather than matching the fixed filenames and calling a
+    # RESUME_PATH resume absent (#145). An explicitly empty RESUME_PATH (e.g. a
+    # workflow `${{ vars.X || '' }}` pattern) is treated the same as unset.
+    resume_path = _resume_text.resolve_resume_path(os.environ.get("RESUME_PATH", ""), ROOT)
 
     resume_txt = resume_path.with_suffix(".txt")
     if resume_txt.exists():
