@@ -85,9 +85,9 @@ PROVIDER_DEFAULTS: dict[str, str] = {
     # Google (shutdown 2026-06-01) and its free-tier quota collapsed months
     # ahead of that. 2.5-flash is supported — but its free-tier RPD is only
     # ~20/day, so users running >20 evaluations per day should override
-    # BATCH_MODEL to gemma-4-26b-a4b-it (1.5K RPD + unlimited TPM). See
-    # gemini_limits.py for the per-model free-tier caps + the run-time warning,
-    # and .env.example.
+    # BATCH_MODEL to gemma-4-26b-a4b-it (14.4K RPD, but 16K TPM — which is what
+    # actually binds, at ~2.4K evaluations/day). See gemini_limits.py for the
+    # per-model free-tier caps + the run-time warning, and .env.example.
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
@@ -459,8 +459,9 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
     else:
         caller = _build_single_caller(provider, models[0] if models else model,
                                       disable_thinking=disable_thinking)
-    # Gemini free-tier conforming: pace each call to the (lead) model's RPM. No-op
-    # unless GEMINI_FREE_TIER is set and the lead model is a known free-tier model.
+    # Gemini free-tier conforming: pace each call to the (lead) model's RPM and
+    # TPM. No-op unless GEMINI_FREE_TIER is set and the lead model is a known
+    # free-tier model.
     lead = models[0] if models else model
     # Warn HERE rather than at the eval stage, because this is where the no-op
     # happens: every caller in the repo is built through this function
@@ -737,16 +738,23 @@ def _run_eval(
 
     # Gemini free tier: when conforming (GEMINI_FREE_TIER), cap the run to the
     # model's daily RPD and defer the rest to the next run; otherwise just warn.
-    # (Per-minute RPM pacing happens inside the caller — see _build_caller.)
+    # (Per-minute RPM *and* per-minute TPM pacing happen inside the caller — see
+    # _build_caller.)
+    #
+    # The warning comes first and prints whether or not the cap fires, because
+    # the two lines answer different questions: the warning is what the model can
+    # get through in a day (which its RPD overstates whenever TPM binds), the cap
+    # line is what this run will attempt. Under the old if/else the capped case —
+    # the biggest queue, the one most in need of the number — was the one case
+    # that never heard it.
     total = len(pending)
+    warning = gemini_limits.format_free_tier_warning(model, total)
+    if warning:
+        print(warning, file=sys.stderr)
     pending, deferred = gemini_limits.cap_to_rpd(pending, model)
     if deferred:
         print(f"[batch-eval] free-tier cap: evaluating {len(pending)} of {total} today; "
               f"{deferred} deferred to the next run.", file=sys.stderr)
-    else:
-        warning = gemini_limits.format_free_tier_warning(model, total)
-        if warning:
-            print(warning, file=sys.stderr)
 
     # The "conforming is on but this model's limits are unknown" warning is not
     # printed here — _build_caller emits it, so every caller-building path gets

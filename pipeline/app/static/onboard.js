@@ -624,10 +624,18 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
       // className too, or this validation error inherits the previous save's
       // green "ok" styling and reads as a success.
       msgEl.className = "action-msg error";
-      msgEl.textContent = "Enter both RPM and RPD (TPM may be blank for unlimited).";
+      msgEl.textContent = "Enter both RPM and RPD (TPM may be blank to keep the built-in value).";
       return;
     } else {
-      geminiLimits = { [limitsModel]: { rpm, tpm, rpd } };
+      // A blank TPM OMITS the key; it does not send null. null means
+      // "unlimited" to _clean_entry, which merges over the built-in row — so a
+      // user who copied their RPM and RPD off AI Studio and skipped TPM would
+      // erase the 16,000 the Gemma rows are paced by and turn the token budget
+      // off, through the only UI this feature has. Omitted keeps whatever the
+      // table already knows.
+      const row = { rpm, rpd };
+      if (tpm !== null) row.tpm = tpm;
+      geminiLimits = { [limitsModel]: row };
     }
   }
   btn.disabled = true;
