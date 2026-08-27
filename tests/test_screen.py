@@ -528,18 +528,19 @@ class TestBackfillDescription:
         # job_url in the CSV is unchanged — user still clicks the human page.
         assert rows[0]["job_url"] == view_url
 
-    def test_non_linkedin_job_fetched_via_original_url(self, tmp_path, monkeypatch, mocker):
+    def test_non_board_job_fetched_via_original_url(self, tmp_path, monkeypatch, mocker):
+        """A URL with no site-specific transport is fetched as-is."""
         cfg = tmp_path / "search.yml"
         write_screen_config(cfg, liveness=True)
         filtered = tmp_path / "filtered_jobs.csv"
-        indeed_url = "https://www.indeed.com/viewjob?jk=abc123"
+        url = "https://careers.acme.com/jobs/123"
         write_filtered_csv(filtered, DESC_COLS, [
-            {"title": "Eng", "company": "Acme", "job_url": indeed_url,
+            {"title": "Eng", "company": "Acme", "job_url": url,
              "description": "", "relevance_score": 8},
         ])
         monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
 
-        page = '<div id="jobDescriptionText">Indeed JD body here. ' * 20 + '</div>'
+        page = '<div id="jobDescriptionText">Acme JD body here. ' * 20 + '</div>'
         fetch_spy = mocker.patch.object(
             screen_mod, "fetch_and_classify",
             return_value=("active", "content present", page),
@@ -547,8 +548,89 @@ class TestBackfillDescription:
 
         run(cfg)
 
-        # Non-LinkedIn URLs are fetched as-is.
-        assert fetch_spy.call_args.args[0] == indeed_url
+        assert fetch_spy.call_args.args[0] == url
+
+    def test_indeed_job_is_not_page_fetched(self, tmp_path, monkeypatch, mocker):
+        """Indeed rows go through the batched jobData API, never the page.
+
+        This replaces a test that asserted the opposite ("non-LinkedIn URLs are
+        fetched as-is"). That assertion only ever held against a mock: a real
+        unauthenticated GET of an Indeed posting answers 401 with a ~1.6KB
+        JavaScript redirect to `?from=bot-detection-anonymous`, which carries no
+        JD to extract and trips the anti-bot check — so every Indeed row
+        resolved `throttled` and was held, every run, forever. Page-fetching
+        Indeed is not a capability being given up here; it stopped working
+        upstream, and the dispatcher is what makes the code say so."""
+        cfg = tmp_path / "search.yml"
+        write_screen_config(cfg, liveness=True)
+        filtered = tmp_path / "filtered_jobs.csv"
+        indeed_url = "https://www.indeed.com/viewjob?jk=abc123"
+        write_filtered_csv(filtered, DESC_COLS, [
+            {"title": "Eng", "company": "Acme", "job_url": indeed_url,
+             "description": "Indeed ships the JD at scrape time.",
+             "relevance_score": 8},
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        fetch_spy = mocker.patch.object(screen_mod, "fetch_and_classify")
+        expiry_spy = mocker.patch.object(
+            screen_mod, "fetch_indeed_expiry", return_value={"abc123": False}
+        )
+
+        run(cfg)
+
+        expiry_spy.assert_called_once()
+        assert list(expiry_spy.call_args.args[0]) == ["abc123"]
+        fetch_spy.assert_not_called()
+        with open(filtered, newline="", encoding="utf-8") as f:
+            assert len(list(csv.DictReader(f))) == 1, "live Indeed row must survive"
+
+    def test_indeed_live_row_survives_a_walled_page(self, tmp_path, monkeypatch, mocker):
+        """The regression, end to end: the jobData API says live, so the row is
+        kept — even though a page fetch would have returned the bot-detection
+        interstitial that used to hold it."""
+        cfg = tmp_path / "search.yml"
+        write_screen_config(cfg, liveness=True)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            {"title": "Patient Access Rep", "company": "Acme Health",
+             "job_url": "https://www.indeed.com/viewjob?jk=live1",
+             "description": "JD from the scrape.", "relevance_score": 9},
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        # If anything reaches the page transport, fail loudly rather than
+        # silently reproducing the bug under a mock that returns a JD.
+        mocker.patch.object(
+            screen_mod, "fetch_and_classify",
+            side_effect=AssertionError("Indeed must not be page-fetched"),
+        )
+        mocker.patch.object(
+            screen_mod, "fetch_indeed_expiry", return_value={"live1": False}
+        )
+
+        dropped = run(cfg)
+
+        assert dropped == 0
+        with open(filtered, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [r["title"] for r in rows] == ["Patient Access Rep"]
+
+    def test_indeed_expired_row_is_dropped(self, tmp_path, monkeypatch, mocker):
+        """Routing must not cost the expired verdict: expired=True still drops."""
+        cfg = tmp_path / "search.yml"
+        write_screen_config(cfg, liveness=True)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            {"title": "Gone", "company": "Acme",
+             "job_url": "https://www.indeed.com/viewjob?jk=dead1",
+             "description": "JD.", "relevance_score": 9},
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify")
+        mocker.patch.object(
+            screen_mod, "fetch_indeed_expiry", return_value={"dead1": True}
+        )
+
+        assert run(cfg) == 1
 
     def test_preserves_existing_description(self, tmp_path, monkeypatch, mocker):
         cfg = tmp_path / "search.yml"

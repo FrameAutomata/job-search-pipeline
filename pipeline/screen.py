@@ -664,10 +664,22 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     held = 0
     backfilled = 0
 
-    # classify_each fetches each job_url in parallel (LinkedIn -> guest endpoint)
-    # and yields as results land; the same helper drives the tracker liveness
-    # re-check (pipeline/recheck.py).
-    for job, result, reason, body in classify_each(
+    # classify_liveness_each routes by site and yields as results land: Indeed
+    # postings go through the batched jobData API, everything else through the
+    # parallel page fetch (LinkedIn -> guest endpoint). The same helper drives
+    # the tracker liveness re-check (pipeline/recheck.py).
+    #
+    # This calls the ROUTER, not classify_each underneath it. Calling the page
+    # fetch directly is what made Indeed contribute zero evaluated rows: its
+    # posting pages answer an unauthenticated fetch with a 401 bot-detection
+    # interstitial, whose body trips the anti-bot check, so every Indeed row
+    # resolved `throttled` and was held. Held rows never enter scan-history, so
+    # they were re-found and re-held every run — permanently invisible, while
+    # the jobData API reported those same keys live. Indeed outscores LinkedIn
+    # at this point in the chain (its rows arrive with descriptions, where
+    # LinkedIn's arrive empty and are backfilled here), so the silent loss was
+    # the larger half of the funnel.
+    for job, result, reason, body in classify_liveness_each(
         jobs, lambda j: j.get("job_url") or "", timeout=liveness_timeout
     ):
         title = (job.get("title") or "?")[:60]
