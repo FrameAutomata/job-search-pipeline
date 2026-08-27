@@ -276,6 +276,15 @@ def load_state(state_path: Path) -> dict:
 
 
 def max_report_num(reports_dir: Path, state: dict) -> int:
+    """Highest report number already claimed, so the next one is free.
+
+    A `NNN-RESERVED.md` lock counts, deliberately: claiming the number is the
+    lock's whole purpose, so skipping it would hand out a number career-ops has
+    already reserved. This is the OPPOSITE of the rule in
+    `pipeline/app/data.py:find_report_file`, which must skip locks because it
+    resolves a number to a file to render. Do not "make them consistent" —
+    they answer different questions.
+    """
     max_num = 0
     if reports_dir.exists():
         for f in reports_dir.glob("*.md"):

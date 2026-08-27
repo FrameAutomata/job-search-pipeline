@@ -64,7 +64,15 @@ header h1 { margin: 0 0 12px; font-size: 18px; }
   font-size: 14px;
   cursor: pointer;
 }
-.toolbar button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+/* :not(.active) is load-bearing. These generic hover rules sit at (0,3,1) and
+   outrank the (0,2,1) rules that give a SELECTED control its filled look, so
+   without the carve-out hovering a filled button repaints its label
+   var(--accent) on a var(--accent) background — 1:1 contrast, label gone. Not a
+   corner case: the pointer rests on the button just clicked. Excluding filled
+   variants here (rather than giving each one a :hover twin) means any state
+   class added later wins by construction. Filled buttons still get feedback
+   from their own :hover rules (opacity/border). */
+.toolbar button:hover:not(:disabled):not(.active) { border-color: var(--accent); color: var(--accent); }
 .toolbar button:disabled { opacity: 0.5; cursor: default; }
 
 #setup-link {
@@ -104,15 +112,7 @@ main { display: flex; height: calc(100vh - 78px); }
   background: var(--panel); border: none; color: var(--muted);
   padding: 7px 12px; font-size: 14px; cursor: pointer;
 }
-/* :hover is listed too, and it is load-bearing. The generic
-   `.toolbar button:hover:not(:disabled)` rule above sets `color: var(--accent)`
-   at (0,3,1) specificity, which outranks a bare `.viewtoggle button.active`
-   at (0,2,1) — so hovering the ACTIVE toggle repainted its label in --accent
-   on an --accent background: a 1:1 contrast ratio, label invisible. That is
-   not a corner case; the pointer is resting on the button the user just
-   clicked, so the selected view's own name disappears every time. */
-.viewtoggle button.active,
-.viewtoggle button.active:hover { background: var(--accent); color: #fff; }
+.viewtoggle button.active { background: var(--accent); color: #fff; }
 
 /* ── Kanban board ──────────────────────────────────────────────────────── */
 #board-pane { flex: 1; overflow: auto; display: flex; gap: 12px; padding: 14px; align-items: flex-start; }
@@ -187,7 +187,7 @@ fieldset.workauth legend { font-size: 14px; padding: 0 6px; }
   background: var(--panel); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 8px 14px; font-size: 14px; cursor: pointer; text-decoration: none;
 }
-.wizard-nav button:hover:not(:disabled), .wizard-nav .linkbtn:hover { border-color: var(--accent); color: var(--accent); }
+.wizard-nav button:hover:not(:disabled):not([type="submit"]), .wizard-nav .linkbtn:hover { border-color: var(--accent); color: var(--accent); }
 .wizard-nav button:disabled { opacity: 0.5; cursor: default; }
 #submit-btn { background: var(--accent); color: #fff; border-color: var(--accent); }
 .banner.ok-banner { background: rgba(63,185,80,0.12); border-color: rgba(63,185,80,0.4); color: var(--good); }
@@ -403,7 +403,7 @@ tbody tr.selected { background: #233047; }
   background: var(--panel);
   color: var(--text);
 }
-.modal-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.modal-actions button:hover:not(:disabled):not([type="submit"]) { border-color: var(--accent); color: var(--accent); }
 .modal-actions button[type="submit"] { background: var(--accent); border-color: var(--accent); color: #fff; }
 .modal-actions button[type="submit"]:hover:not(:disabled) { opacity: 0.85; }
 .modal-actions button:disabled { opacity: 0.5; cursor: default; }

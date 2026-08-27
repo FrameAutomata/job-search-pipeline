@@ -330,18 +330,20 @@
       </div>
     </form>
 
-    <section id="danger-zone" class="danger-zone">
+    <!-- Hidden by default: #danger-zone is a sibling of the wizard form, not a
+         step, so it would otherwise sit on screen through a FIRST-time setup —
+         a "Reset my job search" button beside someone uploading their resume,
+         with nothing yet to reset. onboard.js reveals it for anyone who has
+         used this copy before (see loadSavedConfig). -->
+    <section id="danger-zone" class="danger-zone" hidden>
       <h2>Danger zone</h2>
       <p class="hint">Start over — wipe your job-search results (tracker, scan history, reports,
         evaluation queue, generated PDFs) and begin a fresh search. Your setup (profile, CV,
         résumés, search config) is kept. A snapshot is saved under <code>.ui-cache/backups/</code>
         first. With the box checked, this also clears your cloud state cache (irreversible) so a
         Refresh can't pull the old history back.</p>
-      <!-- Deliberately NOT checked by default: this deletes the cloud state cache
-           irreversibly, and #danger-zone sits outside the wizard form, so it is on
-           screen during step 1 of a FIRST-time setup. An irreversible default on a
-           panel a new user meets while uploading their resume is the wrong way
-           round — opting in should be the deliberate act. -->
+      <!-- Unchecked by default: deleting the cloud cache is irreversible, so
+           opting in should be the deliberate act. -->
       <label class="check"><input type="checkbox" id="reset-clear-cloud" />
         Also reset the cloud (delete the GitHub Actions state cache)</label>
       <button type="button" id="reset-btn" class="danger-btn">Reset my job search</button>

@@ -288,6 +288,17 @@ async function loadSavedConfig() {
   try {
     const resp = await fetch("/api/onboard/load-config");
     const { form: saved, has_resume } = await resp.json();
+
+    // Reveal the reset panel for anyone who has used this before. Gate on
+    // `has_resume` as well as `saved`, NOT on enterEditMode: load-config
+    // returns {form: null, has_resume: true} for a copy that was set up from
+    // the CLI rather than this wizard, and such a copy can still hold a full
+    // tracker, reports and a populated evaluation queue — exactly the state
+    // reset exists to wipe. Gating on the saved FORM would hide the button
+    // from the only people with a reason to press it.
+    const danger = document.getElementById("danger-zone");
+    if (danger && (saved || has_resume)) danger.hidden = false;
+
     if (!saved) return;
     prefillForm(saved);
     enterEditMode(!!has_resume);
@@ -468,12 +479,17 @@ document.getElementById("local-handoff-browse")?.addEventListener("click", async
 // and the cloud-cache deletion is irreversible.
 const resetBtn = document.getElementById("reset-btn");
 resetBtn.addEventListener("click", async () => {
-  const typed = prompt(
-    "This wipes your job-search results (tracker, history, reports, queue, PDFs) and " +
-    "cannot be fully undone — the cloud cache deletion is irreversible. Your setup is kept. " +
-    "Type RESET to confirm:");
-  if (typed !== "RESET") return;
+  // Read the checkbox BEFORE prompting: the cloud clause is the only
+  // irreversible part, and it is now opt-in, so warning about it unconditionally
+  // would cry wolf on the default path — and the one warning that matters gets
+  // clicked through.
   const clearCloud = document.getElementById("reset-clear-cloud").checked;
+  const typed = prompt(
+    "This wipes your job-search results (tracker, history, reports, queue, PDFs). " +
+    "Your setup is kept and a snapshot is saved first." +
+    (clearCloud ? " The cloud cache deletion is IRREVERSIBLE." : "") +
+    "\nType RESET to confirm:");
+  if (typed !== "RESET") return;
   const msg = document.getElementById("reset-msg");
   const show = (text, kind) => { msg.hidden = false; msg.textContent = text; msg.className = "action-msg" + (kind ? " " + kind : ""); };
   resetBtn.disabled = true;

@@ -132,12 +132,8 @@ class TestFindReportFile:
         assert data.find_report_file(tmp_path / "nope", "001") is None
 
     def test_reserved_lock_never_shadows_a_real_report(self, tmp_path):
-        """career-ops' reserve-report-num.mjs drops `NNN-RESERVED.md` to claim a
-        number, and it survives any run killed before the real report replaces
-        it. It shares the `NNN-` prefix this matches on and sorts FIRST, so a
-        first-match glob returned the lock — and the report pane rendered its
-        JSON body ({"pid","token","created_at"}) where the evaluation belongs,
-        silently, looking like a corrupt report rather than the wrong file."""
+        """A lock sorts before the real report, so a first-match glob returned
+        it and the pane rendered JSON. See find_report_file's comment."""
         d = self._make_reports(tmp_path)
         (d / "003-RESERVED.md").write_text(
             '{"pid":405455,"token":"109541c8","created_at":"2026-08-27T03:10:07Z"}',
