@@ -35,6 +35,17 @@
             gh # the Setup wizard pushes GitHub secrets
             git
 
+            # bashInteractive, not the default bash: career-ops'
+            # batch-runner.sh verifies a worker actually wrote its report with
+            # `compgen -G`, and pkgs.bash is built --disable-progcomp, so
+            # compgen is not a builtin there. It exits 127 "command not found",
+            # the `[[ -z "$(compgen -G ...)" ]]` guard reads that as an empty
+            # glob, and every SUCCESSFUL evaluation is recorded
+            # "❌ Failed (no report file on disk)" — then retried MAX_RETRIES
+            # times, tripling the spend for a result already on disk. A guard
+            # written to fail closed was failing closed on completed work.
+            bashInteractive
+
             # soffice, for --handoff-tailor's one-page resume fit and the
             # LibreOffice-gated tests in tests/test_resume_build.py. Left out
             # by default: it is a ~2 GB closure and the stage degrades
