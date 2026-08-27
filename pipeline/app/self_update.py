@@ -53,6 +53,12 @@ def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True)
 
 
+def _last_line(cp: subprocess.CompletedProcess) -> str:
+    """git's most specific complaint: the last non-empty line of stderr, else
+    stdout. Both are always str (the runner captures text), so no None guard."""
+    return (cp.stderr or cp.stdout).strip().rpartition("\n")[2].strip()
+
+
 def apply_update(repo_root: Path, template_url: str = TEMPLATE_URL) -> dict:
     """Merge the template's latest main into the local clone and push to origin.
 
@@ -81,17 +87,30 @@ def apply_update(repo_root: Path, template_url: str = TEMPLATE_URL) -> dict:
 
     fetched = git("fetch", template_url, "main")
     if fetched.returncode != 0:
-        return {"ok": False, "error": f"fetch from template failed: {fetched.stderr.strip()}"}
+        return {"ok": False, "error": f"fetch from template failed: {_last_line(fetched)}"}
 
-    merged = git("merge", "--no-edit", "FETCH_HEAD")
+    # --allow-unrelated-histories is required, not defensive. Copies are made
+    # with "Use this template", which starts a fresh root commit — so a copy and
+    # the template share no ancestor and `git merge` refuses outright with
+    # "refusing to merge unrelated histories". That is EVERY copy's first
+    # update, not an edge case, and it made this button (and the
+    # update-from-template workflow) unable to do the one thing they exist for.
+    # After the first merge a shared ancestor exists and the flag is a no-op.
+    merged = git("merge", "--no-edit", "--allow-unrelated-histories", "FETCH_HEAD")
     if merged.returncode != 0:
         git("merge", "--abort")
+        # Carry git's own last line. Without it every failure read "merge
+        # conflict — resolve it manually", which is what sent the unrelated-
+        # histories refusal above to users as a conflict they could not find:
+        # there were no conflict markers to look for.
+        error = "merge conflict — resolve it manually, then push"
+        reason = _last_line(merged)
         return {"ok": False, "conflict": True,
-                "error": "merge conflict — resolve it manually, then push"}
+                "error": f"{error} ({reason})" if reason else error}
     if "Already up to date" in (merged.stdout + merged.stderr):
         return {"ok": True, "updated": False}
 
     pushed = git("push", "origin", "HEAD")
     if pushed.returncode != 0:
-        return {"ok": False, "error": f"push to origin failed: {pushed.stderr.strip()}"}
+        return {"ok": False, "error": f"push to origin failed: {_last_line(pushed)}"}
     return {"ok": True, "updated": True}

@@ -85,7 +85,12 @@ class TestApplyUpdate:
         assert r == {"ok": True, "updated": True}
         sigs = [" ".join(a) for a in calls]
         assert any(s.startswith("fetch ") for s in sigs)
-        assert any(s.startswith("merge --no-edit") for s in sigs)
+        # --allow-unrelated-histories is required, not defensive: a copy made
+        # with "Use this template" has a fresh root commit, so it shares no
+        # ancestor with the template and a bare merge refuses. That is every
+        # copy's FIRST update.
+        assert any(s.startswith("merge --no-edit --allow-unrelated-histories")
+                   for s in sigs)
         assert any(s.startswith("push origin") for s in sigs)
 
     def test_already_up_to_date_skips_push(self, tmp_path, mocker):
@@ -103,6 +108,17 @@ class TestApplyUpdate:
         sigs = [" ".join(a) for a in calls]
         assert any(s.startswith("merge --abort") for s in sigs)
         assert not any(s.startswith("push") for s in sigs)
+
+    def test_conflict_error_carries_gits_own_reason(self, tmp_path, mocker):
+        """Every merge failure used to report one fixed string, which is how an
+        unrelated-histories refusal reached users as a conflict with no markers
+        to find."""
+        self._fake_git(mocker, {
+            "merge --no-edit": _cp(1, "", "fatal: refusing to merge unrelated histories"),
+        })
+        r = self_update.apply_update(tmp_path)
+        assert r["ok"] is False
+        assert "refusing to merge unrelated histories" in r["error"]
 
     def test_push_failure_reported(self, tmp_path, mocker):
         self._fake_git(mocker, {

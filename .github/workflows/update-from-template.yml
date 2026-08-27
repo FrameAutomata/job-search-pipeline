@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0        # full history so the merge has a common ancestor
+          fetch-depth: 0        # full history, so the merge sees every commit
 
       - name: Merge latest template main
         run: |
@@ -32,12 +32,17 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add template https://github.com/FrameAutomata/job-search-pipeline.git
           git fetch template main
-          if git merge --no-edit FETCH_HEAD; then
+          # --allow-unrelated-histories is required, not defensive: copies are
+          # made with "Use this template", which starts a fresh root commit, so
+          # a copy shares no ancestor with the template and plain `git merge`
+          # refuses. That is every copy's FIRST update — the case this workflow
+          # exists for. After it, a shared ancestor exists and the flag no-ops.
+          if git merge --no-edit --allow-unrelated-histories FETCH_HEAD; then
             git push origin HEAD
           else
             # Leave a clean tree and fail loudly — the user resolves it locally
             # (fetch the template, merge, push) rather than the bot guessing.
             git merge --abort
-            echo "::error::Merge conflict with the template. Resolve it locally: add the template remote, merge template/main, push."
+            echo "::error::Merge conflict with the template. Resolve it locally: add the template remote, merge template/main --allow-unrelated-histories, push."
             exit 1
           fi
