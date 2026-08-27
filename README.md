@@ -92,7 +92,7 @@ git clone <your-private-copy-url>
 cd <your-private-copy>
 git remote add template <this-template-url>
 git fetch template
-git merge template/main   # or rebase, your call
+git merge --allow-unrelated-histories template/main   # first update only; harmless after
 git push
 ```
 
