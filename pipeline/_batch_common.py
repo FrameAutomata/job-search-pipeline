@@ -501,9 +501,42 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     return "\t".join(parts)
 
 
+# Any http(s) URL, and the `req <id>` we write — the two things a notes cell is
+# checked for before something is prepended to it.
+_NOTES_URL_RE = re.compile(r"https?://\S+")
+_NOTES_REQ_ID_RE = re.compile(r"\breq[\s:#_-]*([A-Za-z0-9_-]+)", re.I)
+
+
+def _prepend_to_notes(tracker_tsv: str, text: str, already_present) -> str:
+    """Put `text` at the front of the notes cell, unless it is already there.
+
+    The notes cell has grown a grammar — `req <id> — <url> — <the model's
+    sentence>` — read back by merge-tracker's `extractReqNumber`, by the UI's
+    "Open posting" link and by bridge's URL dedup. One composer, so the column
+    guard, the ` — ` separator and the front-of-cell rule are stated once and a
+    third injector cannot invent a fourth shape.
+
+    `already_present(notes)` is the only real difference between the callers:
+    "any URL at all" defers to a model that supplied its own, while "this exact
+    id" is idempotence. Both are one predicate slot, not two mechanisms.
+
+    A row with an unexpected column count is returned untouched — better to lose
+    the annotation than to corrupt the row by rejoining at the wrong boundary."""
+    if not text or not tracker_tsv.strip():
+        return tracker_tsv
+    parts = tracker_tsv.strip("\r\n").split("\t")
+    if len(parts) != _TRACKER_TSV_COLUMNS:
+        return tracker_tsv
+    notes = parts[_NOTES_IDX].strip()
+    if already_present(notes):
+        return tracker_tsv
+    parts[_NOTES_IDX] = f"{text} — {notes}" if notes else text
+    return "\t".join(parts)
+
+
 def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
-    """Splice the job URL into the notes (last) column of the tracker row so
-    the UI's "Open posting" link works.
+    """Splice the job URL into the notes cell so the UI's "Open posting" link
+    works.
 
     The LLM generates the notes cell freely — per our prompt it's a
     one-sentence summary, not the URL. The UI's report pane resolves the
@@ -512,22 +545,112 @@ def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     at and renders as `#`. Splicing the URL here keeps the prompt unchanged
     and works for every provider / model.
 
-    If the LLM already put a URL in notes, or returned a row with an
-    unexpected number of columns, leave it alone — better to lose the link
-    than corrupt the row."""
-    if not url:
-        return tracker_tsv
-    line = tracker_tsv.strip("\r\n")
-    if not line.strip():
-        return tracker_tsv
-    parts = line.split("\t")
-    if len(parts) != _TRACKER_TSV_COLUMNS:
-        return tracker_tsv
-    notes = parts[_NOTES_IDX].strip()
-    if re.search(r"https?://\S+", notes):
-        return tracker_tsv
-    parts[_NOTES_IDX] = f"{url} — {notes}" if notes else url
-    return "\t".join(parts)
+    If the LLM already put a URL in notes, leave it alone."""
+    return _prepend_to_notes(tracker_tsv, url,
+                             lambda notes: bool(_NOTES_URL_RE.search(notes)))
+
+
+# Markdown decoration, removed before matching rather than matched around.
+# JobSpy's `description_format` defaults to MARKDOWN and `scrape.py` forwards it
+# untouched, so an Indeed JD reaches the cache as `**Job ID:** 88214`, and
+# markdownify escapes `_` and `-` mid-word (`R\_1488728`, `JR\-00124259`). All
+# three defeat a pattern written for plain prose. LinkedIn's descriptions are
+# backfilled as plain text by screen.py, so this hit one board and not the other
+# — which is worse than hitting both, because the extractor then looks like it
+# works. Neither character can appear in a requisition id, so stripping them is
+# lossless here.
+_MARKDOWN_NOISE_RE = re.compile(r"[*\\]")
+
+# A requisition id as JOB-DESCRIPTION PROSE states it. Deliberately narrower
+# than merge-tracker's own REQ_NUMBER_RE, which reads the tracker's Notes cell:
+# that regex accepts a BARE `job`/`req`/`ref` label because a human wrote that
+# cell and meant the number they put there. A JD is thousands of words we did not
+# write, where "job 2 of 5" and "reference 401k" are ordinary prose — so here the
+# label must carry an explicit qualifier. Recall costs nothing (no id is exactly
+# today's behaviour); a wrong id SPLITS two rows that should fold.
+#
+# `#` is a qualifier in its own right ("Req #1311") and must NOT be followed by
+# `\b`: both it and the space after it are non-word characters, so the boundary
+# could only hold when a digit followed immediately — `Req # 1311` and
+# `Position #: 12345` matched nothing. Upstream sidesteps this by keeping `#` in
+# its separator class; here the qualifier is mandatory, so it needs both roles.
+#
+# `code` is deliberately absent from the qualifiers: in public-sector and
+# healthcare postings — the shape this exists for — "Job Code: 4021" is a pay
+# grade shared by every posting of that title, so reading it as a requisition
+# would split a cross-board pair rather than two genuine reqs.
+_JD_REQ_ID_RE = re.compile(
+    r"\b(?:job|requisition|req|posting|position|vacancy|reference|ref)\s*"
+    r"(?:(?:id|no|nr|num|number)\b|#)[\s:#=.-]*"
+    r"([A-Za-z0-9][A-Za-z0-9_-]*)", re.I)
+
+# The capture is unbounded and the length judged AFTER, because a bounded
+# `{2,23}` does not decline an over-long token — it truncates one, and a
+# truncation is more dangerous than a miss. `Job ID: 5340-Nurse-Practitioner-
+# Days-FT` yielded `5340-NURSE-PRACTITIONER-`, and `REQ-2026-3206100…` yielded
+# `REQ-2026-`, which merge-tracker reads back as `REQ-2026` — a DIFFERENT string
+# from the one we wrote, and one that two genuinely different reqs sharing a
+# prefix would both produce. Over-long means "we cannot tell where the id ends",
+# which is a decline.
+_REQ_ID_MAX_LEN = 24
+_REQ_ID_MIN_LEN = 3
+
+
+def extract_req_id(jd_text: str) -> str:
+    """The requisition id a JD states, uppercased — or "" when it states none,
+    or more than one.
+
+    Why this is worth extracting: `company::role` is the identity the pipeline
+    runs on, and merge-tracker's fuzzy tier drops tokens of three characters or
+    fewer before comparing titles, so `INSURANCE SPECIALIST I` and `… II` (and
+    `PACT PRN Representative I` vs `PACT Representative I`) match as one opening
+    and fold into a single row — the level and the PRN are invisible to it. A req
+    id in the Notes column is the signal career-ops documents for exactly this:
+    merge-tracker reads it and treats two rows carrying DIFFERENT ids as distinct
+    openings, overriding the title match.
+
+    Ambiguity resolves to "": several DIFFERENT ids in one JD means we cannot
+    tell which is the requisition, and guessing splits a row that should fold.
+    The same id repeated (JD body and footer) is not ambiguity, so the values are
+    compared, not counted. That doubles as the guard for the UI's Add-Job path,
+    where `screen.extract_description` can fall back to a whole page body: a
+    related-jobs panel usually carries several ids, and several is a decline. A
+    page carrying exactly one foreign id is the residual risk there.
+
+    Deliberately not the board's own job key (`jk=`, `currentJobId`): that is a
+    per-POSTING identifier, so a re-post of one requisition carries a new one, and
+    keying on it would split every re-post into a second tracker row. The
+    employer's req id is stable across re-posts and differs between levels, which
+    is the distinction being drawn here."""
+    text = _MARKDOWN_NOISE_RE.sub("", jd_text or "")
+    found = set()
+    for m in _JD_REQ_ID_RE.finditer(text):
+        # rstrip: a trailing separator is never part of the id, and leaving one
+        # on changes what merge-tracker reads back out of what we write.
+        value = m.group(1).rstrip("-_")
+        if not _REQ_ID_MIN_LEN <= len(value) <= _REQ_ID_MAX_LEN:
+            continue
+        if any(c.isdigit() for c in value):
+            found.add(value.upper())
+    return found.pop() if len(found) == 1 else ""
+
+
+def _inject_req_id_into_notes(tracker_tsv: str, req_id: str) -> str:
+    """Prepend `req <id>` to the notes cell so merge-tracker can read it.
+
+    FIRST in the cell, ahead of the URL, because merge-tracker's
+    `extractReqNumber` takes the first match in the cell: leading with the id we
+    resolved makes the extraction deterministic instead of dependent on whatever
+    the LLM's free-text sentence happens to contain. (Today's posting URLs yield
+    no match at all — pinned by a test — but that is a property of current URL
+    shapes, not a guarantee about the next board.)
+
+    `req <id>` because that is a form merge-tracker's own regex reads back
+    unchanged; it uppercases both sides, so case never matters here either."""
+    return _prepend_to_notes(
+        tracker_tsv, f"req {req_id}" if req_id else "",
+        lambda notes: any(m.group(1).upper() == req_id.upper()
+                          for m in _NOTES_REQ_ID_RE.finditer(notes)))
 
 
 def write_job_result(
@@ -555,6 +678,9 @@ def write_job_result(
         tracker_tsv = _strip_role_pipe(tracker_tsv)
         tracker_tsv = _normalize_score_cell(tracker_tsv)
         tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
+        # After the URL, so the id ends up ahead of it in the cell.
+        tracker_tsv = _inject_req_id_into_notes(
+            tracker_tsv, extract_req_id(job_meta.get("jd_text", "")))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {

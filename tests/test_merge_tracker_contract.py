@@ -32,16 +32,30 @@ import pytest
 from pipeline._batch_common import _pending_additions, _warn_on_lost_additions
 from pipeline.tracker_layout import career_ops_dir
 
-TRACKER = ("# Applications Tracker\n\n"
-           "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
-           "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
-           "| 10 | 2026-08-01 | UT Southwestern Medical Center | INSURANCE SPECIALIST II "
-           "| 4.0/5 | Evaluated | ❌ | [200](../reports/200-ut-2026-08-01.md) | note |\n")
+HEADER = ("# Applications Tracker\n\n"
+          "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+          "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
 
-# Same company, a title that fuzzy-matches the row above, a NEW report number.
-ADDITION = ("11\t2026-09-01\tUT Southwestern Medical Center\tINSURANCE SPECIALIST I\t"
-            "Evaluated\t4.7/5\tnull\t[229](reports/229-ut-2026-09-01.md)\t"
-            "https://indeed.com/viewjob?jk=new — APPLY\n")
+# One scenario, used with and without req ids: two levels of one title at one
+# company. Both fuzzy-match, because role-matcher drops tokens of ≤3 characters
+# and the level never reaches the comparison — so the id is the only thing that
+# can tell them apart. Single-sourced deliberately: if upstream ever tightens
+# that matcher, this premise must fail in ONE place, not rot in a second copy
+# while the first is repaired.
+def _notes(req, jk):
+    return (f"req {req} — " if req else "") + f"https://indeed.com/viewjob?jk={jk} — APPLY"
+
+
+def _tracker(role, report, req=None):
+    return HEADER + (f"| 10 | 2026-08-01 | UT Southwestern Medical Center | {role} "
+                     f"| 4.0/5 | Evaluated | ❌ | [{report}](../reports/{report}-ut.md) "
+                     f"| {_notes(req, 'old')} |\n")
+
+
+def _addition(role, report, req=None):
+    return ("11\t2026-09-01\tUT Southwestern Medical Center\t" + role +
+            f"\tEvaluated\t4.7/5\tnull\t[{report}](reports/{report}-ut.md)\t"
+            f"{_notes(req, 'new')}\n")
 
 
 def _merge_tracker_runnable() -> bool:
@@ -67,22 +81,20 @@ pytestmark = pytest.mark.skipif(
     reason="needs a career-ops checkout with npm deps (local install; CI does neither)")
 
 
-@pytest.fixture(scope="module")
-def merged(tmp_path_factory):
-    """Run the real merge-tracker over one fuzzy-matching addition, entirely
-    inside a tmp dir. Returns (tracker_text, career_ops_root, additions_dir).
-
-    Module-scoped: merge-tracker shells out to sync-pdf-flags.mjs, so each run is
-    two node startups plus a tracker-lock acquisition, and every assertion below
-    is read-only over one immutable result."""
-    tmp_path = tmp_path_factory.mktemp("merge")
+def _merge(tmp_path, tracker_text, additions, batch_state=""):
+    """Run the real merge-tracker over `additions` ({filename: row}), entirely
+    inside tmp_path. Returns (tracker_text_after, career_ops_root, additions_dir,
+    completed_process)."""
     career_ops = tmp_path / "co"
     (career_ops / "data").mkdir(parents=True)
     tracker = career_ops / "data" / "applications.md"
-    tracker.write_text(TRACKER, encoding="utf-8")
-    additions = tmp_path / "adds"
-    additions.mkdir()
-    (additions / "123.tsv").write_text(ADDITION, encoding="utf-8")
+    tracker.write_text(tracker_text, encoding="utf-8")
+    additions_dir = tmp_path / "adds"
+    additions_dir.mkdir()
+    for name, row in additions.items():
+        (additions_dir / name).write_text(row, encoding="utf-8")
+    state = tmp_path / "batch-state.tsv"
+    state.write_text(batch_state, encoding="utf-8")
 
     r = subprocess.run(
         ["node", "merge-tracker.mjs"], cwd=str(career_ops_dir()),
@@ -93,11 +105,23 @@ def merged(tmp_path_factory):
         # local-only test into a hard failure rather than the skip above.
         env={**os.environ,
              "CAREER_OPS_TRACKER": str(tracker),
-             "CAREER_OPS_ADDITIONS": str(additions),
-             "CAREER_OPS_BATCH_STATE": str(tmp_path / "batch-state.tsv")},
+             "CAREER_OPS_ADDITIONS": str(additions_dir),
+             "CAREER_OPS_BATCH_STATE": str(state)},
     )
     assert r.returncode == 0, r.stderr
-    return tracker.read_text(encoding="utf-8"), career_ops, additions, r
+    return tracker.read_text(encoding="utf-8"), career_ops, additions_dir, r
+
+
+@pytest.fixture(scope="module")
+def merged(tmp_path_factory):
+    """One fuzzy-matching addition, no req ids on either side.
+
+    Module-scoped: merge-tracker shells out to sync-pdf-flags.mjs, so each run is
+    two node startups plus a tracker-lock acquisition, and every assertion below
+    is read-only over one immutable result."""
+    return _merge(tmp_path_factory.mktemp("merge"),
+                  _tracker("INSURANCE SPECIALIST II", 200),
+                  {"123.tsv": _addition("INSURANCE SPECIALIST I", 229)})
 
 
 class TestFuzzyMergeKeepsTheRowsTitle:
@@ -138,10 +162,7 @@ class TestFuzzyMergeKeepsTheRowsTitle:
 # `failed` in batch-state.tsv) and archives into merged/ anyway, exit 0. This is
 # the loss the guard exists to report, and the reason line is the operator's only
 # clue about it.
-REFUSED_TRACKER = ("# Applications Tracker\n\n"
-                   "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
-                   "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
-                   "| 10 | 2026-08-01 | Initech | SRE | 4.0/5 | Evaluated | ❌ "
+REFUSED_TRACKER = (HEADER + "| 10 | 2026-08-01 | Initech | SRE | 4.0/5 | Evaluated | ❌ "
                    "| [200](../reports/200-initech-2026-08-01.md) | note |\n")
 REFUSED_ADDITION = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.7/5\tnull\t"
                     "[229](reports/229-acme-2026-09-01.md)\tAPPLY — note\n")
@@ -149,27 +170,12 @@ REFUSED_ADDITION = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.
 
 @pytest.fixture(scope="module")
 def refused(tmp_path_factory):
-    """(completed_process, career_ops_root, additions_dir) for a refused row."""
-    tmp_path = tmp_path_factory.mktemp("refused")
-    career_ops = tmp_path / "co"
-    (career_ops / "data").mkdir(parents=True)
-    (career_ops / "data" / "applications.md").write_text(REFUSED_TRACKER, encoding="utf-8")
-    additions = tmp_path / "adds"
-    additions.mkdir()
-    (additions / "7.tsv").write_text(REFUSED_ADDITION, encoding="utf-8")
-    state = tmp_path / "batch-state.tsv"
-    state.write_text("id\tx\tstatus\ty\tz\treport\n7\t-\tfailed\t-\t-\t229\n", encoding="utf-8")
-
-    r = subprocess.run(
-        ["node", "merge-tracker.mjs"], cwd=str(career_ops_dir()),
-        capture_output=True, text=True, timeout=120,
-        env={**os.environ,
-             "CAREER_OPS_TRACKER": str(career_ops / "data" / "applications.md"),
-             "CAREER_OPS_ADDITIONS": str(additions),
-             "CAREER_OPS_BATCH_STATE": str(state)},
-    )
-    assert r.returncode == 0, r.stderr
-    return r, career_ops, additions
+    """A refused row, in `_merge`'s own (tracker, career_ops, additions, proc)
+    ordering — a second ordering of one value set is a trap for the next test."""
+    return _merge(
+        tmp_path_factory.mktemp("refused"), REFUSED_TRACKER,
+        {"7.tsv": REFUSED_ADDITION},
+        batch_state="id\tx\tstatus\ty\tz\treport\n7\t-\tfailed\t-\t-\t229\n")
 
 
 class TestRefusalReasonsReachTheOperator:
@@ -185,16 +191,71 @@ class TestRefusalReasonsReachTheOperator:
         If a future release moves this to stdout, this failing is the
         notification; `run_merge_tracker` already reads both, so relax the
         stdout half rather than the combined one."""
-        r, _, _ = refused
+        _, _, _, r = refused
         assert "Skipping" in r.stderr
         assert "Skipping" not in r.stdout
 
     def test_the_guard_prints_that_reason_end_to_end(self, refused, capsys):
         """The wiring, over the real streams: warn about the loss and say why."""
-        r, career_ops, additions = refused
+        _, career_ops, additions, r = refused
         before = _pending_additions(additions / "merged")
         _warn_on_lost_additions(before, career_ops, additions, f"{r.stdout}\n{r.stderr}")
         out = capsys.readouterr().out
         assert "WARNING: 1 evaluation(s)" in out
         assert "7.tsv (Acme Corp — Platform Engineer)" in out
         assert "merge-tracker's reasons:" in out and 'marked "failed"' in out
+
+
+@pytest.fixture(scope="module")
+def levelled_apart(tmp_path_factory):
+    """Two levels of one title, carrying DIFFERENT req ids."""
+    return _merge(tmp_path_factory.mktemp("apart"),
+                  _tracker("INSURANCE SPECIALIST II", 200, req="5001"),
+                  {"123.tsv": _addition("INSURANCE SPECIALIST I", 229, req="5002")})
+
+
+@pytest.fixture(scope="module")
+def same_req(tmp_path_factory):
+    """One requisition re-posted under a re-worded title, same id.
+
+    The title has to DIFFER, or the scenario tests nothing: `roleFuzzyMatch`
+    short-circuits on `textA === textB` before tokenizing, and bridge drops an
+    identically-titled addition long before the merge — so a same-title pair can
+    neither reach the fuzzy tier nor occur in production. `(Remote)` is a wording
+    a re-post really picks up, and it still fuzzy-matches, so the merge reaches
+    the req comparison and the matching id has to let the fold proceed."""
+    return _merge(tmp_path_factory.mktemp("same"),
+                  _tracker("INSURANCE SPECIALIST II", 200, req="5001"),
+                  {"123.tsv": _addition("Insurance Specialist II (Remote)", 229, req="5001")})
+
+
+class TestReqIdOverridesTheFuzzyTitleMatch:
+    """What `extract_req_id` buys, and what it must not cost. Both directions
+    are load-bearing: the id has to split what the title match wrongly folds,
+    without splitting a re-post of one requisition into a second row."""
+
+    def test_different_ids_keep_two_rows(self, levelled_apart):
+        """The #152/#154 case. Without the ids these fold, and `SPECIALIST I`
+        stops existing — invisible to dedup, the handoff and the UI."""
+        tracker, _, _, r = levelled_apart
+        assert "INSURANCE SPECIALIST I |" in tracker
+        assert "INSURANCE SPECIALIST II |" in tracker
+        assert "➕ Add" in r.stdout and "🔄 Update" not in r.stdout
+
+    def test_the_same_id_still_folds(self, same_req):
+        """The safety direction, and the one that has to survive a re-wording.
+        An employer's req id is stable across re-posts, which is why it — and not
+        the board's per-posting `jk=` key — is what we extract: keying on the
+        posting would add a row every time a listing is re-published."""
+        tracker, _, _, r = same_req
+        assert tracker.count("| INSURANCE SPECIALIST II |") == 1   # kept its title
+        assert "Insurance Specialist II (Remote)" not in tracker   # no second row
+        assert "🔄 Update" in r.stdout and "➕ Add" not in r.stdout
+
+    def test_the_id_survives_into_the_new_row(self, levelled_apart):
+        """The split above only holds for the NEXT merge if the id merge-tracker
+        wrote into the row is still readable there — the guard needs it on both
+        sides, and the row it just added is one of them."""
+        tracker, _, _, _ = levelled_apart
+        added = [l for l in tracker.splitlines() if "INSURANCE SPECIALIST I |" in l]
+        assert added and "req 5002" in added[0]
