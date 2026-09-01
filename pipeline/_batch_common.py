@@ -530,6 +530,72 @@ def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     return "\t".join(parts)
 
 
+# A requisition id as JOB-DESCRIPTION PROSE states it. Deliberately narrower
+# than merge-tracker's own REQ_NUMBER_RE, which reads the tracker's Notes cell:
+# that regex accepts a BARE `job`/`req`/`ref` label because a human wrote that
+# cell and meant the number they put there. A JD is thousands of words we did not
+# write, where "job 2 of 5" and "reference 401k" are ordinary prose — so here the
+# label must carry an explicit id/number qualifier. Recall costs nothing (no id
+# is exactly today's behaviour); a wrong id SPLITS two rows that should fold.
+_JD_REQ_ID_RE = re.compile(
+    r"\b(?:job|requisition|req|posting|position|vacancy|reference|ref)[\s\u00a0]*"
+    r"(?:id|no|nr|num|number|code|#)\b[\s:#=.\-]*"
+    r"([A-Za-z0-9][A-Za-z0-9_-]{2,23})\b", re.I)
+
+
+def extract_req_id(jd_text: str) -> str:
+    """The requisition id a JD states, uppercased — or "" when it states none,
+    or more than one.
+
+    Why this is worth extracting: `company::role` is the identity the pipeline
+    runs on, and merge-tracker's fuzzy tier drops tokens of three characters or
+    fewer before comparing titles, so `INSURANCE SPECIALIST I` and `… II` (and
+    `PACT PRN Representative I` vs `PACT Representative I`) match as one opening
+    and fold into a single row — the level and the PRN are invisible to it. A req
+    id in the Notes column is the signal career-ops documents for exactly this:
+    merge-tracker reads it and treats two rows carrying DIFFERENT ids as distinct
+    openings, overriding the title match.
+
+    Ambiguity resolves to "": several DIFFERENT ids in one JD means we cannot
+    tell which is the requisition, and guessing splits a row that should fold.
+    The same id repeated (JD body and footer) is not ambiguity, so the values are
+    compared, not counted.
+
+    Deliberately not the board's own job key (`jk=`, `currentJobId`): that is a
+    per-POSTING identifier, so a re-post of one requisition carries a new one, and
+    keying on it would split every re-post into a second tracker row. The
+    employer's req id is stable across re-posts and differs between levels, which
+    is the distinction being drawn here."""
+    found = {m.group(1).upper() for m in _JD_REQ_ID_RE.finditer(jd_text or "")
+             if any(c.isdigit() for c in m.group(1))}
+    return found.pop() if len(found) == 1 else ""
+
+
+def _inject_req_id_into_notes(tracker_tsv: str, req_id: str) -> str:
+    """Prepend `req <id>` to the notes cell so merge-tracker can read it.
+
+    FIRST in the cell, ahead of the URL, because merge-tracker's
+    `extractReqNumber` takes the first match in the cell: leading with the id we
+    resolved makes the extraction deterministic instead of dependent on whatever
+    the LLM's free-text sentence happens to contain. (Today's posting URLs yield
+    no match at all — pinned by a test — but that is a property of current URL
+    shapes, not a guarantee about the next board.)
+
+    `req <id>` because that is a form merge-tracker's own regex reads back
+    unchanged; it uppercases both sides, so case never matters."""
+    if not req_id:
+        return tracker_tsv
+    line = tracker_tsv.strip("\r\n")
+    parts = line.split("\t")
+    if len(parts) != _TRACKER_TSV_COLUMNS:
+        return tracker_tsv
+    notes = parts[_NOTES_IDX].strip()
+    if re.search(rf"\breq[\s:#_-]*{re.escape(req_id)}\b", notes, re.I):
+        return tracker_tsv          # the model already stated it
+    parts[_NOTES_IDX] = f"req {req_id} — {notes}" if notes else f"req {req_id}"
+    return "\t".join(parts)
+
+
 def write_job_result(
     response_text: str,
     job_meta: dict,
@@ -555,6 +621,9 @@ def write_job_result(
         tracker_tsv = _strip_role_pipe(tracker_tsv)
         tracker_tsv = _normalize_score_cell(tracker_tsv)
         tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
+        # After the URL, so the id ends up ahead of it in the cell.
+        tracker_tsv = _inject_req_id_into_notes(
+            tracker_tsv, extract_req_id(job_meta.get("jd_text", "")))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {

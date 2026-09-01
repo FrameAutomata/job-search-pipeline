@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pipeline._batch_common import (
+    _inject_req_id_into_notes,
     _normalize_score_cell,
     _pending_additions,
     _warn_on_lost_additions,
@@ -15,6 +16,7 @@ from pipeline._batch_common import (
     eval_system_prompt,
     extract_tag,
     load_pending,
+    extract_req_id,
     load_state,
     max_report_num,
     max_tracker_num,
@@ -868,3 +870,88 @@ class TestLostAdditionGuard:
             "| [229](../reports/229-x-2026-09-01.md) | note |\n"))
         self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
         assert self._run(career_ops, tracker_dir, capsys) == ""
+
+
+
+class TestExtractReqId:
+    """A req id in the Notes column is what stops merge-tracker's fuzzy title
+    match folding two distinct requisitions into one row (#154) — its matcher
+    drops tokens of ≤3 characters, so `SPECIALIST I` and `SPECIALIST II` compare
+    equal. The extractor is deliberately strict: no id is exactly today's
+    behaviour, while a WRONG id splits two rows that should fold."""
+
+    @pytest.mark.parametrize("jd,expected", [
+        ("Job ID: 88214", "88214"),
+        ("Requisition Number R-2291", "R-2291"),
+        ("Posting ID 5340", "5340"),
+        ("Job Reference Number JR00124259 — apply today", "JR00124259"),
+        ("job id 65136", "65136"),                     # case-insensitive
+        ("Position Number: 00012345", "00012345"),
+        ("Job ID: 88214 … and in the footer, Job ID 88214", "88214"),
+    ])
+    def test_reads_a_labelled_id(self, jd, expected):
+        assert extract_req_id(jd) == expected
+
+    @pytest.mark.parametrize("jd", [
+        "This job 2 of 5 in the series",       # a bare label + a number is prose
+        "benefits include a 401k plan",
+        "Job Type: Full-time. Remote.",        # no digit in the value
+        "reference checks required",
+        "",
+    ])
+    def test_prose_does_not_become_an_id(self, jd):
+        """merge-tracker's own regex accepts a BARE `job`/`ref` label because a
+        human wrote that cell deliberately. A JD is prose we did not write."""
+        assert extract_req_id(jd) == ""
+
+    def test_two_different_ids_are_ambiguous_and_yield_nothing(self):
+        """Guessing which one is the requisition splits a row that should fold;
+        declining leaves today's behaviour untouched."""
+        assert extract_req_id("Job ID 123 … Reference code ABC9") == ""
+
+    def test_none_of_this_reads_the_boards_own_job_key(self):
+        """A `jk=`/`currentJobId` key identifies the POSTING, so a re-post of one
+        requisition carries a new one — keying on it would add a tracker row
+        every time a listing is re-published."""
+        assert extract_req_id("https://www.indeed.com/viewjob?jk=1a2b3c4d5e") == ""
+        assert extract_req_id("https://www.linkedin.com/jobs/view/4123456789/") == ""
+
+
+class TestInjectReqIdIntoNotes:
+    @staticmethod
+    def _row(notes):
+        return "\t".join(["3", "2026-08-25", "Initech", "SRE", "Evaluated", "4.2/5",
+                          "null", "[003](reports/003-x.md)", notes])
+
+    def test_leads_the_cell(self):
+        """Ahead of the URL: merge-tracker's extractReqNumber takes the FIRST
+        match in the cell, so leading with the resolved id makes the reading
+        deterministic rather than dependent on the free-text sentence."""
+        out = _inject_req_id_into_notes(self._row("https://x/j — APPLY"), "R-2291")
+        assert out.split("\t")[-1] == "req R-2291 — https://x/j — APPLY"
+
+    def test_empty_notes(self):
+        assert _inject_req_id_into_notes(self._row(""), "5340").split("\t")[-1] == "req 5340"
+
+    def test_no_id_is_a_no_op(self):
+        row = self._row("APPLY")
+        assert _inject_req_id_into_notes(row, "") == row
+
+    def test_does_not_restate_an_id_the_model_already_wrote(self):
+        row = self._row("req 5340 — APPLY")
+        assert _inject_req_id_into_notes(row, "5340") == row
+
+    def test_malformed_row_is_left_alone(self):
+        assert _inject_req_id_into_notes("a\tb\tc", "5340") == "a\tb\tc"
+
+    def test_applied_by_write_job_result(self, tmp_path):
+        """On the write path, not merely available — and after the URL, so the
+        id ends up ahead of it."""
+        reports, tracker = tmp_path / "reports", tmp_path / "tsv"
+        reports.mkdir(); tracker.mkdir()
+        response = TestWriteJobResult()._make_response(tracker=self._row("APPLY strong match"))
+        write_job_result(response,
+                         {"id": 3, "url": "https://x/j/3", "jd_text": "Job ID: 88214"},
+                         reports, tracker, "2026-08-25")
+        notes = (tracker / "3.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")[-1]
+        assert notes == "req 88214 — https://x/j/3 — APPLY strong match"
