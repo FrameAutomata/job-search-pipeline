@@ -11,6 +11,10 @@ from pathlib import Path
 
 from pipeline.tracker_layout import (
     SCORE_SENTINELS, data_rows, header_columns, is_score_cell, split_row,
+    # Aliased: `report_num` is also the name of the number itself in
+    # write_job_result and below, and a local shadowing a callable is a
+    # TypeError waiting for whoever adds the next call.
+    report_num as row_report_num,
 )
 
 MAX_TOKENS = 8192
@@ -353,10 +357,23 @@ def parse_json_loose(text: str) -> dict | None:
     return None
 
 
-# Tracker schema (9 cols): # · Date · Company · Role · Status · Score · PDF ·
-# Report · Notes. Mirrors what the LLM is told to emit in _profile.md and what
-# merge-tracker.mjs writes into applications.md.
-_TRACKER_TSV_COLUMNS = 9
+# Tracker-additions TSV schema — note STATUS comes before SCORE here, the
+# opposite of applications.md (merge-tracker.mjs swaps them when merging).
+# Mirrors what the LLM is told to emit in _profile.md. Named rather than
+# counted because this module writes the file and `pipeline/app/data.py` reads
+# it back: two spellings of one layout is how a column insertion upstream gets
+# fixed in one reader and silently misread by the other.
+ADDITION_COLUMNS = [
+    "num", "date", "company", "role", "status", "score", "pdf", "report", "notes",
+]
+_TRACKER_TSV_COLUMNS = len(ADDITION_COLUMNS)
+# Every cell the sanitizers below reach for, resolved from that list rather than
+# written as a literal — the width guards only check the TOTAL, so a column
+# inserted upstream would leave them silently rewriting the wrong cells.
+_ROLE_IDX = ADDITION_COLUMNS.index("role")
+_STATUS_IDX = ADDITION_COLUMNS.index("status")
+_SCORE_IDX = ADDITION_COLUMNS.index("score")
+_NOTES_IDX = ADDITION_COLUMNS.index("notes")
 
 
 def _restore_trailing_cells(tracker_tsv: str) -> str:
@@ -393,8 +410,8 @@ def _strip_role_pipe(tracker_tsv: str) -> str:
     # merge-tracker then refuses. The row this chain exists to save was the one
     # it skipped.
     parts = tracker_tsv.strip("\r\n").split("\t")
-    if len(parts) >= 4:
-        parts[3] = re.sub(r"\s*\|.*$", "", parts[3]).strip()
+    if len(parts) > _ROLE_IDX:
+        parts[_ROLE_IDX] = re.sub(r"\s*\|.*$", "", parts[_ROLE_IDX]).strip()
     return "\t".join(parts)
 
 
@@ -456,9 +473,9 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     parts = tracker_tsv.strip("\r\n").split("\t")
     if len(parts) != _TRACKER_TSV_COLUMNS:
         return tracker_tsv
-    raw = parts[5].replace("*", "").strip()
+    raw = parts[_SCORE_IDX].replace("*", "").strip()
     if raw.upper() in _SCORE_SENTINELS:
-        parts[5] = raw.upper()
+        parts[_SCORE_IDX] = raw.upper()
         return "\t".join(parts)
     # The model may have written the pair the other way round (status in col 6,
     # score in col 5). merge-tracker resolves that on its own — it asks which
@@ -466,21 +483,21 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     # like one, so its "exactly one" test fails and it refuses a row it would
     # otherwise have merged correctly: the loss this function exists to prevent,
     # caused by this function. Leave a swapped pair alone.
-    if is_score_cell(parts[4]):
+    if is_score_cell(parts[_STATUS_IDX]):
         return tracker_tsv
     value = score_value(raw)
     if value is None:
         # No number at all (empty, "unknown", a stray status). N/A is a shape
         # merge-tracker recognises, so the row still merges and the evaluation
         # stays visible — a scoreless row beats a silently discarded one.
-        parts[5] = "N/A"
+        parts[_SCORE_IDX] = "N/A"
         return "\t".join(parts)
     # Out of range means the model answered on some other scale ("8/10", "84%")
     # and we cannot know which. Clamping to 5 would invent a perfect score, and
     # the handoff work-order ranks by score descending — a fabricated 5 puts the
     # role first. N/A merges the row and leaves it unranked, which is the true
     # statement.
-    parts[5] = f"{value:g}/5" if 0 <= value <= 5 else "N/A"
+    parts[_SCORE_IDX] = f"{value:g}/5" if 0 <= value <= 5 else "N/A"
     return "\t".join(parts)
 
 
@@ -506,10 +523,10 @@ def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     parts = line.split("\t")
     if len(parts) != _TRACKER_TSV_COLUMNS:
         return tracker_tsv
-    notes = parts[-1].strip()
+    notes = parts[_NOTES_IDX].strip()
     if re.search(r"https?://\S+", notes):
         return tracker_tsv
-    parts[-1] = f"{url} — {notes}" if notes else url
+    parts[_NOTES_IDX] = f"{url} — {notes}" if notes else url
     return "\t".join(parts)
 
 
@@ -661,12 +678,18 @@ def run_merge_tracker(career_ops: Path) -> bool:
     # fresh run (see ensure_applications_md).
     ensure_applications_md(career_ops)
     tracker_dir = career_ops / "batch" / "tracker-additions"
-    before = _pending_addition_keys(tracker_dir)
+    before = _pending_additions(tracker_dir)
     print("[batch] running merge-tracker.mjs...")
     r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
     if r.returncode == 0:
         print("[batch] tracker merged")
-        _warn_on_lost_additions(before, career_ops, tracker_dir, r.stdout)
+        # BOTH streams: merge-tracker refuses a row with console.warn, which is
+        # stderr. Passing stdout alone left the reasons block empty on every
+        # genuine loss — and printed the one refusal it does log to stdout (the
+        # benign unscoreable re-eval) as the explanation for some other
+        # addition's disappearance.
+        _warn_on_lost_additions(before, career_ops, tracker_dir,
+                                f"{r.stdout}\n{r.stderr}")
         return True
     print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
     _hint_missing_node_modules(r.stderr)
@@ -674,30 +697,96 @@ def run_merge_tracker(career_ops: Path) -> bool:
 
 
 def _addition_key(company: str, role: str) -> str:
-    """The identity merge-tracker itself dedups on. Keying on the addition's `#`
-    instead would flag every re-evaluation as lost: merge-tracker folds a re-eval
-    into the EXISTING row, keeping that row's num, so the addition's own num
-    never appears in the tracker even though the evaluation landed."""
+    """The company::role identity, normalized the way merge-tracker's own dedup
+    normalizes it. Not stable across a merge on its own — see `_report_key`."""
     return f"{normalize_company(company)}::{normalize_company(role)}"
 
 
-def _pending_addition_keys(tracker_dir: Path) -> dict[str, list[str]]:
-    """{company::role: [filename, ...]} for the un-merged addition TSVs (cols 3
-    and 4). A list, not a single name: a re-evaluation of a role already queued
-    puts two TSVs under one key, and collapsing them would under-report the loss
-    and send the operator hunting for one report while another stays buried."""
-    keys: dict[str, list[str]] = {}
-    for f in sorted(tracker_dir.glob("*.tsv")) if tracker_dir.exists() else []:
-        cells = read_text(f).split("\t")
-        if len(cells) >= 4:
-            keys.setdefault(_addition_key(cells[2], cells[3]), []).append(f.name)
-    return keys
+def _report_key(company: str, num: str) -> str:
+    """The company + report-number identity, which a merge DOES preserve.
+
+    merge-tracker matches an addition against the tracker on four tiers, and only
+    two of them are provable identity: an exact posting URL, and an exact report
+    number. On the GUESSED tiers — entry number, fuzzy title — it updates the row
+    but deliberately keeps THE ROW'S OWN TITLE, so that a fuzzy false positive
+    cannot also destroy the evidence that two reqs were distinct
+    (`role: (reportNumMatched || dupReason === 'url') ? addition.role :
+    duplicate.role`). Its `🔄 Update` log line prints the ADDITION's role, so the
+    substitution is invisible there too.
+
+    The report link, the score and the company are written through on every one
+    of those tiers, so they are what survives. Company is part of the key because
+    merge-tracker's own report-number tier requires it: report-file numbering and
+    tracker-row numbering drift, so a bare number can name an unrelated row.
+
+    Not a replacement for `_addition_key` — a second reading of the same row. An
+    unscoreable re-eval is skipped with the existing score, report and PDF left
+    standing, so there the row keeps its company::role and never receives the new
+    report number. Each key covers the other's blind spot."""
+    return f"{normalize_company(company)}::{num}"
 
 
-def _warn_on_lost_additions(before: dict[str, list[str]], career_ops: Path,
+def _addition_cells(text: str) -> list[str]:
+    """The cells of one addition row, in ADDITION_COLUMNS order.
+
+    Both shapes merge-tracker accepts, because a row it can read is a row it can
+    also REFUSE and archive, and a shape this function cannot parse is an
+    evaluation that vanishes without even being counted — the one outcome the
+    guard exists to prevent. A model that ignores the prompt's tab rule and emits
+    a markdown table row is the case `_strip_role_pipe` already tells us happens;
+    every sanitizer no-ops on it (they split on tabs and find one cell), so it
+    reaches merge-tracker exactly as the model wrote it.
+
+    The two shapes disagree about columns 5-6 — the pipe form is score-then-status
+    — but agree on every cell read here (company, role, report, notes), and
+    merge-tracker resolves that pair by content rather than position anyway. Do
+    not read `row["score"]` or `row["status"]` off this without fixing that.
+
+    maxsplit on the tab form, as `app/data.py:parse_tracker_additions` reads the
+    same file: a tab inside the free-text notes must not become a tenth cell."""
+    text = text.strip()
+    if text.startswith("|"):
+        cells = [c.strip() for c in text.split("|")]
+        if cells and not cells[0]:
+            cells.pop(0)
+        if cells and not cells[-1]:
+            cells.pop()
+        return cells
+    return [c.strip() for c in text.split("\t", len(ADDITION_COLUMNS) - 1)]
+
+
+def _pending_additions(tracker_dir: Path) -> list[dict]:
+    """One record per un-merged addition TSV: the file it came from, and the
+    company, role and report number it carries — the raw cells, with both
+    identities derived at the one place they are compared.
+
+    One record per FILE, not per key: a re-evaluation of a role already queued
+    puts two TSVs under one company::role, and collapsing them would under-report
+    a loss and send the operator hunting for one report while another stays
+    buried. The filename is also what "still pending" is decided on, since
+    merge-tracker moves a processed TSV into merged/ under its own name — so the
+    file answers "was this addition processed at all" exactly, where a shared key
+    answers it for whichever TSV moved first.
+
+    Short of `role` the row is unreadable and skipped; short of `notes` it is
+    not, since a lost trailing tab is routine (see `_restore_trailing_cells`)."""
+    additions: list[dict] = []
+    for f in sorted(tracker_dir.glob("*.tsv")):
+        row = dict(zip(ADDITION_COLUMNS, _addition_cells(read_text(f))))
+        if "role" not in row:
+            continue
+        additions.append({
+            "name": f.name,
+            "company": row["company"],
+            "role": row["role"],
+            "report": row_report_num(row.get("report", ""), row.get("notes", "")),
+        })
+    return additions
+
+
+def _warn_on_lost_additions(before: list[dict], career_ops: Path,
                             tracker_dir: Path, merge_output: str = "") -> None:
-    """Report evaluations that left tracker-additions/ without reaching the
-    tracker.
+    """Report what became of each evaluation that left tracker-additions/.
 
     merge-tracker declines a row it can't read confidently — an unreadable score
     cell, a report number marked `failed` in batch-state.tsv — and archives the
@@ -710,42 +799,100 @@ def _warn_on_lost_additions(before: dict[str, list[str]], career_ops: Path,
     messages come in half a dozen phrasings and at least one of them is BENIGN
     (a re-eval that produced no score deliberately keeps the row's existing
     score — a case `_normalize_score_cell`'s N/A output makes more likely, not
-    less). "Did the row land?" has one answer and upstream cannot reword it."""
+    less). "Did the row land?" has one answer and upstream cannot reword it.
+
+    But it has TWO readings, and asking only for company::role made this cry wolf
+    on three intact evaluations in a real run (#152): each had been merged into an
+    existing row on a heuristic tier, which keeps that row's title, so the key the
+    addition carried was not the key it landed under. A guard that fires on intact
+    rows camouflages the loss it exists to catch, so an addition found under
+    EITHER identity counts as landed. The substitution gets its own line, because
+    it is real information nothing else surfaces: the fuzzy tier can fold two
+    genuinely distinct reqs (a leveled title and its sibling) into one row, and
+    from then on only one of them is visible to dedup, the handoff and the UI."""
     if not before:
         return
-    still_pending = set(_pending_addition_keys(tracker_dir))
-    landed = _tracker_keys(career_ops / "data" / "applications.md")
-    lost = {key: names for key, names in before.items()
-            if key not in still_pending and key not in landed}
-    if not lost:
-        return
-    print(f"[batch] WARNING: {sum(len(n) for n in lost.values())} evaluation(s) left "
-          "batch/tracker-additions/ without reaching applications.md — their "
-          "reports are on disk but the roles are invisible to the UI and to the "
-          "handoff, and no later run retries them. The TSVs are in "
-          "batch/tracker-additions/merged/:")
-    for key, names in sorted(lost.items()):
-        print(f"[batch]   {', '.join(names)} ({key.replace('::', ' / ')})")
-    # merge-tracker's stdout is captured, so the one line saying WHY it refused
-    # each row would otherwise be unreachable — in a cloud run the log is all
-    # the operator has.
-    reasons = [l.strip() for l in merge_output.splitlines() if "Skipping" in l]
-    if reasons:
-        print("[batch] merge-tracker's reasons:")
-        for line in reasons:
-            print(f"[batch]   {line}")
+    # The directory entry is the whole question here — a TSV merge-tracker
+    # processed is one it moved into merged/ under the same name — so this is a
+    # listing, not a re-read of every file `before` already parsed.
+    still_pending = {f.name for f in tracker_dir.glob("*.tsv")}
+    landed, role_by_report = _tracker_identities(career_ops / "data" / "applications.md")
+
+    lost: list[dict] = []
+    retitled: list[tuple[dict, str]] = []
+    for add in before:
+        if add["name"] in still_pending:
+            continue                      # never processed; a later run retries it
+        # The two readings, side by side. Either one finding the row means the
+        # evaluation is in the tracker.
+        if _addition_key(add["company"], add["role"]) in landed:
+            continue
+        key = _report_key(add["company"], add["report"]) if add["report"] else None
+        # `in`, not truthiness of the title: a tracker row with a blank Role cell
+        # (hand-added, or half-migrated) matched here would otherwise be read as
+        # no match at all, and an intact evaluation would get the loud loss
+        # warning — the #152 cry-wolf back again by a different route.
+        if key in role_by_report:
+            retitled.append((add, role_by_report[key]))
+        else:
+            lost.append(add)
+
+    if lost:
+        print(f"[batch] WARNING: {len(lost)} evaluation(s) left "
+              "batch/tracker-additions/ without reaching applications.md — their "
+              "reports are on disk but the roles are invisible to the UI and to the "
+              "handoff, and no later run retries them. The TSVs are in "
+              "batch/tracker-additions/merged/:")
+        for add in lost:
+            print(f"[batch]   {add['name']} ({add['company']} — {add['role']})")
+        # merge-tracker's output is captured, so the one line saying WHY it
+        # refused each row would otherwise be unreachable — in a cloud run the
+        # log is all the operator has. `merge_output` must therefore carry
+        # stderr: every refusal but one is a console.warn.
+        reasons = [l.strip() for l in merge_output.splitlines() if "Skipping" in l]
+        if reasons:
+            print("[batch] merge-tracker's reasons:")
+            for line in reasons:
+                print(f"[batch]   {line}")
+
+    if retitled:
+        print(f"[batch] note: {len(retitled)} evaluation(s) merged into an existing "
+              "tracker row that kept its own role title — merge-tracker matched them "
+              "on a guessed tier (entry number, or fuzzy title), where it will not "
+              "let an addition rewrite a title. Nothing was lost: the report link "
+              "and score wrote through. Worth a look, because a fuzzy match can fold "
+              "two genuinely distinct reqs into one row:")
+        for add, row_role in retitled:
+            print(f"[batch]   {add['name']}: {add['company']} — "
+                  f'"{add["role"]}" merged into "{row_role}" (report {add["report"]})')
 
 
-def _tracker_keys(applications_md: Path) -> set[str]:
-    """The company::role identity of every data row in the tracker."""
+def _tracker_identities(applications_md: Path) -> tuple[set[str], dict[str, str]]:
+    """The two identities every tracker data row can be found by, in one walk:
+    the set of company::role keys, and {company::report_num: that row's role}.
+
+    The role title comes back with the report key rather than a bare `True`
+    because it is what makes the retitle line above readable — the operator needs
+    to see which existing row swallowed the addition to judge whether the pairing
+    was right."""
+    keys: set[str] = set()
+    role_by_report: dict[str, str] = {}
     if not applications_md.exists():
-        return set()
-    keys = set()
+        return keys, role_by_report
     for columns, cells in data_rows(read_text(applications_md)):
-        company_idx, role_idx = columns.index("company"), columns.index("role")
-        if len(cells) > role_idx:
-            keys.add(_addition_key(cells[company_idx], cells[role_idx]))
-    return keys
+        # By name, as every tracker reader here does: the optional Via column
+        # shifts Role right by one, and read positionally the agency lands where
+        # the role belongs. Zipping is also the width guard — a row too short to
+        # reach Role has no Role key, and Report/Notes are optional columns.
+        row = dict(zip(columns, cells))
+        if "role" not in row:
+            continue
+        company, role = row["company"], row["role"]
+        keys.add(_addition_key(company, role))
+        num = row_report_num(row.get("report", ""), row.get("notes", ""))
+        if num:
+            role_by_report.setdefault(_report_key(company, num), role.strip())
+    return keys, role_by_report
 
 
 def _hint_missing_node_modules(stderr: str) -> None:
