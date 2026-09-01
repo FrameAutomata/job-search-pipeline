@@ -8,6 +8,7 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
+    sanitize_addition,
     _inject_req_id_into_notes,
     _normalize_score_cell,
     _pending_additions,
@@ -990,3 +991,89 @@ class TestInjectReqIdIntoNotes:
                          reports, tracker, "2026-08-25")
         notes = (tracker / "3.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")[-1]
         assert notes == "req 88214 — https://x/j/3 — APPLY strong match"
+
+
+
+class TestSanitizePendingAdditions:
+    """`--batch` routes through career-ops' own runner, where the agent CLI
+    writes each tracker-additions TSV directly and never enters Python — so none
+    of the chain ran on those rows. An unreadable score cell got the row REFUSED
+    and archived (exit 0, never retried), which is permanent loss. Sanitizing at
+    the merge is the choke point every writer funnels through."""
+
+    CLI_ROW = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer | Remote\tEvaluated\t4.2\t"
+               "null\t[229](reports/229-acme.md)\tAPPLY strong match")
+
+    def _career_ops(self, tmp_path, row=CLI_ROW, jd="Job ID: 88214", queued=True):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        additions = co / "batch" / "tracker-additions"
+        additions.mkdir(parents=True)
+        (additions / "7.tsv").write_text(row + "\n", encoding="utf-8")
+        (co / "batch" / "jds").mkdir()
+        (co / "batch" / "jds" / "7.txt").write_text(jd, encoding="utf-8")
+        if queued:
+            (co / "batch" / "batch-input.tsv").write_text(
+                "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
+                encoding="utf-8")
+        return co, additions
+
+    def _cells(self, additions):
+        return (additions / "7.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
+
+    def _run(self, co, mocker):
+        mocker.patch("pipeline._batch_common.subprocess.run",
+                     return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""))
+        run_merge_tracker(co)
+
+    def test_repairs_a_row_no_python_writer_touched(self, tmp_path, mocker):
+        co, additions = self._career_ops(tmp_path)
+        self._run(co, mocker)
+        cells = self._cells(additions)
+        assert cells[3] == "Platform Engineer"          # pipe suffix stripped
+        assert cells[5] == "4.2/5"                      # merge-tracker can read it
+        assert cells[8] == "req 88214 — https://x/j/7 — APPLY strong match"
+
+    def test_says_so(self, tmp_path, mocker, capsys):
+        """In a cloud run the log is all the operator has."""
+        co, _ = self._career_ops(tmp_path)
+        self._run(co, mocker)
+        assert "sanitized 1 addition" in capsys.readouterr().out
+
+    def test_a_row_already_sanitized_is_left_exactly_alone(self, tmp_path, mocker, capsys):
+        """The chain runs at two points and must not be two mechanisms: an
+        `--evaluate-batch` row arrives here already correct."""
+        done = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.2/5\tnull\t"
+                "[229](reports/229-acme.md)\treq 88214 — https://x/j/7 — APPLY strong match")
+        co, additions = self._career_ops(tmp_path, row=done)
+        self._run(co, mocker)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == done + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_a_row_with_no_queue_entry_still_gets_what_it_can(self, tmp_path, mocker):
+        """No batch-input row means no URL to recover — the score and the req id
+        do not depend on it, and a partial repair beats none."""
+        co, additions = self._career_ops(tmp_path, queued=False)
+        self._run(co, mocker)
+        cells = self._cells(additions)
+        assert cells[5] == "4.2/5"
+        assert cells[8] == "req 88214 — APPLY strong match"
+
+    def test_a_pipe_delimited_row_is_left_alone(self, tmp_path, mocker):
+        """merge-tracker parses that shape natively; every step here splits on
+        tabs. Rewriting it would change which of upstream's parsers reads it."""
+        piped = "| 11 | 2026-09-01 | Acme Corp | Platform Engineer | Evaluated | 4.2 | null | [229](reports/229-acme.md) | note |"
+        co, additions = self._career_ops(tmp_path, row=piped)
+        self._run(co, mocker)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == piped + "\n"
+
+
+class TestSanitizeAddition:
+    def test_is_idempotent(self):
+        """What lets the chain run on the write path AND at the merge without
+        being two mechanisms."""
+        raw = ("11\t2026-09-01\tAcme\tPlatform Engineer | Remote\tEvaluated\t4.2\tnull\t"
+               "[229](reports/229-a.md)\tAPPLY")
+        once = sanitize_addition(raw, "https://x/j", "Job ID: 88214")
+        assert sanitize_addition(once, "https://x/j", "Job ID: 88214") == once

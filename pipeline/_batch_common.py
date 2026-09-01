@@ -674,13 +674,8 @@ def write_job_result(
     if report_content:
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
     if tracker_tsv:
-        tracker_tsv = _restore_trailing_cells(tracker_tsv)
-        tracker_tsv = _strip_role_pipe(tracker_tsv)
-        tracker_tsv = _normalize_score_cell(tracker_tsv)
-        tracker_tsv = _inject_url_into_notes(tracker_tsv, job_meta.get("url", ""))
-        # After the URL, so the id ends up ahead of it in the cell.
-        tracker_tsv = _inject_req_id_into_notes(
-            tracker_tsv, extract_req_id(job_meta.get("jd_text", "")))
+        tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
+                                        job_meta.get("jd_text", ""))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {
@@ -796,6 +791,87 @@ def ensure_applications_md(career_ops: Path) -> Path:
     return apps_md
 
 
+def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "") -> str:
+    """Turn a model's tracker row into one merge-tracker can read, and read
+    correctly. The whole chain, in the one order that works.
+
+    Each step is documented at its own definition; the ORDER is the part that
+    only makes sense here. Trailing cells are restored first because every guard
+    below counts columns; the role's pipe suffix goes before anything reads the
+    role; the score is normalized before merge-tracker has to tell it from the
+    status; and the req id is prepended AFTER the URL so it ends up ahead of it
+    in the cell, where `extractReqNumber`'s first-match rule finds it.
+
+    **Idempotent**, which is what lets it run at two points without a second
+    mechanism: padding a nine-column row does nothing, the pipe strip has nothing
+    left to strip, a normalized score re-normalizes to itself, and both injectors
+    bail when their content is already present."""
+    row = _restore_trailing_cells(tracker_tsv)
+    row = _strip_role_pipe(row)
+    row = _normalize_score_cell(row)
+    row = _inject_url_into_notes(row, url)
+    return _inject_req_id_into_notes(row, extract_req_id(jd_text))
+
+
+def _batch_input_urls(batch_input: Path) -> dict[str, str]:
+    """{job id: posting URL} from batch-input.tsv — how a row written outside
+    Python gets its URL back at merge time. The addition file is `{id}.tsv` and
+    the queue is keyed by the same id."""
+    urls: dict[str, str] = {}
+    if not batch_input.exists():
+        return urls
+    try:
+        with open(batch_input, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f, delimiter="\t"):
+                jid, url = (row.get("id") or "").strip(), (row.get("url") or "").strip()
+                if jid and url:
+                    urls[jid] = url
+    except OSError:
+        pass
+    return urls
+
+
+def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> int:
+    """Apply `sanitize_addition` to every un-merged addition on disk, whoever
+    wrote it. Returns how many files changed.
+
+    `write_job_result` covers the rows this pipeline's Python produces, but it is
+    not the only writer: `--batch` routes through career-ops' own
+    `batch-runner.sh`, which owns `tracker-additions/` and lets the agent CLI
+    write each TSV directly, never entering Python. Those rows reached
+    merge-tracker with none of the chain applied — no score normalization, so an
+    unreadable score cell got the row REFUSED and archived (exit 0, never
+    retried); no URL, so the UI's "Open posting" link rendered as `#`; and no req
+    id, so two levels of one title folded. A prompt rule is not something a local
+    model reliably honours, which is exactly what that path was relying on.
+
+    Here rather than in each writer, because this is the choke point every writer
+    funnels through — and it can be, only because the chain is idempotent: a row
+    already sanitized on the write path passes through unchanged. Both readings
+    are recovered by job id, which is the addition's own filename: the URL from
+    `batch-input.tsv`, the JD from `batch/jds/{id}.txt`.
+
+    A pipe-delimited row is left alone. merge-tracker parses that shape natively,
+    while every step here splits on tabs and no-ops on it — rewriting it into a
+    TSV would change which of upstream's two parsers reads the row, for no gain
+    the sanitizers can deliver."""
+    urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
+    jds = career_ops / "batch" / "jds"
+    changed = 0
+    for f in sorted(tracker_dir.glob("*.tsv")):
+        raw = read_text(f)
+        if not raw.strip():
+            continue
+        fixed = sanitize_addition(raw, urls.get(f.stem, ""), read_text(jds / f"{f.stem}.txt"))
+        if fixed != raw:
+            try:
+                atomic_write_text(f, fixed + "\n")
+            except OSError:
+                continue        # a row we could not repair still merges as it is
+            changed += 1
+    return changed
+
+
 def run_merge_tracker(career_ops: Path) -> bool:
     merge_script = career_ops / "merge-tracker.mjs"
     if not merge_script.exists():
@@ -804,6 +880,12 @@ def run_merge_tracker(career_ops: Path) -> bool:
     # fresh run (see ensure_applications_md).
     ensure_applications_md(career_ops)
     tracker_dir = career_ops / "batch" / "tracker-additions"
+    # Before the snapshot: sanitizing can change the role cell (a pipe suffix),
+    # which is half the identity the loss guard matches on.
+    repaired = _sanitize_pending_additions(career_ops, tracker_dir)
+    if repaired:
+        print(f"[batch] sanitized {repaired} addition(s) written outside the "
+              "Python path (score/URL/req-id)")
     before = _pending_additions(tracker_dir)
     print("[batch] running merge-tracker.mjs...")
     r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")

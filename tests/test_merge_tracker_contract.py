@@ -259,3 +259,51 @@ class TestReqIdOverridesTheFuzzyTitleMatch:
         tracker, _, _, _ = levelled_apart
         added = [l for l in tracker.splitlines() if "INSURANCE SPECIALIST I |" in l]
         assert added and "req 5002" in added[0]
+
+
+# A row shaped the way an agent CLI writes one on the `--batch` path: the score
+# cell as "4.2" rather than "4.2/5". Nothing in Python touched it, because
+# career-ops' batch-runner.sh owns tracker-additions/ on that path.
+CLI_ROW = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t{score}\tnull\t"
+           "[229](reports/229-acme.md)\tAPPLY strong match\n")
+EMPTY_TRACKER = HEADER
+
+
+@pytest.fixture(scope="module")
+def unsanitized(tmp_path_factory):
+    return _merge(tmp_path_factory.mktemp("raw"), EMPTY_TRACKER,
+                  {"7.tsv": CLI_ROW.format(score="4.2")})
+
+
+@pytest.fixture(scope="module")
+def sanitized(tmp_path_factory):
+    from pipeline._batch_common import sanitize_addition
+    return _merge(tmp_path_factory.mktemp("fixed"), EMPTY_TRACKER,
+                  {"7.tsv": sanitize_addition(CLI_ROW.format(score="4.2"),
+                                              "https://x/j/7", "Job ID: 88214") + "\n"})
+
+
+class TestUnsanitizedRowsAreRefused:
+    """Why `_sanitize_pending_additions` exists, proven against the real script
+    rather than asserted. If upstream ever starts accepting a bare `4.2`, the
+    first test fails — and that is the notification, not a reason to relax it."""
+
+    def test_a_bare_score_gets_the_row_refused_and_archived(self, unsanitized):
+        """Refused, archived into merged/, exit 0 — so nothing ever retries it.
+        That is the permanent loss the `--batch` path was exposed to."""
+        tracker, _, additions, r = unsanitized
+        assert "Platform Engineer" not in tracker            # never reached the tracker
+        assert "Skipping" in r.stderr
+        assert (additions / "merged" / "7.tsv").exists()      # gone from the queue
+        assert r.returncode == 0                             # and no error to notice
+
+    def test_the_same_row_sanitized_merges(self, sanitized):
+        tracker, _, _, r = sanitized
+        assert "Platform Engineer" in tracker and "4.2/5" in tracker
+        assert "➕ Add" in r.stdout
+
+    def test_and_carries_its_url_and_req_id(self, sanitized):
+        """The other two things that path lost: the UI's "Open posting" target,
+        and the id that keeps two levels of one title apart."""
+        tracker, _, _, _ = sanitized
+        assert "https://x/j/7" in tracker and "req 88214" in tracker
