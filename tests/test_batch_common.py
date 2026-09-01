@@ -8,6 +8,8 @@ import pytest
 
 from pipeline._batch_common import (
     _normalize_score_cell,
+    _pending_additions,
+    _warn_on_lost_additions,
     build_system_prompt,
     build_user_message,
     eval_system_prompt,
@@ -392,6 +394,36 @@ class TestRunMergeTracker:
         mock_run.return_value = mocker.MagicMock(returncode=1, stderr="error msg")
         assert run_merge_tracker(career_ops) is False
 
+    def test_refusal_reasons_are_read_off_stderr(self, tmp_path, mocker, capsys):
+        """merge-tracker refuses a row with console.warn — stderr. Reading only
+        stdout left the reasons block empty on every genuine loss, and printed
+        the one refusal it does log to stdout (the benign unscoreable re-eval)
+        as the explanation for a different addition's disappearance.
+        `tests/test_merge_tracker_contract.py` pins the stream itself."""
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        (career_ops / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        additions = career_ops / "batch" / "tracker-additions"
+        (additions / "merged").mkdir(parents=True)
+        (additions / "7.tsv").write_text(
+            "11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.7/5\tnull\t"
+            "[229](reports/229-x.md)\tnote", encoding="utf-8")
+
+        def archive_like_merge_tracker(*a, **kw):
+            """merge-tracker archives a row it refused, and still exits 0."""
+            for f in additions.glob("*.tsv"):
+                f.rename(additions / "merged" / f.name)
+            return mocker.MagicMock(
+                returncode=0, stdout="📊 Existing: 1 entries\n",
+                stderr='⚠️  Skipping 7.tsv: report #229 is marked "failed"\n')
+
+        mocker.patch("pipeline._batch_common.subprocess.run",
+                     side_effect=archive_like_merge_tracker)
+        run_merge_tracker(career_ops)
+        out = capsys.readouterr().out
+        assert "WARNING: 1 evaluation(s)" in out
+        assert 'Skipping 7.tsv: report #229 is marked "failed"' in out
+
     def test_seeds_applications_md_before_merge(self, tmp_path, mocker):
         # Regression: merge-tracker no-ops if applications.md doesn't exist.
         # run_merge_tracker must seed the header first so the merge lands.
@@ -678,3 +710,161 @@ class TestMaxReportNumCountsLocks:
         (reports / "004-acme-2026-01-01.md").write_text("# real", encoding="utf-8")
         (reports / "011-RESERVED.md").write_text('{"pid":1,"token":"x"}', encoding="utf-8")
         assert max_report_num(reports, {}) == 11, "a lock must reserve its number"
+
+
+class TestLostAdditionGuard:
+    """`run_merge_tracker`'s loss guard asks the filesystem "did this evaluation
+    reach applications.md", because merge-tracker archives a row it refused and
+    still exits 0. The question has TWO readings, and asking only for
+    company::role reported three intact evaluations as lost on a real run (#152):
+    merge-tracker's guessed match tiers (entry number, fuzzy title) update the row
+    but keep THAT row's title, so the key the addition carried is not the key it
+    landed under. Verified against the real merge-tracker.mjs — the score and
+    report link write through while the title does not."""
+
+    HEADER = ("# Applications Tracker\n\n"
+              "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+
+    @staticmethod
+    def _addition(tracker_dir, name, company, role, report="229"):
+        (tracker_dir / name).write_text(
+            "\t".join(["11", "2026-09-01", company, role, "Evaluated", "4.7/5", "null",
+                       f"[{report}](reports/{report}-x-2026-09-01.md)", "APPLY — note"]),
+            encoding="utf-8")
+
+    def _setup(self, tmp_path, rows="", header=None):
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        (career_ops / "data" / "applications.md").write_text(
+            (self.HEADER if header is None else header) + rows, encoding="utf-8")
+        tracker_dir = career_ops / "batch" / "tracker-additions"
+        (tracker_dir / "merged").mkdir(parents=True)
+        return career_ops, tracker_dir
+
+    @staticmethod
+    def _row(company, role, report="229", score="4.7/5"):
+        return (f"| 10 | 2026-09-01 | {company} | {role} | {score} | Evaluated | ❌ "
+                f"| [{report}](../reports/{report}-x-2026-09-01.md) | note |\n")
+
+    def _run(self, career_ops, tracker_dir, capsys, merge_output=""):
+        """Snapshot the pending additions, archive them the way merge-tracker
+        does, then report — the real sequence around the subprocess call."""
+        before = _pending_additions(tracker_dir)
+        for f in tracker_dir.glob("*.tsv"):
+            f.rename(tracker_dir / "merged" / f.name)
+        _warn_on_lost_additions(before, career_ops, tracker_dir, merge_output)
+        return capsys.readouterr().out
+
+    def test_retitled_row_is_not_reported_lost(self, tmp_path, capsys):
+        """The #152 case: merged into an existing row on a fuzzy tier, which
+        keeps the row's own title. Report and company survive; the key doesn't."""
+        career_ops, tracker_dir = self._setup(
+            tmp_path, self._row("UT Southwestern Medical Center", "INSURANCE SPECIALIST II"))
+        self._addition(tracker_dir, "123.tsv", "UT Southwestern Medical Center",
+                       "INSURANCE SPECIALIST I")
+        out = self._run(career_ops, tracker_dir, capsys)
+        assert "WARNING" not in out
+        assert "123.tsv" in out
+        assert "INSURANCE SPECIALIST I" in out and "INSURANCE SPECIALIST II" in out
+
+    def test_landed_under_its_own_identity_is_silent(self, tmp_path, capsys):
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Acme Corp", "Platform Engineer"))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
+        assert self._run(career_ops, tracker_dir, capsys) == ""
+
+    def test_unscoreable_reeval_keeps_the_rows_old_report_and_stays_silent(self, tmp_path, capsys):
+        """merge-tracker deliberately keeps the row's score, report and PDF when a
+        re-eval produces no score. The new report number never lands, so only the
+        company::role reading can see this one — which is why both are kept."""
+        career_ops, tracker_dir = self._setup(
+            tmp_path, self._row("Acme Corp", "Platform Engineer", report="200", score="4.0/5"))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer", report="229")
+        assert self._run(career_ops, tracker_dir, capsys) == ""
+
+    def test_genuinely_lost_addition_still_warns(self, tmp_path, capsys):
+        """Neither identity in the tracker, and the TSV is gone from the queue —
+        merge-tracker refused it (a `failed` report number, an unreadable score)
+        and archived it anyway, so nothing retries it."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Initech", "SRE", report="200"))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
+        out = self._run(career_ops, tracker_dir, capsys,
+                        merge_output='⚠️  Skipping 7.tsv: report #229 is marked "failed"')
+        assert "WARNING: 1 evaluation(s)" in out
+        assert "7.tsv (Acme Corp — Platform Engineer)" in out
+        assert 'Skipping 7.tsv' in out          # merge-tracker's own reason, captured
+
+    def test_report_number_alone_does_not_count_as_landed(self, tmp_path, capsys):
+        """Report-file and tracker-row sequences drift, so a bare number can name
+        an unrelated row — merge-tracker's own report tier requires the company
+        too (#912 upstream), and so must this."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Initech", "SRE", report="229"))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer", report="229")
+        assert "WARNING: 1 evaluation(s)" in self._run(career_ops, tracker_dir, capsys)
+
+    def test_still_pending_addition_is_not_reported(self, tmp_path, capsys):
+        """merge-tracker leaves a TSV it could not apply in place, so a later run
+        retries it. That is not a loss."""
+        career_ops, tracker_dir = self._setup(tmp_path)
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
+        before = _pending_additions(tracker_dir)      # nothing archived
+        _warn_on_lost_additions(before, career_ops, tracker_dir)
+        assert capsys.readouterr().out == ""
+
+    def test_two_additions_sharing_one_key_are_reported_separately(self, tmp_path, capsys):
+        """A re-evaluation of a queued role puts two TSVs under one company::role.
+        Collapsing them sends the operator after one report while the other stays
+        buried."""
+        career_ops, tracker_dir = self._setup(tmp_path)
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer", report="229")
+        self._addition(tracker_dir, "8.tsv", "Acme Corp", "Platform Engineer", report="230")
+        out = self._run(career_ops, tracker_dir, capsys)
+        assert "WARNING: 2 evaluation(s)" in out
+        assert "7.tsv" in out and "8.tsv" in out
+
+    def test_blank_role_in_the_matched_row_is_not_a_loss(self, tmp_path, capsys):
+        """A tracker row with an empty Role cell (hand-added, half-migrated) is
+        still a row the addition merged into. Testing the matched title for
+        truthiness rather than the key for membership put this back in the loud
+        WARNING — the #152 cry-wolf by another route."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Acme Corp", ""))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
+        out = self._run(career_ops, tracker_dir, capsys)
+        assert "WARNING" not in out
+        assert "7.tsv" in out
+
+    def test_pipe_delimited_addition_is_still_seen(self, tmp_path, capsys):
+        """A model that ignores the prompt's tab rule and emits a markdown row
+        produces a file merge-tracker reads — and can therefore refuse and
+        archive. Splitting on tabs alone made that addition invisible here, so
+        its loss would have been silent, uncounted and unnamed."""
+        career_ops, tracker_dir = self._setup(tmp_path, self._row("Initech", "SRE", report="200"))
+        (tracker_dir / "7.tsv").write_text(
+            "| 11 | 2026-09-01 | Acme Corp | Platform Engineer | Evaluated | 4.7/5 "
+            "| null | [229](reports/229-x.md) | note |", encoding="utf-8")
+        out = self._run(career_ops, tracker_dir, capsys)
+        assert "WARNING: 1 evaluation(s)" in out
+        assert "7.tsv (Acme Corp — Platform Engineer)" in out
+
+    def test_report_zero_is_not_an_identity(self, tmp_path, capsys):
+        """`000` is what write_job_result writes when it has NO number, and
+        merge-tracker's own `if (reportNum && …)` treats 0 as absent. Reading it
+        as an identity would let two numberless additions at one company be
+        taken for the same evaluation, and report a real loss as a retitle."""
+        career_ops, tracker_dir = self._setup(
+            tmp_path, self._row("Acme Corp", "Other Role", report="000"))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer", report="000")
+        assert "WARNING: 1 evaluation(s)" in self._run(career_ops, tracker_dir, capsys)
+
+    def test_via_layout_is_read_by_header_name(self, tmp_path, capsys):
+        """The tracker's optional Via column shifts Role right by one. Read
+        positionally the agency lands where the role belongs, and every addition
+        looks lost."""
+        career_ops, tracker_dir = self._setup(tmp_path, header=(
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Via | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|-----|------|-------|--------|-----|--------|-------|\n"
+            "| 10 | 2026-09-01 | Acme Corp | Hays | Platform Engineer | 4.7/5 | Evaluated | ❌ "
+            "| [229](../reports/229-x-2026-09-01.md) | note |\n"))
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
+        assert self._run(career_ops, tracker_dir, capsys) == ""

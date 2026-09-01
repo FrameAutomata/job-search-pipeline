@@ -12,6 +12,7 @@ import threading
 from pathlib import Path
 
 from pipeline._batch_common import (
+    ADDITION_COLUMNS,
     atomic_write_text,
     normalize_company,
     read_url_set,
@@ -373,10 +374,15 @@ def canonical_status(raw: str, vocabulary: tuple | None = None) -> str:
 # pipeline/tracker_layout.py, which both this module and bridge.py share.
 _COLUMNS = list(CANONICAL_COLUMNS)
 
-# Tracker-additions TSV column order — note status comes BEFORE score here
-# (merge-tracker.mjs swaps them when merging into applications.md):
-#   num \t date \t company \t role \t status \t score \t pdf \t report \t notes
-_TRACKER_COLUMNS = ["num", "date", "company", "role", "status", "score", "pdf", "report", "notes"]
+# Tracker-additions TSV column order — from the module that WRITES that file,
+# so a reader and its writer cannot disagree about the layout. Note status comes
+# BEFORE score here (merge-tracker.mjs swaps them when merging into
+# applications.md).
+# `list(...)`, matching `_COLUMNS` above: sharing the writer's mutable
+# list would let an in-place edit in either module silently redefine the
+# other's layout — while `_TRACKER_TSV_COLUMNS` there was snapshotted at
+# import, so the sanitizers would keep enforcing the old width.
+_TRACKER_COLUMNS = list(ADDITION_COLUMNS)
 
 # Pull the report number + relative path out of the Report cell, which holds a
 # markdown link like: [042](reports/042-acme-2026-05-27.md)

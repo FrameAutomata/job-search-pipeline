@@ -265,3 +265,34 @@ def data_rows(text: str):
         cells = split_row(line)
         if not is_header_row(cells, aliases):
             yield columns, cells
+
+
+# The `[N]` of a report link. Two places carry one, and merge-tracker reads both
+# (`extractReportNum`): the Report cell, then — for a customized tracker with no
+# Report column, where its own `buildRow` puts the link instead — a report link
+# in Notes. The Notes pattern is scoped to `reports/` so a posting URL sitting in
+# the same prose cell cannot be read as a report number.
+_REPORT_NUM_RE = re.compile(r"\[(\d+)\]")
+_NOTES_REPORT_NUM_RE = re.compile(r"\[(\d+)\]\([^)]*reports/[^)]+\)")
+
+
+def report_num(report_cell: str, notes_cell: str = "") -> str:
+    """The report number a tracker row claims, unpadded, or "".
+
+    Unpadded because this answers "WHICH report is this row", and the pipeline
+    mints numbers zero-padded (`f"{n:03d}"`) while other writers emit `str(n)` —
+    so `[003]` and `[3]` have to be one key or an identity check on them silently
+    fails. Deliberately NOT the same reader as `app/data.py:_report_link`, which
+    answers "parse this link into its parts" and must keep the number verbatim
+    beside the path it feeds (report rendering, and a renumber that rewrites the
+    cell by string). Same distinction as `max_report_num` vs `find_report_file`:
+    consistency between them would be a bug, not a tidy-up.
+
+    `[000]` reads as ABSENT, not as report zero, mirroring merge-tracker's own
+    `if (reportNum && …)` — its `parseInt` makes 0 falsy, so it never matches on
+    it. Numbering starts at 1, and `000` is what `write_job_result` writes when
+    it has no number at all; treating that as an identity would let two
+    numberless additions at one company be read as the same evaluation."""
+    m = (_REPORT_NUM_RE.search(report_cell or "")
+         or _NOTES_REPORT_NUM_RE.search(notes_cell or ""))
+    return str(int(m.group(1))) if m and int(m.group(1)) else ""
