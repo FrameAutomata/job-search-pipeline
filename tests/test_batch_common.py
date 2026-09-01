@@ -8,6 +8,7 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
+    _sanitize_pending_additions,
     sanitize_addition,
     _inject_req_id_into_notes,
     _normalize_score_cell,
@@ -577,9 +578,9 @@ class TestEvalSystemPrompt:
         assert "EVALUATION FRAMEWORK" in result
 
 
-def _tracker_row(score="4.2/5", status="Evaluated", notes="note"):
+def _tracker_row(score="4.2/5", status="Evaluated", notes="note", role="SRE"):
     """One nine-field tracker-additions row, the shape write_job_result emits."""
-    return "\t".join(["3", "2026-08-25", "Initech", "SRE", status,
+    return "\t".join(["3", "2026-08-25", "Initech", role, status,
                       score, "null", "[003](reports/003-x.md)", notes])
 
 
@@ -995,78 +996,106 @@ class TestInjectReqIdIntoNotes:
 
 
 class TestSanitizePendingAdditions:
-    """`--batch` routes through career-ops' own runner, where the agent CLI
-    writes each tracker-additions TSV directly and never enters Python — so none
-    of the chain ran on those rows. An unreadable score cell got the row REFUSED
-    and archived (exit 0, never retried), which is permanent loss. Sanitizing at
-    the merge is the choke point every writer funnels through."""
+    """career-ops' own evaluators write straight into tracker-additions/, never
+    entering Python — so those rows reached a merge with none of the chain
+    applied, and an unreadable score cell got the row REFUSED and archived
+    (exit 0, never retried), which is permanent loss."""
 
-    CLI_ROW = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer | Remote\tEvaluated\t4.2\t"
-               "null\t[229](reports/229-acme.md)\tAPPLY strong match")
+    CLI_ROW = _tracker_row(role="Platform Engineer | Remote", score="4.2",
+                           notes="APPLY strong match")
 
-    def _career_ops(self, tmp_path, row=CLI_ROW, jd="Job ID: 88214", queued=True):
+    def _tree(self, tmp_path, rows=None, queued=True):
         co = tmp_path / "career-ops"
-        (co / "data").mkdir(parents=True)
-        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
         additions = co / "batch" / "tracker-additions"
         additions.mkdir(parents=True)
-        (additions / "7.tsv").write_text(row + "\n", encoding="utf-8")
         (co / "batch" / "jds").mkdir()
-        (co / "batch" / "jds" / "7.txt").write_text(jd, encoding="utf-8")
+        for name, row in (rows or {"7.tsv": self.CLI_ROW}).items():
+            (additions / name).write_text(row + "\n", encoding="utf-8")
+            (co / "batch" / "jds" / f"{Path(name).stem}.txt").write_text(
+                "Job ID: 88214", encoding="utf-8")
         if queued:
             (co / "batch" / "batch-input.tsv").write_text(
                 "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
                 encoding="utf-8")
         return co, additions
 
-    def _cells(self, additions):
-        return (additions / "7.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
+    @staticmethod
+    def _cells(additions, name="7.tsv"):
+        return (additions / name).read_text(encoding="utf-8").rstrip("\n").split("\t")
 
-    def _run(self, co, mocker):
-        mocker.patch("pipeline._batch_common.subprocess.run",
-                     return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""))
-        run_merge_tracker(co)
-
-    def test_repairs_a_row_no_python_writer_touched(self, tmp_path, mocker):
-        co, additions = self._career_ops(tmp_path)
-        self._run(co, mocker)
+    def test_repairs_a_row_no_python_writer_touched(self, tmp_path):
+        co, additions = self._tree(tmp_path)
+        _sanitize_pending_additions(co, additions)
         cells = self._cells(additions)
         assert cells[3] == "Platform Engineer"          # pipe suffix stripped
         assert cells[5] == "4.2/5"                      # merge-tracker can read it
         assert cells[8] == "req 88214 — https://x/j/7 — APPLY strong match"
 
-    def test_says_so(self, tmp_path, mocker, capsys):
+    def test_says_so(self, tmp_path, capsys):
         """In a cloud run the log is all the operator has."""
-        co, _ = self._career_ops(tmp_path)
-        self._run(co, mocker)
+        co, additions = self._tree(tmp_path)
+        _sanitize_pending_additions(co, additions)
         assert "sanitized 1 addition" in capsys.readouterr().out
 
-    def test_a_row_already_sanitized_is_left_exactly_alone(self, tmp_path, mocker, capsys):
-        """The chain runs at two points and must not be two mechanisms: an
-        `--evaluate-batch` row arrives here already correct."""
-        done = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t4.2/5\tnull\t"
-                "[229](reports/229-acme.md)\treq 88214 — https://x/j/7 — APPLY strong match")
-        co, additions = self._career_ops(tmp_path, row=done)
-        self._run(co, mocker)
+    def test_a_row_already_sanitized_is_left_exactly_alone(self, tmp_path, capsys):
+        """The chain runs at two points and must not be two mechanisms."""
+        done = _tracker_row(score="4.2/5",
+                            notes="req 88214 — https://x/j/7 — APPLY strong match")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": done})
+        _sanitize_pending_additions(co, additions)
         assert (additions / "7.tsv").read_text(encoding="utf-8") == done + "\n"
         assert "sanitized" not in capsys.readouterr().out
 
-    def test_a_row_with_no_queue_entry_still_gets_what_it_can(self, tmp_path, mocker):
-        """No batch-input row means no URL to recover — the score and the req id
-        do not depend on it, and a partial repair beats none."""
-        co, additions = self._career_ops(tmp_path, queued=False)
-        self._run(co, mocker)
+    def test_the_rows_own_trailing_url_is_preferred_over_a_lookup(self, tmp_path):
+        """career-ops' batch worker is told to append the URL as a 10th field, so
+        on the path this exists for it is already in the row — no lookup, and no
+        dependence on the filename being a job id."""
+        co, additions = self._tree(
+            tmp_path, rows={"229-acme.tsv": self.CLI_ROW + "\thttps://own/j/9"},
+            queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert "https://own/j/9" in self._cells(additions, "229-acme.tsv")[8]
+
+    def test_a_ten_column_row_gets_its_score_fixed(self, tmp_path):
+        """Nine columns is OUR prompt's shape; career-ops tells its own worker to
+        write nine PLUS a trailing url, and merge-tracker parses that natively. A
+        `== 9` guard skipped the score normalization while the pipe strip still
+        rewrote the row — so the repair was COUNTED and the row refused anyway."""
+        co, additions = self._tree(
+            tmp_path, rows={"7.tsv": self.CLI_ROW + "\thttps://own/j/9"})
+        _sanitize_pending_additions(co, additions)
         cells = self._cells(additions)
         assert cells[5] == "4.2/5"
-        assert cells[8] == "req 88214 — APPLY strong match"
+        assert cells[9] == "https://own/j/9"            # extras carried through
 
-    def test_a_pipe_delimited_row_is_left_alone(self, tmp_path, mocker):
+    def test_an_unknown_filename_still_gets_the_score_repair(self, tmp_path):
+        """career-ops' other writers name additions `{num}-{slug}.tsv`, so the
+        job-id lookups find nothing. The repair that does not depend on them must
+        still happen."""
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": self.CLI_ROW},
+                                   queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert self._cells(additions, "229-acme.tsv")[5] == "4.2/5"
+
+    def test_a_pipe_delimited_row_is_left_alone(self, tmp_path):
         """merge-tracker parses that shape natively; every step here splits on
         tabs. Rewriting it would change which of upstream's parsers reads it."""
         piped = "| 11 | 2026-09-01 | Acme Corp | Platform Engineer | Evaluated | 4.2 | null | [229](reports/229-acme.md) | note |"
-        co, additions = self._career_ops(tmp_path, row=piped)
-        self._run(co, mocker)
+        co, additions = self._tree(tmp_path, rows={"7.tsv": piped})
+        _sanitize_pending_additions(co, additions)
         assert (additions / "7.tsv").read_text(encoding="utf-8") == piped + "\n"
+
+    def test_run_merge_tracker_wires_it_in(self, tmp_path, mocker):
+        """The one test that goes through the merge: sanitizing must happen, and
+        must happen BEFORE the loss guard's snapshot, since stripping a role's
+        pipe suffix changes half the identity that guard matches on."""
+        co, additions = self._tree(tmp_path)
+        (co / "data").mkdir(parents=True)
+        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        mocker.patch("pipeline._batch_common.subprocess.run",
+                     return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""))
+        run_merge_tracker(co)
+        assert self._cells(additions)[5] == "4.2/5"
 
 
 class TestSanitizeAddition:

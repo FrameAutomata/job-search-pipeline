@@ -266,19 +266,18 @@ class TestReqIdOverridesTheFuzzyTitleMatch:
 # career-ops' batch-runner.sh owns tracker-additions/ on that path.
 CLI_ROW = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t{score}\tnull\t"
            "[229](reports/229-acme.md)\tAPPLY strong match\n")
-EMPTY_TRACKER = HEADER
 
 
 @pytest.fixture(scope="module")
 def unsanitized(tmp_path_factory):
-    return _merge(tmp_path_factory.mktemp("raw"), EMPTY_TRACKER,
+    return _merge(tmp_path_factory.mktemp("raw"), HEADER,
                   {"7.tsv": CLI_ROW.format(score="4.2")})
 
 
 @pytest.fixture(scope="module")
 def sanitized(tmp_path_factory):
     from pipeline._batch_common import sanitize_addition
-    return _merge(tmp_path_factory.mktemp("fixed"), EMPTY_TRACKER,
+    return _merge(tmp_path_factory.mktemp("fixed"), HEADER,
                   {"7.tsv": sanitize_addition(CLI_ROW.format(score="4.2"),
                                               "https://x/j/7", "Job ID: 88214") + "\n"})
 

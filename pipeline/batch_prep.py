@@ -9,6 +9,7 @@ import csv
 import sys
 from pathlib import Path
 
+from pipeline._batch_common import read_batch_input
 from pipeline.stdio import line_buffer_stdout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,19 +19,19 @@ FIELDNAMES = ["id", "url", "source", "notes"]
 
 def _load_existing(batch_input: Path) -> tuple[int, set[str]]:
     """Return (max_id, seen_urls) from an existing batch-input.tsv."""
-    if not batch_input.exists():
-        return 0, set()
     max_id = 0
     seen: set[str] = set()
-    with open(batch_input, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f, delimiter="\t"):
-            try:
-                max_id = max(max_id, int(row.get("id") or 0))
-            except ValueError:
-                pass
-            url = (row.get("url") or "").strip()
-            if url:
-                seen.add(url)
+    # Through the shared reader: the FORMAT is one fact, the question is ours.
+    # An IO error propagates here deliberately — swallowing it would restart ids
+    # at 1 and re-queue every job already in the file.
+    for row in read_batch_input(batch_input):
+        try:
+            max_id = max(max_id, int(row.get("id") or 0))
+        except ValueError:
+            pass
+        url = (row.get("url") or "").strip()
+        if url:
+            seen.add(url)
     return max_id, seen
 
 
