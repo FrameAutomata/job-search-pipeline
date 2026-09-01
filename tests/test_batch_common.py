@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pipeline._batch_common import (
+    ADDITION_COLUMNS,
     _inject_req_id_into_notes,
     _normalize_score_cell,
     _pending_additions,
@@ -14,9 +15,9 @@ from pipeline._batch_common import (
     build_system_prompt,
     build_user_message,
     eval_system_prompt,
+    extract_req_id,
     extract_tag,
     load_pending,
-    extract_req_id,
     load_state,
     max_report_num,
     max_tracker_num,
@@ -575,10 +576,10 @@ class TestEvalSystemPrompt:
         assert "EVALUATION FRAMEWORK" in result
 
 
-def _tracker_row(score, status="Evaluated"):
+def _tracker_row(score="4.2/5", status="Evaluated", notes="note"):
     """One nine-field tracker-additions row, the shape write_job_result emits."""
     return "\t".join(["3", "2026-08-25", "Initech", "SRE", status,
-                      score, "null", "[003](reports/003-x.md)", "note"])
+                      score, "null", "[003](reports/003-x.md)", notes])
 
 
 class TestNormalizeScoreCell:
@@ -589,11 +590,6 @@ class TestNormalizeScoreCell:
     with no error anywhere. The older merge-tracker's fallback assumed this row
     order, so any score string merged and the prompt's "format X.X/5" rule was
     advisory; it is load-bearing now."""
-
-    @staticmethod
-    def _row(score):
-        return "\t".join(["3", "2026-08-25", "Initech", "SRE", "Evaluated",
-                          score, "null", "[003](reports/003-x.md)", "note"])
 
     def _score_of(self, raw):
         return _normalize_score_cell(_tracker_row(raw)).split("\t")[5]
@@ -645,11 +641,6 @@ class TestNormalizeScoreCell:
 class TestScoreNormalizationDoesNotInvent:
     """The normalizer must never manufacture a score, and never turn a row
     merge-tracker would accept into one it refuses."""
-
-    @staticmethod
-    def _row(score, status="Evaluated"):
-        return "\t".join(["3", "2026-08-25", "Initech", "SRE", status,
-                          score, "null", "[003](reports/003-x.md)", "note"])
 
     @pytest.mark.parametrize("raw", [
         "Top 5%",                 # -> 5/5: a fabricated TOP score, ranked first
@@ -872,7 +863,6 @@ class TestLostAdditionGuard:
         assert self._run(career_ops, tracker_dir, capsys) == ""
 
 
-
 class TestExtractReqId:
     """A req id in the Notes column is what stops merge-tracker's fuzzy title
     match folding two distinct requisitions into one row (#154) — its matcher
@@ -888,14 +878,50 @@ class TestExtractReqId:
         ("job id 65136", "65136"),                     # case-insensitive
         ("Position Number: 00012345", "00012345"),
         ("Job ID: 88214 … and in the footer, Job ID 88214", "88214"),
+        ("Req #1311", "1311"),
+        ("Req # 1311", "1311"),            # `#` and the space are both non-word
+        ("Position #: 12345", "12345"),
     ])
     def test_reads_a_labelled_id(self, jd, expected):
         assert extract_req_id(jd) == expected
 
+    @pytest.mark.parametrize("jd,expected", [
+        ("**Job ID:** 88214", "88214"),
+        ("- **Job ID**: 65136", "65136"),
+        ("Requisition ID: R\\_1488728", "R_1488728"),
+        ("Job ID: JR\\-00124259", "JR-00124259"),
+    ])
+    def test_reads_the_markdown_its_own_cache_is_written_in(self, jd, expected):
+        """JobSpy's description_format defaults to MARKDOWN and scrape.py
+        forwards it, so an Indeed JD is cached as `**Job ID:** 88214` with `_`
+        and `-` backslash-escaped mid-word. LinkedIn's is backfilled as plain
+        text by screen.py — so a pattern written for prose worked on one board
+        and silently never fired on the other."""
+        assert extract_req_id(jd) == expected
+
+    @pytest.mark.parametrize("jd", [
+        "Job ID: 5340-Nurse-Practitioner-Days-FT",          # id + slugged title
+        "Requisition ID REQ-2026-320610000000000000000000",  # not an id at all
+    ])
+    def test_an_overlong_token_is_declined_not_truncated(self, jd):
+        """A bounded capture truncated instead of declining: this yielded
+        `5340-NURSE-PRACTITIONER-` and `REQ-2026-`, and merge-tracker reads the
+        latter back as `REQ-2026` — a different string from the one we wrote, and
+        one that two different reqs sharing a prefix would both produce. Over-long
+        means we cannot tell where the id ends."""
+        assert extract_req_id(jd) == ""
+
+    def test_a_pay_grade_is_not_a_requisition(self):
+        """In public-sector and healthcare postings — the shape this exists for —
+        "Job Code" is a classification shared by every posting of that title. One
+        board's copy stating only that, against another stating a real req id,
+        would split a cross-board pair."""
+        assert extract_req_id("Job Code: 4021 — Insurance Specialist I") == ""
+
     @pytest.mark.parametrize("jd", [
         "This job 2 of 5 in the series",       # a bare label + a number is prose
         "benefits include a 401k plan",
-        "Job Type: Full-time. Remote.",        # no digit in the value
+        "Job Type: Full-time. Remote.",        # `Type` is not a qualifier
         "reference checks required",
         "",
     ])
@@ -904,10 +930,17 @@ class TestExtractReqId:
         human wrote that cell deliberately. A JD is prose we did not write."""
         assert extract_req_id(jd) == ""
 
+    @pytest.mark.parametrize("jd", ["Job ID: TBD", "Requisition Number: Pending"])
+    def test_a_labelled_value_with_no_digit_is_not_an_id(self, jd):
+        """The digit filter, which every other negative case reaches the regex
+        too early to exercise. Without it, "reference number for our EEO policy
+        is 11246" yields `FOR`."""
+        assert extract_req_id(jd) == ""
+
     def test_two_different_ids_are_ambiguous_and_yield_nothing(self):
         """Guessing which one is the requisition splits a row that should fold;
         declining leaves today's behaviour untouched."""
-        assert extract_req_id("Job ID 123 … Reference code ABC9") == ""
+        assert extract_req_id("Job ID 123 … Requisition Number ABC9") == ""
 
     def test_none_of_this_reads_the_boards_own_job_key(self):
         """A `jk=`/`currentJobId` key identifies the POSTING, so a re-post of one
@@ -918,38 +951,40 @@ class TestExtractReqId:
 
 
 class TestInjectReqIdIntoNotes:
-    @staticmethod
-    def _row(notes):
-        return "\t".join(["3", "2026-08-25", "Initech", "SRE", "Evaluated", "4.2/5",
-                          "null", "[003](reports/003-x.md)", notes])
-
     def test_leads_the_cell(self):
         """Ahead of the URL: merge-tracker's extractReqNumber takes the FIRST
         match in the cell, so leading with the resolved id makes the reading
         deterministic rather than dependent on the free-text sentence."""
-        out = _inject_req_id_into_notes(self._row("https://x/j — APPLY"), "R-2291")
+        out = _inject_req_id_into_notes(_tracker_row(notes="https://x/j — APPLY"), "R-2291")
         assert out.split("\t")[-1] == "req R-2291 — https://x/j — APPLY"
 
     def test_empty_notes(self):
-        assert _inject_req_id_into_notes(self._row(""), "5340").split("\t")[-1] == "req 5340"
+        assert _inject_req_id_into_notes(_tracker_row(notes=""), "5340").split("\t")[-1] == "req 5340"
 
     def test_no_id_is_a_no_op(self):
-        row = self._row("APPLY")
+        row = _tracker_row(notes="APPLY")
         assert _inject_req_id_into_notes(row, "") == row
 
     def test_does_not_restate_an_id_the_model_already_wrote(self):
-        row = self._row("req 5340 — APPLY")
+        row = _tracker_row(notes="req 5340 — APPLY")
         assert _inject_req_id_into_notes(row, "5340") == row
 
     def test_malformed_row_is_left_alone(self):
         assert _inject_req_id_into_notes("a\tb\tc", "5340") == "a\tb\tc"
+
+    def test_a_whitespace_only_row_is_left_alone(self):
+        """`_restore_trailing_cells` pads a short row to nine fields, so an empty
+        row can reach here WITH the right column count. Writing into it produces
+        a half-populated garbage row instead of one visibly left untouched."""
+        blank = "\t" * (len(ADDITION_COLUMNS) - 1)
+        assert _inject_req_id_into_notes(blank, "5340") == blank
 
     def test_applied_by_write_job_result(self, tmp_path):
         """On the write path, not merely available — and after the URL, so the
         id ends up ahead of it."""
         reports, tracker = tmp_path / "reports", tmp_path / "tsv"
         reports.mkdir(); tracker.mkdir()
-        response = TestWriteJobResult()._make_response(tracker=self._row("APPLY strong match"))
+        response = TestWriteJobResult()._make_response(tracker=_tracker_row(notes="APPLY strong match"))
         write_job_result(response,
                          {"id": 3, "url": "https://x/j/3", "jd_text": "Job ID: 88214"},
                          reports, tracker, "2026-08-25")
