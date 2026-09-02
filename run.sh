@@ -65,5 +65,9 @@ if [[ "$run_batch" == "true" ]]; then
   echo ""
   echo "==> Running batch evaluation ($display_str)..."
   bash "$root/career-ops/batch/batch-runner.sh" "${batch_args[@]}"
+  # The runner merged its own additions as its last step. A row the agent CLI
+  # wrote with an unreadable score was refused there and archived; this pulls
+  # such rows back, repairs them, and merges again. See pipeline/merge_additions.py.
+  "$root/.venv/bin/python" -m pipeline.merge_additions
 fi
 

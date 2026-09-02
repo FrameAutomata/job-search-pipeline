@@ -8,6 +8,9 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
+    _recover_refused_additions,
+    _sanitize_pending_additions,
+    sanitize_addition,
     _inject_req_id_into_notes,
     _normalize_score_cell,
     _pending_additions,
@@ -576,9 +579,9 @@ class TestEvalSystemPrompt:
         assert "EVALUATION FRAMEWORK" in result
 
 
-def _tracker_row(score="4.2/5", status="Evaluated", notes="note"):
+def _tracker_row(score="4.2/5", status="Evaluated", notes="note", role="SRE"):
     """One nine-field tracker-additions row, the shape write_job_result emits."""
-    return "\t".join(["3", "2026-08-25", "Initech", "SRE", status,
+    return "\t".join(["3", "2026-08-25", "Initech", role, status,
                       score, "null", "[003](reports/003-x.md)", notes])
 
 
@@ -890,6 +893,11 @@ class TestExtractReqId:
         ("- **Job ID**: 65136", "65136"),
         ("Requisition ID: R\\_1488728", "R_1488728"),
         ("Job ID: JR\\-00124259", "JR-00124259"),
+        # Bold closed with no whitespace before the next label. Deleting the
+        # asterisks glued `Remote` to `Requisition` and killed the label's
+        # leading word boundary — found by measuring a real corpus, where two
+        # postings carried their req number three newlines below exactly this.
+        ("Location: Remote**Requisition Number\n\n\nR2857 Insurance Service Associate", "R2857"),
     ])
     def test_reads_the_markdown_its_own_cache_is_written_in(self, jd, expected):
         """JobSpy's description_format defaults to MARKDOWN and scrape.py
@@ -990,3 +998,237 @@ class TestInjectReqIdIntoNotes:
                          reports, tracker, "2026-08-25")
         notes = (tracker / "3.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")[-1]
         assert notes == "req 88214 — https://x/j/3 — APPLY strong match"
+
+
+
+class TestSanitizePendingAdditions:
+    """career-ops' own evaluators write straight into tracker-additions/, never
+    entering Python — so those rows reached a merge with none of the chain
+    applied, and an unreadable score cell got the row REFUSED and archived
+    (exit 0, never retried), which is permanent loss."""
+
+    CLI_ROW = _tracker_row(role="Platform Engineer | Remote", score="4.2",
+                           notes="APPLY strong match")
+
+    def _tree(self, tmp_path, rows=None, queued=True):
+        co = tmp_path / "career-ops"
+        additions = co / "batch" / "tracker-additions"
+        additions.mkdir(parents=True)
+        (co / "batch" / "jds").mkdir()
+        for name, row in (rows or {"7.tsv": self.CLI_ROW}).items():
+            (additions / name).write_text(row + "\n", encoding="utf-8")
+            # A JD is cached under a QUEUE id only — that is what the
+            # "unknown filename" tests below are about, so it must be absent there.
+            if Path(name).stem.isdigit():
+                (co / "batch" / "jds" / f"{Path(name).stem}.txt").write_text(
+                    "Job ID: 88214", encoding="utf-8")
+        if queued:
+            (co / "batch" / "batch-input.tsv").write_text(
+                "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
+                encoding="utf-8")
+        return co, additions
+
+    @staticmethod
+    def _cells(additions, name="7.tsv"):
+        return (additions / name).read_text(encoding="utf-8").rstrip("\n").split("\t")
+
+    def test_repairs_a_row_no_python_writer_touched(self, tmp_path):
+        co, additions = self._tree(tmp_path)
+        _sanitize_pending_additions(co, additions)
+        cells = self._cells(additions)
+        assert cells[3] == "Platform Engineer"          # pipe suffix stripped
+        assert cells[5] == "4.2/5"                      # merge-tracker can read it
+        assert cells[8] == "req 88214 — https://x/j/7 — APPLY strong match"
+
+    def test_says_so(self, tmp_path, capsys):
+        """In a cloud run the log is all the operator has."""
+        co, additions = self._tree(tmp_path)
+        _sanitize_pending_additions(co, additions)
+        assert "sanitized 1 addition" in capsys.readouterr().out
+
+    def test_a_row_already_sanitized_is_left_exactly_alone(self, tmp_path, capsys):
+        """The chain runs at two points and must not be two mechanisms."""
+        done = _tracker_row(score="4.2/5",
+                            notes="req 88214 — https://x/j/7 — APPLY strong match")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": done})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == done + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_the_rows_own_trailing_url_is_the_fallback(self, tmp_path):
+        """career-ops' batch worker is told to append the URL as a 10th field, so
+        a row nothing queued can still carry its own. The QUEUED URL wins when
+        there is one — handoff routes by the notes URL, and an agent may have
+        written a resolved careers-page URL as the 10th field."""
+        co, additions = self._tree(
+            tmp_path, rows={"229-acme.tsv": self.CLI_ROW + "\thttps://own/j/9"},
+            queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert "https://own/j/9" in self._cells(additions, "229-acme.tsv")[8]
+
+    def test_a_ten_column_row_gets_its_score_fixed(self, tmp_path):
+        """Nine columns is OUR prompt's shape; career-ops tells its own worker to
+        write nine PLUS a trailing url, and merge-tracker parses that natively. A
+        `== 9` guard skipped the score normalization while the pipe strip still
+        rewrote the row — so the repair was COUNTED and the row refused anyway."""
+        co, additions = self._tree(
+            tmp_path, rows={"7.tsv": self.CLI_ROW + "\thttps://own/j/9"})
+        _sanitize_pending_additions(co, additions)
+        cells = self._cells(additions)
+        assert cells[5] == "4.2/5"
+        assert cells[9] == "https://own/j/9"            # extras carried through
+
+    def test_an_unknown_filename_still_gets_the_score_repair(self, tmp_path):
+        """career-ops' other writers name additions `{num}-{slug}.tsv`, so the
+        job-id lookups find nothing. The repair that does not depend on them must
+        still happen."""
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": self.CLI_ROW},
+                                   queued=False)
+        _sanitize_pending_additions(co, additions)
+        cells = self._cells(additions, "229-acme.tsv")
+        assert cells[5] == "4.2/5"
+        assert "req " not in cells[8]                  # no JD to read one from
+
+    def test_the_queued_url_wins_over_the_rows_own(self, tmp_path):
+        co, additions = self._tree(tmp_path, rows={"7.tsv": self.CLI_ROW + "\thttps://own/j/9"})
+        _sanitize_pending_additions(co, additions)
+        assert "https://x/j/7" in self._cells(additions)[8]
+
+    def test_a_shifted_wide_row_is_left_alone_and_not_counted(self, tmp_path, capsys):
+        """Ten cells with the extra one EARLY — a tab inside the company name. A
+        width guard cannot tell it from career-ops' "9 plus a trailing url"; the
+        Report cell can. Sanitizing it wrote N/A into the STATUS and a URL into
+        the REPORT LINK, and merge-tracker — now seeing one score-shaped cell —
+        accepted the garbage it had been refusing, so the loss guard saw it land."""
+        shifted = "12\t2026-09-01\tAcme\tInc\tPlatform Engineer\tEvaluated\t4.2/5\tnull\t[12](reports/12-acme.md)\tAPPLY"
+        co, additions = self._tree(tmp_path, rows={"12.tsv": shifted})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "12.tsv").read_text(encoding="utf-8") == shifted + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_an_empty_notes_cell_is_not_repaired_on_every_merge(self, tmp_path, capsys):
+        """read_text's strip() eats the trailing tab of an empty Notes cell, so an
+        already-correct row read as 8 cells, was padded back to 9, differed from
+        what was read, and was rewritten and counted — on every merge, forever."""
+        done = _tracker_row(score="4.2/5", notes="")          # ends in a tab
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": done}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "229-acme.tsv").read_text(encoding="utf-8") == done + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_one_unreadable_row_does_not_hold_up_the_rest(self, tmp_path):
+        co, additions = self._tree(tmp_path)
+        (additions / "8.tsv").write_bytes(b"11\t2026\tAcme \x96 Inc\tSRE\t...")   # cp1252
+        _sanitize_pending_additions(co, additions)
+        assert self._cells(additions)[5] == "4.2/5"         # 7.tsv still repaired
+
+    def test_a_pipe_delimited_row_is_left_alone(self, tmp_path):
+        """merge-tracker parses that shape natively; every step here splits on
+        tabs. Rewriting it would change which of upstream's parsers reads it."""
+        piped = "| 11 | 2026-09-01 | Acme Corp | Platform Engineer | Evaluated | 4.2 | null | [229](reports/229-acme.md) | note |"
+        co, additions = self._tree(tmp_path, rows={"7.tsv": piped})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == piped + "\n"
+
+    def test_run_merge_tracker_wires_it_in(self, tmp_path, mocker):
+        """The one test that goes through the merge: sanitizing must happen, and
+        must happen BEFORE the loss guard's snapshot, since stripping a role's
+        pipe suffix changes half the identity that guard matches on."""
+        co, additions = self._tree(tmp_path)
+        (co / "data").mkdir(parents=True)
+        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        mocker.patch("pipeline._batch_common.subprocess.run",
+                     return_value=mocker.MagicMock(returncode=0, stdout="", stderr=""))
+        run_merge_tracker(co)
+        assert self._cells(additions)[5] == "4.2/5"
+
+
+class TestSanitizeAddition:
+    @pytest.mark.parametrize("raw", [
+        _tracker_row(score="4.2", role="Platform Engineer | Remote", notes="APPLY"),
+        _tracker_row(score="4.0/5"),                         # first pass rewrites to 4/5
+        _tracker_row(score="4.2", notes=""),                 # empty notes
+        _tracker_row(score="4.2", notes="APPLY") + "\tHTTPS://X/J/7",   # upper-case scheme
+        _tracker_row(score="4.2", notes="APPLY") + "\tvia=Hays\thttps://x/j",
+    ])
+    def test_is_idempotent(self, raw):
+        """What lets the chain run on the write path AND at the merge without
+        being two mechanisms: sanitize(sanitize(x)) == sanitize(x), over the
+        shapes the chain actually meets."""
+        once = sanitize_addition(raw, "https://x/j", "Job ID: 88214")
+        assert sanitize_addition(once, "https://x/j", "Job ID: 88214") == once
+
+    def test_declines_a_row_whose_columns_are_not_in_place(self):
+        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
+        assert sanitize_addition(shifted, "https://x/j", "Job ID: 5") == shifted
+
+
+
+class TestRecoverRefusedAdditions:
+    """The half of #156 the merge-time sanitizer cannot reach: `--batch` runs
+    career-ops' own runner, whose last step is its OWN merge-tracker call, so a
+    row with a bare `4.2` is refused and archived into merged/ before Python
+    runs. From there nothing retries it. This pulls it back — but ONLY a row
+    that did not land AND whose score fix would change it."""
+
+    HEADER = ("# Applications Tracker\n\n"
+              "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+
+    def _tree(self, tmp_path, merged_rows, tracker_rows=""):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(self.HEADER + tracker_rows, encoding="utf-8")
+        additions = co / "batch" / "tracker-additions"
+        (additions / "merged").mkdir(parents=True)
+        (co / "batch" / "jds").mkdir()
+        for name, row in merged_rows.items():
+            (additions / "merged" / name).write_text(row + "\n", encoding="utf-8")
+        return co, additions
+
+    def test_a_refused_row_with_a_bad_score_comes_back_repaired(self, tmp_path, capsys):
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")})
+        _recover_refused_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8").split("\t")[5] == "4.2/5"
+        assert "recovered 1 evaluation" in capsys.readouterr().out
+
+    def test_a_row_that_landed_is_left_in_the_archive(self, tmp_path):
+        """Landed by either reading — including a #152 retitle, found under
+        company + report number."""
+        landed = ("| 10 | 2026-08-25 | Initech | SRE (Remote) | 4.2/5 | Evaluated | ❌ "
+                  "| [003](../reports/003-x.md) | note |\n")
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")}, landed)
+        _recover_refused_additions(co, additions)
+        assert not (additions / "7.tsv").exists()
+
+    def test_a_row_refused_for_a_reason_we_cannot_fix_is_not_retried(self, tmp_path, capsys):
+        """A readable score means the refusal was something else — a report
+        number marked `failed`, which upstream refuses on purpose. Re-queuing it
+        would have it refused again on every run. This rule is also what keeps a
+        row the user DELETED from the tracker from coming back."""
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2/5")})
+        _recover_refused_additions(co, additions)
+        assert not (additions / "7.tsv").exists()
+        assert "recovered" not in capsys.readouterr().out
+
+    def test_a_row_already_back_in_the_queue_is_not_clobbered(self, tmp_path):
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")})
+        (additions / "7.tsv").write_text("in progress", encoding="utf-8")
+        _recover_refused_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == "in progress"
+
+    def test_no_archive_is_fine(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        _recover_refused_additions(co, co / "batch" / "tracker-additions")
+
+    def test_run_merge_tracker_recovers_before_it_merges(self, tmp_path, mocker):
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")})
+        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        seen = {}
+        def snapshot(*a, **kw):
+            seen["pending"] = sorted(f.name for f in additions.glob("*.tsv"))
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        mocker.patch("pipeline._batch_common.subprocess.run", side_effect=snapshot)
+        run_merge_tracker(co)
+        assert seen["pending"] == ["7.tsv"]         # back in the queue when node ran

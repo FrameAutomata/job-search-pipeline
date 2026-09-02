@@ -25,8 +25,11 @@ pytestmark = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Appends, because run.sh --batch now invokes python TWICE — orchestrate.py, then
+# `-m pipeline.merge_additions` after the runner — and every assertion below is
+# a membership test over the whole recording.
 _RECORDER = """#!/usr/bin/env bash
-printf '%s\\n' "$@" > "{out}"
+printf '%s\\n' "$@" >> "{out}"
 """
 
 
