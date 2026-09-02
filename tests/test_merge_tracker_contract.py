@@ -36,12 +36,16 @@ HEADER = ("# Applications Tracker\n\n"
           "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
           "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
 
-# One scenario, used with and without req ids: two levels of one title at one
-# company. Both fuzzy-match, because role-matcher drops tokens of ≤3 characters
-# and the level never reaches the comparison — so the id is the only thing that
-# can tell them apart. Single-sourced deliberately: if upstream ever tightens
-# that matcher, this premise must fail in ONE place, not rot in a second copy
-# while the first is repaired.
+# One scenario, used with and without req ids: one title at one company, and a
+# re-wording of it that still fuzzy-matches — `(Remote)` is a suffix a re-post
+# really picks up. NOT two levels of one title, deliberately: that was the
+# original premise, and career-ops#3651 (merged 2026-09-02) made a stated level a
+# disagreement, so `SPECIALIST I` vs `… II` stopped fuzzy-matching and the three
+# tests on this fixture failed by design. This pair matches under both matchers,
+# so the suite is honest against a checkout on either side of that release.
+# Single-sourced, so if upstream tightens the matcher again the premise fails in
+# ONE place rather than rotting in a second copy while the first is repaired.
+BASE, VARIANT = "INSURANCE SPECIALIST II", "Insurance Specialist II (Remote)"
 def _notes(req, jk):
     return (f"req {req} — " if req else "") + f"https://indeed.com/viewjob?jk={jk} — APPLY"
 
@@ -120,8 +124,7 @@ def merged(tmp_path_factory):
     two node startups plus a tracker-lock acquisition, and every assertion below
     is read-only over one immutable result."""
     return _merge(tmp_path_factory.mktemp("merge"),
-                  _tracker("INSURANCE SPECIALIST II", 200),
-                  {"123.tsv": _addition("INSURANCE SPECIALIST I", 229)})
+                  _tracker(BASE, 200), {"123.tsv": _addition(VARIANT, 229)})
 
 
 class TestFuzzyMergeKeepsTheRowsTitle:
@@ -131,8 +134,8 @@ class TestFuzzyMergeKeepsTheRowsTitle:
         `reportNumMatched || dupReason === 'url'` ternary before touching the
         guard, and do not relax the test."""
         tracker, _, _, _ = merged
-        assert "INSURANCE SPECIALIST II" in tracker
-        assert "INSURANCE SPECIALIST I |" not in tracker
+        assert f"| {BASE} |" in tracker
+        assert VARIANT not in tracker
 
     def test_report_and_score_do_write_through(self, merged):
         """The other half: the addition's report number reaches the row, which
@@ -155,7 +158,7 @@ class TestFuzzyMergeKeepsTheRowsTitle:
         _warn_on_lost_additions(before, career_ops, additions)
         out = capsys.readouterr().out
         assert "WARNING" not in out
-        assert "INSURANCE SPECIALIST I" in out and "INSURANCE SPECIALIST II" in out
+        assert VARIANT in out and BASE in out
 
 
 # A second run: an addition merge-tracker REFUSES (its report number is marked
@@ -207,26 +210,23 @@ class TestRefusalReasonsReachTheOperator:
 
 
 @pytest.fixture(scope="module")
-def levelled_apart(tmp_path_factory):
-    """Two levels of one title, carrying DIFFERENT req ids."""
+def distinct_reqs(tmp_path_factory):
+    """The same fuzzy-matching pair, carrying DIFFERENT req ids — two openings
+    that happen to share a title's wording."""
     return _merge(tmp_path_factory.mktemp("apart"),
-                  _tracker("INSURANCE SPECIALIST II", 200, req="5001"),
-                  {"123.tsv": _addition("INSURANCE SPECIALIST I", 229, req="5002")})
+                  _tracker(BASE, 200, req="5001"),
+                  {"123.tsv": _addition(VARIANT, 229, req="5002")})
 
 
 @pytest.fixture(scope="module")
 def same_req(tmp_path_factory):
-    """One requisition re-posted under a re-worded title, same id.
-
-    The title has to DIFFER, or the scenario tests nothing: `roleFuzzyMatch`
-    short-circuits on `textA === textB` before tokenizing, and bridge drops an
-    identically-titled addition long before the merge — so a same-title pair can
-    neither reach the fuzzy tier nor occur in production. `(Remote)` is a wording
-    a re-post really picks up, and it still fuzzy-matches, so the merge reaches
-    the req comparison and the matching id has to let the fold proceed."""
+    """The same pair, carrying the SAME id — one requisition re-posted under a
+    re-worded title. The wording has to differ or the scenario tests nothing:
+    `roleFuzzyMatch` short-circuits on identical strings, and bridge drops an
+    identically-titled addition long before the merge."""
     return _merge(tmp_path_factory.mktemp("same"),
-                  _tracker("INSURANCE SPECIALIST II", 200, req="5001"),
-                  {"123.tsv": _addition("Insurance Specialist II (Remote)", 229, req="5001")})
+                  _tracker(BASE, 200, req="5001"),
+                  {"123.tsv": _addition(VARIANT, 229, req="5001")})
 
 
 class TestReqIdOverridesTheFuzzyTitleMatch:
@@ -234,12 +234,11 @@ class TestReqIdOverridesTheFuzzyTitleMatch:
     are load-bearing: the id has to split what the title match wrongly folds,
     without splitting a re-post of one requisition into a second row."""
 
-    def test_different_ids_keep_two_rows(self, levelled_apart):
-        """The #152/#154 case. Without the ids these fold, and `SPECIALIST I`
+    def test_different_ids_keep_two_rows(self, distinct_reqs):
+        """The #154 case. Without the ids these fold, and the second opening
         stops existing — invisible to dedup, the handoff and the UI."""
-        tracker, _, _, r = levelled_apart
-        assert "INSURANCE SPECIALIST I |" in tracker
-        assert "INSURANCE SPECIALIST II |" in tracker
+        tracker, _, _, r = distinct_reqs
+        assert f"| {VARIANT} |" in tracker and f"| {BASE} |" in tracker
         assert "➕ Add" in r.stdout and "🔄 Update" not in r.stdout
 
     def test_the_same_id_still_folds(self, same_req):
@@ -248,16 +247,16 @@ class TestReqIdOverridesTheFuzzyTitleMatch:
         the board's per-posting `jk=` key — is what we extract: keying on the
         posting would add a row every time a listing is re-published."""
         tracker, _, _, r = same_req
-        assert tracker.count("| INSURANCE SPECIALIST II |") == 1   # kept its title
-        assert "Insurance Specialist II (Remote)" not in tracker   # no second row
+        assert tracker.count(f"| {BASE} |") == 1       # kept its title
+        assert VARIANT not in tracker                   # no second row
         assert "🔄 Update" in r.stdout and "➕ Add" not in r.stdout
 
-    def test_the_id_survives_into_the_new_row(self, levelled_apart):
+    def test_the_id_survives_into_the_new_row(self, distinct_reqs):
         """The split above only holds for the NEXT merge if the id merge-tracker
         wrote into the row is still readable there — the guard needs it on both
         sides, and the row it just added is one of them."""
-        tracker, _, _, _ = levelled_apart
-        added = [l for l in tracker.splitlines() if "INSURANCE SPECIALIST I |" in l]
+        tracker, _, _, _ = distinct_reqs
+        added = [l for l in tracker.splitlines() if f"| {VARIANT} |" in l]
         assert added and "req 5002" in added[0]
 
 
