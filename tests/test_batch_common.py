@@ -892,6 +892,11 @@ class TestExtractReqId:
         ("- **Job ID**: 65136", "65136"),
         ("Requisition ID: R\\_1488728", "R_1488728"),
         ("Job ID: JR\\-00124259", "JR-00124259"),
+        # Bold closed with no whitespace before the next label. Deleting the
+        # asterisks glued `Remote` to `Requisition` and killed the label's
+        # leading word boundary — found by measuring a real corpus, where two
+        # postings carried their req number three newlines below exactly this.
+        ("Location: Remote**Requisition Number\n\n\nR2857 Insurance Service Associate", "R2857"),
     ])
     def test_reads_the_markdown_its_own_cache_is_written_in(self, jd, expected):
         """JobSpy's description_format defaults to MARKDOWN and scrape.py

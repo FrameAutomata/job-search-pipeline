@@ -592,16 +592,29 @@ def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
                              lambda notes: bool(_NOTES_URL_RE.search(notes)))
 
 
-# Markdown decoration, removed before matching rather than matched around.
+# Markdown decoration, normalized before matching rather than matched around.
 # JobSpy's `description_format` defaults to MARKDOWN and `scrape.py` forwards it
 # untouched, so an Indeed JD reaches the cache as `**Job ID:** 88214`, and
 # markdownify escapes `_` and `-` mid-word (`R\_1488728`, `JR\-00124259`). All
 # three defeat a pattern written for plain prose. LinkedIn's descriptions are
 # backfilled as plain text by screen.py, so this hit one board and not the other
 # — which is worse than hitting both, because the extractor then looks like it
-# works. Neither character can appear in a requisition id, so stripping them is
-# lossless here.
-_MARKDOWN_NOISE_RE = re.compile(r"[*\\]")
+# works.
+#
+# The two characters get DIFFERENT treatment, and the difference was measured
+# rather than guessed. A backslash is an escape INSIDE an id, so it is deleted:
+# spacing it out would turn `R\_1488728` into `R _1488728` and capture a bare
+# `R`. An asterisk is emphasis AROUND words, so it becomes a space: deleting it
+# glued `Remote**Requisition Number` into `RemoteRequisition`, and the label's
+# leading `\b` no longer held — two real postings whose requisition number sat
+# right there, three newlines below the label, read as having none.
+_MARKDOWN_ESCAPE_RE = re.compile(r"\\")
+_MARKDOWN_EMPHASIS_RE = re.compile(r"\*")
+
+
+def _demarkdown(text: str) -> str:
+    return _MARKDOWN_EMPHASIS_RE.sub(" ", _MARKDOWN_ESCAPE_RE.sub("", text))
+
 
 # A requisition id as JOB-DESCRIPTION PROSE states it. Deliberately narrower
 # than merge-tracker's own REQ_NUMBER_RE, which reads the tracker's Notes cell:
@@ -664,7 +677,7 @@ def extract_req_id(jd_text: str) -> str:
     keying on it would split every re-post into a second tracker row. The
     employer's req id is stable across re-posts and differs between levels, which
     is the distinction being drawn here."""
-    text = _MARKDOWN_NOISE_RE.sub("", jd_text or "")
+    text = _demarkdown(jd_text or "")
     found = set()
     for m in _JD_REQ_ID_RE.finditer(text):
         # rstrip: a trailing separator is never part of the id, and leaving one
