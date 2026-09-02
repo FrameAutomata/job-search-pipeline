@@ -989,8 +989,10 @@ def run_merge_tracker(career_ops: Path) -> bool:
     # fresh run (see ensure_applications_md).
     ensure_applications_md(career_ops)
     tracker_dir = career_ops / "batch" / "tracker-additions"
-    # Before the snapshot: sanitizing can change the role cell (a pipe suffix),
-    # which is half the identity the loss guard matches on.
+    # Recovery first, so a restored row is sanitized and snapshotted with the
+    # rest; sanitizing before the snapshot, since it can change the role cell (a
+    # pipe suffix), which is half the identity the loss guard matches on.
+    _recover_refused_additions(career_ops, tracker_dir)
     _sanitize_pending_additions(career_ops, tracker_dir)
     before = _pending_additions(tracker_dir)
     print("[batch] running merge-tracker.mjs...")
@@ -1098,6 +1100,92 @@ def _pending_additions(tracker_dir: Path) -> list[dict]:
     return additions
 
 
+def _classify_landing(records: list[dict], career_ops: Path) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """(lost, retitled) for every addition record: which of the two readings of
+    "did it land" found it in the tracker, or neither.
+
+    Shared by the loss guard, which reports the answer, and the recovery pass,
+    which acts on it — one definition, so the row the guard calls lost is the
+    row recovery goes after, never two slightly different sets."""
+    landed, role_by_report = _tracker_identities(career_ops / "data" / "applications.md")
+    lost: list[dict] = []
+    retitled: list[tuple[dict, str]] = []
+    for add in records:
+        # The two readings, side by side. Either one finding the row means the
+        # evaluation is in the tracker.
+        if _addition_key(add["company"], add["role"]) in landed:
+            continue
+        key = _report_key(add["company"], add["report"]) if add["report"] else None
+        # `in`, not truthiness of the title: a tracker row with a blank Role cell
+        # (hand-added, or half-migrated) matched here would otherwise be read as
+        # no match at all, and an intact evaluation would get the loud loss
+        # warning — the #152 cry-wolf back again by a different route.
+        if key in role_by_report:
+            retitled.append((add, role_by_report[key]))
+        else:
+            lost.append(add)
+    return lost, retitled
+
+
+def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
+    """Put back into the queue the rows a previous merge refused for a reason
+    the sanitizer can fix.
+
+    This is the half of #156 the merge-time sanitizer cannot reach: `--batch`
+    runs career-ops' `batch-runner.sh`, whose last step is its OWN
+    `node merge-tracker.mjs`, so a row the agent CLI wrote with a bare `4.2` is
+    refused and archived into `merged/` before any Python runs. From there
+    nothing retries it — the report is on disk, the tracker has no row, and the
+    evaluation is simply gone. `run.sh`/`run.ps1` run `pipeline.merge_additions`
+    after the runner returns, which lands here.
+
+    Two rules decide what comes back, and both are load-bearing:
+
+    **It did not land, by either reading.** `_classify_landing` is the loss
+    guard's own test, so the set recovered is exactly the set that guard would
+    have reported. A row merge-tracker folded into an existing one under a
+    different title (#152) is NOT lost and is not touched.
+
+    **The score fix would change it.** Of the whole chain, an unreadable score
+    cell is the only defect that gets a row REFUSED; the others corrupt or
+    impoverish a row that still merges. So a lost row whose score is already
+    readable was refused for a reason we cannot cure — a report number marked
+    `failed` in batch-state.tsv, which upstream refuses on purpose — and pulling
+    it back would only have it refused again, run after run. The same rule is
+    what stops a row the user DELETED from the tracker coming back: it merged
+    with a readable score, so it never qualifies. (A row that is both repairable
+    and doomed gets one retry: after it, the archived copy is the repaired one,
+    and the score no longer changes.)
+
+    A row already back in the queue is left to the merge in progress."""
+    merged = tracker_dir / "merged"
+    lost, _ = _classify_landing(_pending_additions(merged), career_ops)
+    if not lost:
+        return
+    urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
+    restored = 0
+    for add in lost:
+        src, dst = merged / add["name"], tracker_dir / add["name"]
+        if dst.exists():
+            continue
+        try:
+            raw = src.read_text(encoding="utf-8").strip("\r\n")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _normalize_score_cell(_restore_trailing_cells(raw)) == _restore_trailing_cells(raw):
+            continue                    # refused for a reason we cannot fix
+        fixed = sanitize_addition(raw, urls.get(Path(add["name"]).stem, ""),
+                                  read_text(jd_cache_path(career_ops, Path(add["name"]).stem)))
+        try:
+            atomic_write_text(dst, fixed + "\n")
+        except OSError:
+            continue
+        restored += 1
+    if restored:
+        print(f"[batch] recovered {restored} evaluation(s) a previous merge refused "
+              "for an unreadable score — re-queued with the score repaired")
+
+
 def _warn_on_lost_additions(before: list[dict], career_ops: Path,
                             tracker_dir: Path, merge_output: str = "") -> None:
     """Report what became of each evaluation that left tracker-additions/.
@@ -1130,26 +1218,8 @@ def _warn_on_lost_additions(before: list[dict], career_ops: Path,
     # processed is one it moved into merged/ under the same name — so this is a
     # listing, not a re-read of every file `before` already parsed.
     still_pending = {f.name for f in tracker_dir.glob("*.tsv")}
-    landed, role_by_report = _tracker_identities(career_ops / "data" / "applications.md")
-
-    lost: list[dict] = []
-    retitled: list[tuple[dict, str]] = []
-    for add in before:
-        if add["name"] in still_pending:
-            continue                      # never processed; a later run retries it
-        # The two readings, side by side. Either one finding the row means the
-        # evaluation is in the tracker.
-        if _addition_key(add["company"], add["role"]) in landed:
-            continue
-        key = _report_key(add["company"], add["report"]) if add["report"] else None
-        # `in`, not truthiness of the title: a tracker row with a blank Role cell
-        # (hand-added, or half-migrated) matched here would otherwise be read as
-        # no match at all, and an intact evaluation would get the loud loss
-        # warning — the #152 cry-wolf back again by a different route.
-        if key in role_by_report:
-            retitled.append((add, role_by_report[key]))
-        else:
-            lost.append(add)
+    lost, retitled = _classify_landing(
+        [add for add in before if add["name"] not in still_pending], career_ops)
 
     if lost:
         print(f"[batch] WARNING: {len(lost)} evaluation(s) left "

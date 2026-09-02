@@ -306,3 +306,46 @@ class TestUnsanitizedRowsAreRefused:
         and the id that keeps two levels of one title apart."""
         tracker, _, _, _ = sanitized
         assert "https://x/j/7" in tracker and "req 88214" in tracker
+
+
+@pytest.fixture(scope="module")
+def recovered(tmp_path_factory):
+    """The `--batch` case end to end, against the real script: the runner's
+    own merge refuses a bare-score row and archives it; `run_merge_tracker` —
+    which the wrappers now run after the runner — pulls it back, repairs it,
+    and the second merge lands it."""
+    from pipeline._batch_common import _recover_refused_additions
+    tmp_path = tmp_path_factory.mktemp("recover")
+    # First merge: exactly what batch-runner.sh's last step does.
+    tracker, career_ops, additions, first = _merge(
+        tmp_path, HEADER, {"7.tsv": CLI_ROW.format(score="4.2")})
+    assert "Platform Engineer" not in tracker           # refused …
+    assert (additions / "merged" / "7.tsv").exists()     # … and archived
+    # What the wrapper runs next. batch-input.tsv supplies the URL, as it
+    # would for a queued job.
+    (career_ops / "batch").mkdir(exist_ok=True)
+    (career_ops / "batch" / "batch-input.tsv").write_text(
+        "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
+        encoding="utf-8")
+    _recover_refused_additions(career_ops, additions)
+    assert (additions / "7.tsv").exists()                # back in the queue
+    # Second merge, same tracker and additions dir.
+    second = subprocess.run(
+        ["node", "merge-tracker.mjs"], cwd=str(career_ops_dir()),
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ,
+             "CAREER_OPS_TRACKER": str(career_ops / "data" / "applications.md"),
+             "CAREER_OPS_ADDITIONS": str(additions),
+             "CAREER_OPS_BATCH_STATE": str(tmp_path / "batch-state.tsv")})
+    assert second.returncode == 0, second.stderr
+    return (career_ops / "data" / "applications.md").read_text(encoding="utf-8"), second
+
+class TestRecoveryAfterTheRunnersOwnMerge:
+    def test_the_evaluation_lands_on_the_second_merge(self, recovered):
+        tracker, second = recovered
+        assert "Platform Engineer" in tracker and "4.2/5" in tracker
+        assert "➕ Add" in second.stdout
+
+    def test_with_the_url_it_was_missing(self, recovered):
+        tracker, _ = recovered
+        assert "https://x/j/7" in tracker

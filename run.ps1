@@ -50,6 +50,10 @@ if ($runBatch) {
                else { $null }
     if ($bashExe) {
         & $bashExe $batchRunner @batchArgs
+        # The runner merged its own additions as its last step. A row the agent
+        # CLI wrote with an unreadable score was refused there and archived; this
+        # pulls such rows back, repairs them, and merges again.
+        & "$root\.venv\Scripts\python.exe" -m pipeline.merge_additions
     } else {
         Write-Host "ERROR: Git for Windows not found. Install from https://git-scm.com/download/win"
         exit 1

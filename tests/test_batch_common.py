@@ -8,6 +8,7 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
+    _recover_refused_additions,
     _sanitize_pending_additions,
     sanitize_addition,
     _inject_req_id_into_notes,
@@ -1160,3 +1161,74 @@ class TestSanitizeAddition:
     def test_declines_a_row_whose_columns_are_not_in_place(self):
         shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
         assert sanitize_addition(shifted, "https://x/j", "Job ID: 5") == shifted
+
+
+
+class TestRecoverRefusedAdditions:
+    """The half of #156 the merge-time sanitizer cannot reach: `--batch` runs
+    career-ops' own runner, whose last step is its OWN merge-tracker call, so a
+    row with a bare `4.2` is refused and archived into merged/ before Python
+    runs. From there nothing retries it. This pulls it back — but ONLY a row
+    that did not land AND whose score fix would change it."""
+
+    HEADER = ("# Applications Tracker\n\n"
+              "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+
+    def _tree(self, tmp_path, merged_rows, tracker_rows=""):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(self.HEADER + tracker_rows, encoding="utf-8")
+        additions = co / "batch" / "tracker-additions"
+        (additions / "merged").mkdir(parents=True)
+        (co / "batch" / "jds").mkdir()
+        for name, row in merged_rows.items():
+            (additions / "merged" / name).write_text(row + "\n", encoding="utf-8")
+        return co, additions
+
+    def test_a_refused_row_with_a_bad_score_comes_back_repaired(self, tmp_path, capsys):
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")})
+        _recover_refused_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8").split("\t")[5] == "4.2/5"
+        assert "recovered 1 evaluation" in capsys.readouterr().out
+
+    def test_a_row_that_landed_is_left_in_the_archive(self, tmp_path):
+        """Landed by either reading — including a #152 retitle, found under
+        company + report number."""
+        landed = ("| 10 | 2026-08-25 | Initech | SRE (Remote) | 4.2/5 | Evaluated | ❌ "
+                  "| [003](../reports/003-x.md) | note |\n")
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")}, landed)
+        _recover_refused_additions(co, additions)
+        assert not (additions / "7.tsv").exists()
+
+    def test_a_row_refused_for_a_reason_we_cannot_fix_is_not_retried(self, tmp_path, capsys):
+        """A readable score means the refusal was something else — a report
+        number marked `failed`, which upstream refuses on purpose. Re-queuing it
+        would have it refused again on every run. This rule is also what keeps a
+        row the user DELETED from the tracker from coming back."""
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2/5")})
+        _recover_refused_additions(co, additions)
+        assert not (additions / "7.tsv").exists()
+        assert "recovered" not in capsys.readouterr().out
+
+    def test_a_row_already_back_in_the_queue_is_not_clobbered(self, tmp_path):
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")})
+        (additions / "7.tsv").write_text("in progress", encoding="utf-8")
+        _recover_refused_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == "in progress"
+
+    def test_no_archive_is_fine(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        _recover_refused_additions(co, co / "batch" / "tracker-additions")
+
+    def test_run_merge_tracker_recovers_before_it_merges(self, tmp_path, mocker):
+        co, additions = self._tree(tmp_path, {"7.tsv": _tracker_row(score="4.2")})
+        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        seen = {}
+        def snapshot(*a, **kw):
+            seen["pending"] = sorted(f.name for f in additions.glob("*.tsv"))
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        mocker.patch("pipeline._batch_common.subprocess.run", side_effect=snapshot)
+        run_merge_tracker(co)
+        assert seen["pending"] == ["7.tsv"]         # back in the queue when node ran
