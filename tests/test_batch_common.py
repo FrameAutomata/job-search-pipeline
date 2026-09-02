@@ -1011,8 +1011,11 @@ class TestSanitizePendingAdditions:
         (co / "batch" / "jds").mkdir()
         for name, row in (rows or {"7.tsv": self.CLI_ROW}).items():
             (additions / name).write_text(row + "\n", encoding="utf-8")
-            (co / "batch" / "jds" / f"{Path(name).stem}.txt").write_text(
-                "Job ID: 88214", encoding="utf-8")
+            # A JD is cached under a QUEUE id only — that is what the
+            # "unknown filename" tests below are about, so it must be absent there.
+            if Path(name).stem.isdigit():
+                (co / "batch" / "jds" / f"{Path(name).stem}.txt").write_text(
+                    "Job ID: 88214", encoding="utf-8")
         if queued:
             (co / "batch" / "batch-input.tsv").write_text(
                 "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
@@ -1046,10 +1049,11 @@ class TestSanitizePendingAdditions:
         assert (additions / "7.tsv").read_text(encoding="utf-8") == done + "\n"
         assert "sanitized" not in capsys.readouterr().out
 
-    def test_the_rows_own_trailing_url_is_preferred_over_a_lookup(self, tmp_path):
+    def test_the_rows_own_trailing_url_is_the_fallback(self, tmp_path):
         """career-ops' batch worker is told to append the URL as a 10th field, so
-        on the path this exists for it is already in the row — no lookup, and no
-        dependence on the filename being a job id."""
+        a row nothing queued can still carry its own. The QUEUED URL wins when
+        there is one — handoff routes by the notes URL, and an agent may have
+        written a resolved careers-page URL as the 10th field."""
         co, additions = self._tree(
             tmp_path, rows={"229-acme.tsv": self.CLI_ROW + "\thttps://own/j/9"},
             queued=False)
@@ -1075,7 +1079,42 @@ class TestSanitizePendingAdditions:
         co, additions = self._tree(tmp_path, rows={"229-acme.tsv": self.CLI_ROW},
                                    queued=False)
         _sanitize_pending_additions(co, additions)
-        assert self._cells(additions, "229-acme.tsv")[5] == "4.2/5"
+        cells = self._cells(additions, "229-acme.tsv")
+        assert cells[5] == "4.2/5"
+        assert "req " not in cells[8]                  # no JD to read one from
+
+    def test_the_queued_url_wins_over_the_rows_own(self, tmp_path):
+        co, additions = self._tree(tmp_path, rows={"7.tsv": self.CLI_ROW + "\thttps://own/j/9"})
+        _sanitize_pending_additions(co, additions)
+        assert "https://x/j/7" in self._cells(additions)[8]
+
+    def test_a_shifted_wide_row_is_left_alone_and_not_counted(self, tmp_path, capsys):
+        """Ten cells with the extra one EARLY — a tab inside the company name. A
+        width guard cannot tell it from career-ops' "9 plus a trailing url"; the
+        Report cell can. Sanitizing it wrote N/A into the STATUS and a URL into
+        the REPORT LINK, and merge-tracker — now seeing one score-shaped cell —
+        accepted the garbage it had been refusing, so the loss guard saw it land."""
+        shifted = "12\t2026-09-01\tAcme\tInc\tPlatform Engineer\tEvaluated\t4.2/5\tnull\t[12](reports/12-acme.md)\tAPPLY"
+        co, additions = self._tree(tmp_path, rows={"12.tsv": shifted})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "12.tsv").read_text(encoding="utf-8") == shifted + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_an_empty_notes_cell_is_not_repaired_on_every_merge(self, tmp_path, capsys):
+        """read_text's strip() eats the trailing tab of an empty Notes cell, so an
+        already-correct row read as 8 cells, was padded back to 9, differed from
+        what was read, and was rewritten and counted — on every merge, forever."""
+        done = _tracker_row(score="4.2/5", notes="")          # ends in a tab
+        co, additions = self._tree(tmp_path, rows={"229-acme.tsv": done}, queued=False)
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "229-acme.tsv").read_text(encoding="utf-8") == done + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_one_unreadable_row_does_not_hold_up_the_rest(self, tmp_path):
+        co, additions = self._tree(tmp_path)
+        (additions / "8.tsv").write_bytes(b"11\t2026\tAcme \x96 Inc\tSRE\t...")   # cp1252
+        _sanitize_pending_additions(co, additions)
+        assert self._cells(additions)[5] == "4.2/5"         # 7.tsv still repaired
 
     def test_a_pipe_delimited_row_is_left_alone(self, tmp_path):
         """merge-tracker parses that shape natively; every step here splits on
@@ -1099,10 +1138,20 @@ class TestSanitizePendingAdditions:
 
 
 class TestSanitizeAddition:
-    def test_is_idempotent(self):
+    @pytest.mark.parametrize("raw", [
+        _tracker_row(score="4.2", role="Platform Engineer | Remote", notes="APPLY"),
+        _tracker_row(score="4.0/5"),                         # first pass rewrites to 4/5
+        _tracker_row(score="4.2", notes=""),                 # empty notes
+        _tracker_row(score="4.2", notes="APPLY") + "\tHTTPS://X/J/7",   # upper-case scheme
+        _tracker_row(score="4.2", notes="APPLY") + "\tvia=Hays\thttps://x/j",
+    ])
+    def test_is_idempotent(self, raw):
         """What lets the chain run on the write path AND at the merge without
-        being two mechanisms."""
-        raw = ("11\t2026-09-01\tAcme\tPlatform Engineer | Remote\tEvaluated\t4.2\tnull\t"
-               "[229](reports/229-a.md)\tAPPLY")
+        being two mechanisms: sanitize(sanitize(x)) == sanitize(x), over the
+        shapes the chain actually meets."""
         once = sanitize_addition(raw, "https://x/j", "Job ID: 88214")
         assert sanitize_addition(once, "https://x/j", "Job ID: 88214") == once
+
+    def test_declines_a_row_whose_columns_are_not_in_place(self):
+        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
+        assert sanitize_addition(shifted, "https://x/j", "Job ID: 5") == shifted

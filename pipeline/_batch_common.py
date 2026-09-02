@@ -368,22 +368,53 @@ ADDITION_COLUMNS = [
 ]
 _TRACKER_TSV_COLUMNS = len(ADDITION_COLUMNS)
 # Every cell the sanitizers below reach for, resolved from that list rather than
-# written as a literal — the width guards only check the TOTAL, so a column
-# inserted upstream would leave them silently rewriting the wrong cells.
-#
-# Those guards are `>= len(ADDITION_COLUMNS)`, not `==`. Nine is OUR prompt's
-# shape; career-ops' own batch worker is told to write "9 columns plus an
-# optional trailing `url`", and merge-tracker parses that natively
-# (`parseTsvExtras`, `parts.slice(9)`). Under `==`, such a row skipped the score
-# normalization while `_strip_role_pipe` — which has no width guard — still
-# rewrote it, so the file changed, the repair was COUNTED, and the row was
-# refused for its score anyway: a loss with a success message on it. Every index
-# these sanitizers touch is below 9 and identical in both layouts, so operating
-# on the longer row is safe; trailing extras are carried through untouched.
+# written as a literal — the guards only check the TOTAL, so a column inserted
+# upstream would leave them silently rewriting the wrong cells.
 _ROLE_IDX = ADDITION_COLUMNS.index("role")
 _STATUS_IDX = ADDITION_COLUMNS.index("status")
 _SCORE_IDX = ADDITION_COLUMNS.index("score")
+_REPORT_IDX = ADDITION_COLUMNS.index("report")
 _NOTES_IDX = ADDITION_COLUMNS.index("notes")
+
+# The Report cell is `[N](path)`, and it is the one cell whose shape identifies
+# it — which makes it the anchor for deciding whether a row's nine columns are
+# where they should be. `app/data.py:_realign_cells` anchors on the same cell for
+# the same reason.
+_REPORT_CELL_RE = re.compile(r"^\[\w+\]\([^)]+\)$")
+
+
+def _row_parts(tracker_tsv: str) -> list[str] | None:
+    """The cells of an addition row whose nine columns are IN PLACE, else None.
+
+    One classifier, shared by every positional sanitizer, so they cannot disagree
+    about which rows to touch — which is exactly what went wrong twice. With
+    `== 9` guards, career-ops' documented "9 columns plus a trailing `url`" row
+    skipped the score normalization while `_strip_role_pipe`, which had no guard,
+    still rewrote it: the file changed, the repair was counted and logged, and
+    the row was refused for its score anyway. With `>= 9` guards, a row carrying
+    an EARLY extra cell (a tab inside the company name) had `N/A` written into
+    its status and a URL prepended to its report link — and merge-tracker, now
+    seeing exactly one score-shaped cell, accepted the garbage where it had been
+    refusing it, so the loss guard saw the row "land". A width alone cannot
+    tell those two ten-cell rows apart. The Report cell can: a trailing extra
+    leaves it at index 7, an inserted one shifts it.
+
+    Nine cells are taken as-is — that is our own prompt's shape, and the chain
+    has always operated on it without an anchor check. Fewer than nine is
+    declined by EVERY step, `_strip_role_pipe` included, so a short row cannot
+    change on disk and be reported as repaired."""
+    # A whitespace-only row splits to nine EMPTY cells — `_restore_trailing_cells`
+    # pads eight tabs to nine — and has nothing to sanitize; writing a URL into
+    # it manufactures a half-populated row out of nothing.
+    if not tracker_tsv.strip():
+        return None
+    parts = tracker_tsv.strip("\r\n").split("\t")
+    if len(parts) < _TRACKER_TSV_COLUMNS:
+        return None
+    if len(parts) > _TRACKER_TSV_COLUMNS and not _REPORT_CELL_RE.match(parts[_REPORT_IDX].strip()):
+        return None
+    return parts
+
 
 
 def _restore_trailing_cells(tracker_tsv: str) -> str:
@@ -419,9 +450,10 @@ def _strip_role_pipe(tracker_tsv: str) -> str:
     # below both no-op on their 9-column guard, leaving the unnormalized score
     # merge-tracker then refuses. The row this chain exists to save was the one
     # it skipped.
-    parts = tracker_tsv.strip("\r\n").split("\t")
-    if len(parts) > _ROLE_IDX:
-        parts[_ROLE_IDX] = re.sub(r"\s*\|.*$", "", parts[_ROLE_IDX]).strip()
+    parts = _row_parts(tracker_tsv)
+    if parts is None:
+        return tracker_tsv
+    parts[_ROLE_IDX] = re.sub(r"\s*\|.*$", "", parts[_ROLE_IDX]).strip()
     return "\t".join(parts)
 
 
@@ -480,8 +512,8 @@ def _normalize_score_cell(tracker_tsv: str) -> str:
     prompt rule is not something a local Ollama/Groq/DeepSeek model reliably
     honours. This is the one place we own the value, so normalize it here
     rather than depend on model compliance."""
-    parts = tracker_tsv.strip("\r\n").split("\t")
-    if len(parts) < _TRACKER_TSV_COLUMNS:
+    parts = _row_parts(tracker_tsv)
+    if parts is None:
         return tracker_tsv
     raw = parts[_SCORE_IDX].replace("*", "").strip()
     if raw.upper() in _SCORE_SENTINELS:
@@ -530,12 +562,12 @@ def _prepend_to_notes(tracker_tsv: str, text: str, already_present) -> str:
     "any URL at all" defers to a model that supplied its own, while "this exact
     id" is idempotence. Both are one predicate slot, not two mechanisms.
 
-    A row with an unexpected column count is returned untouched — better to lose
-    the annotation than to corrupt the row by rejoining at the wrong boundary."""
-    if not text or not tracker_tsv.strip():
+    A row `_row_parts` declines is returned untouched — better to lose the
+    annotation than to write it into the wrong cell."""
+    if not text:
         return tracker_tsv
-    parts = tracker_tsv.strip("\r\n").split("\t")
-    if len(parts) < _TRACKER_TSV_COLUMNS:
+    parts = _row_parts(tracker_tsv)
+    if parts is None:
         return tracker_tsv
     notes = parts[_NOTES_IDX].strip()
     if already_present(notes):
@@ -709,6 +741,13 @@ def build_user_message(job_meta: dict, today: str) -> str:
     )
 
 
+def jd_cache_path(career_ops: Path, job_id: str) -> Path:
+    """Where batch_prep caches a job's description, keyed on its queue id — the
+    same id that names its tracker addition, which is what lets the merge-time
+    sanitizer find the JD for a row it did not write."""
+    return career_ops / "batch" / "jds" / f"{job_id}.txt"
+
+
 def assign_job_numbers(
     pending: list[dict],
     state: dict,
@@ -742,7 +781,7 @@ def assign_job_numbers(
             "status": "pending",
         }
         if load_jd_text:
-            meta["jd_text"] = read_text(career_ops / "batch" / "jds" / f"{jid}.txt")
+            meta["jd_text"] = read_text(jd_cache_path(career_ops, jid))
         jobs.append(meta)
 
         state_entry = {k: v for k, v in meta.items() if k != "jd_text"}
@@ -762,8 +801,7 @@ def load_pending(
         if job.get("status") in done_statuses
     }
     return [row for row in read_batch_input(batch_input)
-            if str(row.get("id", "")).strip()
-            and str(row.get("id", "")).strip() not in already_done]
+            if (jid := str(row.get("id", "")).strip()) and jid not in already_done]
 
 
 # Canonical applications.md header (matches career-ops onboarding). Seeded
@@ -813,7 +851,12 @@ def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "") -> str
     row = _restore_trailing_cells(tracker_tsv)
     row = _strip_role_pipe(row)
     row = _normalize_score_cell(row)
-    row = _inject_url_into_notes(row, url)
+    # The URL the pipeline QUEUED first, the row's own trailing field second.
+    # Everything downstream routes by the notes URL — handoff picks the site
+    # session from it — so it should be the board URL the run searched from, not
+    # a careers-page URL an agent resolved and wrote as the 10th field. The
+    # trailing field is what a `{num}-{slug}.tsv` row has when nothing else does.
+    row = _inject_url_into_notes(row, url or _trailing_url(row))
     return _inject_req_id_into_notes(row, extract_req_id(jd_text))
 
 
@@ -828,36 +871,46 @@ def read_batch_input(batch_input: Path) -> list[dict]:
     the merge swallowing one costs a URL lookup and nothing else."""
     if not batch_input.exists():
         return []
-    with open(batch_input, newline="", encoding="utf-8") as f:
-        return [dict(row) for row in csv.DictReader(f, delimiter="\t")]
+    # utf-8-sig, as rowio reads: an Excel round-trip leaves a BOM that renames the
+    # first header to `\ufeffid`, after which every `row.get("id")` is None —
+    # batch_prep restarts ids at 1 and the merge finds no URLs, both in silence.
+    with open(batch_input, newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
 
 
 def _batch_input_urls(batch_input: Path) -> dict[str, str]:
-    """{job id: posting URL} from batch-input.tsv — the fallback for a row that
-    does not carry its own URL. An unreadable queue costs the URL repair only,
-    so it degrades to {} rather than taking the merge down with it."""
+    """{job id: posting URL} from batch-input.tsv — the URL for a row that was
+    queued by this pipeline. An unreadable queue costs the URL repair only, so
+    it degrades to {} rather than taking the merge down with it. All three ways
+    the read can fail, not just OSError: a hand-edited file saved as cp1252
+    raises UnicodeDecodeError, a NUL byte raises csv.Error, and the UI's Add-Job
+    handler above this has already written the report and the TSV."""
     try:
         rows = read_batch_input(batch_input)
-    except OSError:
+    except (OSError, UnicodeDecodeError, csv.Error):
         return {}
-    return {jid: url for jid, url in
-            (((r.get("id") or "").strip(), (r.get("url") or "").strip()) for r in rows)
-            if jid and url}
+    urls: dict[str, str] = {}
+    for row in rows:
+        jid, url = (row.get("id") or "").strip(), (row.get("url") or "").strip()
+        if jid and url:
+            urls[jid] = url
+    return urls
 
 
-def _trailing_url(parts: list[str]) -> str:
+def _trailing_url(tracker_tsv: str) -> str:
     """The posting URL a row carries in its own optional trailing fields.
 
     career-ops' batch worker is told to write "9 columns plus an optional
-    trailing `url`", so on the path this pass exists for the URL is usually right
-    there in the row — no lookup, and no dependence on the addition's filename
-    being a job id. Detected by SHAPE, exactly as merge-tracker's
-    `parseTsvExtras` does, so it stays order-independent with the optional
-    location and `via=` extras."""
-    for cell in parts[_TRACKER_TSV_COLUMNS:]:
-        cell = cell.strip()
-        if cell.lower().startswith(("http://", "https://")):
-            return cell
+    trailing `url`", so a foreign row often carries its URL with it. Detected by
+    shape as merge-tracker's `parseTsvExtras` does, so it stays order-independent
+    with the optional location and `via=` extras — and with the SAME pattern the
+    notes injector uses to ask "already present", or a `HTTPS://` cell would be
+    detected here, prepended, and not recognised on the next pass: the chain
+    grew a URL per merge."""
+    parts = _row_parts(tracker_tsv)
+    for cell in (parts or [])[_TRACKER_TSV_COLUMNS:]:
+        if _NOTES_URL_RE.match(cell.strip()):
+            return cell.strip()
     return ""
 
 
@@ -891,12 +944,18 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     while every step here splits on tabs and no-ops on it — rewriting it would
     change which of upstream's two parsers reads the row, for no gain."""
     urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
-    jds = career_ops / "batch" / "jds"
     changed = 0
     for f in sorted(tracker_dir.glob("*.tsv")):
-        raw = read_text(f)
-        url = _trailing_url(raw.split("\t")) or urls.get(f.stem, "")
-        fixed = sanitize_addition(raw, url, read_text(jds / f"{f.stem}.txt"))
+        try:
+            # Line endings only — NOT read_text's strip(), which eats the trailing
+            # tab of an empty Notes cell. Read that way, an 8-cell row is padded
+            # back to 9, differs from what was read, and is rewritten and
+            # counted as repaired on every merge, forever.
+            raw = f.read_text(encoding="utf-8").strip("\r\n")
+        except (OSError, UnicodeDecodeError):
+            continue        # one unreadable row must not hold up the other nine
+        fixed = sanitize_addition(raw, urls.get(f.stem, ""),
+                                  read_text(jd_cache_path(career_ops, f.stem)))
         if fixed == raw:
             continue
         try:
