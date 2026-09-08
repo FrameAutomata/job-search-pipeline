@@ -10,10 +10,7 @@ this decides how big to render it. docx→PDF is resume_tailor's job.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +29,7 @@ class BuildResult:
         overflow the trim loop retries, or one generate_for_job's two-page guard
         turns down). A result the caller accepts is consumed by `os.replace`
         into its final name instead, so either way nothing is left behind."""
-        Path(self.pdf).unlink(missing_ok=True)
+        self.pdf.unlink(missing_ok=True)
 
 
 def _search_scale(measure_at, *, lo: float = 0.9, hi: float = 1.35, steps: int = 6,
@@ -77,28 +74,26 @@ def fit_to_page(content: dict, out_dir, *, lo: float = 0.9, hi: float = 1.35,
     consume (`os.replace`) or `discard()`."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    # A content-derived tag keeps fits of DIFFERENT résumés in the same out_dir
-    # apart; mkdtemp's suffix keeps two fits of the SAME content apart, so a
-    # parallel build can never consume or discard the other's PDF.
-    tag = hashlib.sha1(json.dumps(content, sort_keys=True, default=str).encode()).hexdigest()[:10]
-    scratch = Path(tempfile.mkdtemp(prefix=f".fit-{tag}-", dir=out_dir))
-    cache: dict[float, tuple[Path, resume_fit.Measurement]] = {}
+    # A fresh scratch dir per call (mkdtemp's unique name), so two fits in the
+    # same out_dir — a parallel build, or two résumés — can never consume or
+    # discard the other's PDF.
+    with tempfile.TemporaryDirectory(prefix=".fit-", dir=out_dir,
+                                     ignore_cleanup_errors=True) as td:
+        scratch = Path(td)
+        cache: dict[float, tuple[Path, resume_fit.Measurement]] = {}
 
-    def measure_at(scale: float) -> resume_fit.Measurement:
-        key = round(scale, 4)
-        if key not in cache:
-            docx = resume_render.render_docx(content, scratch / f"{key}.docx", scale=scale)
-            pdf = resume_tailor.render_pdf(docx, scratch)
-            if pdf is None:
-                raise RuntimeError("LibreOffice (soffice) is required to fit a résumé to one page")
-            cache[key] = (pdf, resume_fit.measure(pdf))
-        return cache[key][1]
+        def measure_at(scale: float) -> resume_fit.Measurement:
+            key = round(scale, 4)
+            if key not in cache:
+                docx = resume_render.render_docx(content, scratch / f"{key}.docx", scale=scale)
+                pdf = resume_tailor.render_pdf(docx, scratch)
+                if pdf is None:
+                    raise RuntimeError("LibreOffice (soffice) is required to fit a résumé to one page")
+                cache[key] = (pdf, resume_fit.measure(pdf))
+            return cache[key][1]
 
-    try:
         scale = _search_scale(measure_at, lo=lo, hi=hi, steps=steps)
         pdf, m = cache[round(scale, 4)]
         chosen = out_dir / f"{scratch.name}.pdf"
         os.replace(pdf, chosen)
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
     return BuildResult(pdf=chosen, scale=scale, fit=resume_fit.result_from(m, content))

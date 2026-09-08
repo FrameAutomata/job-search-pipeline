@@ -263,13 +263,9 @@ class TestFitToPage:
         self._skip_if_no_soffice()
         r = resume_build.fit_to_page(_CONTENT, tmp_path)
         assert r.pdf.exists() and r.fit.pages == 1 and 0.9 <= r.scale <= 1.35
-
-    def test_leaves_only_the_chosen_pdf_behind(self, tmp_path):
-        # The real toolchain end to end: every non-chosen render and every docx
-        # is gone when fit_to_page returns (#164). The fake-toolchain class
-        # below pins the same rule without LibreOffice.
-        self._skip_if_no_soffice()
-        r = resume_build.fit_to_page(_CONTENT, tmp_path)
+        # And the real toolchain end to end leaves nothing else: every non-chosen
+        # render and every docx is gone when fit_to_page returns (#164). The
+        # fake-toolchain class below pins the same rule without LibreOffice.
         assert [p.name for p in tmp_path.iterdir()] == [r.pdf.name]
 
 
@@ -282,7 +278,7 @@ class TestFitScratchFiles:
     (#164). docx→PDF and the page measurement are faked here so the file
     accounting is testable without LibreOffice."""
 
-    def _fake_toolchain(self, monkeypatch, pages_by_call=None):
+    def _fake_toolchain(self, monkeypatch):
         from pipeline import resume_tailor
         calls = []
 
@@ -293,10 +289,10 @@ class TestFitScratchFiles:
 
         def fake_measure(pdf):
             calls.append(Path(pdf))
-            # Default: the first render (the `hi` probe) spills, every later one
-            # fits — so the search bisects through all `steps` and renders the
-            # maximum number of candidates.
-            pages = (pages_by_call or (lambda n: 2 if n == 1 else 1))(len(calls))
+            # The first render (the `hi` probe) spills, every later one fits —
+            # so the search bisects through all `steps` and renders the maximum
+            # number of candidates.
+            pages = 2 if len(calls) == 1 else 1
             return resume_fit.Measurement(pages, 0.9, 0.5)
 
         monkeypatch.setattr(resume_tailor, "render_pdf", fake_render_pdf)

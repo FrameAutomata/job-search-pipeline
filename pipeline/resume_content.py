@@ -187,7 +187,6 @@ def generate_for_job(career_ops, job, *, profile_dir, caller=None,
         print(f"[build] {job.company}: built résumé spills to {result.fit.pages} pages — using default")
         result.discard()
         return None
-    pdf_out.parent.mkdir(parents=True, exist_ok=True)
     os.replace(result.pdf, pdf_out)         # atomic: never leaves a truncated cache
     role_marker.write_text(role, encoding="utf-8")
     return pdf_out
