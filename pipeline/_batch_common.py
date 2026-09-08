@@ -340,10 +340,14 @@ def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
 
     Lives here rather than in `app/data.py` because the merge-time sanitizer and
     the three report readers need the same lookup and cannot import the UI."""
+    # No `Path(reports_dir)` re-wrap: callers pass a Path, and constructing a
+    # new one reads `os.name` at call time (3.12's Path.__new__), which the
+    # skills launcher's tests patch to "posix" — on Windows that is a PosixPath
+    # nothing can instantiate, and the UI's report lookup sits on that path.
     wanted = _report_int(report_num)
-    if wanted is None or not Path(reports_dir).exists():
+    if wanted is None or not reports_dir.exists():
         return None
-    for f in sorted(Path(reports_dir).glob("*.md")):
+    for f in sorted(reports_dir.glob("*.md")):
         if f.name.endswith(RESERVED_REPORT_SUFFIX):
             continue
         m = re.match(r"^(\d+)-", f.name)
@@ -386,11 +390,11 @@ def resolve_report(base: Path, report_path: str) -> Path | None:
     report_path = _REPORT_ASCENT_RE.sub("", (report_path or "").strip())
     if not report_path:
         return None
-    direct = Path(base) / report_path
+    direct = base / report_path
     if direct.is_file():
         return direct
-    num = re.match(r"^(\d+)-", Path(report_path).name)
-    return find_report_file(Path(base) / "reports", num.group(1)) if num else None
+    num = re.match(r"^(\d+)-", report_path.rsplit("/", 1)[-1])
+    return find_report_file(base / "reports", num.group(1)) if num else None
 
 
 def read_report(base: Path, report_path: str, *, label: str = "report") -> str:
@@ -404,7 +408,7 @@ def read_report(base: Path, report_path: str, *, label: str = "report") -> str:
     if found is None:
         print(f"[{label}] report {report_path} not found — building from the JD alone")
         return ""
-    if found != Path(base) / _REPORT_ASCENT_RE.sub("", report_path.strip()):
+    if found != base / _REPORT_ASCENT_RE.sub("", report_path.strip()):
         print(f"[{label}] report link {report_path} is dead — using {found.name} (same number)")
     return read_text(found)
 
