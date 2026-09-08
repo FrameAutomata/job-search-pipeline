@@ -290,6 +290,25 @@ class TestNodeRoundTrip:
             assert derived[key] == sent, f"{key} did not survive the round trip"
 
 
+class TestExtractResumeText:
+    """onboard.extract_resume_text(bytes, filename) dispatches by the uploaded
+    filename's suffix so the UI accepts DOCX/ODT as well as PDF."""
+
+    def test_extracts_docx_bytes(self, tmp_path):
+        from docx import Document
+        d = Document()
+        d.add_paragraph("Jane Dev")
+        d.add_paragraph("Python, AWS")
+        f = tmp_path / "src.docx"
+        d.save(str(f))
+        text = onboard.extract_resume_text(f.read_bytes(), "Jane_Resume.docx")
+        assert "Jane Dev" in text and "Python, AWS" in text
+
+    def test_unsupported_format_raises(self):
+        with pytest.raises(ValueError):
+            onboard.extract_resume_text(b"x", "resume.rtf")
+
+
 @pytest.mark.skipif(not _node_deps_available(),
                     reason="needs node + npm deps (local install)")
 class TestNarrativeDefaults:
@@ -353,25 +372,6 @@ class TestNarrativeDefaults:
         _, _, md = self._generate(tmp_path, {**self.FORM, "target_roles": "Backend Engineer"},
                                   "Sam\nSKILLS\nGo")
         assert "Backend Engineer" in md and "APIs, databases" in md
-
-
-class TestExtractResumeText:
-    """onboard.extract_resume_text(bytes, filename) dispatches by the uploaded
-    filename's suffix so the UI accepts DOCX/ODT as well as PDF."""
-
-    def test_extracts_docx_bytes(self, tmp_path):
-        from docx import Document
-        d = Document()
-        d.add_paragraph("Jane Dev")
-        d.add_paragraph("Python, AWS")
-        f = tmp_path / "src.docx"
-        d.save(str(f))
-        text = onboard.extract_resume_text(f.read_bytes(), "Jane_Resume.docx")
-        assert "Jane Dev" in text and "Python, AWS" in text
-
-    def test_unsupported_format_raises(self):
-        with pytest.raises(ValueError):
-            onboard.extract_resume_text(b"x", "resume.rtf")
 
 
 class TestRunGenerationErrors:
