@@ -103,6 +103,11 @@ class TestBuildOnboardingJson:
         assert payload["searchSettings"]["hoursOld"] == 48
         assert payload["searchSettings"]["includeEasyApply"] is True
 
+    def test_maps_the_narrative_headline_and_story(self):
+        n = onboard.build_onboarding_json(
+            {"headline": "Front-desk lead", "exit_story": "Moving into patient access."}, "")["narrative"]
+        assert n["headline"] == "Front-desk lead" and n["exitStory"] == "Moving into patient access."
+
     def test_defaults_when_empty(self):
         payload = onboard.build_onboarding_json({}, resume_text="")
         # No locations -> a single US-Remote default entry.
@@ -263,6 +268,7 @@ class TestNodeRoundTrip:
             "github": "github.com/janedev", "website": "janedev.dev",
             "street": "1 Main St", "state": "TX", "postal_code": "75201",
             "tailoring_instructions": "Lead with impact.",
+            "headline": "Hands-on backend engineer", "exit_story": "Moving to platform work.",
             "target_roles": "Backend Engineer, Platform Engineer",
             "negative_roles": "Intern, Director",
             "comp_target": "$150K-190K", "comp_min": "$130K",
@@ -282,6 +288,71 @@ class TestNodeRoundTrip:
         for key, sent in form.items():
             assert key in derived, f"{key} was written but derive_form doesn't read it back"
             assert derived[key] == sent, f"{key} did not survive the round trip"
+
+
+@pytest.mark.skipif(not _node_deps_available(),
+                    reason="needs node + npm deps (local install)")
+class TestNarrativeDefaults:
+    """The Narrative step is optional, and what filled its blanks was an
+    engineer's prose — written into profile.yml and _profile.md for every
+    candidate, shipped to the cloud, and read by the evaluator as the seed
+    whenever no PROFILE.md exists (#161). Blanks now derive from the résumé's
+    summary and the first target role. Driven through the real generator."""
+
+    ENGINEERING = ("software", "ship", "full-stack", "technical excellence",
+                   "excels in this domain", "impactful products")
+
+    def _generate(self, tmp_path, form, resume):
+        repo = Path(__file__).resolve().parent.parent
+        work = tmp_path
+        (work / "config").mkdir()
+        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
+        (work / "career-ops" / "config").mkdir(parents=True)
+        (work / "career-ops" / "modes").mkdir(parents=True)
+        result = onboard.run_generation(work, onboard.build_onboarding_json(form, resume))
+        assert result.get("ok") is True, result
+        import yaml
+        profile = yaml.safe_load((work / "career-ops" / "config" / "profile.yml").read_text(encoding="utf-8"))
+        md = (work / "career-ops" / "modes" / "_profile.md").read_text(encoding="utf-8")
+        return work, profile["narrative"], md
+
+    FORM = {"name": "Pat Lee", "locations": "Dallas, TX", "sites": ["indeed"],
+            "target_roles": "Patient Access Representative"}
+    RESUME = ("Pat Lee\nPROFESSIONAL SUMMARY\nPatient-focused registration professional with "
+              "5 years in hospital front-desk operations. Fluent in Epic and insurance verification.\n"
+              "SKILLS\nEpic, Scheduling\nEXPERIENCE\nMercy Hospital")
+
+    def test_blank_narrative_derives_from_the_resume_summary(self, tmp_path):
+        _, narrative, md = self._generate(tmp_path, self.FORM, self.RESUME)
+        summary = "Patient-focused registration professional with 5 years in hospital front-desk operations."
+        assert narrative["exit_story"] == summary
+        assert narrative["headline"] == summary
+        assert narrative["superpowers"] == []
+        block = " ".join(str(v) for v in narrative.values()).lower()
+        assert not any(w in block for w in self.ENGINEERING)
+        assert summary in md and not any(w in md.lower() for w in self.ENGINEERING)
+
+    def test_blank_narrative_and_no_summary_falls_back_to_the_target_role(self, tmp_path):
+        _, narrative, _ = self._generate(tmp_path, self.FORM, "Pat Lee\nSKILLS\nEpic\nEXPERIENCE\nMercy")
+        assert narrative["exit_story"] == "Seeking Patient Access Representative roles that build on my experience."
+        assert narrative["headline"] == "Patient Access Representative candidate"
+
+    def test_a_filled_narrative_reaches_profile_yml_and_profile_md(self, tmp_path):
+        form = {**self.FORM, "headline": "Front-desk lead who keeps registration moving",
+                "exit_story": "Moving into patient access where my Epic scheduling work carries the most weight."}
+        work, narrative, md = self._generate(tmp_path, form, self.RESUME)
+        assert narrative["headline"] == form["headline"]
+        assert narrative["exit_story"] == form["exit_story"]
+        assert form["exit_story"] in md
+        derived = onboard.derive_form(work, work / "career-ops")
+        assert derived["headline"] == form["headline"] and derived["exit_story"] == form["exit_story"]
+
+    def test_engineering_rows_still_fire_for_engineering_roles(self, tmp_path):
+        # The keyed archetype prose is not removed — it just only applies when a
+        # target role names it.
+        _, _, md = self._generate(tmp_path, {**self.FORM, "target_roles": "Backend Engineer"},
+                                  "Sam\nSKILLS\nGo")
+        assert "Backend Engineer" in md and "APIs, databases" in md
 
 
 class TestExtractResumeText:

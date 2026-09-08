@@ -179,6 +179,11 @@ _PROFILE_TEXT_FIELDS = {
     "voluntary_disclosures": {"eeo_gender": "gender", "eeo_race": "race_ethnicity",
                               "eeo_veteran": "veteran_status",
                               "eeo_disability": "disability_status"},
+    # The Narrative step's two prose answers now reach profile.yml (#161), so
+    # they read back like every other field; the rest of that step (deal-
+    # breakers, flexibility, portfolio) is rendered only into _profile.md and
+    # still lives in the sidecar alone.
+    "narrative": {"headline": "headline", "exit_story": "exit_story"},
 }
 
 # form field -> (section, profile.yml key) for the yes/no answers.
@@ -579,6 +584,7 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "includeEasyApply": bool(form.get("include_easy_apply")),
         },
         "narrative": {
+            "headline": form.get("headline") or "",
             "exitStory": form.get("exit_story") or "",
             "dealBreakers": _split_csv(form.get("deal_breakers")),
             "locationPolicy": {
