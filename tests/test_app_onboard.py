@@ -284,6 +284,76 @@ class TestNodeRoundTrip:
             assert derived[key] == sent, f"{key} did not survive the round trip"
 
 
+@pytest.mark.skipif(not _node_deps_available(),
+                    reason="needs node + npm deps (local install)")
+class TestGroupedRoles:
+    """Both real wizard-configured copies typed their target roles as
+    slash-grouped alternatives, and the wizard passed each string through
+    verbatim as one board query and one `target_titles` entry no title could
+    ever contain — the +5 title bonus had never fired on either (#160).
+    Driven through the real generator, like the round trip above."""
+
+    def _generate(self, tmp_path, form):
+        repo = Path(__file__).resolve().parent.parent
+        work = tmp_path
+        (work / "config").mkdir()
+        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
+        (work / "career-ops" / "config").mkdir(parents=True)
+        (work / "career-ops" / "modes").mkdir(parents=True)
+        result = onboard.run_generation(work, onboard.build_onboarding_json(form, "Jane\nSKILLS\nx"))
+        assert result.get("ok") is True, result
+        import yaml
+        return work, yaml.safe_load((work / "config" / "search.yml").read_text(encoding="utf-8"))
+
+    def test_slash_and_or_groups_become_separate_queries(self, tmp_path):
+        _, cfg = self._generate(tmp_path, {
+            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
+            "target_roles": "Patient Access / Patient Registration Representative, "
+                            "research assistant / policy or program analyst"})
+        terms = cfg["searches"][0]["search_terms"]
+        assert terms == ["patient access", "patient registration representative",
+                         "research assistant", "policy analyst", "program analyst"]
+
+    def test_title_fragments_are_what_a_title_keeps(self, tmp_path):
+        _, cfg = self._generate(tmp_path, {
+            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
+            "target_roles": "Patient Access Representative / Patient Registration Representative"})
+        titles = cfg["filter"]["target_titles"]
+        assert not any(" / " in t or " or " in t for t in titles)
+        # The stem without the generic suffix: "Patient Access Rep II" earns the bonus.
+        assert {"patient access representative", "patient access",
+                "patient registration representative", "patient registration"} <= set(titles)
+
+    def test_the_bonus_actually_fires_on_a_real_title(self, tmp_path):
+        from pipeline import filter as filter_mod
+        _, cfg = self._generate(tmp_path, {
+            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
+            "target_roles": "Patient Access / Patient Registration Representative"})
+        row = {"title": "Patient Access Rep II", "description": ""}
+        score, matched = filter_mod.score_job(row, {}, cfg["filter"]["target_titles"], [])
+        assert score == filter_mod.SCORE_TITLE_MATCH and matched == ["title:patient access"]
+
+    def test_compound_slash_and_coordinator_are_one_title(self, tmp_path):
+        _, cfg = self._generate(tmp_path, {
+            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
+            "target_roles": "UI/UX Designer, Patient Care Coordinator"})
+        assert cfg["searches"][0]["search_terms"] == ["ui/ux designer", "patient care coordinator"]
+
+    def test_negative_roles_split_the_same_way(self, tmp_path):
+        _, cfg = self._generate(tmp_path, {
+            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
+            "target_roles": "Nurse", "negative_roles": "Intern, Manager / Director"})
+        assert cfg["filter"]["negative_titles"] == ["Intern", "Manager", "Director"]
+
+    def test_the_form_reads_back_what_was_typed(self, tmp_path):
+        # profile.yml keeps the user's own text (archetypes), so the wizard shows
+        # "Patient Access / Patient Registration Representative", not the split.
+        typed = "Patient Access / Patient Registration Representative"
+        work, _ = self._generate(tmp_path, {"name": "Jane", "locations": "Dallas, TX",
+                                            "sites": ["indeed"], "target_roles": typed})
+        assert onboard.derive_form(work, work / "career-ops")["target_roles"] == typed
+
+
 class TestExtractResumeText:
     """onboard.extract_resume_text(bytes, filename) dispatches by the uploaded
     filename's suffix so the UI accepts DOCX/ODT as well as PDF."""

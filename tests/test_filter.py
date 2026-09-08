@@ -931,3 +931,21 @@ filter:
 
         urls = set(pd.read_csv(output_path)["job_url"])
         assert urls == {"https://ok.com"}
+
+
+class TestUnmatchableTargetTitles:
+    """A `target_titles` entry that groups alternatives is matched literally
+    and can never fire; the stage log still counted it (#160)."""
+
+    def test_slash_and_or_entries_are_warned(self, capsys):
+        grouped = filter_mod._warn_unmatchable_titles([
+            "patient access / patient registration representative",
+            "policy or program analyst", "software engineer", None])
+        assert grouped == ["patient access / patient registration representative",
+                           "policy or program analyst"]
+        out = capsys.readouterr().out
+        assert out.count("WARNING") == 2 and "software engineer" not in out
+
+    def test_compounds_and_coordinator_are_not_grouped(self, capsys):
+        assert filter_mod._warn_unmatchable_titles(["ui/ux designer", "patient care coordinator"]) == []
+        assert capsys.readouterr().out == ""
