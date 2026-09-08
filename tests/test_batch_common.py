@@ -8,11 +8,6 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
-    _liveness_closed_rows,
-    _reopen_reposted,
-    closed_by_recheck,
-    liveness_closed_mark,
-    reopened_mark,
     _recover_refused_additions,
     _sanitize_pending_additions,
     sanitize_addition,
@@ -34,6 +29,10 @@ from pipeline._batch_common import (
     run_merge_tracker,
     tail_text,
     write_job_result,
+)
+from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
+    _liveness_closed_rows, _reopen_reposted, closed_by_recheck, liveness_closed_mark,
+    reopened_mark,
 )
 
 

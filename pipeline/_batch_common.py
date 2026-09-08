@@ -927,6 +927,94 @@ def _trailing_url(tracker_tsv: str) -> str:
     return ""
 
 
+def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
+    """Apply `sanitize_addition` to every un-merged addition on disk, whoever
+    wrote it, and say so when something was repaired.
+
+    `write_job_result` covers the rows this pipeline's Python produces, but it is
+    not the only writer: career-ops' own evaluators (`batch-runner.sh` on the
+    `--batch` path, `gemini-eval.mjs`, the web runner) write straight into
+    `tracker-additions/`, never entering Python. Those rows reach a merge with
+    none of the chain applied — no score normalization, so an unreadable score
+    cell gets the row REFUSED and archived (exit 0, never retried); no URL in
+    notes, so the UI's "Open posting" link renders as `#`; and no req id, so two
+    levels of one title fold.
+
+    **This covers the merges WE run** — `--evaluate-batch`, the UI, and the heal
+    sweep that picks up whatever is still pending. It does NOT cover a `--batch`
+    run end to end: `batch-runner.sh` calls `node merge-tracker.mjs` itself as its
+    last step, with no Python in the process tree, so those rows are merged before
+    this can see them. Recovering those means going after `tracker-additions/
+    merged/` once the runner has finished; see #156.
+
+    Recovery of what a foreign row is missing prefers the row's OWN trailing URL
+    (career-ops' documented 10th field) and falls back to `batch-input.tsv` keyed
+    on the addition's filename — which is a job id for our writers and for
+    career-ops' batch prompt, but not for its other writers, whose
+    `{num}-{slug}.tsv` names simply find nothing and keep the score repair.
+
+    A pipe-delimited row is left alone. merge-tracker parses that shape natively,
+    while every step here splits on tabs and no-ops on it — rewriting it would
+    change which of upstream's two parsers reads the row, for no gain."""
+    urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
+    changed = 0
+    for f in sorted(tracker_dir.glob("*.tsv")):
+        try:
+            # Line endings only — NOT read_text's strip(), which eats the trailing
+            # tab of an empty Notes cell. Read that way, an 8-cell row is padded
+            # back to 9, differs from what was read, and is rewritten and
+            # counted as repaired on every merge, forever.
+            raw = f.read_text(encoding="utf-8").strip("\r\n")
+        except (OSError, UnicodeDecodeError):
+            continue        # one unreadable row must not hold up the other nine
+        fixed = sanitize_addition(raw, urls.get(f.stem, ""),
+                                  read_text(jd_cache_path(career_ops, f.stem)))
+        if fixed == raw:
+            continue
+        try:
+            atomic_write_text(f, fixed + "\n")
+        except OSError:
+            continue        # a row we cannot repair still merges as it stands
+        changed += 1
+    if changed:
+        print(f"[batch] sanitized {changed} addition(s) written outside the "
+              "Python path (score/URL/req-id)")
+
+
+def run_merge_tracker(career_ops: Path) -> bool:
+    merge_script = career_ops / "merge-tracker.mjs"
+    if not merge_script.exists():
+        return False
+    # Seed the tracker header first — otherwise merge-tracker no-ops on a
+    # fresh run (see ensure_applications_md).
+    ensure_applications_md(career_ops)
+    tracker_dir = career_ops / "batch" / "tracker-additions"
+    # Recovery first, so a restored row is sanitized and snapshotted with the
+    # rest; sanitizing before the snapshot, since it can change the role cell (a
+    # pipe suffix), which is half the identity the loss guard matches on.
+    _recover_refused_additions(career_ops, tracker_dir)
+    _sanitize_pending_additions(career_ops, tracker_dir)
+    before = _pending_additions(tracker_dir)
+    # The re-check's Discards, read before the merge can rewrite their Notes.
+    closed = _liveness_closed_rows(career_ops / "data" / "applications.md")
+    print("[batch] running merge-tracker.mjs...")
+    r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
+    if r.returncode == 0:
+        print("[batch] tracker merged")
+        # BOTH streams: merge-tracker refuses a row with console.warn, which is
+        # stderr. Passing stdout alone left the reasons block empty on every
+        # genuine loss — and printed the one refusal it does log to stdout (the
+        # benign unscoreable re-eval) as the explanation for some other
+        # addition's disappearance.
+        _warn_on_lost_additions(before, career_ops, tracker_dir,
+                                f"{r.stdout}\n{r.stderr}")
+        _reopen_reposted(closed, career_ops)
+        return True
+    print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
+    _hint_missing_node_modules(r.stderr)
+    return False
+
+
 # ── "Discarded" is two different things (#163) ───────────────────────────────
 #
 # A person drags a card to Discarded because they decided against the role.
@@ -1037,94 +1125,6 @@ def _reopen_reposted(closed_before: dict[str, dict], career_ops: Path) -> None:
           "re-posted and re-evaluated in this merge, so back to Evaluated:")
     for num, _, company, role in changes:
         print(f"[batch]   #{num} {company} — {role}")
-
-
-def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
-    """Apply `sanitize_addition` to every un-merged addition on disk, whoever
-    wrote it, and say so when something was repaired.
-
-    `write_job_result` covers the rows this pipeline's Python produces, but it is
-    not the only writer: career-ops' own evaluators (`batch-runner.sh` on the
-    `--batch` path, `gemini-eval.mjs`, the web runner) write straight into
-    `tracker-additions/`, never entering Python. Those rows reach a merge with
-    none of the chain applied — no score normalization, so an unreadable score
-    cell gets the row REFUSED and archived (exit 0, never retried); no URL in
-    notes, so the UI's "Open posting" link renders as `#`; and no req id, so two
-    levels of one title fold.
-
-    **This covers the merges WE run** — `--evaluate-batch`, the UI, and the heal
-    sweep that picks up whatever is still pending. It does NOT cover a `--batch`
-    run end to end: `batch-runner.sh` calls `node merge-tracker.mjs` itself as its
-    last step, with no Python in the process tree, so those rows are merged before
-    this can see them. Recovering those means going after `tracker-additions/
-    merged/` once the runner has finished; see #156.
-
-    Recovery of what a foreign row is missing prefers the row's OWN trailing URL
-    (career-ops' documented 10th field) and falls back to `batch-input.tsv` keyed
-    on the addition's filename — which is a job id for our writers and for
-    career-ops' batch prompt, but not for its other writers, whose
-    `{num}-{slug}.tsv` names simply find nothing and keep the score repair.
-
-    A pipe-delimited row is left alone. merge-tracker parses that shape natively,
-    while every step here splits on tabs and no-ops on it — rewriting it would
-    change which of upstream's two parsers reads the row, for no gain."""
-    urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
-    changed = 0
-    for f in sorted(tracker_dir.glob("*.tsv")):
-        try:
-            # Line endings only — NOT read_text's strip(), which eats the trailing
-            # tab of an empty Notes cell. Read that way, an 8-cell row is padded
-            # back to 9, differs from what was read, and is rewritten and
-            # counted as repaired on every merge, forever.
-            raw = f.read_text(encoding="utf-8").strip("\r\n")
-        except (OSError, UnicodeDecodeError):
-            continue        # one unreadable row must not hold up the other nine
-        fixed = sanitize_addition(raw, urls.get(f.stem, ""),
-                                  read_text(jd_cache_path(career_ops, f.stem)))
-        if fixed == raw:
-            continue
-        try:
-            atomic_write_text(f, fixed + "\n")
-        except OSError:
-            continue        # a row we cannot repair still merges as it stands
-        changed += 1
-    if changed:
-        print(f"[batch] sanitized {changed} addition(s) written outside the "
-              "Python path (score/URL/req-id)")
-
-
-def run_merge_tracker(career_ops: Path) -> bool:
-    merge_script = career_ops / "merge-tracker.mjs"
-    if not merge_script.exists():
-        return False
-    # Seed the tracker header first — otherwise merge-tracker no-ops on a
-    # fresh run (see ensure_applications_md).
-    ensure_applications_md(career_ops)
-    tracker_dir = career_ops / "batch" / "tracker-additions"
-    # Recovery first, so a restored row is sanitized and snapshotted with the
-    # rest; sanitizing before the snapshot, since it can change the role cell (a
-    # pipe suffix), which is half the identity the loss guard matches on.
-    _recover_refused_additions(career_ops, tracker_dir)
-    _sanitize_pending_additions(career_ops, tracker_dir)
-    before = _pending_additions(tracker_dir)
-    # The re-check's Discards, read before the merge can rewrite their Notes.
-    closed = _liveness_closed_rows(career_ops / "data" / "applications.md")
-    print("[batch] running merge-tracker.mjs...")
-    r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
-    if r.returncode == 0:
-        print("[batch] tracker merged")
-        # BOTH streams: merge-tracker refuses a row with console.warn, which is
-        # stderr. Passing stdout alone left the reasons block empty on every
-        # genuine loss — and printed the one refusal it does log to stdout (the
-        # benign unscoreable re-eval) as the explanation for some other
-        # addition's disappearance.
-        _warn_on_lost_additions(before, career_ops, tracker_dir,
-                                f"{r.stdout}\n{r.stderr}")
-        _reopen_reposted(closed, career_ops)
-        return True
-    print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
-    _hint_missing_node_modules(r.stderr)
-    return False
 
 
 def _addition_key(company: str, role: str) -> str:
