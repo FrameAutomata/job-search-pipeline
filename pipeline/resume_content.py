@@ -143,7 +143,7 @@ def generate_for_job(career_ops, job, *, profile_dir, caller=None,
     tailor)."""
     # pipeline.* imports stay lazy: handoff↔resume_content would cycle at module
     # load, and a fully-cached run must not need a provider key.
-    from pipeline._batch_common import read_text
+    from pipeline._batch_common import read_report, read_text
     from pipeline.handoff import HANDOFF_PROFILE
     from pipeline.resume_tailor import jd_text_for_job, resume_paths
 
@@ -167,8 +167,10 @@ def generate_for_job(career_ops, job, *, profile_dir, caller=None,
         return pdf_out
 
     jd = jd_text_for_job(career_ops, report_base, job)
-    report_path = getattr(job, "report_path", "")
-    report = read_text(Path(report_base or career_ops) / report_path) if report_path else ""
+    # By number when the link is dead (#162) — the report's proof-points are
+    # half of what makes the build role-specific, and losing them was silent.
+    report = read_report(Path(report_base or career_ops), getattr(job, "report_path", ""),
+                         label="build")
 
     result = build_for_job(profile_md, jd, pdf_out.parent, report=report,
                            caller=caller, provider=provider, model=model)

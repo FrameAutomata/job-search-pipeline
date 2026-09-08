@@ -218,6 +218,26 @@ class TestGenerateForJob:
         assert resume_content.generate_for_job(co, self._job(), profile_dir=pd) is None
         assert not pdf_out.exists()                           # a 2-page résumé is never cached
 
+    def test_dead_report_link_still_feeds_the_report(self, tmp_path, monkeypatch):
+        """The tracker's Report link is model-authored and can name a file the
+        writer never created; the build then silently lost the report's proof
+        points (#162). It now resolves by number, like the UI."""
+        from pipeline import resume_build
+        from pipeline.role_select import ApplyJob
+        co, pd = self._dirs(tmp_path)
+        (co / "reports").mkdir()
+        (co / "reports" / "001-acme-2026-01-01.md").write_text("PROOF POINT: shipped X", encoding="utf-8")
+        job = ApplyJob(num="1", company="Acme", role="Engineer", url="u", score=4.5,
+                       report_path="reports/001-acme-&-co-–-engineer-2026-01-01.md")
+        winner = tmp_path / "w.pdf"; winner.write_bytes(b"%PDF")
+        seen = {}
+        def fake_build(profile_md, jd, out_dir, *, report="", **kw):
+            seen["report"] = report
+            return resume_build.BuildResult(pdf=winner, scale=1.0, fit=None)
+        monkeypatch.setattr(resume_content, "build_for_job", fake_build)
+        resume_content.generate_for_job(co, job, profile_dir=pd, caller=lambda s, u: "")
+        assert "PROOF POINT: shipped X" in seen["report"]
+
     def test_reuses_cached_pdf_newer_than_profile_and_role(self, tmp_path, monkeypatch):
         from pipeline import resume_tailor
         co, pd = self._dirs(tmp_path)

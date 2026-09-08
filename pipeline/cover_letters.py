@@ -16,7 +16,7 @@ import os
 import re
 from pathlib import Path
 
-from pipeline._batch_common import atomic_write_text, normalize_company, read_text
+from pipeline._batch_common import atomic_write_text, normalize_company, read_report, read_text
 from pipeline import role_select as queue
 from pipeline.candidate_profile import ApplyProfile
 from pipeline.stdio import line_buffer_stdout
@@ -176,8 +176,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
     cv = read_text(career_ops / "cv.md")
     # The CV is local, but the report lives next to the tracker (the refreshed
     # artifact's reports/ when applying against cloud evaluations).
-    report_path = getattr(job, "report_path", "") or ""
-    report_text = read_text(Path(report_base or career_ops) / report_path) if report_path else ""
+    report_text = read_report(Path(report_base or career_ops),
+                              getattr(job, "report_path", ""), label="cover")
     system, user = build_prompt(profile, cv, job, report_text,
                                 jd_text=jd_text_for_job(career_ops, report_base, job))
     from pipeline.batch_evaluate import _call_with_retry

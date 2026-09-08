@@ -8,8 +8,13 @@ import pytest
 
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
+    _dead_link_repair,
     _recover_refused_additions,
     _sanitize_pending_additions,
+    _set_report_link,
+    find_report_file,
+    read_report,
+    resolve_report,
     sanitize_addition,
     _inject_req_id_into_notes,
     _normalize_score_cell,
@@ -321,6 +326,40 @@ class TestWriteJobResult:
         meta = {"id": "1", "report_num": "001"}
         out = write_job_result(response, meta, reports, tracker, "2026-01-01")
         assert "acme-corp-llc" in out["report_file"]
+
+    def test_report_link_names_the_file_the_writer_created(self, tmp_path):
+        """The Report cell is model-authored from a shape alone, so it invents
+        the slug — keeps the `&`, appends the role, uses an en-dash — while the
+        file is written under the writer's own slug. Six of 230 rows in a real
+        tracker linked a file that never existed; the tailor then silently built
+        from the JD alone (#162). The writer knows the name: it wins."""
+        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
+        reports.mkdir(); tracker.mkdir()
+        company = "Baylor Scott & White Health"
+        meta = {"id": "42", "report_num": "271", "company": company}
+        row = (f"11\t2026-09-03\t{company}\tFront Desk Lead – Heart & Vascular"
+               "\tEvaluated\t4.2/5\tnull"
+               "\t[271](reports/271-baylor-scott-&-white-health-front-desk-lead-–-heart-2026-09-03.md)"
+               "\tAPPLY")
+        summary = json.dumps({"status": "completed", "id": "42", "report_num": "271",
+                              "company": company, "role": "Front Desk Lead", "score": 4.2})
+        response = (f"<evaluation><report>report</report><tracker_tsv>{row}</tracker_tsv>"
+                    f"<summary>{summary}</summary></evaluation>")
+        write_job_result(response, meta, reports, tracker, "2026-09-03")
+        cells = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
+        assert cells[7] == "[271](reports/271-baylor-scott-white-health-2026-09-03.md)"
+        assert (reports / "271-baylor-scott-white-health-2026-09-03.md").exists()
+
+    def test_report_link_left_as_written_when_no_report_was_written(self, tmp_path):
+        # A response with no <report> writes no file, so there is nothing true to
+        # point the cell at; it keeps the model's link rather than a dead one of ours.
+        reports, tracker = tmp_path / "reports", tmp_path / "tracker"
+        reports.mkdir(); tracker.mkdir()
+        meta = {"id": "42", "report_num": "001", "company": "Acme"}
+        row = "1\t2026-01-01\tAcme\tEng\tEvaluated\t4.0/5\tnull\t[001](reports/001-acme-&-co.md)\tn"
+        write_job_result(self._make_response(report="", tracker=row), meta, reports, tracker, "2026-01-01")
+        cells = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
+        assert cells[7] == "[001](reports/001-acme-&-co.md)"
 
     def test_url_spliced_into_notes_cell(self, tmp_path):
         # The UI's "Open posting" link reads the URL out of the notes cell.
@@ -1130,6 +1169,43 @@ class TestSanitizePendingAdditions:
         _sanitize_pending_additions(co, additions)
         assert (additions / "7.tsv").read_text(encoding="utf-8") == piped + "\n"
 
+    def test_a_dead_report_link_is_pointed_at_the_file_with_its_number(self, tmp_path):
+        """A row from a writer that trusted the model's slug (#162): the link
+        names no file, but a report with that number exists — the same lookup
+        the UI resolves by points the cell at it."""
+        co, additions = self._tree(tmp_path)
+        (co / "reports").mkdir()
+        (co / "reports" / "003-initech-2026-08-25.md").write_text("# report", encoding="utf-8")
+        _sanitize_pending_additions(co, additions)
+        assert self._cells(additions)[7] == "[003](reports/003-initech-2026-08-25.md)"
+
+    def test_a_live_report_link_is_left_as_written(self, tmp_path, capsys):
+        """Whichever relative shape it has: merge-tracker relativises the cell to
+        data/applications.md, so `../reports/` is a valid link too. And the link
+        is the one cell that knows which of two same-numbered files was meant."""
+        row = _tracker_row(score="4.2/5", notes="req 88214 — https://x/j/7 — APPLY strong match"
+                           ).replace("[003](reports/003-x.md)", "[003](../reports/003-x.md)")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": row})
+        (co / "reports").mkdir()
+        (co / "reports" / "003-x.md").write_text("# report", encoding="utf-8")
+        (co / "reports" / "003-other.md").write_text("# a second file with the number", encoding="utf-8")
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == row + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_a_reserved_lock_is_not_a_repair_target(self, tmp_path):
+        # `003-RESERVED.md` is career-ops' number lock, not a report.
+        co, additions = self._tree(tmp_path)
+        (co / "reports").mkdir()
+        (co / "reports" / "003-RESERVED.md").write_text('{"pid": 1}', encoding="utf-8")
+        _sanitize_pending_additions(co, additions)
+        assert self._cells(additions)[7] == "[003](reports/003-x.md)"
+
+    def test_no_report_with_the_number_leaves_the_link(self, tmp_path):
+        co, additions = self._tree(tmp_path)
+        _sanitize_pending_additions(co, additions)                  # no reports/ at all
+        assert self._cells(additions)[7] == "[003](reports/003-x.md)"
+
     def test_run_merge_tracker_wires_it_in(self, tmp_path, mocker):
         """The one test that goes through the merge: sanitizing must happen, and
         must happen BEFORE the loss guard's snapshot, since stripping a role's
@@ -1161,6 +1237,114 @@ class TestSanitizeAddition:
     def test_declines_a_row_whose_columns_are_not_in_place(self):
         shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
         assert sanitize_addition(shifted, "https://x/j", "Job ID: 5") == shifted
+        assert sanitize_addition(shifted, "https://x/j", "Job ID: 5",
+                                 report_file="12-acme-2026-09-01.md") == shifted
+
+    def test_is_idempotent_with_a_report_file(self):
+        raw = _tracker_row(score="4.2", role="SRE | Remote") + "\thttps://own/j/9"
+        once = sanitize_addition(raw, "https://x/j", "Job ID: 88214", report_file="003-initech-2026.md")
+        assert "[003](reports/003-initech-2026.md)" in once
+        assert sanitize_addition(once, "https://x/j", "Job ID: 88214",
+                                 report_file="003-initech-2026.md") == once
+
+
+class TestSetReportLink:
+    """The Report cell is `[N](reports/N-slug-DATE.md)` with N the FILE's own
+    leading number, so the two cannot disagree. Empty means nothing known."""
+
+    def test_points_the_cell_at_the_file(self):
+        out = _set_report_link(_tracker_row(), "003-initech-2026-08-25.md")
+        assert out.split("\t")[7] == "[003](reports/003-initech-2026-08-25.md)"
+
+    def test_keeps_trailing_extras(self):
+        out = _set_report_link(_tracker_row() + "\thttps://own/j/9", "003-i.md")
+        assert out.split("\t")[9] == "https://own/j/9"
+
+    def test_empty_or_unnumbered_file_leaves_the_row(self):
+        assert _set_report_link(_tracker_row(), "") == _tracker_row()
+        assert _set_report_link(_tracker_row(), "notes.md") == _tracker_row()
+
+    def test_declines_a_shifted_row(self):
+        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
+        assert _set_report_link(shifted, "12-acme.md") == shifted
+
+
+class TestDeadLinkRepair:
+    def _co(self, tmp_path, *names):
+        co = tmp_path / "co"; (co / "reports").mkdir(parents=True)
+        for n in names:
+            (co / "reports" / n).write_text("#", encoding="utf-8")
+        return co
+
+    def test_dead_link_resolves_by_the_filename_number(self, tmp_path):
+        co = self._co(tmp_path, "003-initech-2026.md")
+        assert _dead_link_repair(co, _tracker_row()) == "003-initech-2026.md"
+
+    def test_padding_of_the_number_is_tolerated(self, tmp_path):
+        co = self._co(tmp_path, "3-initech-2026.md")
+        assert _dead_link_repair(co, _tracker_row()) == "3-initech-2026.md"
+
+    def test_live_link_is_not_repaired(self, tmp_path):
+        co = self._co(tmp_path, "003-x.md", "003-y.md")
+        assert _dead_link_repair(co, _tracker_row()) == ""
+
+    def test_link_text_is_the_fallback_number(self, tmp_path):
+        # A slug so mangled it lost its numeric prefix: the `[N]` text still says.
+        co = self._co(tmp_path, "003-initech-2026.md")
+        row = _tracker_row().replace("[003](reports/003-x.md)", "[003](reports/initech.md)")
+        assert _dead_link_repair(co, row) == "003-initech-2026.md"
+
+    def test_shifted_row_declined(self, tmp_path):
+        co = self._co(tmp_path, "12-a.md")
+        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-b.md)\tAPPLY"
+        assert _dead_link_repair(co, shifted) == ""
+
+
+class TestReadReport:
+    """The readers — cover letters and both tailors — resolved `base / link`
+    and got "" from read_text on a dead link, building from the JD alone with
+    no log line (#162). Now they resolve like the UI, and say so."""
+
+    def _co(self, tmp_path, **files):
+        co = tmp_path / "co"; (co / "reports").mkdir(parents=True)
+        for n, body in files.items():
+            (co / "reports" / n).write_text(body, encoding="utf-8")
+        return co
+
+    def test_live_link_reads_directly_and_quietly(self, tmp_path, capsys):
+        co = self._co(tmp_path, **{"271-baylor-2026.md": "PROOF"})
+        assert read_report(co, "reports/271-baylor-2026.md") == "PROOF"
+        assert capsys.readouterr().out == ""
+
+    def test_ascent_form_of_a_live_link_reads_directly(self, tmp_path, capsys):
+        co = self._co(tmp_path, **{"271-baylor-2026.md": "PROOF"})
+        assert read_report(co, "../reports/271-baylor-2026.md") == "PROOF"
+        assert capsys.readouterr().out == ""
+
+    def test_dead_link_resolves_by_number_and_says_so(self, tmp_path, capsys):
+        co = self._co(tmp_path, **{"271-baylor-scott-white-health-2026-09-03.md": "PROOF"})
+        text = read_report(co, "reports/271-baylor-scott-&-white-health-2026-09-03.md", label="build")
+        assert text == "PROOF"
+        out = capsys.readouterr().out
+        assert out.startswith("[build]") and "271-baylor-scott-white-health-2026-09-03.md" in out
+
+    def test_missing_report_warns_and_returns_empty(self, tmp_path, capsys):
+        co = self._co(tmp_path)
+        assert read_report(co, "reports/999-gone.md", label="cover") == ""
+        assert "[cover] report reports/999-gone.md not found" in capsys.readouterr().out
+
+    def test_lock_is_not_a_report(self, tmp_path):
+        co = self._co(tmp_path, **{"271-RESERVED.md": '{"pid": 1}'})
+        assert resolve_report(co, "reports/271-baylor.md") is None
+
+    def test_empty_path_is_silent(self, tmp_path, capsys):
+        assert read_report(tmp_path, "") == ""
+        assert capsys.readouterr().out == ""
+
+    def test_find_report_file_is_the_shared_lookup(self, tmp_path):
+        # app/data re-exports it; one implementation for the UI and the readers.
+        from pipeline.app import data
+        assert data.find_report_file is find_report_file
 
 
 
