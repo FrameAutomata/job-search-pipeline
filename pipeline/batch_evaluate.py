@@ -297,16 +297,24 @@ def _call_with_retry(
     Backoff: 1, 2, 4, 8, 16 seconds, each with up to 0.5s of random jitter to
     avoid thundering-herd when multiple workers throttle simultaneously.
 
+    The budget is about the PROVIDER's time. A paced `caller` may first sleep
+    for minutes on our own token budget (gemini_limits.paced_caller), and that
+    queue wait is credited back to the deadline (#148) — otherwise a worker that
+    spent its budget queuing met a transient 429 with a retry loop that gave up
+    on attempt 1, exactly where the soft token estimate relies on the backoff.
+
     `sleep`/`monotonic` are parameterized so tests don't have to actually wait."""
     if budget is None:
         budget = _llm_job_budget()
     deadline = monotonic() + budget
     delay = base_delay
     empty_attempts = 0
+    gemini_limits.take_pacer_wait()          # this job's credit starts at zero
     for attempt in range(1, max_attempts + 1):
         try:
             return caller(system, user)
         except Exception as exc:
+            deadline += gemini_limits.take_pacer_wait()   # queued on OUR budget, not the provider's
             if not _is_transient_provider_error(exc) or attempt == max_attempts:
                 raise
             if _is_empty_content_error(exc):
@@ -424,12 +432,18 @@ def _split_models(model: str) -> list[str]:
 
 
 def _build_failover_caller(provider: str, models: list[str], *,
-                           disable_thinking: bool = False) -> Caller:
+                           disable_thinking: bool = False, wrap=None) -> Caller:
     """Try each model in order, falling over to the next when one is overloaded
     (429 / "engine_overloaded"). Raises the last overload error if ALL are busy —
     which _call_with_retry then backs off and retries (re-trying the whole chain).
-    Non-overload errors (e.g. a bad model id) raise immediately and aren't masked."""
-    built = [(m, _build_single_caller(provider, m, disable_thinking=disable_thinking))
+    Non-overload errors (e.g. a bad model id) raise immediately and aren't masked.
+
+    `wrap(model, caller)` decorates each member's caller before it joins the
+    chain — how `_build_caller` paces each member on its OWN limits (#147),
+    so the request that actually goes out is the one that is paced, and to the
+    row of the model it goes to."""
+    wrap = wrap or (lambda _model, caller: caller)
+    built = [(m, wrap(m, _build_single_caller(provider, m, disable_thinking=disable_thinking)))
              for m in models]
 
     def call(system: str, user: str) -> str:
@@ -454,15 +468,23 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
     (tried in order on overload). `disable_thinking` is honored per the
     single-model builder."""
     models = _split_models(model)
+    # Gemini free-tier conforming: pace each call to the RPM and TPM of the
+    # model it goes to. No-op unless GEMINI_FREE_TIER is set and that model is
+    # a known free-tier model. Per MEMBER, not on the chain's lead (#147): the
+    # documented chain "gemini-2.5-flash,gemma-4-26b-a4b-it" spends flash's 20
+    # RPD in its first 20 evaluations and then answers from gemma — 16,000 TPM —
+    # which lead-pacing held to flash's 250,000 budget, 15x over, for the rest
+    # of the run. Wrapping inside the chain also charges each real request to
+    # the model that served it, rather than N attempts to the lead as one.
+    def paced(m: str, caller: Caller) -> Caller:
+        return gemini_limits.paced_caller(caller, m)
+
     if len(models) > 1:
-        caller = _build_failover_caller(provider, models, disable_thinking=disable_thinking)
+        caller = _build_failover_caller(provider, models, disable_thinking=disable_thinking,
+                                        wrap=paced)
     else:
-        caller = _build_single_caller(provider, models[0] if models else model,
-                                      disable_thinking=disable_thinking)
-    # Gemini free-tier conforming: pace each call to the (lead) model's RPM and
-    # TPM. No-op unless GEMINI_FREE_TIER is set and the lead model is a known
-    # free-tier model.
-    lead = models[0] if models else model
+        only = models[0] if models else model
+        caller = paced(only, _build_single_caller(provider, only, disable_thinking=disable_thinking))
     # Warn HERE rather than at the eval stage, because this is where the no-op
     # happens: every caller in the repo is built through this function
     # (resume_tailor, cover_letters, article_digest and handoff's --handoff-tailor
@@ -481,7 +503,7 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
         unconformable = gemini_limits.format_unconformable_warning(model)
         if unconformable:
             print(unconformable, file=sys.stderr)
-    return gemini_limits.paced_caller(caller, lead)
+    return caller
 
 
 def _build_single_caller(provider: str, model: str, *, disable_thinking: bool = False) -> Caller:

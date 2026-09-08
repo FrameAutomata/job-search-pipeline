@@ -449,6 +449,28 @@ class TestPacedCaller:
         # put it at t=4.0.
         assert st["t"] == 60.0
 
+    def test_wait_is_recorded_for_the_retry_loop(self, monkeypatch):
+        """The queue wait is ours, not the provider's (#148): the wrapper records
+        it per thread so _call_with_retry can credit it back to the job budget."""
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        self._real_clock_injected(monkeypatch)
+        gl.take_pacer_wait()                           # a clean slate for this thread
+        prompt = "x" * 32_000
+        wrapped = gl.paced_caller(lambda s, u: "ok", "gemma-4-26b-a4b-it")
+        wrapped("", prompt)
+        assert gl.take_pacer_wait() == 0.0             # first call: no wait
+        wrapped("", prompt)
+        assert gl.take_pacer_wait() == 60.0            # the token-window wait
+        assert gl.take_pacer_wait() == 0.0             # taking resets
+
+    def test_acquire_reports_its_wait(self, monkeypatch):
+        st, mono, sleep = fake_clock()
+        rl = gl.RateLimiter(5, monotonic=mono, sleep=sleep)
+        assert rl.acquire() == 0.0 and rl.acquire() == 12.0
+        tb = gl.TokenBudget(1_000, monotonic=mono, sleep=sleep)
+        assert tb.acquire(800) == 0.0 and tb.acquire(800) == 60.0
+        assert gl.TokenBudget(None).acquire(5) == 0.0   # unlimited: no wait, no crash
+
     def test_noop_when_conforming_off(self, monkeypatch):
         monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)
         base = lambda: "R"
