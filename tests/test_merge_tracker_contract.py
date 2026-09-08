@@ -29,7 +29,10 @@ import subprocess
 
 import pytest
 
-from pipeline._batch_common import _pending_additions, _warn_on_lost_additions
+from pipeline._batch_common import (
+    _liveness_closed_rows, _pending_additions, _reopen_reposted,
+    _warn_on_lost_additions, closed_by_recheck, liveness_closed_mark,
+)
 from pipeline.tracker_layout import career_ops_dir
 
 HEADER = ("# Applications Tracker\n\n"
@@ -348,3 +351,49 @@ class TestRecoveryAfterTheRunnersOwnMerge:
     def test_with_the_url_it_was_missing(self, recovered):
         tracker, _ = recovered
         assert "https://x/j/7" in tracker
+
+
+class TestRecheckDiscardIsReopenedOnRepost:
+    """The premise of #163 against the real script, then our half of the fix.
+
+    merge-tracker's update tier writes a re-eval's score, report, date and
+    notes through and KEEPS the row's status — so a re-post of a role the
+    liveness re-check had Discarded was folded onto the Discarded row and never
+    surfaced again. `_reopen_reposted` resets such a row (its report number
+    changed in the merge, and the snapshot taken before the merge saw the
+    re-check's mark) to Evaluated, and `extract_url` then reads the new
+    posting's URL — the one the next re-check must verify. A higher score is
+    used so the case holds on a checkout on either side of upstream's #2411
+    (the older script skips a lower one)."""
+
+    @pytest.fixture
+    def reopened(self, tmp_path):
+        text = (_tracker(BASE, 200)
+                .replace("| Evaluated |", "| Discarded |")
+                .replace("— APPLY |", f"— APPLY — {liveness_closed_mark('2026-08-20', 'HTTP 404')} |"))
+        pre = tmp_path / "pre.md"
+        pre.write_text(text, encoding="utf-8")
+        closed = _liveness_closed_rows(pre)
+        merged_text, career_ops, _, _ = _merge(tmp_path, text, {"123.tsv": _addition(VARIANT, 229)})
+        _reopen_reposted(closed, career_ops)
+        after = (career_ops / "data" / "applications.md").read_text(encoding="utf-8")
+        return closed, merged_text, after
+
+    @staticmethod
+    def _row(text):
+        from pipeline.app import data
+        return {r["num"]: r for r in data.parse_applications_text(text)}["10"]
+
+    def test_upstream_writes_through_and_keeps_the_status(self, reopened):
+        closed, merged_text, _ = reopened
+        assert set(closed) == {"10"}
+        row = self._row(merged_text)
+        assert row["report_num"] == "229" and row["status_canonical"] == "Discarded"
+
+    def test_reopen_resets_to_evaluated_and_points_at_the_new_posting(self, reopened):
+        from pipeline.app import data
+        _, _, after = reopened
+        row = self._row(after)
+        assert row["status_canonical"] == "Evaluated"
+        assert data.extract_url(row["notes"]) == "https://indeed.com/viewjob?jk=new"
+        assert not closed_by_recheck(row["notes"])          # a later Discard is a person's

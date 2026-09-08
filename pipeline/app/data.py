@@ -148,12 +148,14 @@ def record_status_override(num: str, status: str, path: Path | None = None,
         pass
 
 
-def record_status_changes(applications_md: Path, changes) -> None:
+def record_status_changes(applications_md: Path, changes, *, notes: dict | None = None) -> None:
     """Batch dual-write: apply many (num, status, company, role) edits with a
     SINGLE read-modify-write of the tracker file and a SINGLE overrides-file
     update. The liveness re-check uses this to Discard many roles at once;
     record_status_change is the one-row case. Entries with an empty num are
-    skipped; an all-empty/empty list is a no-op.
+    skipped; an all-empty/empty list is a no-op. `notes` ({num: text}) appends
+    text to those rows' Notes cells in the same write — how the re-check marks
+    its Discards as its own, and the merge marks the rows it reopens (#163).
 
     Writes BOTH places that matter:
       1. The tracker file's Status cells (minimal in-place edits), so the file
@@ -173,7 +175,7 @@ def record_status_changes(applications_md: Path, changes) -> None:
         text = applications_md.read_text(encoding="utf-8")
         new = text
         for num, status, _company, _role in items:
-            new = set_status_in_text(new, num, status)
+            new = _edit_row_cells(new, num, status=status, note=(notes or {}).get(num))
         if new != text:
             atomic_write_text(applications_md, new)
     try:
@@ -474,10 +476,29 @@ def _realign_cells(cells: list[str], columns: list[str]) -> list[str]:
 _NOTES_URL_RE = re.compile(r"https?://\S+")
 
 
+# merge-tracker's re-evaluation marker. The fork the cloud runs keeps a row's
+# existing Notes verbatim and FIRST and appends `Re-eval DATE (a→b)[ — …]: {new
+# notes}` after them; the older script replaced the cell with the marker
+# leading. Under both, the posting the row's NEWEST evaluation looked at is the
+# first URL after the last marker.
+_REEVAL_MARK_RE = re.compile(r"\bRe-eval \d{4}-\d{2}-\d{2}")
+
+
 def extract_url(notes: str) -> str:
-    """The first URL in a Notes cell, or "" if none. Shared by the apply queue
-    (pick a posting to apply to) and the liveness re-check (re-fetch it)."""
-    m = _NOTES_URL_RE.search(notes or "")
+    """The posting URL of a Notes cell — the first URL of its newest evaluation
+    — or "" if none. Shared by the apply queue (pick a posting to apply to),
+    the handoff work-order and the liveness re-check (re-fetch it).
+
+    "Newest evaluation", not "first in the cell" (#163): when a posting dies
+    and the opening is re-posted, the re-eval lands on the same row and the
+    live posting's URL sits AFTER the old one under the fork's Notes merge. The
+    first URL sent the re-check back to the dead posting (re-Discarding a role
+    the merge had just reopened) and the browser agent to a 404. A re-eval
+    clause with no URL of its own — upstream elides notes that repeat an
+    existing clause — falls back to the first URL, which is then the same one."""
+    notes = notes or ""
+    start = max((m.end() for m in _REEVAL_MARK_RE.finditer(notes)), default=0)
+    m = _NOTES_URL_RE.search(notes, start) or _NOTES_URL_RE.search(notes)
     return m.group(0).rstrip(".,);]") if m else ""
 
 
@@ -800,18 +821,32 @@ def _safe_int(s) -> int:
 
 def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> str:
     """Return applications.md text with the Status cell of row `num` replaced.
+    The one-cell case of `_edit_row_cells`, which documents the mechanics."""
+    return _edit_row_cells(applications_md_text, num, status=new_status)
+
+
+def append_note_in_text(applications_md_text: str, num: str, note: str) -> str:
+    """Return applications.md text with `note` appended to row `num`'s Notes
+    cell (` — `-joined, the separator this pipeline's own notes use)."""
+    return _edit_row_cells(applications_md_text, num, note=note)
+
+
+def _edit_row_cells(applications_md_text: str, num: str, *, status: str | None = None,
+                    note: str | None = None) -> str:
+    """Rewrite the Status cell and/or append to the Notes cell of row `num`.
 
     Operates at the line level — finds the table row whose first cell (the #
-    column) equals `num` and rewrites only its Status cell, leaving every other
-    byte untouched. This avoids re-serializing the whole table (which could
+    column) equals `num` and rewrites only the cells asked for, leaving every
+    other byte untouched. This avoids re-serializing the whole table (which could
     mangle notes containing special chars) and makes the change a minimal diff.
 
-    The row and its Status cell are located through the table's OWN header, the
-    same mapping every read path uses. This is the single MUTATING path, and it
-    was the last one reading fixed slots: `resolve_num_by_identity` hands it a
-    num it found by header name, so against a table whose `#` is not first the
-    lookup succeeded and the write then matched nothing — the local edit silently
-    no-opped while the cloud push still fired, leaving the two diverged.
+    The row and its cells are located through the table's OWN header, the same
+    mapping every read path uses. This is the single MUTATING path, and it was
+    the last one reading fixed slots: `resolve_num_by_identity` hands it a num
+    it found by header name, so against a table whose `#` is not first the
+    lookup succeeded and the write then matched nothing — the local edit
+    silently no-opped while the cloud push still fired, leaving the two
+    diverged.
 
     Returns the text unchanged if the row isn't found."""
     want = str(num).strip()
@@ -819,6 +854,7 @@ def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> 
     # +1 because splitting on "|" puts an empty cell before the leading pipe.
     num_idx = columns.index("num") + 1
     status_idx_default = columns.index("status") + 1
+    notes_idx_default = columns.index("notes") + 1 if "notes" in columns else None
     report_idx = columns.index("report") + 1 if "report" in columns else None
     out_lines = []
     changed = False
@@ -832,15 +868,21 @@ def set_status_in_text(applications_md_text: str, num: str, new_status: str) -> 
                     and cells[num_idx] == want and cells[num_idx] not in ("#", "")):
                 # Anchor on the Report link where the layout has one: it is
                 # always [num](path), so it survives extra cells the LLM may have
-                # injected (e.g. "Role | Remote") shifting everything right.
-                status_idx = status_idx_default
+                # injected (e.g. "Role | Remote") shifting everything right. The
+                # same shift applies to every cell after the injection.
+                shift = 0
                 if report_idx is not None:
-                    offset = report_idx - status_idx_default
                     for pi, p in enumerate(parts):
                         if _REPORT_CELL_RE.match(p.strip()):
-                            status_idx = pi - offset
+                            shift = pi - report_idx
                             break
-                parts[status_idx] = f" {new_status} "
+                if status is not None:
+                    parts[status_idx_default + shift] = f" {status} "
+                if note and notes_idx_default is not None:
+                    idx = notes_idx_default + shift
+                    if idx < len(parts) - 1:          # the last part is the trailing pipe's ""
+                        existing = parts[idx].strip()
+                        parts[idx] = f" {existing} — {note} " if existing else f" {note} "
                 line = "|".join(parts)
                 changed = True
         out_lines.append(line)

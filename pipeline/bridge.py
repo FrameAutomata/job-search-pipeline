@@ -14,7 +14,8 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from pipeline._batch_common import parse_date_posted, read_url_set
+from pipeline._batch_common import closed_by_recheck, parse_date_posted, read_url_set
+from pipeline.app.data import canonical_status
 from pipeline.rowio import read_rows
 from pipeline.tracker_layout import data_rows
 from pipeline.stdio import line_buffer_stdout
@@ -49,7 +50,14 @@ def _find_section(text: str, markers: tuple[str, ...]) -> re.Match | None:
 
 
 def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
-    """Walk applications.md once. Return (urls, company::role pairs)."""
+    """Walk applications.md once. Return (urls, company::role pairs).
+
+    The pairs are what stage-2 dedup drops a new URL for, so they exclude the
+    rows whose Discard was the liveness re-check's (#163): that Discard means
+    the POSTING died, and a same-titled re-post of the opening is exactly the
+    row that should be evaluated again — its re-eval lands on the old row, and
+    the merge reopens it. A Discard a person made carries no mark and stays a
+    decision, as does every other status."""
     urls: set[str] = set()
     roles: set[str] = set()
 
@@ -65,8 +73,13 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
         if len(cols) <= role_idx:
             continue
         company, role = cols[company_idx].lower(), cols[role_idx].lower()
-        if company and role:
-            roles.add(f"{company}::{role}")
+        if not (company and role):
+            continue
+        row = dict(zip(columns, cols))
+        if (canonical_status(row.get("status", "")) == "Discarded"
+                and closed_by_recheck(row.get("notes", ""))):
+            continue
+        roles.add(f"{company}::{role}")
 
     return urls, roles
 

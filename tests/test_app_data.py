@@ -795,3 +795,85 @@ class TestHeaderAliasesComeFromCareerOps:
             assert tracker_layout.header_aliases()["#"] == "num"
         finally:
             _reset_contract_cache()
+
+
+class TestExtractUrl:
+    """The posting URL of a Notes cell is the first URL of its NEWEST
+    evaluation (#163). merge-tracker's fork keeps a row's existing Notes first
+    and appends `Re-eval DATE (a→b): {new notes}`; the older script led with
+    the marker. Under both, the live posting after a re-post sits after the
+    last marker — the first URL sent the re-check back to the dead one."""
+
+    def test_first_url_when_never_re_evaluated(self):
+        assert data.extract_url("req 5 — https://a/1 — APPLY. see https://b/2") == "https://a/1"
+
+    def test_newest_evaluations_url_under_the_forks_notes_merge(self):
+        notes = ("https://a/old — APPLY — Closed 2026-09-06 (liveness re-check: HTTP 404). "
+                 "Re-eval 2026-09-08 (4.1→4.7): req 5 — https://a/new — APPLY")
+        assert data.extract_url(notes) == "https://a/new"
+
+    def test_last_of_several_re_evals_wins(self):
+        notes = ("https://a/1 — x. Re-eval 2026-09-05 (4.1→3.8) — Superseded report [170] (was 4.1/5): "
+                 "https://a/2 — y. Re-eval 2026-09-06 (3.8→4.7): https://a/3 — z")
+        assert data.extract_url(notes) == "https://a/3"
+
+    def test_older_marker_leading_shape(self):
+        assert data.extract_url("Re-eval 2026-09-08 (4→4.7). https://a/new — APPLY") == "https://a/new"
+
+    def test_re_eval_clause_without_a_url_falls_back_to_the_first(self):
+        # Upstream elides incoming notes that repeat an existing clause — the
+        # marker alone means "same posting, evaluated again".
+        assert data.extract_url("https://a/1 — APPLY. Re-eval 2026-09-08 (4→4.7)") == "https://a/1"
+
+    def test_trailing_punctuation_stripped(self):
+        assert data.extract_url("(see https://a/1).") == "https://a/1"
+
+    def test_none_and_empty(self):
+        assert data.extract_url("") == "" and data.extract_url(None) == ""
+
+
+class TestAppendNoteInText:
+    """The row editor behind set_status_in_text can append to Notes in the same
+    line-level edit — how the re-check marks its Discards (#163)."""
+
+    APPS = TestSetStatusInText.APPS
+
+    @staticmethod
+    def _cells(text, num):
+        for line in text.splitlines():
+            if line.lstrip().startswith(f"| {num} "):
+                return [c.strip() for c in line.split("|")]
+        return None
+
+    def test_appends_with_the_pipelines_separator(self):
+        out = data.append_note_in_text(self.APPS, "2", "Closed 2026-09-06 (liveness re-check: HTTP 404)")
+        assert self._cells(out, "2")[9] == "maybe — Closed 2026-09-06 (liveness re-check: HTTP 404)"
+        assert self._cells(out, "1")[9] == "apply now"                  # other rows untouched
+
+    def test_empty_notes_cell_gets_just_the_note(self):
+        out = data.append_note_in_text(self.APPS.replace("| maybe |", "|  |"), "2", "note")
+        assert self._cells(out, "2")[9] == "note"
+
+    def test_unknown_num_unchanged(self):
+        assert data.append_note_in_text(self.APPS, "999", "note") == self.APPS
+
+    def test_status_and_note_in_one_edit(self):
+        out = data._edit_row_cells(self.APPS, "2", status="Discarded", note="n")
+        cells = self._cells(out, "2")
+        assert cells[6] == "Discarded" and cells[9] == "maybe — n"
+
+    def test_anchors_on_the_report_cell_when_a_pipe_shifted_the_row(self):
+        # "Eng | Remote" split the Role cell: Status AND Notes sit one to the right.
+        row = "| 3 | 2026-05-27 | Initech | Eng | Remote | 4.0/5 | Evaluated | ❌ | [003](reports/003-z.md) | note |\n"
+        out = data._edit_row_cells(self.APPS + row, "3", status="Discarded", note="n")
+        cells = self._cells(out, "3")
+        assert cells[7] == "Discarded" and cells[10] == "note — n"
+
+    def test_record_status_changes_writes_the_note_in_the_same_write(self, tmp_path):
+        apps = tmp_path / "applications.md"
+        apps.write_text(self.APPS, encoding="utf-8")
+        data.record_status_changes(apps, [("2", "Discarded", "Globex", "Dev")],
+                                   notes={"2": "Closed 2026-09-06 (liveness re-check: HTTP 404)"})
+        cells = self._cells(apps.read_text(encoding="utf-8"), "2")
+        assert cells[6] == "Discarded"
+        assert cells[9] == "maybe — Closed 2026-09-06 (liveness re-check: HTTP 404)"
