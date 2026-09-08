@@ -34,6 +34,7 @@ from pipeline._batch_common import (
     _warn_on_lost_additions, closed_by_recheck, liveness_closed_mark,
 )
 from pipeline.tracker_layout import career_ops_dir
+from tests.conftest import tracker_row
 
 HEADER = ("# Applications Tracker\n\n"
           "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
@@ -381,8 +382,7 @@ class TestRecheckDiscardIsReopenedOnRepost:
 
     @staticmethod
     def _row(text):
-        from pipeline.app import data
-        return {r["num"]: r for r in data.parse_applications_text(text)}["10"]
+        return tracker_row(text, "10")
 
     def test_upstream_writes_through_and_keeps_the_status(self, reopened):
         closed, merged_text, _ = reopened

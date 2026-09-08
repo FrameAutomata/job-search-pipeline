@@ -321,6 +321,15 @@ class TestCanonicalStatus:
         assert rows[0]["status_canonical"] == "Evaluated"
 
 
+def _row_cells(text, num):
+    """The stripped cells of tracker row `num` at the LINE level (edge cells
+    included), or None — how the row editor's tests read what it wrote."""
+    for line in text.splitlines():
+        if line.lstrip().startswith(f"| {num} "):
+            return [c.strip() for c in line.split("|")]
+    return None
+
+
 class TestSetStatusInText:
     APPS = (
         "# Applications Tracker\n\n"
@@ -332,10 +341,8 @@ class TestSetStatusInText:
 
     @staticmethod
     def _status_of(text, num):
-        for line in text.splitlines():
-            if line.lstrip().startswith(f"| {num} "):
-                return [c.strip() for c in line.split("|")][6]
-        return None
+        cells = _row_cells(text, num)
+        return cells[6] if cells else None
 
     def test_changes_only_target_status(self):
         out = data.set_status_in_text(self.APPS, "2", "Applied")
@@ -838,35 +845,28 @@ class TestAppendNoteInText:
 
     APPS = TestSetStatusInText.APPS
 
-    @staticmethod
-    def _cells(text, num):
-        for line in text.splitlines():
-            if line.lstrip().startswith(f"| {num} "):
-                return [c.strip() for c in line.split("|")]
-        return None
-
     def test_appends_with_the_pipelines_separator(self):
         out = data.append_note_in_text(self.APPS, "2", "Closed 2026-09-06 (liveness re-check: HTTP 404)")
-        assert self._cells(out, "2")[9] == "maybe — Closed 2026-09-06 (liveness re-check: HTTP 404)"
-        assert self._cells(out, "1")[9] == "apply now"                  # other rows untouched
+        assert _row_cells(out, "2")[9] == "maybe — Closed 2026-09-06 (liveness re-check: HTTP 404)"
+        assert _row_cells(out, "1")[9] == "apply now"                  # other rows untouched
 
     def test_empty_notes_cell_gets_just_the_note(self):
         out = data.append_note_in_text(self.APPS.replace("| maybe |", "|  |"), "2", "note")
-        assert self._cells(out, "2")[9] == "note"
+        assert _row_cells(out, "2")[9] == "note"
 
     def test_unknown_num_unchanged(self):
         assert data.append_note_in_text(self.APPS, "999", "note") == self.APPS
 
     def test_status_and_note_in_one_edit(self):
         out = data._edit_row_cells(self.APPS, "2", status="Discarded", note="n")
-        cells = self._cells(out, "2")
+        cells = _row_cells(out, "2")
         assert cells[6] == "Discarded" and cells[9] == "maybe — n"
 
     def test_anchors_on_the_report_cell_when_a_pipe_shifted_the_row(self):
         # "Eng | Remote" split the Role cell: Status AND Notes sit one to the right.
         row = "| 3 | 2026-05-27 | Initech | Eng | Remote | 4.0/5 | Evaluated | ❌ | [003](reports/003-z.md) | note |\n"
         out = data._edit_row_cells(self.APPS + row, "3", status="Discarded", note="n")
-        cells = self._cells(out, "3")
+        cells = _row_cells(out, "3")
         assert cells[7] == "Discarded" and cells[10] == "note — n"
 
     def test_record_status_changes_writes_the_note_in_the_same_write(self, tmp_path):
@@ -874,6 +874,6 @@ class TestAppendNoteInText:
         apps.write_text(self.APPS, encoding="utf-8")
         data.record_status_changes(apps, [("2", "Discarded", "Globex", "Dev")],
                                    notes={"2": "Closed 2026-09-06 (liveness re-check: HTTP 404)"})
-        cells = self._cells(apps.read_text(encoding="utf-8"), "2")
+        cells = _row_cells(apps.read_text(encoding="utf-8"), "2")
         assert cells[6] == "Discarded"
         assert cells[9] == "maybe — Closed 2026-09-06 (liveness re-check: HTTP 404)"

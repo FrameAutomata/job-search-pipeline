@@ -34,6 +34,7 @@ from pipeline._batch_common import (   # the #163 marks, a separate block on pur
     _liveness_closed_rows, _reopen_reposted, closed_by_recheck, liveness_closed_mark,
     reopened_mark,
 )
+from tests.conftest import tracker_row
 
 
 class TestTailText:
@@ -1319,8 +1320,7 @@ class TestReopenRepostedDiscards:
 
     @staticmethod
     def _row(co, num):
-        from pipeline.app import data
-        return {r["num"]: r for r in data.parse_applications(co / "data" / "applications.md")}[num]
+        return tracker_row(co / "data" / "applications.md", num)
 
     def _fork_update(self, text):
         # Score/report/date through, status kept, existing notes first + re-eval clause.

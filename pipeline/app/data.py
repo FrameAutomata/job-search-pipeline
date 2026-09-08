@@ -14,6 +14,7 @@ from pathlib import Path
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
     atomic_write_text,
+    closed_by_recheck,
     normalize_company,
     read_url_set,
     score_value,
@@ -168,6 +169,7 @@ def record_status_changes(applications_md: Path, changes, *, notes: dict | None 
     the cloud tracker mints numbers independently — anchoring on identity marks
     the row actually acted on, never a different company sharing the num."""
     items = [(str(n).strip(), s, c, r) for (n, s, c, r) in changes if str(n).strip()]
+    notes = notes or {}
     if not items:
         return
     applications_md = Path(applications_md)
@@ -175,7 +177,7 @@ def record_status_changes(applications_md: Path, changes, *, notes: dict | None 
         text = applications_md.read_text(encoding="utf-8")
         new = text
         for num, status, _company, _role in items:
-            new = _edit_row_cells(new, num, status=status, note=(notes or {}).get(num))
+            new = _edit_row_cells(new, num, status=status, note=notes.get(num))
         if new != text:
             atomic_write_text(applications_md, new)
     try:
@@ -369,6 +371,18 @@ def canonical_status(raw: str, vocabulary: tuple | None = None) -> str:
         if s.lower() == lower:
             return s
     return aliases.get(lower, clean)
+
+
+def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:
+    """True when a row's Discard is the liveness re-check's, not a person's:
+    its status is Discarded AND the newest mark in its Notes is the re-check's
+    Closed one (#163). Both halves in one place, so no reader — bridge's dedup,
+    the merge's reopen, the next one — can drop the status half and read a
+    stale Closed mark on an Evaluated row as provisional. `vocabulary` is
+    `canonical_status`'s: a caller walking many rows resolves it once."""
+    return (canonical_status(status, vocabulary) == "Discarded"
+            and closed_by_recheck(notes))
+
 
 # Canonical applications.md column order (see career-ops AGENTS.md):
 #   | # | Date | Company | Role | Score | Status | PDF | Report | Notes |

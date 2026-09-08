@@ -1036,16 +1036,17 @@ def run_merge_tracker(career_ops: Path) -> bool:
 LIVENESS_CLOSED_RE = re.compile(r"\bClosed \d{4}-\d{2}-\d{2} \(liveness re-check", re.I)
 REOPENED_RE = re.compile(r"\bReopened \d{4}-\d{2}-\d{2} \(re-posted", re.I)
 # What must never reach a Notes cell: a `|` is a cell boundary in the markdown
-# table, and a URL would be read back by `extract_url` as the posting.
-_NOTE_UNSAFE_RE = re.compile(r"https?://\S+|\|")
+# table, and a URL would be read back by `extract_url` as the posting — so the
+# URL half IS the pattern `extract_url` reads with, not a re-spelling of it.
+_NOTE_UNSAFE_RE = re.compile(_NOTES_URL_RE.pattern + r"|\|")
 
 
-def _note_safe(text: str, limit: int = 80) -> str:
+def _note_safe(text: str) -> str:
     """`text` fit to sit inside a Notes cell: no `|`, no URL, one-line, capped.
     The re-check's reasons include a regex pattern (`body: (?:closed|filled)`)
     and a redirect URL, either of which would corrupt the row or hijack it."""
     text = " ".join(_NOTE_UNSAFE_RE.sub(" ", text or "").split())
-    return text[:limit].rstrip()
+    return text[:80].rstrip()
 
 
 def liveness_closed_mark(date: str, reason: str) -> str:
@@ -1061,27 +1062,37 @@ def reopened_mark(date: str) -> str:
 def closed_by_recheck(notes: str) -> bool:
     """True when the newest mark in `notes` is the re-check's Closed one — the
     row's Discard is the re-check's, not a person's. Only meaningful on a row
-    whose status IS Discarded; callers check that first."""
-    last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes or "")), default=-1)
-    last_reopened = max((m.end() for m in REOPENED_RE.finditer(notes or "")), default=-1)
+    whose status IS Discarded; `app.data.recheck_discarded` asks both halves."""
+    notes = notes or ""
+    last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes)), default=-1)
+    last_reopened = max((m.end() for m in REOPENED_RE.finditer(notes)), default=-1)
     return last_closed > last_reopened
+
+
+def _tracker_rows(applications_md: Path):
+    """Every data row of the tracker as {column: cell}, read by NAME the way
+    every tracker reader here does: the optional Via column shifts Role right
+    by one, and read positionally the agency lands where the role belongs.
+    Zipping is also the width guard — a row too short to reach Role has no
+    Role key and is skipped (Report/Notes are optional columns). A missing
+    file reads as no rows."""
+    for columns, cells in data_rows(read_text(applications_md)):
+        row = dict(zip(columns, cells))
+        if "role" in row:
+            yield row
 
 
 def _liveness_closed_rows(applications_md: Path) -> dict[str, dict]:
     """{num: {company, role, report}} for every row the liveness re-check
-    Discarded — status Discarded AND `closed_by_recheck`. Taken BEFORE a merge:
-    the older merge-tracker replaces Notes on an update, so afterwards the mark
-    may be gone, while the newer one keeps them — the snapshot reads the same
-    either way. A person's Discard carries no mark and is not here."""
-    from pipeline.app.data import canonical_status   # lazy: app.data imports this module
+    Discarded (`app.data.recheck_discarded`). Taken BEFORE a merge: the older
+    merge-tracker replaces Notes on an update, so afterwards the mark may be
+    gone, while the newer one keeps them — the snapshot reads the same either
+    way. A person's Discard carries no mark and is not here."""
+    from pipeline.app.data import _load_states, recheck_discarded   # lazy: app.data imports this module
+    vocabulary = _load_states()             # once per walk, not per row
     out: dict[str, dict] = {}
-    if not applications_md.exists():
-        return out
-    for columns, cells in data_rows(read_text(applications_md)):
-        row = dict(zip(columns, cells))
-        if "role" not in row or "status" not in row:
-            continue
-        if canonical_status(row["status"]) != "Discarded" or not closed_by_recheck(row.get("notes", "")):
+    for row in _tracker_rows(applications_md):
+        if not recheck_discarded(row.get("status", ""), row.get("notes", ""), vocabulary):
             continue
         out[row.get("num", "").strip()] = {
             "company": row["company"], "role": row["role"],
@@ -1109,11 +1120,10 @@ def _reopen_reposted(closed_before: dict[str, dict], career_ops: Path) -> None:
     from pipeline.app.data import record_status_changes   # lazy, as above
     apps = career_ops / "data" / "applications.md"
     after: dict[str, str] = {}
-    for columns, cells in data_rows(read_text(apps)):
-        row = dict(zip(columns, cells))
-        if "role" in row:
-            after[row.get("num", "").strip()] = row_report_num(row.get("report", ""),
-                                                                row.get("notes", ""))
+    for row in _tracker_rows(apps):
+        num = row.get("num", "").strip()
+        if num in closed_before:
+            after[num] = row_report_num(row.get("report", ""), row.get("notes", ""))
     today = datetime.now().date().isoformat()
     changes = [(num, "Evaluated", was["company"], was["role"])
                for num, was in closed_before.items()
@@ -1376,16 +1386,7 @@ def _tracker_identities(applications_md: Path) -> tuple[set[str], dict[str, str]
     was right."""
     keys: set[str] = set()
     role_by_report: dict[str, str] = {}
-    if not applications_md.exists():
-        return keys, role_by_report
-    for columns, cells in data_rows(read_text(applications_md)):
-        # By name, as every tracker reader here does: the optional Via column
-        # shifts Role right by one, and read positionally the agency lands where
-        # the role belongs. Zipping is also the width guard — a row too short to
-        # reach Role has no Role key, and Report/Notes are optional columns.
-        row = dict(zip(columns, cells))
-        if "role" not in row:
-            continue
+    for row in _tracker_rows(applications_md):
         company, role = row["company"], row["role"]
         keys.add(_addition_key(company, role))
         num = row_report_num(row.get("report", ""), row.get("notes", ""))

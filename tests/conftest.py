@@ -269,6 +269,15 @@ def _isolate_resume_env(monkeypatch):
     monkeypatch.delenv("RESUME_PATH", raising=False)
 
 
+def tracker_row(source, num) -> dict:
+    """Tracker row `num` as the UI's parser reads it, from a path or the text
+    of an applications.md. KeyError when the row is not there."""
+    from pipeline.app import data
+    rows = (data.parse_applications_text(source) if isinstance(source, str)
+            else data.parse_applications(source))
+    return {r["num"]: r for r in rows}[str(num)]
+
+
 @pytest.fixture
 def patch_bridge_paths(monkeypatch, tmp_path):
     """Patch bridge.FILTERED_PATH to tmp_path and return the path."""

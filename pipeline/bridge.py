@@ -14,8 +14,8 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from pipeline._batch_common import closed_by_recheck, parse_date_posted, read_url_set
-from pipeline.app.data import canonical_status
+from pipeline._batch_common import parse_date_posted, read_url_set
+from pipeline.app.data import _load_states, recheck_discarded
 from pipeline.rowio import read_rows
 from pipeline.tracker_layout import data_rows
 from pipeline.stdio import line_buffer_stdout
@@ -68,16 +68,14 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     # Company and Role by name, through the shared walk — career-ops has two
     # supported layouts and the Via one shifts Role right by one. The UI's parser
     # uses the same walk, so the two can't disagree about a row's identity.
+    # Zipping is the width guard: a row too short to reach Role has no Role.
+    vocabulary = _load_states()             # once per walk, not per row
     for columns, cols in data_rows(text):
-        company_idx, role_idx = columns.index("company"), columns.index("role")
-        if len(cols) <= role_idx:
-            continue
-        company, role = cols[company_idx].lower(), cols[role_idx].lower()
+        row = dict(zip(columns, cols))
+        company, role = row.get("company", "").lower(), row.get("role", "").lower()
         if not (company and role):
             continue
-        row = dict(zip(columns, cols))
-        if (canonical_status(row.get("status", "")) == "Discarded"
-                and closed_by_recheck(row.get("notes", ""))):
+        if recheck_discarded(row.get("status", ""), row.get("notes", ""), vocabulary):
             continue
         roles.add(f"{company}::{role}")
 
