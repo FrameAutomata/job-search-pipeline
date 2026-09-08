@@ -273,8 +273,9 @@ class TestLoadPending:
 
 
 class TestWriteJobResult:
-    def _make_response(self, report="report content", tracker="1\t2026-01-01\tAcme\tEng\tEvaluada\t4.0/5\tnull\t[001](reports/001-acme-2026-01-01.md)\tAPPLY", score=4.0):
-        summary = json.dumps({"status": "completed", "id": "42", "report_num": "001", "company": "Acme", "role": "Eng", "score": score, "legitimacy": "High Confidence", "pdf": None, "report": "reports/001-acme-2026-01-01.md", "error": None})
+    def _make_response(self, report="report content", tracker="1\t2026-01-01\tAcme\tEng\tEvaluada\t4.0/5\tnull\t[001](reports/001-acme-2026-01-01.md)\tAPPLY", score=4.0,
+                       company="Acme", report_num="001"):
+        summary = json.dumps({"status": "completed", "id": "42", "report_num": report_num, "company": company, "role": "Eng", "score": score, "legitimacy": "High Confidence", "pdf": None, "report": "reports/001-acme-2026-01-01.md", "error": None})
         return f"<evaluation><report>{report}</report><tracker_tsv>{tracker}</tracker_tsv><summary>{summary}</summary></evaluation>"
 
     def test_writes_report_file(self, tmp_path):
@@ -341,10 +342,8 @@ class TestWriteJobResult:
                "\tEvaluated\t4.2/5\tnull"
                "\t[271](reports/271-baylor-scott-&-white-health-front-desk-lead-–-heart-2026-09-03.md)"
                "\tAPPLY")
-        summary = json.dumps({"status": "completed", "id": "42", "report_num": "271",
-                              "company": company, "role": "Front Desk Lead", "score": 4.2})
-        response = (f"<evaluation><report>report</report><tracker_tsv>{row}</tracker_tsv>"
-                    f"<summary>{summary}</summary></evaluation>")
+        response = self._make_response(report="report", tracker=row, score=4.2,
+                                       company=company, report_num="271")
         write_job_result(response, meta, reports, tracker, "2026-09-03")
         cells = (tracker / "42.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
         assert cells[7] == "[271](reports/271-baylor-scott-white-health-2026-09-03.md)"
@@ -622,6 +621,22 @@ def _tracker_row(score="4.2/5", status="Evaluated", notes="note", role="SRE"):
     """One nine-field tracker-additions row, the shape write_job_result emits."""
     return "\t".join(["3", "2026-08-25", "Initech", role, status,
                       score, "null", "[003](reports/003-x.md)", notes])
+
+
+# A ten-cell row whose columns are NOT in place (an early extra cell), which
+# every positional step of the chain must decline.
+_SHIFTED_ROW = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
+
+
+def _reports(tmp_path, *names, **files):
+    """A career-ops dir at tmp_path/co holding these files under reports/:
+    `names` get a placeholder body, `files` map name → body."""
+    co = tmp_path / "co"; (co / "reports").mkdir(parents=True)
+    for n in names:
+        (co / "reports" / n).write_text("#", encoding="utf-8")
+    for n, body in files.items():
+        (co / "reports" / n).write_text(body, encoding="utf-8")
+    return co
 
 
 class TestNormalizeScoreCell:
@@ -1049,11 +1064,14 @@ class TestSanitizePendingAdditions:
     CLI_ROW = _tracker_row(role="Platform Engineer | Remote", score="4.2",
                            notes="APPLY strong match")
 
-    def _tree(self, tmp_path, rows=None, queued=True):
+    def _tree(self, tmp_path, rows=None, queued=True, reports=None):
         co = tmp_path / "career-ops"
         additions = co / "batch" / "tracker-additions"
         additions.mkdir(parents=True)
         (co / "batch" / "jds").mkdir()
+        for name, body in (reports or {}).items():
+            (co / "reports").mkdir(exist_ok=True)
+            (co / "reports" / name).write_text(body, encoding="utf-8")
         for name, row in (rows or {"7.tsv": self.CLI_ROW}).items():
             (additions / name).write_text(row + "\n", encoding="utf-8")
             # A JD is cached under a QUEUE id only — that is what the
@@ -1173,9 +1191,7 @@ class TestSanitizePendingAdditions:
         """A row from a writer that trusted the model's slug (#162): the link
         names no file, but a report with that number exists — the same lookup
         the UI resolves by points the cell at it."""
-        co, additions = self._tree(tmp_path)
-        (co / "reports").mkdir()
-        (co / "reports" / "003-initech-2026-08-25.md").write_text("# report", encoding="utf-8")
+        co, additions = self._tree(tmp_path, reports={"003-initech-2026-08-25.md": "# report"})
         _sanitize_pending_additions(co, additions)
         assert self._cells(additions)[7] == "[003](reports/003-initech-2026-08-25.md)"
 
@@ -1185,19 +1201,15 @@ class TestSanitizePendingAdditions:
         is the one cell that knows which of two same-numbered files was meant."""
         row = _tracker_row(score="4.2/5", notes="req 88214 — https://x/j/7 — APPLY strong match"
                            ).replace("[003](reports/003-x.md)", "[003](../reports/003-x.md)")
-        co, additions = self._tree(tmp_path, rows={"7.tsv": row})
-        (co / "reports").mkdir()
-        (co / "reports" / "003-x.md").write_text("# report", encoding="utf-8")
-        (co / "reports" / "003-other.md").write_text("# a second file with the number", encoding="utf-8")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": row}, reports={
+            "003-x.md": "# report", "003-other.md": "# a second file with the number"})
         _sanitize_pending_additions(co, additions)
         assert (additions / "7.tsv").read_text(encoding="utf-8") == row + "\n"
         assert "sanitized" not in capsys.readouterr().out
 
     def test_a_reserved_lock_is_not_a_repair_target(self, tmp_path):
         # `003-RESERVED.md` is career-ops' number lock, not a report.
-        co, additions = self._tree(tmp_path)
-        (co / "reports").mkdir()
-        (co / "reports" / "003-RESERVED.md").write_text('{"pid": 1}', encoding="utf-8")
+        co, additions = self._tree(tmp_path, reports={"003-RESERVED.md": '{"pid": 1}'})
         _sanitize_pending_additions(co, additions)
         assert self._cells(additions)[7] == "[003](reports/003-x.md)"
 
@@ -1235,10 +1247,9 @@ class TestSanitizeAddition:
         assert sanitize_addition(once, "https://x/j", "Job ID: 88214") == once
 
     def test_declines_a_row_whose_columns_are_not_in_place(self):
-        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
-        assert sanitize_addition(shifted, "https://x/j", "Job ID: 5") == shifted
-        assert sanitize_addition(shifted, "https://x/j", "Job ID: 5",
-                                 report_file="12-acme-2026-09-01.md") == shifted
+        assert sanitize_addition(_SHIFTED_ROW, "https://x/j", "Job ID: 5") == _SHIFTED_ROW
+        assert sanitize_addition(_SHIFTED_ROW, "https://x/j", "Job ID: 5",
+                                 report_file="12-acme-2026-09-01.md") == _SHIFTED_ROW
 
     def test_is_idempotent_with_a_report_file(self):
         raw = _tracker_row(score="4.2", role="SRE | Remote") + "\thttps://own/j/9"
@@ -1265,38 +1276,31 @@ class TestSetReportLink:
         assert _set_report_link(_tracker_row(), "notes.md") == _tracker_row()
 
     def test_declines_a_shifted_row(self):
-        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-a.md)\tAPPLY"
-        assert _set_report_link(shifted, "12-acme.md") == shifted
+        assert _set_report_link(_SHIFTED_ROW, "12-acme.md") == _SHIFTED_ROW
 
 
 class TestDeadLinkRepair:
-    def _co(self, tmp_path, *names):
-        co = tmp_path / "co"; (co / "reports").mkdir(parents=True)
-        for n in names:
-            (co / "reports" / n).write_text("#", encoding="utf-8")
-        return co
-
     def test_dead_link_resolves_by_the_filename_number(self, tmp_path):
-        co = self._co(tmp_path, "003-initech-2026.md")
+        co = _reports(tmp_path, "003-initech-2026.md")
         assert _dead_link_repair(co, _tracker_row()) == "003-initech-2026.md"
 
     def test_padding_of_the_number_is_tolerated(self, tmp_path):
-        co = self._co(tmp_path, "3-initech-2026.md")
+        co = _reports(tmp_path, "3-initech-2026.md")
         assert _dead_link_repair(co, _tracker_row()) == "3-initech-2026.md"
 
     def test_live_link_is_not_repaired(self, tmp_path):
-        co = self._co(tmp_path, "003-x.md", "003-y.md")
+        co = _reports(tmp_path, "003-x.md", "003-y.md")
         assert _dead_link_repair(co, _tracker_row()) == ""
 
     def test_link_text_is_the_fallback_number(self, tmp_path):
         # A slug so mangled it lost its numeric prefix: the `[N]` text still says.
-        co = self._co(tmp_path, "003-initech-2026.md")
+        co = _reports(tmp_path, "003-initech-2026.md")
         row = _tracker_row().replace("[003](reports/003-x.md)", "[003](reports/initech.md)")
         assert _dead_link_repair(co, row) == "003-initech-2026.md"
 
     def test_shifted_row_declined(self, tmp_path):
-        co = self._co(tmp_path, "12-a.md")
-        shifted = "12\t2026-09-01\tAcme\tInc\tSRE\tEvaluated\t4.2/5\tnull\t[12](reports/12-b.md)\tAPPLY"
+        co = _reports(tmp_path, "12-a.md")
+        shifted = _SHIFTED_ROW.replace("12-a.md", "12-b.md")      # a dead link, so only the shape declines it
         assert _dead_link_repair(co, shifted) == ""
 
 
@@ -1305,36 +1309,30 @@ class TestReadReport:
     and got "" from read_text on a dead link, building from the JD alone with
     no log line (#162). Now they resolve like the UI, and say so."""
 
-    def _co(self, tmp_path, **files):
-        co = tmp_path / "co"; (co / "reports").mkdir(parents=True)
-        for n, body in files.items():
-            (co / "reports" / n).write_text(body, encoding="utf-8")
-        return co
-
     def test_live_link_reads_directly_and_quietly(self, tmp_path, capsys):
-        co = self._co(tmp_path, **{"271-baylor-2026.md": "PROOF"})
+        co = _reports(tmp_path, **{"271-baylor-2026.md": "PROOF"})
         assert read_report(co, "reports/271-baylor-2026.md") == "PROOF"
         assert capsys.readouterr().out == ""
 
     def test_ascent_form_of_a_live_link_reads_directly(self, tmp_path, capsys):
-        co = self._co(tmp_path, **{"271-baylor-2026.md": "PROOF"})
+        co = _reports(tmp_path, **{"271-baylor-2026.md": "PROOF"})
         assert read_report(co, "../reports/271-baylor-2026.md") == "PROOF"
         assert capsys.readouterr().out == ""
 
     def test_dead_link_resolves_by_number_and_says_so(self, tmp_path, capsys):
-        co = self._co(tmp_path, **{"271-baylor-scott-white-health-2026-09-03.md": "PROOF"})
+        co = _reports(tmp_path, **{"271-baylor-scott-white-health-2026-09-03.md": "PROOF"})
         text = read_report(co, "reports/271-baylor-scott-&-white-health-2026-09-03.md", label="build")
         assert text == "PROOF"
         out = capsys.readouterr().out
         assert out.startswith("[build]") and "271-baylor-scott-white-health-2026-09-03.md" in out
 
     def test_missing_report_warns_and_returns_empty(self, tmp_path, capsys):
-        co = self._co(tmp_path)
+        co = _reports(tmp_path)
         assert read_report(co, "reports/999-gone.md", label="cover") == ""
         assert "[cover] report reports/999-gone.md not found" in capsys.readouterr().out
 
     def test_lock_is_not_a_report(self, tmp_path):
-        co = self._co(tmp_path, **{"271-RESERVED.md": '{"pid": 1}'})
+        co = _reports(tmp_path, **{"271-RESERVED.md": '{"pid": 1}'})
         assert resolve_report(co, "reports/271-baylor.md") is None
 
     def test_empty_path_is_silent(self, tmp_path, capsys):

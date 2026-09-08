@@ -292,15 +292,27 @@ def max_report_num(reports_dir: Path, state: dict) -> int:
     max_num = 0
     if reports_dir.exists():
         for f in reports_dir.glob("*.md"):
-            m = re.match(r"^(\d+)-", f.name)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
+            num = _report_num_prefix(f.name)
+            if num:
+                max_num = max(max_num, int(num))
     for job in state.get("jobs", {}).values():
         try:
             max_num = max(max_num, int(job.get("report_num", 0)))
         except (ValueError, TypeError):
             pass
     return max_num
+
+
+# The leading `NNN-` of a report filename (`{num}-{company-slug}-{date}.md`):
+# the one thing `max_report_num`, `find_report_file`, the Report-cell writer and
+# the dead-link resolver all key on, so it is spelled once.
+_REPORT_PREFIX_RE = re.compile(r"^(\d+)-")
+
+
+def _report_num_prefix(name: str) -> str:
+    """The leading number of a report filename, or "" when it has none."""
+    m = _REPORT_PREFIX_RE.match(name)
+    return m.group(1) if m else ""
 
 
 # `NNN-RESERVED.md` is career-ops' report-number LOCK, not a report: a JSON body
@@ -350,17 +362,25 @@ def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
     for f in sorted(reports_dir.glob("*.md")):
         if f.name.endswith(RESERVED_REPORT_SUFFIX):
             continue
-        m = re.match(r"^(\d+)-", f.name)
-        if m and int(m.group(1)) == wanted:
+        if _report_int(_report_num_prefix(f.name)) == wanted:
             return f
     return None
 
 
-# The `[N](path)` of a Report cell, and the two things the readers below need
-# from it: the number, and the career-ops-relative path with any `../` ascent
-# stripped (merge-tracker relativises the cell to data/applications.md, so both
-# shapes coexist in one file — see `app/data._report_link`, the UI's copy of
-# the same read).
+# The `[N](path)` of a Report cell, and the two things every reader needs from
+# it: the number, and the career-ops-relative path. merge-tracker.mjs
+# normalizes the Report link relative to the tracker FILE
+# (tracker-links.mjs:normalizeReportLink), and the pipeline seeds the tracker at
+# career-ops/data/applications.md — so a link the pipeline emitted as
+# `reports/042-x.md` comes back as `../reports/042-x.md`. The older
+# merge-tracker copied the cell verbatim, so both shapes are in circulation
+# within one file. Every consumer of `report_path` (the UI's two parsers in
+# app/data, cover letters, both tailors) resolves it as `career_ops /
+# report_path`, which the `../` form escapes — and `read_text` returns "" on the
+# miss, so tailoring and cover letters silently lose the evaluation report's
+# proof points. Strip the ascent HERE, the single point every parser extracts
+# it through (app/data imports these rather than keeping a copy), so the stored
+# value is career-ops-relative whichever shape the file holds.
 _REPORT_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _REPORT_ASCENT_RE = re.compile(r"^(?:\.\./)+")
 
@@ -373,9 +393,18 @@ def _report_link(cell: str) -> tuple[str, str]:
     return m.group(1).strip(), _REPORT_ASCENT_RE.sub("", m.group(2).strip())
 
 
-def resolve_report(base: Path, report_path: str) -> Path | None:
+def _linked_report(base: Path, report_path: str) -> Path | None:
+    """The file a Report link names taken literally (ascent stripped), or None
+    for an empty link. Whether it exists is the caller's question."""
+    report_path = _REPORT_ASCENT_RE.sub("", (report_path or "").strip())
+    return base / report_path if report_path else None
+
+
+def resolve_report(base: Path, report_path: str, *, num_text: str = "") -> Path | None:
     """The file a tracker row's Report link actually names — the link target
-    when it exists, else the report in `base/reports/` with the link's number.
+    when it exists, else the report in `base/reports/` with the link's number:
+    the filename's own `NNN-` prefix, or failing that `num_text` (the link's
+    `[N]` text, which a model that mangled the slug may have padded differently).
 
     The link is model-authored (#162): the prompt gives the model only the
     SHAPE `[N](reports/N-company-slug-DATE.md)` and it invents the slug — keeps
@@ -387,14 +416,13 @@ def resolve_report(base: Path, report_path: str) -> Path | None:
     keep the link they were merged with, so the readers resolve the same way
     the UI does. The link is asked FIRST: a number can match two files and only
     the link knows which was meant."""
-    report_path = _REPORT_ASCENT_RE.sub("", (report_path or "").strip())
-    if not report_path:
+    direct = _linked_report(base, report_path)
+    if direct is None:
         return None
-    direct = base / report_path
     if direct.is_file():
         return direct
-    num = re.match(r"^(\d+)-", report_path.rsplit("/", 1)[-1])
-    return find_report_file(base / "reports", num.group(1)) if num else None
+    num = _report_num_prefix(direct.name) or num_text
+    return find_report_file(base / "reports", num) if num else None
 
 
 def read_report(base: Path, report_path: str, *, label: str = "report") -> str:
@@ -408,7 +436,7 @@ def read_report(base: Path, report_path: str, *, label: str = "report") -> str:
     if found is None:
         print(f"[{label}] report {report_path} not found — building from the JD alone")
         return ""
-    if found != base / _REPORT_ASCENT_RE.sub("", report_path.strip()):
+    if found != _linked_report(base, report_path):
         print(f"[{label}] report link {report_path} is dead — using {found.name} (same number)")
     return read_text(found)
 
@@ -828,13 +856,13 @@ def _set_report_link(tracker_tsv: str, report_file: str) -> str:
     the model put there, which is no worse than before. Declined on a row whose
     columns are not in place, like every positional step (`_row_parts`)."""
     report_file = (report_file or "").strip()
+    num = _report_num_prefix(report_file)
+    if not num:
+        return tracker_tsv
     parts = _row_parts(tracker_tsv)
-    if not report_file or parts is None:
+    if parts is None:
         return tracker_tsv
-    m = re.match(r"^(\d+)-", report_file)
-    if not m:
-        return tracker_tsv
-    cell = f"[{m.group(1)}](reports/{report_file})"
+    cell = f"[{num}](reports/{report_file})"
     if parts[_REPORT_IDX].strip() == cell:
         return tracker_tsv
     parts[_REPORT_IDX] = cell
@@ -858,6 +886,7 @@ def write_job_result(
     company = summary.get("company") or job_meta.get("company") or "unknown"
     company_slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
     report_name = f"{report_num}-{company_slug}-{today}.md"
+    report_file = report_name if report_content else None
 
     if report_content:
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
@@ -866,11 +895,11 @@ def write_job_result(
         # model guessed at (#162): the prompt gives it only the link's shape.
         tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
                                         job_meta.get("jd_text", ""),
-                                        report_file=report_name if report_content else "")
+                                        report_file=report_file or "")
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {
-        "report_file": report_name if report_content else None,
+        "report_file": report_file,
         "tracker_file": f"{job_id}.tsv" if tracker_tsv else None,
         "summary": summary,
     }
@@ -1072,18 +1101,16 @@ def _trailing_url(tracker_tsv: str) -> str:
 def _dead_link_repair(career_ops: Path, tracker_tsv: str) -> str:
     """The filename to point a row's Report link at, or "" to leave it alone:
     only a link whose target does NOT exist is repaired, and only when a report
-    with its number does. The number comes from the link's own filename prefix
-    when it has one, else from the `[N]` text — a model that mangled the slug
-    may have padded the two differently."""
+    with its number does — resolved exactly as the readers resolve it
+    (`resolve_report`), with the `[N]` text as the fallback number."""
     parts = _row_parts(tracker_tsv)
     if parts is None:
         return ""
     num_text, path = _report_link(parts[_REPORT_IDX])
-    if not path or (career_ops / path).is_file():
+    found = resolve_report(career_ops, path, num_text=num_text)
+    if found is None or found == _linked_report(career_ops, path):
         return ""
-    m = re.match(r"^(\d+)-", Path(path).name)
-    found = find_report_file(career_ops / "reports", m.group(1) if m else num_text)
-    return found.name if found else ""
+    return found.name
 
 
 def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:

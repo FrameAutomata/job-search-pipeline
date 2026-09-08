@@ -282,7 +282,7 @@ def report_num(report_cell: str, notes_cell: str = "") -> str:
     Unpadded because this answers "WHICH report is this row", and the pipeline
     mints numbers zero-padded (`f"{n:03d}"`) while other writers emit `str(n)` —
     so `[003]` and `[3]` have to be one key or an identity check on them silently
-    fails. Deliberately NOT the same reader as `app/data.py:_report_link`, which
+    fails. Deliberately NOT the same reader as `_batch_common._report_link`, which
     answers "parse this link into its parts" and must keep the number verbatim
     beside the path it feeds (report rendering, and a renumber that rewrites the
     cell by string). Same distinction as `max_report_num` vs `find_report_file`:
