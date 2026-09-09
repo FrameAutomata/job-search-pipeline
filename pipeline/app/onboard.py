@@ -55,6 +55,25 @@ PROVIDER_SECRETS = dict(_PROVIDER_KEYS)
 # the names are the digest module's own, so the wizard's status check and the
 # workflow's env cannot drift from what the sender reads.
 DIGEST_SECRET_NAMES = tuple(_DIGEST_SECRET_VARS)
+# Wizard form field → digest secret, derived from the names (DIGEST_SMTP_PASS
+# ↔ digest_smtp_pass) so the table and the sender cannot name different
+# things. onboard_submit iterates it: every non-blank field is written under
+# its secret; blank keeps the existing one. /api/onboard/status answers "is a
+# channel configured" from the two constants after it.
+DIGEST_FORM_SECRETS = {name.lower(): name for name in DIGEST_SECRET_NAMES}
+DIGEST_DISCORD_SECRET = "DIGEST_DISCORD_WEBHOOK"
+DIGEST_EMAIL_REQUIRED = ("DIGEST_EMAIL_TO", "DIGEST_SMTP_HOST")
+for _n in (DIGEST_DISCORD_SECRET, *DIGEST_EMAIL_REQUIRED):
+    assert _n in DIGEST_SECRET_NAMES, _n
+
+# Form fields that are CREDENTIALS and must never reach the sidecar on disk:
+# the provider key, the Discord webhook URL (whoever holds it can post to the
+# channel) and the SMTP password. The digest's address, host, port and user
+# are configuration and may be kept, so a revisit prefills them. A table
+# rather than a `!= "api_key"` so the next secret the wizard learns to write
+# is one line here — tests/test_app_onboard.py checks every digest field whose
+# secret name reads as a credential is listed.
+SECRET_FORM_FIELDS = frozenset({"api_key", "digest_discord_webhook", "digest_smtp_pass"})
 
 # Generated file -> secret name. The first four are required by the workflow;
 # PROFILE_MD_B64 is optional but always generated, so we include it.
@@ -99,13 +118,14 @@ _SCRIPT = Path(__file__).resolve().parent.parent.parent / "setup-profile.mjs"
 
 
 def save_sidecar(root: Path, payload: dict) -> None:
-    """Persist the last-submitted onboarding form (minus api_key) so the
-    wizard can prefill on its next visit. Never raises — sidecar persistence
-    is a UX nicety; failures shouldn't fail the onboarding submission."""
+    """Persist the last-submitted onboarding form (minus every field in
+    SECRET_FORM_FIELDS) so the wizard can prefill on its next visit. Never
+    raises — sidecar persistence is a UX nicety; failures shouldn't fail the
+    onboarding submission."""
     sidecar = root / _SIDECAR_NAME
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        snapshot = {k: v for k, v in payload.items() if k != "api_key"}
+        snapshot = {k: v for k, v in payload.items() if k not in SECRET_FORM_FIELDS}
         sidecar.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     except OSError:
         pass

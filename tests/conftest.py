@@ -309,6 +309,27 @@ def _isolate_handoff_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_ui_env(monkeypatch):
+    """Keep the UI's LAN mode off in tests. server.py reads UI_LAN, UI_PASSWORD
+    and UI_ALLOWED_HOSTS at request time (a developer's .env leaks them via
+    load_dotenv the same way — see _isolate_provider_env), and under UI_LAN
+    every request needs Basic auth, so a leaked UI_LAN=1 would 401 every route
+    test. UI_LAN is set to "" rather than deleted: the client fixtures reload
+    server.py, whose load_dotenv(override=False) re-adds a deleted name but
+    leaves a present-and-empty one alone — and an empty UI_LAN is "off" to
+    _lan_enabled — which also keeps that reload from hitting the import-time
+    "UI_LAN without UI_PASSWORD" SystemExit on a developer's machine. The names
+    come from the module constant; without the UI deps the literals stand in."""
+    try:
+        from pipeline.app.server import LAN_ENV_VARS, UI_LAN_ENV
+    except Exception:
+        LAN_ENV_VARS, UI_LAN_ENV = ("UI_LAN", "UI_PASSWORD", "UI_ALLOWED_HOSTS"), "UI_LAN"
+    for var in LAN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(UI_LAN_ENV, "")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_resume_env(monkeypatch):
     """Keep resume resolution hermetic. RESUME_PATH leaks from the developer's
     .env the same way (see _isolate_provider_env), and resolve_resume_path
