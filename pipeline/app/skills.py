@@ -327,8 +327,9 @@ def skill_command(skill_id: str, report_path: Path | None,
     The rendering itself is `agent_cli.shell_command`: the resolved CLI's own
     interactive argv (`-i` / `--prompt` / positional — never a bare
     `<binary> "<prompt>"`, which is one-shot on qwen and a project dir on
-    opencode), quoted for this server's shell, behind the env prefix that keeps
-    a Google API key out of Gemini CLI's sight."""
+    opencode), quoted for this server's shell. Gemini also gets
+    `-m <default_model>` (AGENT_MODEL overrides it for every CLI); nothing
+    strips the Google key — an individual runs Gemini CLI on the API key now."""
     s = SKILLS[skill_id]
     prompt = f"use {s['mode']} mode to {s['verb']} for {company} / {role}"
     if report_path is not None:

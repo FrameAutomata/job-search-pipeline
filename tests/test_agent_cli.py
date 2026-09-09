@@ -657,6 +657,28 @@ class TestMain:
         assert agent_cli.main(["--resolved"]) == 0
         assert capsys.readouterr().out.strip() == DEFAULT_CLI
 
+    def test_resolved_model_prints_agent_model_when_set(self, capsys, monkeypatch):
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+        monkeypatch.setenv("BATCH_CLI", "opencode")
+        monkeypatch.setenv(AGENT_MODEL_ENV, "google/model-x")
+        assert agent_cli.main(["--resolved-model"]) == 0
+        assert capsys.readouterr().out.strip() == "google/model-x"
+
+    def test_resolved_model_falls_back_to_the_registry_default_for_gemini(self, capsys, monkeypatch):
+        # This is the line run.sh/run.ps1 forward as batch-runner's --model, so
+        # gemini's --batch runs on the ~500 req/day model, not the CLI's ~20.
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+        monkeypatch.setenv("BATCH_CLI", "gemini")
+        assert agent_cli.main(["--resolved-model"]) == 0
+        assert capsys.readouterr().out.strip() == GEMINI_MODEL
+
+    def test_resolved_model_prints_nothing_when_the_cli_has_no_default(self, capsys, monkeypatch):
+        # An empty line, not an error: the wrappers pass --model only when
+        # there is one, and "" means the CLI's own default.
+        monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+        assert agent_cli.main(["--resolved-model"]) == 0
+        assert capsys.readouterr().out == "\n"
+
     def test_module_runs_as_a_script(self):
         proc = subprocess.run(
             [sys.executable, "-m", "pipeline.agent_cli", "--list"],
@@ -705,6 +727,8 @@ class TestEnvExampleMirror:
         line = next(l for l in comments if re.match(r"^#\s{3}gemini\b", l))
         assert "personal Google login" not in line or "ended" in line
         assert "GEMINI_API_KEY" in line
+        # The launch model is restated here too; keep it the registry's.
+        assert f"-m {GEMINI_MODEL}" in line
 
     def test_agent_model_is_documented_with_the_registry_default(self):
         m = re.search(r"^#?\s*" + AGENT_MODEL_ENV + r"=", self.text, re.M)
@@ -712,7 +736,22 @@ class TestEnvExampleMirror:
         block = self.text[:m.start()].rsplit("\n\n", 1)[-1]
         assert GEMINI_MODEL in block
         for c in AGENT_CLIS.values():
-            assert c.model_flag in block, c.id
+            # Whole token: `-m` is a substring of `--model`, so a plain `in`
+            # would be satisfied for gemini/qwen by any `--model` mention.
+            assert re.search(r"(?<![\w-])" + re.escape(c.model_flag) + r"(?![\w-])", block), c.id
+
+    def test_agent_model_block_says_it_reaches_batch_and_what_outranks_it(self):
+        # AGENT_MODEL sits under "the one that applies for you and runs
+        # --batch", so it must actually reach --batch — and say that
+        # OLLAMA_MODEL, the older --batch-only name, still wins there.
+        m = re.search(r"^#?\s*" + AGENT_MODEL_ENV + r"=", self.text, re.M)
+        block = self.text[:m.start()].rsplit("\n\n", 1)[-1]
+        assert "--batch" in block
+        assert "OLLAMA_MODEL" in block
+        m2 = re.search(r"^#?\s*OLLAMA_MODEL=", self.text, re.M)
+        assert m2, "no OLLAMA_MODEL line in .env.example"
+        ollama_block = self.text[:m2.start()].rsplit("\n\n", 1)[-1]
+        assert AGENT_MODEL_ENV in ollama_block and "--batch" in ollama_block
 
 
 class TestSetupProfileMirror:
@@ -743,6 +782,14 @@ class TestWrapperMirror:
         src = (ROOT / name).read_text(encoding="utf-8")
         assert re.search(r"-m pipeline\.agent_cli --resolved\b", src), name
 
+    @pytest.mark.parametrize("name", ["run.sh", "run.ps1"])
+    def test_calls_resolved_model(self, name):
+        # AGENT_MODEL reaches --batch through this, not just the hand-off
+        # command; OLLAMA_MODEL is consulted first (the older --batch name).
+        src = (ROOT / name).read_text(encoding="utf-8")
+        assert re.search(r"-m pipeline\.agent_cli --resolved-model\b", src), name
+        assert "OLLAMA_MODEL" in src
+
     def test_no_literal_default_remains(self):
         sh = (ROOT / "run.sh").read_text(encoding="utf-8")
         ps = (ROOT / "run.ps1").read_text(encoding="utf-8")
@@ -766,6 +813,10 @@ class TestNoKeyStrippingAnywhere:
         assert "_launch_env" not in src
         assert "env_unset" not in src
         assert "GOOGLE_API_KEY" not in src
+        # The prose form as well: the identifiers left before the docstring
+        # describing the rendered command did.
+        assert "env prefix" not in src
+        assert not re.search(r"key out of", src)
 
     def test_registry_source_has_no_unset_rendering(self):
         src = (ROOT / "pipeline" / "agent_cli.py").read_text(encoding="utf-8")
@@ -777,6 +828,12 @@ class TestAgentCliDataclass:
     def test_is_frozen(self):
         with pytest.raises(Exception):
             AGENT_CLIS["gemini"].tier = "paid"  # type: ignore[misc]
+
+    def test_is_hashable_despite_the_dict_field(self):
+        # frozen=True advertises hashability; the dict field opts out of the
+        # generated __hash__ (hash=False) rather than making it raise.
+        assert len({c for c in AGENT_CLIS.values()}) == len(AGENT_CLIS)
+        assert hash(AGENT_CLIS[DEFAULT_CLI].mcp_registration(home=Path("/h"), env={})) is not None
 
     def test_custom_entry_shapes(self):
         c = AgentCli(id="x", label="X", binary="x", tier="paid", tier_note="n",

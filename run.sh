@@ -61,9 +61,19 @@ if [[ "$run_batch" == "true" ]]; then
   fi
   batch_args=(--cli "$batch_cli")
   display_str="$batch_cli"
-  if [[ -n "${OLLAMA_MODEL:-}" ]]; then
-    batch_args+=(--model "$OLLAMA_MODEL")
-    display_str="$batch_cli / $OLLAMA_MODEL"
+  # The model too: OLLAMA_MODEL (the older, --batch-only name) when set, else
+  # AGENT_MODEL / the registry's default for this CLI (`--resolved-model`, which
+  # may print nothing — then the CLI starts on its own default and no --model
+  # is passed). Without this, gemini's --batch ran on the CLI's own default
+  # model, which has ~20 requests/day on a free key where the registry's
+  # default has ~500.
+  batch_model="${OLLAMA_MODEL:-}"
+  if [[ -z "$batch_model" ]]; then
+    batch_model="$(cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --resolved-model)"
+  fi
+  if [[ -n "$batch_model" ]]; then
+    batch_args+=(--model "$batch_model")
+    display_str="$batch_cli / $batch_model"
   fi
   [[ "$skip_pdf" == "true" ]] && batch_args+=(--skip-pdf)
   [[ -n "$min_score" ]] && batch_args+=(--min-score "$min_score")

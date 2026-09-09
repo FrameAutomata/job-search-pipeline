@@ -86,7 +86,11 @@ DEFAULT_CLI = "opencode"
 
 # The model the agent CLI is started with, for every CLI that takes a model
 # flag. Unset → only gemini renders a model (its `default_model`); the others
-# start on their own default. Isolated by tests/conftest.py's provider fixture.
+# start on their own default. It reaches both launch paths: the interactive
+# hand-off command renders it as the CLI's own flag, and `--batch` gets it as
+# batch-runner's `--model` via `--resolved-model` in run.sh/run.ps1 — where
+# `OLLAMA_MODEL`, the older name for that one path, still wins when set.
+# Isolated by tests/conftest.py's provider fixture.
 AGENT_MODEL_ENV = "AGENT_MODEL"
 
 # The one MCP server the apply skill needs. Registered the same way with every
@@ -129,7 +133,9 @@ class McpRegistration:
     argv: tuple = ()
     config_path: Path | None = None
     servers_key: str = ""
-    merge: dict = field(default_factory=dict)
+    # `hash=False`: a frozen dataclass advertises hashability, and a dict
+    # field would make `hash()` raise. The value is immutable data in practice.
+    merge: dict = field(default_factory=dict, hash=False)
 
     @property
     def is_argv(self) -> bool:
@@ -164,7 +170,9 @@ class AgentCli:
     mcp_config_rel: str = ""
     mcp_config_base: str = "xdg"   # "xdg" | "home"
     mcp_servers_key: str = ""
-    mcp_server_entry: dict = field(default_factory=dict)
+    # `hash=False` keeps AgentCli hashable (set members, dict keys) despite
+    # the dict: with eq=True, frozen=True the generated __hash__ would raise.
+    mcp_server_entry: dict = field(default_factory=dict, hash=False)
 
     def interactive_argv(self, prompt: str, *, model: str | None = None) -> list:
         """The argv that opens the CLI interactively, seeded with `prompt`.
@@ -525,14 +533,21 @@ def main(argv=None) -> int:
                     help="exit 1 if the resolved CLI is not installed; print how it will be launched")
     ap.add_argument("--resolved", action="store_true",
                     help="print the resolved CLI id (reads .env)")
+    ap.add_argument("--resolved-model", action="store_true",
+                    help=f"print the model the resolved CLI starts with — {AGENT_MODEL_ENV}, "
+                         "else its registry default, else nothing (reads .env)")
     args = ap.parse_args(argv)
 
-    if args.resolved:
+    if args.resolved or args.resolved_model:
         # Only here: the module stays import-clean for the UI venv and tests,
         # but the wrappers need the same `.env` view the wizard writes to.
         from dotenv import load_dotenv
         load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-        print(resolve_cli().id)
+        cli = resolve_cli()
+        # `--resolved-model` may print an empty line: the wrappers pass
+        # batch-runner's `--model` only when there is one, so "no model" has
+        # to be sayable, and the CLI's own default is what "" means.
+        print(cli.id if args.resolved else resolve_model(cli))
         return 0
     if args.list:
         _print_list()
