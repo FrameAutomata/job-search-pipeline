@@ -1374,6 +1374,14 @@ class TestReadReport:
         assert read_report(co, "reports/999-gone.md", label="cover") == ""
         assert "[cover] report reports/999-gone.md not found" in capsys.readouterr().out
 
+    def test_the_rows_number_resolves_a_dead_link_that_lost_its_own(self, tmp_path, capsys):
+        # A slug so mangled it lost its numeric prefix: the UI and the merge-time
+        # repair resolve it from the row's `[N]`; the readers can too, given it.
+        co = _reports(tmp_path, **{"271-acme-2026.md": "PROOF"})
+        assert read_report(co, "reports/acme.md", num_text="271") == "PROOF"
+        assert "is dead — using 271-acme-2026.md" in capsys.readouterr().out
+        assert read_report(co, "reports/acme.md") == ""
+
     def test_two_reports_with_the_number_read_the_companys_or_nothing(self, tmp_path, capsys):
         co = _reports(tmp_path, **{"042-globex-2026-05-27.md": "GLOBEX",
                                    "042-zeta-corp-2026-08-25.md": "ZETA"})

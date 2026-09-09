@@ -715,7 +715,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
 
     report_text = read_report(Path(report_base or career_ops),
                               getattr(job, "report_path", ""), label="tailor",
-                              company=getattr(job, "company", ""))
+                              company=getattr(job, "company", ""),
+                              num_text=getattr(job, "report_num", ""))
     jd_text = jd_text_for_job(career_ops, report_base, job)
     instructions = _tailoring_instructions(career_ops)   # candidate's own setup guidance
 

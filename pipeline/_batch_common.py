@@ -449,15 +449,17 @@ def resolve_report(base: Path, report_path: str, *, num_text: str = "",
 
 
 def read_report(base: Path, report_path: str, *, label: str = "report",
-                company: str = "") -> str:
+                company: str = "", num_text: str = "") -> str:
     """The text of the report a tracker row links to, or "" — resolving a dead
     link by its number (`resolve_report`, with the row's `company` to tell two
-    same-numbered reports apart) and SAYING so either way, since the consumers
-    (cover letters, both tailors) otherwise build from the JD alone in silence,
-    which is the failure this exists to end."""
+    same-numbered reports apart, and its `[N]` text as `num_text` for a dead
+    path that lost its own number, as the UI and the merge-time repair already
+    could) and SAYING so either way, since the consumers (cover letters, both
+    tailors) otherwise build from the JD alone in silence, which is the failure
+    this exists to end."""
     if not (report_path or "").strip():
         return ""
-    found = resolve_report(base, report_path, company=company)
+    found = resolve_report(base, report_path, num_text=num_text, company=company)
     if found is None:
         print(f"[{label}] report {report_path} not found — building from the JD alone")
         return ""

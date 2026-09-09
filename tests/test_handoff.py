@@ -1676,6 +1676,28 @@ class TestReportPathThreaded:
                                  report="reports/001-acme.md"))
         assert seen["report_path"] == "reports/001-acme.md"
 
+    def test_report_num_flows_from_the_tracker_to_the_tailor(self, monkeypatch, tmp_path):
+        """The row's `[N]` rides beside the path (#162 follow-up): a dead link
+        whose filename lost its number is resolvable by the UI and the merge-time
+        repair, and the readers can only match that given the number."""
+        from pipeline import resume_content
+        co = tmp_path / "career-ops"; (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "# Applications Tracker\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 7 | 2026-09-01 | Acme | Eng | 4.5/5 | Evaluated | ❌ | [271](reports/acme.md) "
+            "| https://www.linkedin.com/jobs/view/1 — APPLY |\n", encoding="utf-8")
+        q = handoff.load_queue_from_tracker(co)[0]
+        assert (q.report, q.report_num) == ("reports/acme.md", "271")
+        item = handoff.build_work_order([q], [])[0]
+        assert item.report_num == "271"
+        seen = {}
+        monkeypatch.setattr(resume_content, "generate_for_job",
+                            lambda co, job, **kw: seen.update(report_num=job.report_num) or None)
+        handoff._make_tailor_fn(tmp_path)(item)
+        assert seen["report_num"] == "271"
+
 
 class TestLimitGuard:
     """L1: fresh[:limit] with no positivity check — --limit 0 emptied the
