@@ -571,6 +571,7 @@ async function promptForRoleCriteria(autoMode) {
       .filter(r => r);
   } else {
     criteria.targetRoles = ['Software Engineer', 'Full-Stack Engineer'];
+    criteria.targetRolesDefaulted = true;   // a search term, not the candidate's role
   }
 
   // Negative roles (roles to avoid)
@@ -781,8 +782,9 @@ async function promptForSearchSettings(autoMode) {
 // Prompt for Career Narrative (for _profile.md)
 // ============================================================
 
-async function promptForCareerNarrative(autoMode, _info, criteria) {
+async function promptForCareerNarrative(autoMode, _info, criteria, resumeText = '') {
   const narrative = {
+    headline: '',
     exitStory: '',
     dealBreakers: [],
     locationPolicy: {},
@@ -790,36 +792,34 @@ async function promptForCareerNarrative(autoMode, _info, criteria) {
   };
 
   if (autoMode) {
-    warn('Skipping career narrative (auto mode). Edit career-ops/modes/_profile.md later.');
-    return narrative;
+    warn('Skipping career narrative (auto mode). Headline and story are derived from your résumé; edit career-ops/config/profile.yml (narrative:) and career-ops/modes/_profile.md later.');
+    return resolveNarrative(narrative, criteria, resumeText);
   }
 
   console.log('\n📖 Career Narrative & Preferences');
   console.log('='.repeat(60));
+  console.log('The evaluator and your browser agent read these answers. Enter on a blank line derives it from your résumé.');
+
+  // Headline
+  const headlineInput = await prompt(
+    '\nOne-line headline (how you would introduce yourself professionally)?\n→ '
+  );
+  narrative.headline = headlineInput;
 
   // Exit story
   const exitStoryInput = await prompt(
-    '\nTell me your career transition story (what brings you to these roles?).\nExample: "Transitioning from platform engineering to full-stack roles where I own the whole product"\n→ '
+    '\nTell me your career transition story (what brings you to these roles?).\nExample: "Moving into patient access roles where my scheduling and insurance-verification experience carries the most weight"\n→ '
   );
-  if (exitStoryInput) {
-    narrative.exitStory = exitStoryInput;
-  } else {
-    narrative.exitStory = `Transitioning to ${criteria.targetRoles[0]} roles where I can ship complete products.`;
-  }
+  narrative.exitStory = exitStoryInput;
 
   // Deal-breakers
   console.log('\n🚫 Deal-breakers (non-negotiables):');
   const dealBreakerInput = await prompt(
-    'What are you NOT interested in? (comma-separated)\nExample: "Legacy codebases only, Startup <10 people, Manager roles"\n→ '
+    'What are you NOT interested in? (comma-separated, optional)\nExample: "Night shifts, Fully on-site, Manager roles"\n→ '
   );
-  if (dealBreakerInput) {
-    narrative.dealBreakers = dealBreakerInput
-      .split(',')
-      .map(d => d.trim())
-      .filter(d => d);
-  } else {
-    narrative.dealBreakers = ['Legacy codebases only (no greenfield)', 'Startup with <10 people'];
-  }
+  narrative.dealBreakers = dealBreakerInput
+    ? dealBreakerInput.split(',').map(d => d.trim()).filter(d => d)
+    : [];                                    // none, as the wizard sends — never a job family's
 
   // Location preferences — preferred already captured in role criteria
   console.log('\n🌍 Location Policy:');
@@ -842,7 +842,7 @@ async function promptForCareerNarrative(autoMode, _info, criteria) {
       .filter(p => p);
   }
 
-  return narrative;
+  return resolveNarrative(narrative, criteria, resumeText);
 }
 
 // ============================================================
@@ -891,7 +891,9 @@ function generateProfileMarkdown(info, criteria, narrative) {
     }
 
     if (!found) {
-      markdown += `| **${role}** | Ownership, technical excellence, impact | Someone who excels in this domain |\n`;
+      // Role-agnostic on purpose (#161): the keyed rows above only fire on
+      // engineering words, so this is what every other candidate reads.
+      markdown += `| **${role}** | The strengths your résumé shows for this work | Someone with a track record in this domain |\n`;
     }
   });
 
@@ -942,7 +944,7 @@ ${criteria.targetRoles.slice(0, 3).map((role) => {
     'lead': '"I elevate teams through technical leadership and mentorship."',
   };
 
-  let frame = 'Someone who excels in this domain';
+  let frame = `"I bring a proven track record to ${role} work."`;
   for (const [key, val] of Object.entries(frames)) {
     if (role.toLowerCase().includes(key)) {
       frame = val;
@@ -984,7 +986,7 @@ ${criteria.targetRoles.slice(0, 4).map(role => `- **${role}:** \`check levels.fy
 ## Negotiation Scripts
 
 **Salary expectations:**
-> "Based on market data for this role, I'm targeting ${criteria.compensationTarget}. I'm flexible on structure—what matters is the total package and the opportunity to ship impactful products."
+> "Based on market data for this role, I'm targeting ${criteria.compensationTarget}. I'm flexible on structure—what matters is the total package and the opportunity to do work that matters."
 
 **When asked about current comp:**
 > "I'm focused on finding the right opportunity and role fit. My target for the market and my skillset is ${criteria.compensationTarget}. What's the range for this position?"
@@ -1001,11 +1003,12 @@ ${narrative.portfolio.length > 0 ? narrative.portfolio.map(p => `- ${p}`).join('
 }
 
 // ============================================================
-// Generate CV Markdown
+// Résumé sections
 // ============================================================
 
-function generateCV(resumeText, info) {
-  // Try to extract sections from resume
+/** The résumé's summary/experience/projects/education/skills blocks, by header.
+ *  Shared by generateCV and the narrative defaults below. */
+function extractResumeSections(resumeText) {
   const sections = {
     summary: '',
     experience: '',
@@ -1016,7 +1019,7 @@ function generateCV(resumeText, info) {
 
   // Match both markdown headers and all-caps section headers
   const sectionRegex = /(?:^#+\s*|^)((?:PROFESSIONAL\s+)?SUMMARY|EXPERIENCE|PROJECTS?|(?:PROJECTS\s+&\s+OUTSIDE\s+)?EXPERIENCE|EDUCATION|SKILLS|CERTIFICATIONS?)\s*\n/im;
-  const splits = resumeText.split(sectionRegex);
+  const splits = String(resumeText || '').split(sectionRegex);
 
   for (let i = 0; i < splits.length - 1; i += 2) {
     const header = (splits[i + 1] || '').toLowerCase();
@@ -1030,6 +1033,86 @@ function generateCV(resumeText, info) {
     else if (header.includes('education')) sections.education = content;
     else if (header.includes('skill')) sections.skills = content;
   }
+  return sections;
+}
+
+// ============================================================
+// Narrative defaults (#161)
+// ============================================================
+//
+// The Narrative step is optional, and what filled its blanks was an engineer's
+// prose — "ship complete products", "Full-stack development", "technical
+// excellence" — written into profile.yml and _profile.md for EVERY candidate,
+// shipped to the cloud as PROFILE_YML_B64 / PROFILE_MD_B64, read by
+// eval_system_prompt as a seed whenever no PROFILE.md exists, and folded into
+// the browser agent's living master. A patient-access candidate was evaluated
+// against a software engineer's exit story. Blanks now derive from the
+// candidate's own material — the résumé's summary, and the first target role —
+// and nothing below assumes a job family.
+
+// A period after one of these does not end a sentence: a title or degree
+// (Sr., Dr., B.S.), a unit (yrs., mos.), a lone initial or list number, or a
+// dotted abbreviation (e.g., Ph.D). Résumé summaries open with them routinely,
+// and cutting there made "Sr." the candidate's headline.
+const NOT_A_SENTENCE_END_RE = /^(?:[A-Za-z]|\d+|(?:[A-Za-z]\.)+[A-Za-z]|sr|jr|dr|mr|mrs|ms|st|vs|etc|approx|dept|inc|ltd|co|corp|yrs?|mos?|hrs?|exp|no|e\.g|i\.e|ph\.d|b\.s|m\.s|b\.a|m\.a|r\.n)$/i;
+
+function firstSentence(text, max = 240) {
+  // One line; a bulleted or numbered summary contributes its first item.
+  const t = String(text || '').replace(/\s+/g, ' ').trim()
+    .replace(/^(?:[-•*]|\d+[.)])\s+/, '').split(/\s+[•·▪]\s+/)[0];
+  if (!t) return '';
+  let sentence = t;
+  const end = /[.!?]+(?=\s|$)/g;
+  let m;
+  while ((m = end.exec(t))) {
+    const candidate = t.slice(0, m.index + m[0].length);
+    const words = candidate.split(' ');
+    const last = words[words.length - 1].replace(/[.!?]+$/, '');
+    // A couple of words ending in an abbreviation-shaped token is an opening,
+    // not a sentence; keep reading to the next stop.
+    if (words.length >= 3 && !NOT_A_SENTENCE_END_RE.test(last)) { sentence = candidate; break; }
+  }
+  if (sentence.length <= max) return sentence;
+  const cut = sentence.slice(0, max - 1);
+  return (cut.includes(' ') ? cut.slice(0, cut.lastIndexOf(' ')) : cut).trimEnd() + '…';
+}
+
+function firstTargetRole(criteria) {
+  // Only a role the candidate TYPED: both entry points default targetRoles to
+  // a job family so the search config has a term, and deriving the narrative
+  // from that made a candidate who skipped the field a "Software Engineer
+  // candidate" — the persona #161 removes.
+  if (!criteria || criteria.targetRolesDefaulted) return '';
+  return (criteria.targetRoles && criteria.targetRoles[0]) || '';
+}
+
+/**
+ * Fill whatever the Narrative step left blank from the candidate's own material:
+ * the résumé's summary sentence, else the first target role. The one place the
+ * rule lives — both entry points resolve once, here, and the generators trust
+ * what they are handed.
+ */
+function resolveNarrative(narrative, criteria, resumeText) {
+  const n = { ...(narrative || {}) };
+  const summary = extractResumeSections(resumeText).summary;
+  const role = firstTargetRole(criteria);
+  n.headline = String(n.headline || '').trim()
+    || firstSentence(summary, 120)
+    || (role ? `${role} candidate` : 'Candidate');
+  n.exitStory = String(n.exitStory || '').trim()
+    || firstSentence(summary)
+    || (role ? `Seeking ${role} roles that build on my experience.`
+             : 'Seeking roles that build on my experience.');
+  n.superpowers = Array.isArray(n.superpowers) ? n.superpowers.filter(Boolean) : [];
+  return n;
+}
+
+// ============================================================
+// Generate CV Markdown
+// ============================================================
+
+function generateCV(resumeText, info) {
+  const sections = extractResumeSections(resumeText);
 
   // Build markdown CV
   let cv = `# ${info.name}\n\n`;
@@ -1073,7 +1156,7 @@ function generateCV(resumeText, info) {
 // Generate Profile YAML
 // ============================================================
 
-function generateProfile(info, criteria) {
+function generateProfile(info, criteria, narrative) {
   // Detect seniority level from target and negative roles
   const targetRolesLower = criteria.targetRoles.map(r => r.toLowerCase()).join(' ');
   const negativeRolesLower = criteria.negativeRoles.map(r => r.toLowerCase()).join(' ');
@@ -1135,15 +1218,12 @@ function generateProfile(info, criteria) {
       primary: criteria.targetRoles.slice(0, 2),
       archetypes: archetypes,
     },
+    // From the Narrative step (or derived from the résumé and target roles —
+    // see resolveNarrative). These used to be engineering constants (#161).
     narrative: {
-      headline: 'Software engineer building impactful products',
-      exit_story:
-        'Passionate about shipping quality software and solving real problems.',
-      superpowers: [
-        'Full-stack development',
-        'Problem-solving',
-        'Learning quickly',
-      ],
+      headline: narrative.headline,
+      exit_story: narrative.exitStory,
+      superpowers: narrative.superpowers,
       proof_points: [],
     },
     compensation: {
@@ -1471,6 +1551,7 @@ async function runFromJson(jsonPath) {
   const c = payload.criteria || {};
   const criteria = {
     targetRoles: (c.targetRoles && c.targetRoles.length) ? c.targetRoles : ['Software Engineer'],
+    targetRolesDefaulted: !(c.targetRoles && c.targetRoles.length),   // a search term, not the candidate's role
     negativeRoles: c.negativeRoles || [],
     compensationTarget: c.compensationTarget || '$130K-170K',
     compensationMin: c.compensationMin || '$110K',
@@ -1490,12 +1571,14 @@ async function runFromJson(jsonPath) {
   };
 
   const n = payload.narrative || {};
-  const narrative = {
-    exitStory: n.exitStory || `Transitioning to ${criteria.targetRoles[0]} roles where I can ship complete products.`,
+  const narrative = resolveNarrative({
+    headline: n.headline,
+    exitStory: n.exitStory,
+    superpowers: n.superpowers,
     dealBreakers: n.dealBreakers || [],
     locationPolicy: n.locationPolicy || { preferred: criteria.locationFlexibility, flexibility: 'Flexible for right opportunity' },
     portfolio: n.portfolio || [],
-  };
+  }, criteria, resumeText);
 
   // Ensure the output directories exist (fresh setup may lack them).
   fs.mkdirSync(path.join(CAREER_OPS_PATH, 'config'), { recursive: true });
@@ -1510,7 +1593,7 @@ async function runFromJson(jsonPath) {
     fs.copyFileSync(examplePath, searchPath);
   }
 
-  const profile = generateProfile(info, criteria);
+  const profile = generateProfile(info, criteria, narrative);
   const cv = generateCV(resumeText, info);
   const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
 
@@ -1611,11 +1694,11 @@ async function main() {
   const searchSettings = await promptForSearchSettings(args.auto);
 
   // Prompt for career narrative (for _profile.md)
-  const narrative = await promptForCareerNarrative(args.auto, info, criteria);
+  const narrative = await promptForCareerNarrative(args.auto, info, criteria, resumeText);
 
   // Generate files
   log('Generating profile.yml, cv.md, and _profile.md...');
-  const profile = generateProfile(info, criteria);
+  const profile = generateProfile(info, criteria, narrative);
   const cv = generateCV(resumeText, info);
   const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
 

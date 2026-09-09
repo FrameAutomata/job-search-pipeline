@@ -131,10 +131,12 @@ def load_sidecar(root: Path) -> dict | None:
 #     Emitting "" would win the merge and then render as an empty box, which is
 #     the symptom this exists to fix.
 #
-# The Narrative step (exit story, deal-breakers, flexibility, portfolio) is the
+# The rest of the Narrative step (deal-breakers, flexibility, portfolio) is the
 # sidecar's remaining job: setup-profile.mjs renders it into
 # career-ops/modes/_profile.md as prose, under headings the file's own banner
 # invites the user to rewrite, so there is nothing there to read back reliably.
+# Its headline and exit story reach profile.yml since #161 and read back like
+# every other field (`_PROFILE_TEXT_FIELDS["narrative"]`).
 #
 # config/search.yml deliberately, not search.local.yml: the wizard writes and
 # ships the shared/cloud config (setup-profile.mjs writes that path, and
@@ -179,6 +181,11 @@ _PROFILE_TEXT_FIELDS = {
     "voluntary_disclosures": {"eeo_gender": "gender", "eeo_race": "race_ethnicity",
                               "eeo_veteran": "veteran_status",
                               "eeo_disability": "disability_status"},
+    # The Narrative step's two prose answers now reach profile.yml (#161), so
+    # they read back like every other field; the rest of that step (deal-
+    # breakers, flexibility, portfolio) is rendered only into _profile.md and
+    # still lives in the sidecar alone.
+    "narrative": {"headline": "headline", "exit_story": "exit_story"},
 }
 
 # form field -> (section, profile.yml key) for the yes/no answers.
@@ -579,6 +586,7 @@ def build_onboarding_json(form: dict, resume_text: str) -> dict:
             "includeEasyApply": bool(form.get("include_easy_apply")),
         },
         "narrative": {
+            "headline": form.get("headline") or "",
             "exitStory": form.get("exit_story") or "",
             "dealBreakers": _split_csv(form.get("deal_breakers")),
             "locationPolicy": {
