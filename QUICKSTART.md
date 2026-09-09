@@ -396,10 +396,19 @@ not work. `From` defaults to the SMTP user.
 Either channel alone is enough; an unset one is skipped. Tuning lives in
 repository **variables** and every one has a working default: `DIGEST_MIN_SCORE`
 (4.0), `DIGEST_LIMIT` (10), `DIGEST_ALWAYS`, `DIGEST_ATTACH_REPORTS`,
-`DIGEST_NEXT_STEP`. To see what it would send without sending it:
+`DIGEST_NEXT_STEP`. To see what it would send without sending it — `--manifest`
+is required, because the digest reports what is new *since* that snapshot, and
+blanking the two channel variables is what guarantees nothing goes out (`.env` is
+loaded, so a webhook set there would otherwise be used):
 
 ```bash
-python -m pipeline.daily_digest --root career-ops --dump /tmp/digest.json
+# before the run
+python -m pipeline.run_artifact snapshot --root career-ops \
+  --manifest /tmp/manifest.json --delta reports
+# after it
+DIGEST_DISCORD_WEBHOOK= DIGEST_EMAIL_TO= \
+  python -m pipeline.daily_digest --root career-ops \
+  --manifest /tmp/manifest.json --dump /tmp/digest.json
 ```
 
 ---
@@ -480,11 +489,11 @@ job-search-pipeline/
 | `HANDOFF_OUT_DIR` | `output/handoff` | Where the per-board work-orders are written. |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides detection) |
 | `BATCH_MODEL` | per-provider default | Model name for `--evaluate-batch` |
-| `OLLAMA_MODEL` | `qwen2.5:32b` | Model name passed as `--model` to whichever CLI `--batch` uses (works with any `BATCH_CLI`) |
+| `OLLAMA_MODEL` | unset | Older, `--batch`-only name for the agent CLI's model (e.g. `llama3.1:70b` against a local Ollama server). When set it wins over `AGENT_MODEL` on that path; unset, `--batch` takes `AGENT_MODEL`, else whatever the registry or the CLI itself would start on. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint for `--evaluate-batch --batch-provider ollama` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic. |
 | `OPENAI_BASE_URL` | OpenAI default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint (local vLLM, custom proxy, etc.) |
 | `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the triage UI (résumé tailoring, etc.): `ask` (pick each time), `api` (always the provider call), or `cli` (always hand off to your agent). See the [README UI section](README.md#running-career-ops-skills-from-the-ui). |
 | `UI_LAN` / `UI_PASSWORD` / `UI_ALLOWED_HOSTS` | off | Serve the triage UI to your home network. `UI_PASSWORD` is required under `UI_LAN`; see the [README](README.md#triaging-from-your-phone-lan-mode). |
 | `DIGEST_*` | — | Daily digest delivery and thresholds — repository secrets and variables in the cloud, `.env` for a local `python -m pipeline.daily_digest`. See [The daily digest](#the-daily-digest). |
-| `GEMINI_FREE_TIER` / `GEMINI_LIMITS_FILE` | off | Pace and cap requests to your Gemini free-tier limits instead of 429-ing. The Setup wizard writes both, and the same numbers reach the cloud. |
+| `GEMINI_FREE_TIER` / `GEMINI_LIMITS_FILE` | off / `config/gemini-limits.json` | `GEMINI_FREE_TIER` paces and caps requests to your Gemini free-tier limits instead of 429-ing. The limits file is read whenever it exists, whether or not that is on — your numbers win per model over the baked table, which also moves what `--show` and the model recommendation say. The Setup wizard writes both, and the same numbers reach the cloud. |

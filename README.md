@@ -158,7 +158,7 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | `HANDOFF_SUBMIT_POLICY` | `stop-before-submit` | What the browser agent does at the Submit button. See [Applying to jobs](#applying-to-jobs). |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides auto-detection) |
 | `BATCH_MODEL` | per-provider default | Model override for `--evaluate-batch` |
-| `OLLAMA_MODEL` | `qwen2.5:32b` | Model name passed as `--model` to whichever CLI `--batch` uses (works with any `BATCH_CLI`) |
+| `OLLAMA_MODEL` | unset | Older, `--batch`-only name for the agent CLI's model (e.g. `llama3.1:70b` against a local Ollama server). When set it wins over `AGENT_MODEL` on that path; unset, `--batch` takes `AGENT_MODEL`, else whatever the registry or the CLI itself would start on. |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic. See [QUICKSTART](QUICKSTART.md#which-provider-should-i-pick) for picking one. |
 | `OPENAI_BASE_URL` | OpenAI's default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint. |
 | `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the UI: `ask` (choose each time), `api`, or `cli`. |
@@ -231,9 +231,9 @@ These flags are for ad-hoc local runs; the daily cloud workflow runs **every** p
 
 The pipeline finds and evaluates roles. **It never submits an application.** When
 you're ready to apply, it builds a *work-order* — one file per job board, holding
-that board's best-scoring roles with the posting link, the score and a tailored
-résumé — and hands it to a browser agent that works through them in *your*
-logged-in browser:
+that board's best-scoring roles with the posting link, the score and (with
+`--handoff-tailor`) a tailored résumé — and hands it to a browser agent that
+works through them in *your* logged-in browser:
 
 ```bash
 ./run.sh --skip-scrape --skip-filter --handoff        # or the UI's 🤝 Hand off button
@@ -450,11 +450,24 @@ default: `DIGEST_MIN_SCORE` (4.0), `DIGEST_LIMIT` (10 roles), `DIGEST_ALWAYS`
 closing "open the UI, Refresh, Hand off" line). The digest can never fail a run —
 it exits 0 whatever happens.
 
-To see what it would send, without sending anything:
+To see what it would send, without sending anything: the digest reports what is
+*new since a manifest*, so take the snapshot before the run and build the digest
+after it, and blank the two channel variables for that one command — which
+guarantees nothing leaves the machine, whether or not roles qualify.
 
 ```bash
-python -m pipeline.daily_digest --root career-ops --dump /tmp/digest.json
+# before the run — record which report files already exist
+python -m pipeline.run_artifact snapshot --root career-ops \
+  --manifest /tmp/manifest.json --delta reports
+# after it — write the digest to a file instead of delivering it
+DIGEST_DISCORD_WEBHOOK= DIGEST_EMAIL_TO= \
+  python -m pipeline.daily_digest --root career-ops \
+  --manifest /tmp/manifest.json --dump /tmp/digest.json
 ```
+
+`--manifest` is required (it is what "new this run" is measured against), and
+`__main__` loads `.env`, so a webhook configured there *is* used unless you blank
+it as above.
 
 ## Running it for free
 
