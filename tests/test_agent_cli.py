@@ -7,7 +7,9 @@ it can't import it gets a guard here that parses the mirror: `.env.example`,
 guarded beside the sites guard in tests/test_app_onboard.py.)
 
 The argv shapes and MCP registrations were read off the installed CLIs' own
-`--help`; the tests pin what was read, so a change here is a deliberate one.
+`--help` (gemini 0.59.0, qwen 0.23.2, opencode 1.18.30); Antigravity's come
+from documentation only and the registry says so. The tests pin what was
+read, so a change here is a deliberate one.
 """
 
 import ast
@@ -23,15 +25,17 @@ import pytest
 
 from pipeline import agent_cli
 from pipeline.agent_cli import (
-    AGENT_CLIS, DEFAULT_CLI, GOOGLE_KEY_VARS, PLAYWRIGHT_MCP_COMMAND,
+    AGENT_CLIS, AGENT_MODEL_ENV, DEFAULT_CLI, PLAYWRIGHT_MCP_COMMAND,
     REGISTER_MCP_CMD, AgentCli, cli_available, installed, playwright_mcp_note,
-    register_playwright_mcp, resolve_cli, shell_command,
+    register_playwright_mcp, resolve_cli, resolve_model, shell_command,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 
 COMPANY = "Acme \"Bob\" & Sons 'Ltd' $tore"
 PROMPT = f"use apply mode to help me fill out the application for {COMPANY} / Rep"
+
+GEMINI_MODEL = AGENT_CLIS["gemini"].default_model
 
 
 def _which(available):
@@ -43,12 +47,14 @@ def _which(available):
 
 class TestRegistry:
     def test_ids_in_display_order_free_first(self):
-        assert list(AGENT_CLIS) == ["gemini", "opencode", "claude", "qwen"]
+        assert list(AGENT_CLIS) == ["opencode", "agy", "gemini", "claude", "qwen"]
         tiers = [c.tier for c in AGENT_CLIS.values()]
-        assert tiers == ["free", "free", "paid", "paid"]
+        assert tiers == ["free", "free", "free", "paid", "paid"]
 
-    def test_default_is_the_free_one(self):
-        assert DEFAULT_CLI == "gemini"
+    def test_default_is_the_free_provider_agnostic_one(self):
+        # OpenCode is free with no key at all (Zen's rotating models) AND the
+        # paid path (any provider key) — one CLI for both halves of the goal.
+        assert DEFAULT_CLI == "opencode"
         assert AGENT_CLIS[DEFAULT_CLI].tier == "free"
 
     def test_every_entry_is_complete_and_keyed_by_its_id(self):
@@ -60,35 +66,71 @@ class TestRegistry:
         binaries = [c.binary for c in AGENT_CLIS.values()]
         assert len(set(binaries)) == len(binaries)
 
-    def test_free_tier_notes_state_the_daily_limit_or_rotation(self):
+    def test_free_tier_notes_state_a_daily_or_weekly_limit_or_rotation(self):
         # "Free" without a number is how a person discovers the ceiling
         # mid-application; the note must translate it or say it moves.
         for c in AGENT_CLIS.values():
             if c.tier != "free":
                 continue
             note = c.tier_note.lower()
-            assert re.search(r"\d[\d,]*\s*(requests|req)?\s*(/|per)\s*day", note) \
-                or "rotating" in note, c.id
+            assert re.search(r"\d[\d,]*\s*(requests|req)?\s*(/|per)\s*(day|week)", note) \
+                or "weekly" in note or "rotating" in note, c.id
 
-    def test_gemini_note_says_the_login_is_the_free_tier_and_the_key_is_stripped(self):
-        note = AGENT_CLIS["gemini"].tier_note
-        assert "login" in note.lower()
-        assert "strips" in note
+    def test_gemini_note_states_the_login_ended_and_the_key_and_model_it_runs_on(self):
+        c = AGENT_CLIS["gemini"]
+        note = c.tier_note
+        assert "2026-06-18" in note
         assert "GEMINI_API_KEY" in note
-        # Data use is disclosed, with the notice cited.
+        # The model the launcher passes is the registry's, not a second copy.
+        assert f"-m {c.default_model}" in note
+        assert "requests/day" in note
+        # Data use is disclosed.
+        assert "improve Google's products" in note
+        # Nothing says the key is stripped any more.
+        assert "strip" not in note.lower()
+
+    def test_agy_note_states_the_weekly_quota_and_data_use(self):
+        note = AGENT_CLIS["agy"].tier_note
+        assert "WEEKLY" in note and "week" in note
         assert "opt out" in note
-        assert "privacy-notice-gemini-code-assist-individuals" in note
+        assert AGENT_CLIS["agy"].label == "Antigravity CLI"
+
+    def test_opencode_note_names_both_free_routes_and_the_paid_one(self):
+        note = AGENT_CLIS["opencode"].tier_note
+        assert "rotating" in note
+        assert "Gemini API key" in note and "requests/day" in note
+        assert "Paid keys" in note
+        assert "--prompt" in note
 
     def test_qwen_is_paid_since_its_free_login_ended(self):
         assert AGENT_CLIS["qwen"].tier == "paid"
         assert "2026-04-15" in AGENT_CLIS["qwen"].tier_note
 
-    def test_google_keys_are_unset_for_gemini_and_qwen_only(self):
+    def test_no_entry_strips_environment_variables(self):
+        # Gemini CLI now runs on the API key, so nothing may unset it — and the
+        # field that did is gone rather than empty, so no launcher can revive it.
         for c in AGENT_CLIS.values():
-            if c.id in ("gemini", "qwen"):
-                assert c.env_unset == GOOGLE_KEY_VARS
+            assert not hasattr(c, "env_unset"), c.id
+        assert not hasattr(agent_cli, "GOOGLE_KEY_VARS")
+
+    def test_only_gemini_has_a_default_model(self):
+        assert GEMINI_MODEL == "gemini-3.1-flash-lite"
+        for c in AGENT_CLIS.values():
+            if c.id != "gemini":
+                assert c.default_model == "", c.id
+
+    def test_every_entry_takes_a_model_flag(self):
+        assert {c.id: c.model_flag for c in AGENT_CLIS.values()} == {
+            "opencode": "--model", "agy": "--model", "gemini": "-m",
+            "claude": "--model", "qwen": "-m",
+        }
+
+    def test_verified_shapes_name_their_help_and_agy_admits_it_is_not(self):
+        for c in AGENT_CLIS.values():
+            if c.id == "agy":
+                assert c.verified_against == ""
             else:
-                assert c.env_unset == ()
+                assert c.verified_against, c.id
 
     def test_module_is_a_stdlib_leaf(self):
         # The jobspy-free UI venv imports it; dotenv is deferred into main().
@@ -107,7 +149,7 @@ class TestRegistry:
         assert {n.split(".")[0] for n in names - ours} <= set(sys.stdlib_module_names)
 
 
-# ── resolve_cli ──────────────────────────────────────────────────────────────
+# ── resolve_cli / resolve_model ──────────────────────────────────────────────
 
 class TestResolveCli:
     def test_default_when_unset_or_blank(self):
@@ -116,7 +158,8 @@ class TestResolveCli:
 
     def test_known_value_case_insensitive(self):
         assert resolve_cli({"BATCH_CLI": "claude"}).id == "claude"
-        assert resolve_cli({"BATCH_CLI": " OpenCode "}).id == "opencode"
+        assert resolve_cli({"BATCH_CLI": " Gemini "}).id == "gemini"
+        assert resolve_cli({"BATCH_CLI": "agy"}).id == "agy"
 
     def test_unknown_value_warns_once_and_uses_the_default(self, capsys, monkeypatch):
         monkeypatch.setattr(agent_cli, "_warned", set())
@@ -137,12 +180,35 @@ class TestResolveCli:
         assert [c.id for c in installed()] == ["gemini", "claude"]
 
 
+class TestResolveModel:
+    def test_env_wins_for_every_cli(self):
+        for c in AGENT_CLIS.values():
+            assert resolve_model(c, {AGENT_MODEL_ENV: " my/model "}) == "my/model"
+
+    def test_unset_falls_back_to_the_registry_default(self):
+        assert resolve_model(AGENT_CLIS["gemini"], {}) == GEMINI_MODEL
+        assert resolve_model(AGENT_CLIS["gemini"], {AGENT_MODEL_ENV: "  "}) == GEMINI_MODEL
+        for cid in ("opencode", "agy", "claude", "qwen"):
+            assert resolve_model(AGENT_CLIS[cid], {}) == ""
+
+    def test_reads_the_process_env_by_default(self, monkeypatch):
+        monkeypatch.setenv(AGENT_MODEL_ENV, "x/y")
+        assert resolve_model(AGENT_CLIS["claude"]) == "x/y"
+        monkeypatch.delenv(AGENT_MODEL_ENV)
+        assert resolve_model(AGENT_CLIS["claude"]) == ""
+
+
 # ── interactive_argv ─────────────────────────────────────────────────────────
 
 class TestInteractiveArgv:
-    def test_gemini_and_qwen_use_the_prompt_interactive_flag(self):
-        assert AGENT_CLIS["gemini"].interactive_argv("hi") == ["gemini", "-i", "hi"]
+    def test_gemini_carries_its_default_model_before_the_seed_flag(self):
+        # Its own default Flash model has ~20 requests/day on a free key.
+        assert AGENT_CLIS["gemini"].interactive_argv("hi") == \
+            ["gemini", "-m", GEMINI_MODEL, "-i", "hi"]
+
+    def test_qwen_and_agy_use_the_prompt_interactive_flag_with_no_model(self):
         assert AGENT_CLIS["qwen"].interactive_argv("hi") == ["qwen", "-i", "hi"]
+        assert AGENT_CLIS["agy"].interactive_argv("hi") == ["agy", "-i", "hi"]
 
     def test_opencode_prefills_the_tui_with_prompt(self):
         # Its root positional is a PROJECT DIRECTORY and `opencode run` is
@@ -151,6 +217,23 @@ class TestInteractiveArgv:
 
     def test_claude_takes_the_positional(self):
         assert AGENT_CLIS["claude"].interactive_argv("hi") == ["claude", "hi"]
+
+    @pytest.mark.parametrize("cid,expected", [
+        ("opencode", ["opencode", "--model", "google/m", "--prompt", "hi"]),
+        ("agy", ["agy", "--model", "google/m", "-i", "hi"]),
+        ("gemini", ["gemini", "-m", "google/m", "-i", "hi"]),
+        ("claude", ["claude", "--model", "google/m", "hi"]),
+        ("qwen", ["qwen", "-m", "google/m", "-i", "hi"]),
+    ])
+    def test_agent_model_renders_the_model_flag_per_cli(self, cid, expected, monkeypatch):
+        monkeypatch.setenv(AGENT_MODEL_ENV, "google/m")
+        assert AGENT_CLIS[cid].interactive_argv("hi") == expected
+        # The explicit kwarg is the same rendering without the env.
+        monkeypatch.delenv(AGENT_MODEL_ENV)
+        assert AGENT_CLIS[cid].interactive_argv("hi", model="google/m") == expected
+
+    def test_explicit_empty_model_renders_none_even_for_gemini(self):
+        assert AGENT_CLIS["gemini"].interactive_argv("hi", model="") == ["gemini", "-i", "hi"]
 
     def test_never_a_bare_run_subcommand(self):
         for c in AGENT_CLIS.values():
@@ -176,21 +259,62 @@ class TestShellCommand:
             "application for Acme 'Bob' & Sons 'Ltd' $tore / Rep\""
         )
 
-    def test_posix_exact_string_for_gemini_carries_the_unset_prefix(self):
+    def test_posix_exact_string_for_gemini_carries_the_default_model_and_no_unset(self):
         got = shell_command(AGENT_CLIS["gemini"], PROMPT, os_name="posix")
         assert got == (
-            "cd career-ops && env -u GEMINI_API_KEY -u GOOGLE_API_KEY gemini -i "
+            f"cd career-ops && gemini -m {GEMINI_MODEL} -i "
             "'use apply mode to help me fill out the application for Acme \"Bob\" "
             "& Sons '\"'\"'Ltd'\"'\"' $tore / Rep'"
         )
 
-    def test_nt_exact_string_for_gemini_carries_the_unset_prefix(self):
+    def test_nt_exact_string_for_gemini_carries_the_default_model_and_no_unset(self):
         got = shell_command(AGENT_CLIS["gemini"], PROMPT, os_name="nt")
         assert got == (
-            "cd career-ops && set GEMINI_API_KEY=&& set GOOGLE_API_KEY=&& gemini -i "
+            f"cd career-ops && gemini -m {GEMINI_MODEL} -i "
             '"use apply mode to help me fill out the application for '
             "Acme 'Bob' & Sons 'Ltd' $tore / Rep\""
         )
+
+    def test_posix_exact_string_for_the_default_cli(self):
+        got = shell_command(AGENT_CLIS[DEFAULT_CLI], PROMPT, os_name="posix")
+        assert got == (
+            "cd career-ops && opencode --prompt 'use apply mode to help me fill out the "
+            "application for Acme \"Bob\" & Sons '\"'\"'Ltd'\"'\"' $tore / Rep'"
+        )
+
+    @pytest.mark.parametrize("cid", list(AGENT_CLIS))
+    def test_no_command_unsets_or_names_the_google_keys(self, cid):
+        # The key is how an individual runs Gemini CLI now; stripping it was
+        # the M1 rule this correction retires.
+        for os_name in ("posix", "nt"):
+            got = shell_command(AGENT_CLIS[cid], PROMPT, os_name=os_name)
+            assert "env -u" not in got
+            assert "set GEMINI_API_KEY" not in got and "GOOGLE_API_KEY" not in got
+
+    @pytest.mark.parametrize("cid", list(AGENT_CLIS))
+    def test_agent_model_reaches_both_shells(self, cid, monkeypatch):
+        cli = AGENT_CLIS[cid]
+        monkeypatch.setenv(AGENT_MODEL_ENV, "prov/model-x")
+        posix = shell_command(cli, "hi", os_name="posix")
+        nt = shell_command(cli, "hi", os_name="nt")
+        assert shlex.split(posix)[3:] == [cli.binary, cli.model_flag, "prov/model-x",
+                                          *([cli.prompt_flag] if cli.prompt_flag else []), "hi"]
+        assert nt.startswith(f"cd career-ops && {cli.binary} {cli.model_flag} prov/model-x ")
+        assert nt.endswith(f"{cli.prompt_flag} hi" if cli.prompt_flag else " hi")
+
+    @pytest.mark.parametrize("cid", list(AGENT_CLIS))
+    def test_without_agent_model_only_gemini_renders_a_model(self, cid):
+        cli = AGENT_CLIS[cid]
+        for os_name in ("posix", "nt"):
+            got = shell_command(cli, "hi", os_name=os_name)
+            if cid == "gemini":
+                assert f" -m {GEMINI_MODEL} -i " in got
+            else:
+                assert cli.model_flag not in got.split("&&", 1)[1]
+
+    def test_model_kwarg_is_passed_through(self):
+        got = shell_command(AGENT_CLIS["claude"], "hi", os_name="posix", model="m1")
+        assert got == "cd career-ops && claude --model m1 hi"
 
     @pytest.mark.parametrize("cid", list(AGENT_CLIS))
     def test_nt_never_emits_an_escaped_quote_so_cmd_keeps_the_prompt_whole(self, cid):
@@ -202,7 +326,7 @@ class TestShellCommand:
         assert '\\"' not in got
         assert "Acme 'Bob & Sons' / Rep" in got
         # Walk cmd's quote state: no `&`, `|`, `<`, `>` outside a quoted
-        # region except the `&&` separators the prefix and `cd` emit.
+        # region except the one `&&` separator after `cd`.
         quoted, bare = False, []
         for ch in got:
             if ch == '"':
@@ -210,7 +334,7 @@ class TestShellCommand:
             elif ch in "&|<>" and not quoted:
                 bare.append(ch)
         assert not quoted
-        assert bare == ["&", "&"] * (1 + len(AGENT_CLIS[cid].env_unset))
+        assert bare == ["&", "&"]
 
     def test_os_name_is_read_at_call_time(self):
         # A default bound at import (`os_name=os.name`) can't see a test's
@@ -226,23 +350,15 @@ class TestShellCommand:
         posix = shell_command(cli, PROMPT, os_name="posix")
         tokens = shlex.split(posix)
         assert tokens[:3] == ["cd", "career-ops", "&&"]
-        skip = 3 + (1 + 2 * len(cli.env_unset) if cli.env_unset else 0)
-        assert tokens[skip:] == cli.interactive_argv(PROMPT)
+        assert tokens[3:] == cli.interactive_argv(PROMPT)
 
     def test_per_cli_shape(self):
         assert " -i " in shell_command(AGENT_CLIS["gemini"], PROMPT, os_name="posix")
         assert " -i " in shell_command(AGENT_CLIS["qwen"], PROMPT, os_name="posix")
+        assert " -i " in shell_command(AGENT_CLIS["agy"], PROMPT, os_name="posix")
         assert " --prompt " in shell_command(AGENT_CLIS["opencode"], PROMPT, os_name="posix")
         claude = shell_command(AGENT_CLIS["claude"], PROMPT, os_name="posix")
         assert claude.startswith("cd career-ops && claude '")
-
-    def test_only_gemini_and_qwen_carry_the_prefix(self):
-        for cid in ("claude", "opencode"):
-            for os_name in ("posix", "nt"):
-                got = shell_command(AGENT_CLIS[cid], PROMPT, os_name=os_name)
-                assert "GEMINI_API_KEY" not in got and "env -u" not in got and "set " not in got
-        for os_name in ("posix", "nt"):
-            assert "GOOGLE_API_KEY" in shell_command(AGENT_CLIS["qwen"], PROMPT, os_name=os_name)
 
     def test_newlines_collapse_to_spaces(self):
         got = shell_command(AGENT_CLIS["claude"], "line one\nline two\r\nthree", os_name="posix")
@@ -284,6 +400,7 @@ class TestMcpRegistration:
         reg = AGENT_CLIS["opencode"].mcp_registration(home=tmp_path, env={})
         assert not reg.is_argv
         assert reg.config_path == tmp_path / ".config" / "opencode" / "opencode.json"
+        assert reg.servers_key == "mcp"
         assert reg.merge == {"mcp": {"playwright": {
             "type": "local", "command": list(PLAYWRIGHT_MCP_COMMAND), "enabled": True,
         }}}
@@ -293,13 +410,27 @@ class TestMcpRegistration:
             home=tmp_path, env={"XDG_CONFIG_HOME": str(tmp_path / "xdg")})
         assert reg.config_path == tmp_path / "xdg" / "opencode" / "opencode.json"
 
+    def test_agy_is_a_config_merge_under_home_in_the_mcpservers_shape(self, tmp_path):
+        # No `agy mcp add`; the file is home-relative (not XDG), so
+        # XDG_CONFIG_HOME must not move it — and on Windows `Path.home()` is
+        # %USERPROFILE%, which is where Google's docs put it too.
+        reg = AGENT_CLIS["agy"].mcp_registration(
+            home=tmp_path, env={"XDG_CONFIG_HOME": str(tmp_path / "xdg")})
+        assert not reg.is_argv
+        assert reg.config_path == tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        assert reg.servers_key == "mcpServers"
+        assert reg.merge == {"mcpServers": {"playwright": {
+            "command": "npx", "args": ["-y", "@playwright/mcp@latest"],
+        }}}
+
 
 class TestRegisterPlaywrightMcp:
     def test_missing_binary_returns_the_install_hint_and_never_raises(self, mocker):
         mocker.patch("pipeline.agent_cli.shutil.which", return_value=None)
         calls = []
-        msg = register_playwright_mcp(AGENT_CLIS["gemini"], run=lambda *a, **k: calls.append(a))
-        assert AGENT_CLIS["gemini"].install_hint in msg
+        for cid in ("gemini", "agy"):
+            msg = register_playwright_mcp(AGENT_CLIS[cid], run=lambda *a, **k: calls.append(a))
+            assert AGENT_CLIS[cid].install_hint in msg
         assert calls == []
 
     def test_argv_success(self, mocker):
@@ -389,6 +520,29 @@ class TestRegisterPlaywrightMcp:
         assert cfg.read_text() == "{not json"
         assert "left it alone" in msg and "playwright" in msg
 
+    def test_agy_merge_keeps_other_servers_under_mcpservers_and_is_idempotent(self, tmp_path, mocker):
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"agy"}))
+        cfg = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}, "extra": 1}))
+        first = register_playwright_mcp(AGENT_CLIS["agy"], home=tmp_path, env={})
+        assert "registered in" in first and "already" not in first
+        got = json.loads(cfg.read_text())
+        assert got["extra"] == 1
+        assert got["mcpServers"]["other"] == {"command": "x"}
+        assert got["mcpServers"]["playwright"] == {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}
+        assert "mcp" not in got   # not OpenCode's shape
+        before = cfg.read_text()
+        second = register_playwright_mcp(AGENT_CLIS["agy"], home=tmp_path, env={})
+        assert "already" in second and cfg.read_text() == before
+
+    def test_agy_merge_creates_the_file_from_nothing(self, tmp_path, mocker):
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"agy"}))
+        register_playwright_mcp(AGENT_CLIS["agy"], home=tmp_path, env={})
+        cfg = tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
+        assert json.loads(cfg.read_text()) == {"mcpServers": {"playwright": {
+            "command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}}
+
 
 class TestPlaywrightMcpNote:
     @pytest.mark.parametrize("cid", ["gemini", "claude", "qwen"])
@@ -407,17 +561,26 @@ class TestPlaywrightMcpNote:
         assert "claude mcp add" not in note
         assert note.endswith(f"`{REGISTER_MCP_CMD}` does this for you")
 
+    def test_agy_config_form_names_its_file(self):
+        note = playwright_mcp_note(AGENT_CLIS["agy"])
+        assert "Antigravity CLI" in note
+        assert "merge the `playwright` server into" in note
+        assert ".gemini/antigravity/mcp_config.json" in note
+        assert "mcp add" not in note
+        assert note.endswith(f"`{REGISTER_MCP_CMD}` does this for you")
+
 
 # ── the command line ─────────────────────────────────────────────────────────
 
 class TestMain:
     def test_list_prints_every_id_with_tier_and_marks_the_default(self, capsys, mocker):
-        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"gemini"}))
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({DEFAULT_CLI}))
         assert agent_cli.main(["--list"]) == 0
         out = capsys.readouterr().out
         for c in AGENT_CLIS.values():
             assert re.search(rf"^{c.id}\s.*\b{c.tier}\b", out, re.M), c.id
-        assert re.search(r"^gemini\s.*\byes\b.*\(default\)", out, re.M)
+        assert re.search(rf"^{DEFAULT_CLI}\s.*\byes\b.*\(default\)", out, re.M)
+        assert re.search(r"^agy\s.*\bfree\b.*\bno\b", out, re.M)
         assert re.search(r"^claude\s.*\bno\b", out, re.M)
 
     def test_check_exits_1_with_the_hint_when_not_installed(self, capsys, mocker):
@@ -425,9 +588,28 @@ class TestMain:
         assert agent_cli.main(["--check"]) == 1
         assert AGENT_CLIS[DEFAULT_CLI].install_hint in capsys.readouterr().out
 
-    def test_check_exits_0_when_installed(self, mocker):
-        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"gemini"}))
+    def test_check_exits_0_and_prints_the_launch_line_when_installed(self, capsys, mocker):
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({DEFAULT_CLI}))
         assert agent_cli.main(["--check"]) == 0
+        out = capsys.readouterr().out
+        assert "Launches as: cd career-ops && opencode --prompt" in out
+        assert "read from `opencode 1.18.30` --help" in out
+
+    def test_check_on_agy_says_the_shape_is_unverified(self, capsys, mocker, monkeypatch):
+        # Its installer is unreachable from the sandbox that read the other
+        # CLIs' --help, so the user's first run is the verification.
+        monkeypatch.setenv("BATCH_CLI", "agy")
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"agy"}))
+        assert agent_cli.main(["--check"]) == 0
+        out = capsys.readouterr().out
+        assert "Launches as: cd career-ops && agy -i" in out
+        assert "documentation only" in out
+
+    def test_check_on_agy_not_installed_prints_the_curl_hint(self, capsys, mocker, monkeypatch):
+        monkeypatch.setenv("BATCH_CLI", "agy")
+        mocker.patch("pipeline.agent_cli.shutil.which", return_value=None)
+        assert agent_cli.main(["--check"]) == 1
+        assert "antigravity.google/cli/install.sh" in capsys.readouterr().out
 
     def test_register_all_installed_always_exits_0_and_prints_hints_when_none(self, capsys, mocker):
         # setup.sh runs it under `set -euo pipefail`.
@@ -438,15 +620,18 @@ class TestMain:
         for c in AGENT_CLIS.values():
             assert c.install_hint in out
 
-    def test_register_all_installed_registers_each_installed_cli(self, capsys, mocker):
-        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"gemini", "claude"}))
+    def test_register_all_installed_registers_each_installed_cli(self, capsys, mocker, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_cli.Path, "home", classmethod(lambda cls: tmp_path))
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"gemini", "claude", "agy"}))
         fake = mocker.patch("pipeline.agent_cli.subprocess.run",
                             return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         assert agent_cli.main(["--register-mcp-all-installed"]) == 0
         ran = [c.args[0][0] for c in fake.call_args_list]
-        assert ran == ["/usr/bin/gemini", "/usr/bin/claude"]   # resolved, in order
+        assert ran == ["/usr/bin/gemini", "/usr/bin/claude"]   # resolved, registry order
         out = capsys.readouterr().out
-        assert "Gemini CLI" in out and "Claude Code" in out
+        assert "Gemini CLI" in out and "Claude Code" in out and "Antigravity CLI" in out
+        # agy went through the config merge, not a subprocess.
+        assert (tmp_path / ".gemini" / "antigravity" / "mcp_config.json").exists()
 
     def test_register_mcp_defaults_to_the_resolved_cli(self, mocker, monkeypatch):
         monkeypatch.setenv("BATCH_CLI", "qwen")
@@ -461,9 +646,9 @@ class TestMain:
         assert "copilot" in capsys.readouterr().err
 
     def test_resolved_prints_the_id(self, capsys, monkeypatch):
-        monkeypatch.setenv("BATCH_CLI", "opencode")
+        monkeypatch.setenv("BATCH_CLI", "gemini")
         assert agent_cli.main(["--resolved"]) == 0
-        assert capsys.readouterr().out.strip() == "opencode"
+        assert capsys.readouterr().out.strip() == "gemini"
 
     def test_resolved_prints_the_default_when_unset(self, capsys, monkeypatch):
         # conftest clears BATCH_CLI; a .env in the checkout could re-add it, so
@@ -478,18 +663,22 @@ class TestMain:
             cwd=str(ROOT), capture_output=True, text=True, timeout=60,
         )
         assert proc.returncode == 0, proc.stderr
-        assert "gemini" in proc.stdout
+        for cid in AGENT_CLIS:
+            assert cid in proc.stdout
 
 
 # ── Mirrors ──────────────────────────────────────────────────────────────────
 
 class TestEnvExampleMirror:
     """`.env.example` restates the registry in a fixed, machine-readable shape:
-    one `#   <id>    <tier>   …` line per CLI above `BATCH_CLI=<default>`."""
+    one `#   <id>    <tier>   …` line per CLI above `BATCH_CLI=<default>`, and
+    an `AGENT_MODEL` block right after it."""
 
-    @staticmethod
-    def _block():
-        lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    text = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    @classmethod
+    def _block(cls):
+        lines = cls.text.splitlines()
         idx = next(i for i, l in enumerate(lines) if l.startswith("BATCH_CLI="))
         start = idx
         while start > 0 and lines[start - 1].startswith("#"):
@@ -510,6 +699,20 @@ class TestEnvExampleMirror:
     def test_assigned_value_is_the_default(self):
         _, assignment = self._block()
         assert assignment == f"BATCH_CLI={DEFAULT_CLI}"
+
+    def test_gemini_line_no_longer_claims_a_personal_login(self):
+        comments, _ = self._block()
+        line = next(l for l in comments if re.match(r"^#\s{3}gemini\b", l))
+        assert "personal Google login" not in line or "ended" in line
+        assert "GEMINI_API_KEY" in line
+
+    def test_agent_model_is_documented_with_the_registry_default(self):
+        m = re.search(r"^#?\s*" + AGENT_MODEL_ENV + r"=", self.text, re.M)
+        assert m, f"no {AGENT_MODEL_ENV} line in .env.example"
+        block = self.text[:m.start()].rsplit("\n\n", 1)[-1]
+        assert GEMINI_MODEL in block
+        for c in AGENT_CLIS.values():
+            assert c.model_flag in block, c.id
 
 
 class TestSetupProfileMirror:
@@ -553,6 +756,23 @@ class TestWrapperMirror:
         assert "claude mcp add" not in src
 
 
+class TestNoKeyStrippingAnywhere:
+    """The M1 rule that stripped GEMINI_API_KEY/GOOGLE_API_KEY from the CLI's
+    environment is retired: the key is the only way an individual runs Gemini
+    CLI since 2026-06-18. Nothing in the launcher path may re-grow it."""
+
+    def test_skills_launcher_passes_no_env_override(self):
+        src = (ROOT / "pipeline" / "app" / "skills.py").read_text(encoding="utf-8")
+        assert "_launch_env" not in src
+        assert "env_unset" not in src
+        assert "GOOGLE_API_KEY" not in src
+
+    def test_registry_source_has_no_unset_rendering(self):
+        src = (ROOT / "pipeline" / "agent_cli.py").read_text(encoding="utf-8")
+        assert "env -u" not in src
+        assert "env_unset" not in src
+
+
 class TestAgentCliDataclass:
     def test_is_frozen(self):
         with pytest.raises(Exception):
@@ -561,5 +781,7 @@ class TestAgentCliDataclass:
     def test_custom_entry_shapes(self):
         c = AgentCli(id="x", label="X", binary="x", tier="paid", tier_note="n",
                      install_hint="i", docs_url="https://x", prompt_flag="--go")
-        assert c.interactive_argv("p") == ["x", "--go", "p"]
+        assert c.interactive_argv("p", model="") == ["x", "--go", "p"]
+        # No model flag: a model is ignored rather than rendered as a positional.
+        assert c.interactive_argv("p", model="m") == ["x", "--go", "p"]
         assert not c.mcp_registration(home=Path("/h"), env={}).is_argv

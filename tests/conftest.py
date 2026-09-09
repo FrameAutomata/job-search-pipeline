@@ -269,10 +269,12 @@ def _isolate_provider_env(monkeypatch):
     # Key vars derive from the provider table so a newly added provider can't
     # leak the developer's real key into tests (the DeepSeek addition slipped
     # past one hand-copied list — review finding).
-    from pipeline.agent_cli import BATCH_CLI_ENV, XDG_CONFIG_HOME_ENV
+    from pipeline.agent_cli import AGENT_MODEL_ENV, BATCH_CLI_ENV, XDG_CONFIG_HOME_ENV
     from pipeline.batch_evaluate import _PROVIDER_KEYS
     # BATCH_CLI too: the agent-CLI registry resolves it on every request, and a
     # developer's `.env` naming claude would flip every default-CLI assertion.
+    # AGENT_MODEL: the model the CLI is launched with; a developer's `.env`
+    # value would render into every command-shape assertion.
     # XDG_CONFIG_HOME: the registry reads it (through the process env) to
     # place OpenCode's config, and the prereq note renders that path.
     # The digest's delivery secrets, settings and run facts derive from its
@@ -280,7 +282,8 @@ def _isolate_provider_env(monkeypatch):
     # would otherwise make a test post to a real Discord channel.
     from pipeline import daily_digest
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "COVER_MODEL",
-                "TAILOR_PROVIDER", "TAILOR_MODEL", BATCH_CLI_ENV, XDG_CONFIG_HOME_ENV,
+                "TAILOR_PROVIDER", "TAILOR_MODEL", BATCH_CLI_ENV, AGENT_MODEL_ENV,
+                XDG_CONFIG_HOME_ENV,
                 *_PROVIDER_KEYS.values(),
                 "OLLAMA_BASE_URL",
                 *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS,

@@ -8,33 +8,64 @@ restate it because it can't import it (`.env.example`, `setup-profile.mjs`,
 Four things used to answer "which CLI" independently — `skills.cli_name()`,
 `run.sh`/`run.ps1`'s `${BATCH_CLI:-claude}`, `server._KNOWN_CLIS`, and the
 wizard's default — and every one of them said claude, which has no free tier.
-The product goal is a loop that runs free by default, so the default is now the
-free CLI (`DEFAULT_CLI`) and the wrappers ask this module (`--resolved`) rather
-than carrying a default of their own.
+The product goal is a loop that runs free by default, so the default is a
+free CLI (`DEFAULT_CLI`) and the wrappers ask this module (`--resolved`)
+rather than carrying a default of their own.
 
-Three facts here are load-bearing and were read off the installed CLIs' own
+What "free" means changed under this module once already, so the facts are
+dated. Verified 2026-09-09 (WebSearch and the Gemini CLI GitHub discussion
+#28017; Google's own docs domains are egress-blocked from here):
+
+- Gemini CLI stopped serving individual Google accounts on 2026-06-18 — the
+  free tier, Google AI Pro and Ultra logins alike; enterprise Gemini Code
+  Assist licences and API-KEY authentication were unaffected. So the
+  open-source `gemini` binary still works with a `GEMINI_API_KEY` from AI
+  Studio, including a free-tier key, at the Gemini API's own free-tier limits
+  (Flash-class models only; the Gemma rows have no tool calling and cannot
+  drive a browser). The CLI's own default Flash model has ~20 requests/day on
+  a free key, where `gemini-3.1-flash-lite` has ~500, so the launcher passes
+  the registry's `default_model` unless `AGENT_MODEL` names another. The
+  earlier rule that stripped `GEMINI_API_KEY`/`GOOGLE_API_KEY` from the CLI's
+  environment (to keep it on the personal-login tier) is therefore gone: the
+  key is the only way an individual runs Gemini CLI now.
+- Antigravity CLI (`agy`) is Google's successor for individuals: a free
+  Individual tier with a WEEKLY agent quota (reports of ~20 requests/day and
+  multi-day cooldowns), a closed-source binary installed by a curl/irm
+  one-liner, `agy -i <prompt>` for an interactive session with a seed prompt
+  (`-p` is headless), and MCP servers read from
+  `~/.gemini/antigravity/mcp_config.json` — there is no `agy mcp add`. Those
+  shapes come from Google's docs as quoted by third parties: the installer
+  returns 403 from here, so they could NOT be checked against the binary.
+  `verified_against` is empty for it, and `--check` prints the launch line so
+  the user's first run is the verification.
+- OpenCode remains free (its Zen gateway's rotating free hosted models, or a
+  key you bring — a free AI Studio Gemini key via `--model google/<model>`
+  included), open source, MCP via its config file, `--prompt` pre-filling the
+  TUI. It is provider-agnostic, so the same CLI is also the paid path
+  (Anthropic/OpenAI keys) — which is the product goal — and it is the default.
+- Qwen Code's free login ended 2026-04-15; Claude Code never had a free tier.
+
+Three shapes here are load-bearing and were read off the installed CLIs' own
 `--help` (gemini 0.59.0, qwen 0.23.2, opencode 1.18.30) — re-run them before
-changing a shape:
+changing one:
 
 - `interactive_argv` opens the CLI INTERACTIVELY with a seed prompt, because the
   apply assistant must stay interactive so the person can intervene. That is
-  `-i` on Gemini CLI and Qwen Code (the positional prompt is one-shot on qwen
-  and was one-shot on older gemini), `--prompt` on OpenCode (its root
-  positional is a PROJECT DIRECTORY, and `opencode run` is non-interactive),
-  and the positional on Claude Code. `shell_command` therefore never renders a
-  bare `<binary> "<prompt>"`.
-- Gemini CLI's free tier is the personal Google LOGIN, not an API key. Both the
-  UI process and `orchestrate` load `.env`, so a `GEMINI_API_KEY` set for cloud
-  evaluation sits in the environment the CLI would inherit — and the CLI can
-  switch to the key's tier silently. `env_unset` names the variables the
-  launcher strips (`env -u` on POSIX, `set NAME=` in cmd, and an env copy in
-  `skills.launch_in_terminal`).
+  `-i` on Gemini CLI, Qwen Code and Antigravity CLI (the positional prompt is
+  one-shot on qwen and was one-shot on older gemini), `--prompt` on OpenCode
+  (its root positional is a PROJECT DIRECTORY, and `opencode run` is
+  non-interactive), and the positional on Claude Code. `shell_command`
+  therefore never renders a bare `<binary> "<prompt>"`.
+- The model flag: `-m/--model` on gemini and qwen, `--model` in
+  `provider/model` form on opencode, `--model` on claude, `--model` on agy
+  (unverified, rendered only when `AGENT_MODEL` is set). It goes before the
+  prompt flag. Only gemini has a `default_model`, for the reason above.
 - Playwright MCP registration has two forms: an argv (`<cli> mcp add …`) and a
-  JSON config merge for OpenCode, whose `mcp add` has no non-interactive form
-  for a local server. Gemini's `mcp add` scope DEFAULTS to `project`, and
-  Claude Code's to `local` (per cwd), so `-s user` is required on both or the
-  registration lands in the directory setup ran from and `cd career-ops &&
-  <cli> …` — a separate checkout — never sees it.
+  JSON config merge — OpenCode (`mcp` map, XDG config dir) and Antigravity
+  (`mcpServers` map under `~/.gemini/antigravity/`). Gemini's `mcp add` scope
+  DEFAULTS to `project`, and Claude Code's to `local` (per cwd), so `-s user`
+  is required on both or the registration lands in the directory setup ran
+  from and `cd career-ops && <cli> …` — a separate checkout — never sees it.
 """
 
 import argparse
@@ -51,16 +82,17 @@ from pathlib import Path
 from pipeline.stdio import line_buffer_stdout
 
 BATCH_CLI_ENV = "BATCH_CLI"
-DEFAULT_CLI = "gemini"
+DEFAULT_CLI = "opencode"
+
+# The model the agent CLI is started with, for every CLI that takes a model
+# flag. Unset → only gemini renders a model (its `default_model`); the others
+# start on their own default. Isolated by tests/conftest.py's provider fixture.
+AGENT_MODEL_ENV = "AGENT_MODEL"
 
 # The one MCP server the apply skill needs. Registered the same way with every
 # CLI; only the wrapper around it differs.
 PLAYWRIGHT_MCP_SERVER = "playwright"
 PLAYWRIGHT_MCP_COMMAND = ("npx", "-y", "@playwright/mcp@latest")
-
-# The Google key names Gemini CLI (and Qwen Code, which shares its lineage)
-# read from the environment. See the module docstring for why they are unset.
-GOOGLE_KEY_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 REGISTER_MCP_CMD = "python -m pipeline.agent_cli --register-mcp"
 
@@ -69,10 +101,19 @@ REGISTER_MCP_CMD = "python -m pipeline.agent_cli --register-mcp"
 # provider-env fixture, like `BATCH_CLI`.
 XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
 
-_PRIVACY_NOTICE_URL = (
-    "https://developers.google.com/gemini-code-assist/resources/"
-    "privacy-notice-gemini-code-assist-individuals"
-)
+# The two config-merge shapes. Each CLI's file holds a map of servers under a
+# top-level key, and the entry for one server is spelled its way.
+OPENCODE_PLAYWRIGHT_ENTRY = {
+    "type": "local",
+    "command": list(PLAYWRIGHT_MCP_COMMAND),
+    "enabled": True,
+}
+ANTIGRAVITY_PLAYWRIGHT_ENTRY = {
+    "command": PLAYWRIGHT_MCP_COMMAND[0],
+    "args": list(PLAYWRIGHT_MCP_COMMAND[1:]),
+}
+
+_GEMINI_API_TERMS_URL = "https://ai.google.dev/gemini-api/terms"
 
 
 @dataclass(frozen=True)
@@ -80,12 +121,14 @@ class McpRegistration:
     """How one CLI learns about the Playwright MCP server.
 
     Exactly one of the two forms is populated: `argv` (run it), or
-    `config_path` + `merge` (read the JSON there, merge the `playwright` server
-    entry in, write back atomically, creating parents). A config merge is
-    idempotent by construction; an argv registration is made idempotent by the
-    caller (`register_playwright_mcp` reads "already" as success)."""
+    `config_path` + `merge` (read the JSON there, merge the `playwright` entry
+    into the server map under `servers_key`, write back atomically, creating
+    parents). A config merge is idempotent by construction; an argv
+    registration is made idempotent by the caller (`register_playwright_mcp`
+    reads "already" as success)."""
     argv: tuple = ()
     config_path: Path | None = None
+    servers_key: str = ""
     merge: dict = field(default_factory=dict)
 
     @property
@@ -105,20 +148,38 @@ class AgentCli:
     # The option that seeds an INTERACTIVE session with a prompt; "" means the
     # prompt is the positional argument.
     prompt_flag: str = ""
-    # Environment variables the launcher strips before the CLI starts.
-    env_unset: tuple = ()
+    # The option that picks the model, rendered only when a model is known
+    # (`AGENT_MODEL`, else `default_model`). "" means the CLI takes none.
+    model_flag: str = ""
+    default_model: str = ""
+    # Which `<binary> --help` the argv shapes were read from; "" means they
+    # come from documentation only and `--check` says so.
+    verified_against: str = ""
     # `<binary> mcp add …` argv (after the binary), or () when the CLI has no
     # non-interactive form and the registration is a config merge.
     mcp_add_args: tuple = ()
-    # For the config-merge form: the config file, relative to the XDG config
-    # dir (`$XDG_CONFIG_HOME`, default `~/.config`).
+    # For the config-merge form: the config file relative to its base — the
+    # XDG config dir (`$XDG_CONFIG_HOME`, default `~/.config`) or the home
+    # dir — the top-level key holding the server map, and the entry shape.
     mcp_config_rel: str = ""
+    mcp_config_base: str = "xdg"   # "xdg" | "home"
+    mcp_servers_key: str = ""
+    mcp_server_entry: dict = field(default_factory=dict)
 
-    def interactive_argv(self, prompt: str) -> list:
-        """The argv that opens the CLI interactively, seeded with `prompt`."""
+    def interactive_argv(self, prompt: str, *, model: str | None = None) -> list:
+        """The argv that opens the CLI interactively, seeded with `prompt`.
+
+        `model=None` resolves it (`AGENT_MODEL`, else `default_model`); pass
+        `""` to render none. The model flag goes before the prompt flag."""
+        model = resolve_model(self) if model is None else model
+        argv = [self.binary]
+        if model and self.model_flag:
+            argv += [self.model_flag, model]
         if self.prompt_flag:
-            return [self.binary, self.prompt_flag, prompt]
-        return [self.binary, prompt]
+            argv += [self.prompt_flag, prompt]
+        else:
+            argv.append(prompt)
+        return argv
 
     def mcp_registration(self, *, home: Path | None = None,
                          env: dict | None = None) -> McpRegistration:
@@ -130,60 +191,97 @@ class AgentCli:
             return McpRegistration(argv=(self.binary, *self.mcp_add_args))
         home = Path.home() if home is None else Path(home)
         env = os.environ if env is None else env
-        xdg = (env.get(XDG_CONFIG_HOME_ENV) or "").strip()
-        config_dir = Path(xdg) if xdg else home / ".config"
+        if self.mcp_config_base == "home":
+            base = home
+        else:
+            xdg = (env.get(XDG_CONFIG_HOME_ENV) or "").strip()
+            base = Path(xdg) if xdg else home / ".config"
         return McpRegistration(
-            config_path=config_dir / self.mcp_config_rel,
-            merge={"mcp": {PLAYWRIGHT_MCP_SERVER: {
-                "type": "local",
-                "command": list(PLAYWRIGHT_MCP_COMMAND),
-                "enabled": True,
-            }}},
+            config_path=base / self.mcp_config_rel,
+            servers_key=self.mcp_servers_key,
+            merge={self.mcp_servers_key: {
+                PLAYWRIGHT_MCP_SERVER: dict(self.mcp_server_entry)}},
         )
 
 
 # Display order: free first, the default at the top. Every tier note for a free
-# entry must translate the limit into applications or say "rotating" — a guard
-# in tests/test_agent_cli.py holds that, because "free" without a number is how
-# a person discovers the ceiling mid-application.
+# entry must translate the limit into applications — a daily or weekly number
+# — or say "rotating"; a guard in tests/test_agent_cli.py holds that, because
+# "free" without a number is how a person discovers the ceiling
+# mid-application.
 AGENT_CLIS: dict = {c.id: c for c in (
-    AgentCli(
-        id="gemini",
-        label="Gemini CLI",
-        binary="gemini",
-        tier="free",
-        tier_note=(
-            "Free with a personal Google login — about 1,000 requests/day "
-            "≈ 10–20 prepared applications. The free tier is the LOGIN, not an "
-            "API key: a GEMINI_API_KEY in the environment switches the CLI to "
-            "that key's tier, so the launcher strips GEMINI_API_KEY/GOOGLE_API_KEY "
-            "before starting it. Under the individual free tier Google may use "
-            "prompts (your profile) to improve its products unless you opt out "
-            "(`privacy.usageStatisticsEnabled: false` in ~/.gemini/settings.json; "
-            "`usageStatisticsEnabled` at the top level in older releases — see "
-            f"{_PRIVACY_NOTICE_URL})."
-        ),
-        install_hint="npm install -g @google/gemini-cli   (then run `gemini` once and sign in with a personal Google account)",
-        docs_url="https://geminicli.com/docs/",
-        prompt_flag="-i",
-        env_unset=GOOGLE_KEY_VARS,
-        mcp_add_args=("mcp", "add", "-s", "user", PLAYWRIGHT_MCP_SERVER, *PLAYWRIGHT_MCP_COMMAND),
-    ),
     AgentCli(
         id="opencode",
         label="OpenCode",
         binary="opencode",
         tier="free",
         tier_note=(
-            "Free CLI with a rotating set of free hosted models via its Zen "
-            "gateway (availability changes), or bring your own API key. "
-            "`--prompt` pre-fills the TUI input: press Enter to start, which "
-            "suits assisted applying."
+            "Free, open-source CLI. Models: its Zen gateway's rotating free "
+            "models (no key needed; availability changes), or your own Gemini "
+            "API key at the API free tier (`gemini-3.1-flash-lite`, ~500 "
+            "requests/day ≈ 6–12 prepared applications). Paid keys (Anthropic, "
+            "OpenAI) plug into the same CLI. `--prompt` pre-fills the prompt; "
+            "press Enter to start."
         ),
         install_hint="curl -fsSL https://opencode.ai/install | bash   (or: npm install -g opencode-ai)",
         docs_url="https://opencode.ai/docs/",
         prompt_flag="--prompt",
+        model_flag="--model",   # provider/model form, e.g. google/<model>
+        verified_against="opencode 1.18.30",
         mcp_config_rel="opencode/opencode.json",
+        mcp_config_base="xdg",
+        mcp_servers_key="mcp",
+        mcp_server_entry=OPENCODE_PLAYWRIGHT_ENTRY,
+    ),
+    AgentCli(
+        id="agy",
+        label="Antigravity CLI",
+        binary="agy",
+        tier="free",
+        tier_note=(
+            "Google's successor to Gemini CLI for individuals. Free Individual "
+            "tier with a WEEKLY agent quota (small — reports of ~20 requests/day "
+            "and multi-day cooldowns), so expect a few prepared applications a "
+            "week, not a day. Under the individual tier Google may use prompts "
+            "(your profile) to improve its products unless you opt out — see "
+            "Google's Antigravity privacy settings."
+        ),
+        install_hint=(
+            "curl -fsSL https://antigravity.google/cli/install.sh | bash   "
+            "(Windows: irm https://antigravity.google/cli/install.ps1 | iex)"
+        ),
+        docs_url="https://antigravity.google/",
+        # `-i` (`--prompt-interactive`) and `--model` per Google's docs as
+        # quoted by third parties — NOT read off the binary (its installer
+        # returns 403 from this sandbox), hence no `verified_against`.
+        # `--check` prints the launch line so the first run confirms them.
+        prompt_flag="-i",
+        model_flag="--model",
+        mcp_config_rel=".gemini/antigravity/mcp_config.json",
+        mcp_config_base="home",   # %USERPROFILE% on Windows
+        mcp_servers_key="mcpServers",
+        mcp_server_entry=ANTIGRAVITY_PLAYWRIGHT_ENTRY,
+    ),
+    AgentCli(
+        id="gemini",
+        label="Gemini CLI",
+        binary="gemini",
+        tier="free",
+        tier_note=(
+            "Google no longer serves personal logins (since 2026-06-18); this "
+            "works with a GEMINI_API_KEY from AI Studio at the API's free-tier "
+            "limits — the launcher passes `-m gemini-3.1-flash-lite` (~500 "
+            "requests/day) because the CLI's own default Flash model has ~20 "
+            "requests/day on a free key. Free-tier prompts may be used to "
+            f"improve Google's products (see {_GEMINI_API_TERMS_URL})."
+        ),
+        install_hint="npm install -g @google/gemini-cli   (then put a GEMINI_API_KEY from aistudio.google.com in .env)",
+        docs_url="https://geminicli.com/docs/",
+        prompt_flag="-i",
+        model_flag="-m",
+        default_model="gemini-3.1-flash-lite",
+        verified_against="gemini 0.59.0",
+        mcp_add_args=("mcp", "add", "-s", "user", PLAYWRIGHT_MCP_SERVER, *PLAYWRIGHT_MCP_COMMAND),
     ),
     AgentCli(
         id="claude",
@@ -196,6 +294,8 @@ AGENT_CLIS: dict = {c.id: c for c in (
         ),
         install_hint="npm install -g @anthropic-ai/claude-code",
         docs_url="https://docs.claude.com/en/docs/claude-code",
+        model_flag="--model",
+        verified_against="claude --help",
         # Its scope DEFAULT is `local` — keyed on the cwd — so a server added
         # from the repo root is invisible to `cd career-ops && claude …`, a
         # separate checkout. `-s user` makes it seen from everywhere.
@@ -208,13 +308,13 @@ AGENT_CLIS: dict = {c.id: c for c in (
         tier="paid",
         tier_note=(
             "Paid — the free login ended 2026-04-15, so it needs a paid API key "
-            "now. Same `-i` seed flag as Gemini CLI; the launcher strips the "
-            "Google key names for it too."
+            "now. Same `-i` seed flag and `-m` model flag as Gemini CLI."
         ),
         install_hint="npm install -g @qwen-code/qwen-code",
         docs_url="https://qwenlm.github.io/qwen-code-docs/",
         prompt_flag="-i",
-        env_unset=GOOGLE_KEY_VARS,
+        model_flag="-m",
+        verified_against="qwen 0.23.2",
         mcp_add_args=("mcp", "add", "-s", "user", PLAYWRIGHT_MCP_SERVER, *PLAYWRIGHT_MCP_COMMAND),
     ),
 )}
@@ -245,6 +345,13 @@ def resolve_cli(env=None) -> AgentCli:
     return AGENT_CLIS[DEFAULT_CLI]
 
 
+def resolve_model(cli: AgentCli, env=None) -> str:
+    """The model `cli` is started with: `AGENT_MODEL` when set, else the
+    registry's `default_model` for that CLI ("" for every CLI but gemini)."""
+    env = os.environ if env is None else env
+    return (env.get(AGENT_MODEL_ENV) or "").strip() or cli.default_model
+
+
 def cli_available(cli: AgentCli) -> bool:
     # Through the module attribute, never `from shutil import which`: the UI
     # tests patch `shutil.which` by that path and must keep reaching this.
@@ -260,13 +367,13 @@ def _collapse(prompt: str) -> str:
 
 
 def shell_command(cli: AgentCli, prompt: str, *, cwd_hint: str = "career-ops",
-                  os_name: str | None = None) -> str:
+                  os_name: str | None = None, model: str | None = None) -> str:
     """The string the UI shows and "Run in terminal" executes.
 
     `cd <cwd_hint> && ` + the CLI's `interactive_argv` rendered for the server's
-    shell — `shlex.join` on POSIX, `subprocess.list2cmdline` on Windows — with
-    the `env_unset` prefix in that shell's spelling. Newlines are collapsed
-    first: a prompt is one line to every shell here.
+    shell — `shlex.join` on POSIX, `subprocess.list2cmdline` on Windows.
+    Newlines are collapsed first: a prompt is one line to every shell here.
+    `model` is passed through (`None` → `AGENT_MODEL` / the CLI's default).
 
     `os_name` is read at CALL time (not bound as a default at import), so a
     test that patches `os.name` to fake Windows reaches this branch.
@@ -278,19 +385,16 @@ def shell_command(cli: AgentCli, prompt: str, *, cwd_hint: str = "career-ops",
     the command (`Acme "Bob & Sons"` started the CLI with a truncated prompt
     and ran `Sons…` as a second command). Embedded `"` are therefore turned
     into `'` on this branch — the prompt is prose for the model, so nothing is
-    lost — and the rendering never contains `\"`. (Pasted into PowerShell, the
-    `set NAME=&&` prefix does not unset anything; Run in terminal launches cmd.)"""
+    lost — and the rendering never contains `\"`."""
     os_name = os.name if os_name is None else os_name
     prompt = _collapse(prompt)
     if os_name == "nt":
-        argv = cli.interactive_argv(prompt.replace('"', "'"))
-        prefix = "".join(f"set {v}=&& " for v in cli.env_unset)
+        argv = cli.interactive_argv(prompt.replace('"', "'"), model=model)
         rendered = subprocess.list2cmdline(argv)
     else:
-        argv = cli.interactive_argv(prompt)
-        prefix = ("env " + " ".join(f"-u {v}" for v in cli.env_unset) + " ") if cli.env_unset else ""
+        argv = cli.interactive_argv(prompt, model=model)
         rendered = shlex.join(argv)
-    return f"cd {cwd_hint} && {prefix}{rendered}"
+    return f"cd {cwd_hint} && {rendered}"
 
 
 def _display_path(path: Path) -> str:
@@ -313,7 +417,7 @@ def playwright_mcp_note(cli: AgentCli) -> str:
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".opencode-", suffix=".json", dir=str(path.parent))
+    fd, tmp = tempfile.mkstemp(prefix=".mcp-config-", suffix=".json", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -329,23 +433,24 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 def _merge_config(reg: McpRegistration) -> str:
     path = reg.config_path
+    key = reg.servers_key
     existing: dict = {}
     if path.exists():
         try:
             existing = json.loads(path.read_text(encoding="utf-8") or "{}")
         except (OSError, ValueError) as e:
             # Never clobber a config we can't read back: the rest of the user's
-            # OpenCode setup lives in this file.
+            # CLI setup lives in this file.
             return (f"Could not read {_display_path(path)} ({e}); left it alone. "
                     f"Add the `{PLAYWRIGHT_MCP_SERVER}` server by hand: {json.dumps(reg.merge)}")
         if not isinstance(existing, dict):
             return (f"{_display_path(path)} is not a JSON object; left it alone. "
                     f"Add the `{PLAYWRIGHT_MCP_SERVER}` server by hand: {json.dumps(reg.merge)}")
-    servers = dict(existing.get("mcp") or {})
-    entry = reg.merge["mcp"][PLAYWRIGHT_MCP_SERVER]
+    servers = dict(existing.get(key) or {})
+    entry = reg.merge[key][PLAYWRIGHT_MCP_SERVER]
     already = servers.get(PLAYWRIGHT_MCP_SERVER) == entry
     servers[PLAYWRIGHT_MCP_SERVER] = entry
-    merged = {**existing, "mcp": servers}
+    merged = {**existing, key: servers}
     if not already:
         _write_json_atomic(path, merged)
     verb = "already registered in" if already else "registered in"
@@ -398,11 +503,11 @@ def _print_install_hints() -> None:
 
 
 def _print_list() -> None:
-    print(f"{'id':<9} {'label':<12} {'tier':<5} installed")
+    print(f"{'id':<9} {'label':<16} {'tier':<5} installed")
     for c in AGENT_CLIS.values():
         mark = "yes" if cli_available(c) else "no"
         tag = "  (default)" if c.id == DEFAULT_CLI else ""
-        print(f"{c.id:<9} {c.label:<12} {c.tier:<5} {mark}{tag}")
+        print(f"{c.id:<9} {c.label:<16} {c.tier:<5} {mark}{tag}")
 
 
 def main(argv=None) -> int:
@@ -417,7 +522,7 @@ def main(argv=None) -> int:
     ap.add_argument("--register-mcp-all-installed", action="store_true",
                     help="register it with every installed CLI (what setup runs; always exits 0)")
     ap.add_argument("--check", action="store_true",
-                    help="exit 1 if the resolved CLI is not installed")
+                    help="exit 1 if the resolved CLI is not installed; print how it will be launched")
     ap.add_argument("--resolved", action="store_true",
                     help="print the resolved CLI id (reads .env)")
     args = ap.parse_args(argv)
@@ -450,11 +555,17 @@ def main(argv=None) -> int:
         return 0
     if args.check:
         cli = resolve_cli()
-        if cli_available(cli):
-            print(f"{cli.label} ({cli.id}) is installed.")
-            return 0
-        print(f"{cli.label} ({cli.id}) is not installed: {cli.install_hint}")
-        return 1
+        if not cli_available(cli):
+            print(f"{cli.label} ({cli.id}) is not installed: {cli.install_hint}")
+            return 1
+        print(f"{cli.label} ({cli.id}) is installed.")
+        print(f"Launches as: {shell_command(cli, '<prompt>')}")
+        if cli.verified_against:
+            print(f"(argv shape read from `{cli.verified_against}` --help)")
+        else:
+            print("(argv shape from documentation only, not read off the binary — "
+                  "run the line above once to confirm it opens an interactive session)")
+        return 0
     ap.print_help()
     return 0
 

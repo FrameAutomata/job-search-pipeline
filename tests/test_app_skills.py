@@ -63,8 +63,8 @@ def client(tmp_path, monkeypatch):
     # even though conftest cleared it — and a server route that reads it
     # would post to a real channel from a test.
     from pipeline import daily_digest
-    for var in ("BATCH_PROVIDER", "BATCH_MODEL", "BATCH_CLI", "SKILL_PATH_DEFAULT",
-                *_PROVIDER_KEYS.values(),
+    for var in ("BATCH_PROVIDER", "BATCH_MODEL", "BATCH_CLI", agent_cli.AGENT_MODEL_ENV,
+                "SKILL_PATH_DEFAULT", *_PROVIDER_KEYS.values(),
                 *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS):
         monkeypatch.delenv(var, raising=False)
     # status-overrides is isolated by the autouse _isolate_status_overrides
@@ -151,8 +151,10 @@ def test_cli_returns_command(client, mocker):
 @pytest.mark.parametrize("cid", list(agent_cli.AGENT_CLIS))
 def test_cli_command_is_the_registry_rendering(client, mocker, monkeypatch, cid):
     # The command is the CLI's own INTERACTIVE argv rendered for this shell —
-    # `-i` on gemini/qwen, `--prompt` on opencode, positional on claude — never
-    # a bare `<binary> "<prompt>"`, and Gemini/Qwen get the key-unset prefix.
+    # `-i` on gemini/qwen/agy, `--prompt` on opencode, positional on claude —
+    # never a bare `<binary> "<prompt>"`. Gemini carries its default model
+    # (`-m`), and nothing strips the Google key: an individual runs Gemini
+    # CLI on the API key now.
     monkeypatch.setenv("BATCH_CLI", cid)
     mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
     r = client.post("/api/skills/run", json={"skill": "apply", "num": "1", "path": "cli"})
@@ -162,10 +164,23 @@ def test_cli_command_is_the_registry_rendering(client, mocker, monkeypatch, cid)
     assert cmd.startswith("cd career-ops && ")
     if cli.prompt_flag:
         assert f" {cli.prompt_flag} " in cmd
-    if cli.env_unset:
-        assert all(v in cmd for v in cli.env_unset)
+    if cli.default_model:
+        assert f" {cli.model_flag} {cli.default_model} " in cmd
     else:
-        assert "GEMINI_API_KEY" not in cmd
+        assert f" {cli.model_flag} " not in cmd
+    assert "GEMINI_API_KEY" not in cmd and "env -u" not in cmd
+
+
+@pytest.mark.parametrize("cid", list(agent_cli.AGENT_CLIS))
+def test_cli_command_renders_agent_model(client, mocker, monkeypatch, cid):
+    # AGENT_MODEL reaches every CLI's model flag in the rendered command.
+    monkeypatch.setenv("BATCH_CLI", cid)
+    monkeypatch.setenv(agent_cli.AGENT_MODEL_ENV, "prov/model-x")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
+    r = client.post("/api/skills/run", json={"skill": "apply", "num": "1", "path": "cli"})
+    assert r.status_code == 200, r.text
+    cli = agent_cli.AGENT_CLIS[cid]
+    assert f"{cli.binary} {cli.model_flag} prov/model-x " in r.json()["command"]
 
 
 @pytest.mark.parametrize("cid", list(agent_cli.AGENT_CLIS))
@@ -186,7 +201,10 @@ def test_cli_returns_prereqs_for_browser_skill(client, mocker, monkeypatch, cid)
     if reg.is_argv:
         assert f"{cli.binary} mcp add" in joined
     else:
-        assert "opencode/opencode.json" in joined
+        # The config-merge CLIs name their own file: OpenCode's under the XDG
+        # config dir, Antigravity's under ~/.gemini/antigravity/.
+        assert cli.mcp_config_rel in joined
+        assert "mcp add" not in joined
     if cid != "claude":
         assert "claude mcp add" not in joined
     # The sentinel never leaks; the capabilities reader expands it the same way.
@@ -323,12 +341,11 @@ def test_launch_writes_cmd_script_and_spawns(client, mocker, monkeypatch):
     assert body["command"] in script
     # The command is the cmd.exe rendering, not the POSIX one: shell_command
     # reads os.name at call time, so this patch reaches it. The default CLI's
-    # own seed flag inside a double-quoted prompt, its key-stripping prefix in
-    # cmd's spelling, and no `env -u`.
+    # own seed flag inside a double-quoted prompt, and no key stripping in
+    # either shell's spelling.
     cli = agent_cli.AGENT_CLIS[agent_cli.DEFAULT_CLI]
     assert f'{cli.binary} {cli.prompt_flag} "' in body["command"]
-    for name in cli.env_unset:
-        assert f"set {name}=&& " in body["command"]
+    assert "set GEMINI_API_KEY" not in body["command"]
     assert "env -u" not in body["command"]
 
 
@@ -399,27 +416,26 @@ def test_launch_linux_uses_first_resolved_terminal(client, mocker, monkeypatch):
     assert cmd[0] == "xterm" and cmd[1] == "-e" and cmd[2].endswith(".sh")
 
 
-def test_launch_strips_the_google_keys_for_gemini(client, mocker, monkeypatch):
-    # Gemini CLI's free tier is the personal login; a GEMINI_API_KEY the UI
-    # loaded from .env would switch it to the key's tier silently. The launcher
-    # hands the console an env copy without the key names — and the script
-    # itself carries the `env -u` prefix for the same names.
+def test_launch_keeps_the_google_key_for_gemini(client, mocker, monkeypatch):
+    # Gemini CLI stopped serving personal logins on 2026-06-18; the API key
+    # in the UI's env (loaded from .env for cloud evaluation) is now the ONLY
+    # way it runs, so the console must inherit our environment untouched —
+    # no `env=` override — and the script carries the registry's default
+    # model rather than any `env -u` prefix.
     monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
     monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
     monkeypatch.delenv("TERMINAL", raising=False)
     monkeypatch.setenv("BATCH_CLI", "gemini")
-    monkeypatch.setenv("GEMINI_API_KEY", "leaked-from-dotenv")
-    monkeypatch.setenv("GOOGLE_API_KEY", "leaked-too")
-    monkeypatch.setenv("OTHER_VAR", "kept")
+    monkeypatch.setenv("GEMINI_API_KEY", "from-dotenv")
     mocker.patch("pipeline.app.skills.shutil.which", side_effect=_which_for("gemini", "xterm"))
     popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
     r = client.post("/api/skills/launch", json={"skill": "apply", "num": "1"})
     assert r.status_code == 200, r.text
-    env = popen.call_args.kwargs["env"]
-    assert "GEMINI_API_KEY" not in env and "GOOGLE_API_KEY" not in env
-    assert env["OTHER_VAR"] == "kept"
+    assert popen.call_args.kwargs.get("env") is None
     script = open(popen.call_args.args[0][2], encoding="utf-8").read()
-    assert "env -u GEMINI_API_KEY -u GOOGLE_API_KEY gemini -i " in script
+    model = agent_cli.AGENT_CLIS["gemini"].default_model
+    assert f"gemini -m {model} -i " in script
+    assert "env -u" not in script and "GOOGLE_API_KEY" not in script
 
 
 def test_launch_keeps_the_env_for_claude(client, mocker, monkeypatch):
@@ -432,7 +448,7 @@ def test_launch_keeps_the_env_for_claude(client, mocker, monkeypatch):
     popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
     r = client.post("/api/skills/launch", json={"skill": "apply", "num": "1"})
     assert r.status_code == 200, r.text
-    assert popen.call_args.kwargs["env"]["GEMINI_API_KEY"] == "k"
+    assert popen.call_args.kwargs.get("env") is None
 
 
 def test_launch_linux_honors_TERMINAL_env(client, mocker, monkeypatch):

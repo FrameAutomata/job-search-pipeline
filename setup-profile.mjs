@@ -92,6 +92,7 @@ const CLI_COMMANDS = {
   claude: (prompt) => `claude -p "${escapePrompt(prompt)}"`,
   opencode: (prompt) => `opencode run "${escapePrompt(prompt)}"`,
   gemini: (prompt) => `gemini -p "${escapePrompt(prompt)}"`,
+  agy: (prompt) => `agy -p "${escapePrompt(prompt)}"`,
   copilot: (prompt) => `copilot -p "${escapePrompt(prompt)}"`,
   qwen: (prompt) => `qwen -p "${escapePrompt(prompt)}"`,
   codex: (prompt) => `codex exec "${escapePrompt(prompt)}"`,
@@ -117,7 +118,7 @@ function parseArgs() {
     force: false,
     // Mirrors DEFAULT_CLI in pipeline/agent_cli.py (Node can't import it);
     // tests/test_agent_cli.py holds the two equal.
-    cli: 'gemini',
+    cli: 'opencode',
     fromJson: null,
   };
 

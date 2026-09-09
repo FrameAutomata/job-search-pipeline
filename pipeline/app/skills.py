@@ -142,20 +142,6 @@ def _write_unix_script(command: str, cwd: str) -> str:
     return tf.name
 
 
-def _launch_env() -> dict:
-    """The environment the console window inherits: ours, minus the variables
-    the resolved CLI must not see. The shell command already carries an
-    `env -u`/`set NAME=` prefix for the same names; this covers the launcher
-    itself, so a terminal emulator that runs the script through a login shell
-    sourcing `.env` still starts the CLI without them (Gemini CLI switches
-    from the free personal-login tier to an API key's tier when one is in its
-    environment — see pipeline/agent_cli.py)."""
-    env = dict(os.environ)
-    for name in agent_cli.resolve_cli().env_unset:
-        env.pop(name, None)
-    return env
-
-
 def _launch_windows(command: str, cwd: str) -> dict:
     """Windows: a .cmd wrapper run via CREATE_NEW_CONSOLE so it pops a new
     visible window. UTF-8 codepage so accented role/company names render."""
@@ -178,7 +164,7 @@ def _launch_windows(command: str, cwd: str) -> dict:
     # CREATE_NEW_CONSOLE = 0x10. We deliberately don't unlink the script —
     # the child needs it alive to run, and Windows cleans %TEMP% over time.
     subprocess.Popen(
-        [tf.name], cwd=cwd, creationflags=0x10, close_fds=True, env=_launch_env(),
+        [tf.name], cwd=cwd, creationflags=0x10, close_fds=True,
     )
     return {"launcher": "cmd", "script": tf.name}
 
@@ -188,8 +174,7 @@ def _launch_macos(command: str, cwd: str) -> dict:
     Terminal.app, which runs it in a new window. The script's `read` keeps
     the window open until the user presses a key."""
     script_path = _write_unix_script(command, cwd)
-    subprocess.Popen(["open", "-a", "Terminal", script_path], close_fds=True,
-                     env=_launch_env())
+    subprocess.Popen(["open", "-a", "Terminal", script_path], close_fds=True)
     return {"launcher": "Terminal.app", "script": script_path}
 
 
@@ -206,7 +191,7 @@ def _launch_linux(command: str, cwd: str) -> dict:
         )
     term, flags = chosen
     script_path = _write_unix_script(command, cwd)
-    subprocess.Popen([term, *flags, script_path], close_fds=True, env=_launch_env())
+    subprocess.Popen([term, *flags, script_path], close_fds=True)
     return {"launcher": term, "script": script_path}
 
 
@@ -238,7 +223,8 @@ def launch_in_terminal(command: str, cwd: str) -> dict:
 #
 # The Playwright-MCP entry is a SENTINEL, not text: how the server is registered
 # differs per agent CLI (`claude mcp add …`, `gemini mcp add -s user …`, a JSON
-# merge for OpenCode), and the CLI is chosen per request via BATCH_CLI. So the
+# merge for OpenCode and Antigravity), and the CLI is chosen per request via
+# BATCH_CLI. So the
 # entry is expanded at call time by `skill_prereqs`, against the resolved CLI,
 # and both readers (`capabilities()` and `/api/skills/run`) go through it — a
 # baked `claude mcp add` string told a Gemini user to run a command for a CLI
