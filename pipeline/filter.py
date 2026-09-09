@@ -195,25 +195,6 @@ def _compile_alternation(terms: list[str]) -> re.Pattern | None:
     return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
 
 
-# A `target_titles` entry is matched LITERALLY against a posting's title, so one
-# that groups alternatives — " / " with spaces, or a word-bounded "or" — can never
-# match anything, and the stage log's `target_titles: N` still counts it (#160).
-# Both real wizard-configured copies had every entry in that shape. The wizard
-# now splits them; this is the warning for a config written any other way.
-# "Coordinator" contains "or" and is not an alternative, hence the boundaries.
-_GROUPED_TITLE_RE = re.compile(r"\s/\s|\bor\b", re.IGNORECASE)
-
-
-def _warn_unmatchable_titles(target_titles: list[str | None]) -> list[str]:
-    """Print one warning per grouped `target_titles` entry; return them."""
-    grouped = [t for t in target_titles if t and _GROUPED_TITLE_RE.search(t)]
-    for t in grouped:
-        print(f'[filter] WARNING: target_titles entry "{t}" groups alternatives with '
-              '" / " or " or " — no posting title contains that literally, so it can '
-              'never earn the title bonus. List each alternative as its own entry.')
-    return grouped
-
-
 def _target_lookup(target_titles: list[str | None]) -> dict[str, str]:
     """Map a matched (lowercased) title term back to its configured casing.
     Drops falsy entries — a bare `-` in the YAML list parses to None — mirroring
@@ -335,7 +316,6 @@ def run(config_path: Path) -> Path:
     min_score = fcfg.get("min_score", 5)
     target_titles = fcfg.get("target_titles") or []
     negative_titles = fcfg.get("negative_titles") or []
-    _warn_unmatchable_titles(target_titles)
     overrides = fcfg.get("keyword_overrides") or {}
     max_age_hours = fcfg.get("max_age_hours")
     cutoff = datetime.now() - timedelta(hours=max_age_hours) if max_age_hours else None
