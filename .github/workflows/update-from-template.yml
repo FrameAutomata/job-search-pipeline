@@ -2,11 +2,19 @@ name: Update from Template
 
 # Pull the maintainer's latest changes (the upstream template) into this copy.
 # Copies made via "Use this template" have no git link to the source, so this
-# adds it as a remote, merges template/main, and pushes. Dispatch-only — run it
-# from the Actions tab, or use the local UI's "Update" button (which does the
-# same merge+push locally and also refreshes the clone running the UI).
+# adds it as a remote, merges template/main, and pushes. Run it from the
+# Actions tab, or use the local UI's "Update" button (which does the same
+# merge+push locally and also refreshes the clone running the UI).
+#
+# It also runs on a weekly schedule, but ONLY when the repository variable
+# AUTO_UPDATE_FROM_TEMPLATE is 'true' (the Setup wizard's "Keep my copy updated
+# weekly" box sets it). Opt-in rather than default because a merge lands in the
+# copy's history unasked and a conflict fails loudly in the Actions tab; a
+# dispatch always proceeds. tests/test_template_update_flag.py pins the gate.
 
 on:
+  schedule:
+    - cron: '0 4 * * 1'    # Mondays 04:00 UTC, well clear of the noon daily
   workflow_dispatch:
 
 permissions:
@@ -18,9 +26,15 @@ concurrency:
 
 jobs:
   update:
-    # Never self-update the upstream template repository.
-    if: github.repository != 'FrameAutomata/job-search-pipeline'
+    # Never self-update the upstream template repository; and a SCHEDULED run
+    # proceeds only when the copy opted in (a dispatch always does).
+    if: >-
+      github.repository != 'FrameAutomata/job-search-pipeline'
+      && (github.event_name == 'workflow_dispatch' || vars.AUTO_UPDATE_FROM_TEMPLATE == 'true')
     runs-on: ubuntu-latest
+    # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
+    # the account's 2,000 free Actions minutes a month.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:

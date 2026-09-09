@@ -61,6 +61,9 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
+    # the account's 2,000 free Actions minutes a month.
+    timeout-minutes: 30
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
@@ -87,6 +90,9 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
+    # the account's 2,000 free Actions minutes a month.
+    timeout-minutes: 30
 
     steps:
       - name: Validate inputs

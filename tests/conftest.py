@@ -260,10 +260,16 @@ def _isolate_provider_env(monkeypatch):
     # leak the developer's real key into tests (the DeepSeek addition slipped
     # past one hand-copied list — review finding).
     from pipeline.batch_evaluate import _PROVIDER_KEYS
+    # The digest's delivery secrets, settings and run facts derive from its
+    # own constants for the same reason: a webhook URL in a developer's .env
+    # would otherwise make a test post to a real Discord channel.
+    from pipeline import daily_digest
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "COVER_MODEL",
                 "TAILOR_PROVIDER", "TAILOR_MODEL",
                 *_PROVIDER_KEYS.values(),
-                "OLLAMA_BASE_URL"):
+                "OLLAMA_BASE_URL",
+                *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS,
+                *daily_digest.RUN_VARS):
         monkeypatch.delenv(var, raising=False)
 
 

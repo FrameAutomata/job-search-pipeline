@@ -56,6 +56,9 @@ jobs:
   gc:
     if: github.repository != 'FrameAutomata/job-search-pipeline'
     runs-on: ubuntu-latest
+    # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
+    # the account's 2,000 free Actions minutes a month.
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}

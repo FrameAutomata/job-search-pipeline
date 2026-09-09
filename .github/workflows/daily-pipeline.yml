@@ -32,6 +32,16 @@ name: Daily Job Pipeline
 #                                   when set, the cloud evaluator scores against it)
 #   At least one LLM key: GEMINI_API_KEY / GROQ_API_KEY / DEEPINFRA_API_KEY /
 #     OPENROUTER_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY
+#   (optional) DIGEST_DISCORD_WEBHOOK — a Discord webhook the daily digest posts to
+#   (optional) DIGEST_EMAIL_TO + DIGEST_SMTP_HOST/PORT/USER/PASS (+ DIGEST_EMAIL_FROM)
+#              — the same digest by email over STARTTLS
+# Repository VARIABLES (Settings → Secrets and variables → Actions → Variables)
+# tune the run without a code change; every one has a default and the Setup
+# wizard writes them: BATCH_PROVIDER / BATCH_MODEL / BATCH_CONCURRENCY,
+# GEMINI_FREE_TIER + GEMINI_LIMITS_JSON (free-tier conformance),
+# RECHECK_BUDGET / RECHECK_MIN_AGE_HOURS (the liveness re-check),
+# DIGEST_MIN_SCORE / DIGEST_LIMIT / DIGEST_ALWAYS / DIGEST_ATTACH_REPORTS /
+# DIGEST_NEXT_STEP (the digest).
 
 on:
   schedule:
@@ -80,6 +90,9 @@ jobs:
     # github.repository and proceed normally.
     if: github.repository != 'FrameAutomata/job-search-pipeline'
     runs-on: ubuntu-latest
+    # Two `gh api` calls; a hang here would otherwise bill GitHub's 360-minute
+    # default against the account's 2,000 free minutes a month.
+    timeout-minutes: 10
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
@@ -106,8 +119,22 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.should_run == 'true'
     runs-on: ubuntu-latest
+    # A hung LinkedIn scrape or a stalled provider would otherwise run to
+    # GitHub's 360-minute default, and one such day is 18% of the account's
+    # 2,000 free minutes a month. A real run takes 30–60 minutes; the digest
+    # step below reports what this run cost against that budget.
+    # tests/test_workflow_env.py keeps this at or under 120.
+    timeout-minutes: 90
 
     steps:
+      # First, before anything is checked out or installed: the digest step at
+      # the end reports how long the run took and projects it over a month of
+      # dailies against the free-minutes budget, so the clock starts where the
+      # billing does.
+      - name: Record when the run started
+        id: started
+        run: echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repo
         uses: actions/checkout@v7
 
@@ -251,11 +278,37 @@ jobs:
             --manifest "$RUNNER_TEMP/artifact-manifest.json" \
             --delta reports
 
+      # The user's own Gemini rate limits (the wizard's RPM/TPM/RPD boxes,
+      # stored as the GEMINI_LIMITS_JSON repository variable) land under
+      # RUNNER_TEMP: not a cached path, not in the checkout, gone with the
+      # runner. gemini_limits reads the file the eval step's GEMINI_LIMITS_FILE
+      # names; a malformed value degrades to its built-in free-tier table, the
+      # same rule a local config/gemini-limits.json follows.
+      - name: Write Gemini limits
+        if: vars.GEMINI_LIMITS_JSON != ''
+        env:
+          GEMINI_LIMITS_JSON: ${{ vars.GEMINI_LIMITS_JSON }}
+        run: printf '%s' "$GEMINI_LIMITS_JSON" > "$RUNNER_TEMP/gemini-limits.json"
+
       - name: Run pipeline and evaluate
+        id: run
         env:
           BATCH_PROVIDER:    ${{ vars.BATCH_PROVIDER || '' }}
           BATCH_MODEL:       ${{ vars.BATCH_MODEL || '' }}
           BATCH_CONCURRENCY: ${{ vars.BATCH_CONCURRENCY || '3' }}
+          # Free-tier conformance in the cloud, the same two knobs a local run
+          # reads: an empty GEMINI_FREE_TIER is "off", and the limits file is
+          # the one the step above wrote (absent when the variable is unset,
+          # which gemini_limits treats as "no overrides").
+          GEMINI_FREE_TIER:   ${{ vars.GEMINI_FREE_TIER || '' }}
+          GEMINI_LIMITS_FILE: ${{ runner.temp }}/gemini-limits.json
+          # The liveness re-check's per-run budget and re-check window. Empty
+          # means "the code's default": recheck.py reads both through
+          # env_float, which returns its default on ''. Deliberately NOT
+          # `|| '100'` — a second copy of the default here would drift from
+          # the one in recheck.py; tests/test_workflow_env.py pins that.
+          RECHECK_BUDGET:        ${{ vars.RECHECK_BUDGET || '' }}
+          RECHECK_MIN_AGE_HOURS: ${{ vars.RECHECK_MIN_AGE_HOURS || '' }}
           GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY:       ${{ secrets.GROQ_API_KEY }}
           OPENAI_API_KEY:     ${{ secrets.OPENAI_API_KEY }}
@@ -275,6 +328,44 @@ jobs:
           python orchestrate.py --evaluate-batch \
             --recheck-liveness \
             --batch-concurrency "$BATCH_CONCURRENCY"
+
+      # Tell the candidate what this run found worth their attention — one
+      # Discord message and/or one email naming the roles at or above
+      # DIGEST_MIN_SCORE, with their reports attached; a one-line failure
+      # notice when the step above did not succeed; a heartbeat otherwise.
+      #
+      # This step only READS cached paths (career-ops/reports and
+      # data/applications.md) and writes nothing under them; the artifact
+      # guard in tests/test_workflow_artifacts.py forbids a scheduled UPLOAD of
+      # cached state, and a read is not that. `if: always()` because a failed
+      # run is the one thing this must never stay quiet about, and the digest
+      # exits 0 whatever happens, so it can never be why the day shows red.
+      # The secrets and variables named here are pipeline/daily_digest.py's
+      # SECRET_VARS and SETTING_VARS; tests/test_workflow_env.py derives the
+      # expected env from those constants. --root and --manifest must match
+      # the snapshot step's, which is how "this run's reports" is decided.
+      - name: Send the daily digest
+        if: always()
+        env:
+          DIGEST_DISCORD_WEBHOOK: ${{ secrets.DIGEST_DISCORD_WEBHOOK }}
+          DIGEST_EMAIL_TO:        ${{ secrets.DIGEST_EMAIL_TO }}
+          DIGEST_SMTP_HOST:       ${{ secrets.DIGEST_SMTP_HOST }}
+          DIGEST_SMTP_PORT:       ${{ secrets.DIGEST_SMTP_PORT }}
+          DIGEST_SMTP_USER:       ${{ secrets.DIGEST_SMTP_USER }}
+          DIGEST_SMTP_PASS:       ${{ secrets.DIGEST_SMTP_PASS }}
+          DIGEST_EMAIL_FROM:      ${{ secrets.DIGEST_EMAIL_FROM }}
+          DIGEST_MIN_SCORE:       ${{ vars.DIGEST_MIN_SCORE || '4.0' }}
+          DIGEST_LIMIT:           ${{ vars.DIGEST_LIMIT || '10' }}
+          DIGEST_ALWAYS:          ${{ vars.DIGEST_ALWAYS || 'true' }}
+          DIGEST_ATTACH_REPORTS:  ${{ vars.DIGEST_ATTACH_REPORTS || 'true' }}
+          DIGEST_NEXT_STEP:       ${{ vars.DIGEST_NEXT_STEP || '' }}
+          RUN_URL:        ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_OUTCOME:    ${{ steps.run.outcome }}
+          RUN_STARTED_AT: ${{ steps.started.outputs.started_at }}
+        run: |
+          python -m pipeline.daily_digest \
+            --root career-ops \
+            --manifest "$RUNNER_TEMP/artifact-manifest.json"
 
       - name: Save pipeline state cache
         if: always()

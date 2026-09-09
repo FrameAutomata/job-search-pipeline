@@ -19,6 +19,8 @@ that fails, months after the code stopped failing.
 import re
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parent.parent
 FLAG = "--allow-unrelated-histories"
 
@@ -54,3 +56,29 @@ def test_readme_documents_the_flag():
     lines = _merge_invocations(rd)
     assert lines, "README no longer shows the manual merge"
     assert all(FLAG in l for l in lines), lines
+
+
+def _update_doc() -> dict:
+    return yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "update-from-template.yml").read_text(encoding="utf-8"))
+
+
+def test_scheduled_runs_are_var_gated():
+    """The weekly schedule is opt-in: a merge lands in the copy's history
+    unasked, so a SCHEDULED run proceeds only when the repository variable
+    AUTO_UPDATE_FROM_TEMPLATE is 'true' (the wizard's "Keep my copy updated
+    weekly" box), while a dispatch always does — and the template never
+    self-updates. PyYAML resolves the bare key `on` to True (YAML 1.1), hence
+    the double lookup."""
+    doc = _update_doc()
+    triggers = doc.get("on", doc.get(True))
+    assert "workflow_dispatch" in triggers
+    assert [s["cron"] for s in triggers["schedule"]] == ["0 4 * * 1"]
+
+    cond = " ".join(str(doc["jobs"]["update"]["if"]).split())
+    assert "github.repository != 'FrameAutomata/job-search-pipeline'" in cond
+    assert re.search(r"github\.event_name\s*==\s*'workflow_dispatch'\s*\|\|\s*"
+                     r"vars\.AUTO_UPDATE_FROM_TEMPLATE\s*==\s*'true'", cond), cond
+    # The gate is AND-ed with the self-skip, so a dispatch on the template
+    # still skips; the `(a || b)` half must be parenthesized for that to hold.
+    assert re.search(r"&&\s*\(.*\|\|.*\)", cond), cond
