@@ -313,6 +313,8 @@ function prefillForm(saved) {
     if (k === "sites" || k === "include_easy_apply") continue;
     if (CONSENT_TOGGLES.includes(k)) continue;
     if (VARIABLE_TOGGLES.includes(k)) continue;
+    // A repository variable already answered this one — see cloudVariableFields.
+    if (cloudVariableFields.has(k)) continue;
     if (v === undefined || v === null || v === "") continue;
     const el = form.querySelector(`[name="${k}"]`);
     if (el && el.tagName !== "FIELDSET") el.value = v;
@@ -332,6 +334,7 @@ function prefillForm(saved) {
   // Both default ON in the markup, so an absent answer keeps that default —
   // only an explicit "no" from a previous submit unticks them.
   VARIABLE_TOGGLES.forEach((name) => {
+    if (cloudVariableFields.has(name)) return;   // the cloud's own answer wins
     const cb = form.querySelector(`input[name="${name}"]`);
     if (cb && name in saved) cb.checked = saved[name] === "yes";
   });
@@ -370,26 +373,34 @@ nextBtn.addEventListener("click", async () => {
     const limits        = readGeminiLimits();
     if (limits.error) { showAction(limits.error, "error"); return; }
     if (cloudProvider && hasKey) {
+      const body = {
+        batch_provider: cloudProvider,
+        batch_model:    cloudModel || "",
+        batch_cli:      "",
+        api_key:        apiKey || "",
+        gemini_limits:  limits.limits,
+        // Not this step's field, but a blank one UNSETS the key: carry the
+        // Local step's current selection through rather than clear it on the
+        // way past.
+        handoff_submit_policy:
+          document.getElementById("local-submit-policy")?.value || "",
+      };
+      // The free-tier answers belong to THIS step, so this is where they reach
+      // .env and config/gemini-limits.json — the same values the submit writes
+      // as repository variables, so a local run and the cloud daily conform to
+      // one set of numbers. Sent ONLY while the row is visible: hidden for a
+      // non-Gemini CLOUD provider, the checkbox is not an answer, and an
+      // explicit `false` would clear GEMINI_FREE_TIER for a user whose cloud
+      // runs on OpenAI while their local eval and tailoring run on a free
+      // Gemini key — with no control left anywhere to turn it back on.
+      // Omitting the field is the "didn't mention it, don't touch it" case
+      // LocalConfigRequest.gemini_free_tier is `bool | None` for.
+      const ftRow = document.getElementById("gemini-free-tier-row");
+      if (ftRow && !ftRow.hidden) body.gemini_free_tier = geminiFreeTierOn();
       await fetch("/api/onboard/local-config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          batch_provider: cloudProvider,
-          batch_model:    cloudModel || "",
-          batch_cli:      "",
-          api_key:        apiKey || "",
-          // The free-tier answers belong to THIS step, so this is where they
-          // reach .env and config/gemini-limits.json — the same values the
-          // submit writes as repository variables, so a local run and the
-          // cloud daily conform to one set of numbers.
-          gemini_free_tier: geminiFreeTierOn(),
-          gemini_limits:    limits.limits,
-          // Not this step's field, but a blank one UNSETS the key: carry the
-          // Local step's current selection through rather than clear it on the
-          // way past.
-          handoff_submit_policy:
-            document.getElementById("local-submit-policy")?.value || "",
-        }),
+        body: JSON.stringify(body),
       }).catch(() => {});
     }
   }
@@ -493,18 +504,34 @@ function showDigestStatus(s) {
 // later would undo typing. Absent names leave the markup defaults alone,
 // which is what makes "checked unless you said otherwise" hold.
 let cloudVariablesApplied = false;
+// Which of those fields a variable actually filled. Four fields can be written
+// by BOTH loaders, and the documented precedence is that what the repository
+// holds wins over the sidecar of the last submit — the files/variables are what
+// the pipeline acts on. That used to be settled by whichever fetch resolved
+// last (status shells out to gh; prefill reads files), i.e. by timing rather
+// than by a rule, and a cached or stubbed gh flipped it. prefillForm skips
+// every name in here, so the sidecar fills a field only when /api/onboard/status
+// returned no variable for it — and if the status call fails outright the set
+// stays empty and the sidecar fills everything, which is the right degradation.
+const cloudVariableFields = new Set();
 function prefillCloudVariables(vars) {
   if (cloudVariablesApplied) return;
   cloudVariablesApplied = true;
   const put = (field, name) => {
     const el = form.querySelector(`[name="${field}"]`);
-    if (el && vars[name] !== undefined && vars[name] !== "") el.value = vars[name];
+    if (el && vars[name] !== undefined && vars[name] !== "") {
+      el.value = vars[name];
+      cloudVariableFields.add(field);
+    }
   };
   put("digest_min_score", "DIGEST_MIN_SCORE");
   put("digest_limit", "DIGEST_LIMIT");
   const tick = (field, name, on) => {
     const cb = form.querySelector(`input[name="${field}"]`);
-    if (cb && vars[name] !== undefined) cb.checked = on(vars[name]);
+    if (cb && vars[name] !== undefined) {
+      cb.checked = on(vars[name]);
+      cloudVariableFields.add(field);
+    }
   };
   // update-from-template.yml's schedule proceeds only on the exact string
   // "true", so that is the only value that reads as checked.
@@ -737,7 +764,9 @@ async function loadLocalProviders() {
         cloudHint.hidden = !(isGemini && rec);
         cloudHint.textContent = isGemini && rec
           ? `Blank = ${rec} on Gemini's free tier (the highest-capacity row your limits allow); `
-            + "other providers use their own default."
+            + "other providers use their own default. The cloud's provider and model are "
+            + "rewritten only when you paste a key above — leave it blank to keep the saved "
+            + "key and they stay as they are."
           : "";
       }
       showLimits();
@@ -957,6 +986,12 @@ resetBtn.addEventListener("click", async () => {
 });
 
 showStep(0);
-loadStatus();
-loadSavedConfig();
-loadLocalProviders();
+// Ordered, not raced: the status call (repository variables) has to have run
+// before the sidecar prefill, or cloudVariableFields is still empty when
+// prefillForm consults it and the precedence those two share is decided by
+// which fetch happened to finish first.
+(async () => {
+  await loadStatus();
+  await loadSavedConfig();
+  loadLocalProviders();
+})();

@@ -1,5 +1,6 @@
 """Shared fixtures for job-search-pipeline tests."""
 
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -308,6 +309,14 @@ def _isolate_handoff_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+# What _isolate_ui_env clears when pipeline.app.server has not been imported —
+# the UI deps may not be installed, and importing it here would run its
+# load_dotenv() over the isolation the other fixtures just did. Pinned against
+# the module's own constants by tests/test_app_server.py.
+LAN_ENV_FALLBACK = ("UI_LAN", "UI_PASSWORD", "UI_ALLOWED_HOSTS")
+LAN_ENV_NAME_FALLBACK = "UI_LAN"
+
+
 @pytest.fixture(autouse=True)
 def _isolate_ui_env(monkeypatch):
     """Keep the UI's LAN mode off in tests. server.py reads UI_LAN, UI_PASSWORD
@@ -318,12 +327,23 @@ def _isolate_ui_env(monkeypatch):
     server.py, whose load_dotenv(override=False) re-adds a deleted name but
     leaves a present-and-empty one alone — and an empty UI_LAN is "off" to
     _lan_enabled — which also keeps that reload from hitting the import-time
-    "UI_LAN without UI_PASSWORD" SystemExit on a developer's machine. The names
-    come from the module constant; without the UI deps the literals stand in."""
-    try:
-        from pipeline.app.server import LAN_ENV_VARS, UI_LAN_ENV
-    except Exception:
-        LAN_ENV_VARS, UI_LAN_ENV = ("UI_LAN", "UI_PASSWORD", "UI_ALLOWED_HOSTS"), "UI_LAN"
+    "UI_LAN without UI_PASSWORD" SystemExit on a developer's machine.
+
+    The names come from the module constant when the module is ALREADY loaded,
+    and from the literals otherwise — this fixture must never be the thing that
+    IMPORTS server.py. Only one fixture may do that, and it is
+    _isolate_provider_env, which imports it deliberately BEFORE clearing the
+    provider keys, precisely so the module's load_dotenv(override=False) cannot
+    put a developer's real keys back afterwards. Importing here too made that
+    guarantee rest on two autouse fixtures' relative order — and on the fact
+    that `except Exception` does not catch the import-time SystemExit a
+    developer with UI_LAN=1 and no password would raise, which would then error
+    every test in the suite from this fixture. The fallback cannot drift
+    silently: tests/test_app_server.py::TestLanEnvExampleMirror pins it against
+    the module's own constants (that file has server.py imported for real)."""
+    srv = sys.modules.get("pipeline.app.server")
+    LAN_ENV_VARS = getattr(srv, "LAN_ENV_VARS", LAN_ENV_FALLBACK)
+    UI_LAN_ENV = getattr(srv, "UI_LAN_ENV", LAN_ENV_NAME_FALLBACK)
     for var in LAN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv(UI_LAN_ENV, "")

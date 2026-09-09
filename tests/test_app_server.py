@@ -1219,16 +1219,45 @@ class TestCloudFreeTierDefaults:
         written = _vars_written(cloud_wizard["set_variable"])
         assert "GEMINI_FREE_TIER" not in written and "GEMINI_LIMITS_JSON" not in written
 
-    def test_a_blank_key_writes_no_variables_at_all(self, cloud_wizard):
-        """Nothing in the provider block runs without a key: an edit-mode
-        revisit that only changed the search settings must not re-point
-        BATCH_PROVIDER or re-derive a model."""
-        r = _onboard_post(cloud_wizard["client"],
-                          _digest_form(api_key="", gemini_free_tier="yes"))
+    def test_a_blank_key_re_points_nothing(self, cloud_wizard):
+        """WHICH provider the cloud calls, and with what, is only rewritten
+        against a key the user just pasted: `has_provider` is true for ANY
+        provider secret, so the select can read `gemini` on a copy whose cloud
+        actually runs on something else, and an edit-mode revisit that changed
+        only the search settings must not re-point it."""
+        r = _onboard_post(cloud_wizard["client"], _digest_form(api_key=""))
         assert r.status_code == 200, r.text
         written = _vars_written(cloud_wizard["set_variable"])
-        for name in ("BATCH_PROVIDER", "BATCH_MODEL", "GEMINI_FREE_TIER", "GEMINI_LIMITS_JSON"):
+        for name in ("BATCH_PROVIDER", "BATCH_MODEL"):
             assert name not in written
+
+    def test_a_blank_key_still_carries_the_free_tier_answer(self, cloud_wizard):
+        """...but the free-tier answer is NOT gated on the key, and that
+        asymmetry is the whole cloud half of the feature. Edit mode is the
+        normal path once a provider secret exists — the box is default-CHECKED
+        and the key field legitimately blank — so gating it meant almost every
+        real Save wrote nothing, and the daily ran a free key unpaced into the
+        429 the box exists to prevent while the wizard reported success.
+        GEMINI_FREE_TIER only decides whether Gemini calls are paced and
+        capped; it re-points nothing."""
+        import json as _json
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            api_key="", gemini_free_tier="yes",
+            gemini_limits={"gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 500}}))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert written["GEMINI_FREE_TIER"] == "true"
+        assert _json.loads(written["GEMINI_LIMITS_JSON"]) == {
+            "gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 500}}
+
+    def test_a_blank_key_on_another_provider_writes_no_gemini_variables(self, cloud_wizard):
+        """The gate that stayed: the flag is Gemini's, so a copy whose cloud
+        provider is OpenAI gets nothing from this path either way."""
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            provider="openai", api_key="", gemini_free_tier="yes"))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert "GEMINI_FREE_TIER" not in written and "GEMINI_LIMITS_JSON" not in written
 
 
 # ── LAN mode ────────────────────────────────────────────────────────────────
@@ -1436,3 +1465,13 @@ class TestLanEnvExampleMirror:
             encoding="utf-8")
         block = text[text.index("UI_LAN"):]
         assert "REQUIRED" in block
+
+    def test_the_conftest_fallback_matches_the_constants(self):
+        """conftest's autouse LAN fixture must not import server.py (that would
+        re-run its load_dotenv over every other fixture's isolation), so it
+        clears literals when the module is absent. This file has the module
+        imported for real, so it is where the two can be compared."""
+        from tests import conftest
+        from pipeline.app import server
+        assert conftest.LAN_ENV_FALLBACK == tuple(server.LAN_ENV_VARS)
+        assert conftest.LAN_ENV_NAME_FALLBACK == server.UI_LAN_ENV

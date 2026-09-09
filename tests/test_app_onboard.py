@@ -1174,16 +1174,24 @@ class TestDigestFormFields:
             n.lower(): n for n in daily_digest.SECRET_VARS}
 
     def test_every_credential_field_is_stripped_from_the_sidecar(self):
-        """A field whose SECRET name reads as a credential must be in
-        SECRET_FORM_FIELDS. Not every digest secret is one — the address, host,
-        port and user are configuration and are kept so a revisit prefills them
-        — so the rule is on the name, which is what a new digest secret arrives
-        with."""
-        credential = {field for field, name in onboard.DIGEST_FORM_SECRETS.items()
-                      if re.search(r"(WEBHOOK|PASS|TOKEN|KEY|SECRET)", name)}
-        assert credential, "no digest secret reads as a credential — check the regex"
+        """Deny by default: every digest field the wizard forwards to
+        gh.set_secret is a credential unless it is explicitly named as
+        configuration. The earlier version of this guard asked whether the
+        SECRET name read as a credential (WEBHOOK|PASS|TOKEN|KEY|SECRET) — and
+        the field this exists to protect is the one the digest grows next, where
+        DIGEST_SLACK_URL or DIGEST_TELEGRAM_CHAT_ID matches none of those words
+        and would reach the plain-text sidecar with the suite green."""
+        credential = set(onboard.DIGEST_FORM_SECRETS) - onboard.SIDECAR_KEEPABLE_DIGEST_FIELDS
+        assert credential, "no digest secret is treated as a credential — check the keep-list"
         assert credential <= onboard.SECRET_FORM_FIELDS, sorted(
             credential - onboard.SECRET_FORM_FIELDS)
+
+    def test_the_keepable_list_names_only_real_digest_fields(self):
+        """A keep-list entry that no digest field carries would exempt nothing
+        today and silently exempt whatever it was renamed from tomorrow; and a
+        field on both lists would be a rule arguing with itself."""
+        assert onboard.SIDECAR_KEEPABLE_DIGEST_FIELDS <= set(onboard.DIGEST_FORM_SECRETS)
+        assert not (onboard.SIDECAR_KEEPABLE_DIGEST_FIELDS & onboard.SECRET_FORM_FIELDS)
 
     def test_no_stripped_field_is_invented(self):
         """The other direction: a name in SECRET_FORM_FIELDS that no form field

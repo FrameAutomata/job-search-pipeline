@@ -66,13 +66,27 @@ DIGEST_EMAIL_REQUIRED = ("DIGEST_EMAIL_TO", "DIGEST_SMTP_HOST")
 for _n in (DIGEST_DISCORD_SECRET, *DIGEST_EMAIL_REQUIRED):
     assert _n in DIGEST_SECRET_NAMES, _n
 
+# Digest fields that are CONFIGURATION and may sit in the plain-text sidecar:
+# an address, a host, a port and a username, kept so a revisit prefills them.
+# Everything else the wizard forwards to gh.set_secret is a CREDENTIAL by
+# default and must be stripped. Deny-by-default because the risk is the secret
+# the digest grows NEXT: the guard used to ask whether a secret's NAME read as
+# a credential (WEBHOOK|PASS|TOKEN|KEY|SECRET), and a plausible new one —
+# DIGEST_SLACK_URL, DIGEST_TEAMS_HOOK, DIGEST_TELEGRAM_CHAT_ID — matches none
+# of those words, so it would have been written verbatim into
+# .ui-cache/onboarding.json with the test still green. Naming a field as
+# configuration is now a deliberate line here.
+SIDECAR_KEEPABLE_DIGEST_FIELDS = frozenset({
+    "digest_email_to", "digest_smtp_host", "digest_smtp_port",
+    "digest_smtp_user", "digest_email_from",
+})
+
 # Form fields that are CREDENTIALS and must never reach the sidecar on disk:
 # the provider key, the Discord webhook URL (whoever holds it can post to the
-# channel) and the SMTP password. The digest's address, host, port and user
-# are configuration and may be kept, so a revisit prefills them. A table
-# rather than a `!= "api_key"` so the next secret the wizard learns to write
-# is one line here — tests/test_app_onboard.py checks every digest field whose
-# secret name reads as a credential is listed.
+# channel) and the SMTP password. A table rather than a `!= "api_key"` so the
+# next secret the wizard learns to write is one line here —
+# tests/test_app_onboard.py checks every digest field that is not on the
+# keep-list above is listed.
 SECRET_FORM_FIELDS = frozenset({"api_key", "digest_discord_webhook", "digest_smtp_pass"})
 
 # Generated file -> secret name. The first four are required by the workflow;

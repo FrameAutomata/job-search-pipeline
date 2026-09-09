@@ -135,6 +135,35 @@ class TestHandoffOutDir:
         assert dotenv_values(root / ".env")["HANDOFF_OUT_DIR"] == str(badfile)
 
 
+class TestAbsentFieldsAreLeftAlone:
+    """The wizard's Provider step posts here on the way past step 5 with only
+    its OWN fields, and a blank string means "unset the key" — so a `str = ""`
+    default on the Local step's fields made walking FORWARD through the wizard
+    wipe a cross-provider tailoring model and a handoff folder the user had
+    already set. Only the screen that shows a field may clear it, and it clears
+    it by sending "" (pinned by TestHandoffOutDir::test_blank_clears... above).
+    """
+
+    def test_absent_tailor_fields_survive_another_screens_save(self, env):
+        client, root, server = env
+        _post(client, tailor_provider="anthropic", tailor_model="claude-x")
+        r = _post(client, batch_provider="gemini", batch_model="gemini-x")
+        assert r.status_code == 200
+        assert "TAILOR_PROVIDER" not in r.json()["updated"]
+        envv = dotenv_values(root / ".env")
+        assert envv["TAILOR_PROVIDER"] == "anthropic"
+        assert envv["TAILOR_MODEL"] == "claude-x"
+
+    def test_absent_handoff_dir_survives_another_screens_save(self, env):
+        client, root, server = env
+        target = root / "agent home"
+        _post(client, handoff_out_dir=str(target))
+        r = _post(client, batch_provider="gemini")
+        assert r.status_code == 200
+        assert "HANDOFF_OUT_DIR" not in r.json()["updated"]
+        assert dotenv_values(root / ".env")["HANDOFF_OUT_DIR"] == str(target)
+
+
 class TestGeminiLimits:
     """The user's own AI Studio numbers, saved from the wizard.
 
@@ -176,6 +205,31 @@ class TestGeminiLimits:
         assert "GEMINI_LIMITS" not in r.json()["updated"]
         from pipeline import gemini_limits
         assert gemini_limits.user_limits()["m"]["rpd"] == 9
+
+    def test_absent_free_tier_leaves_the_flag_alone(self, env):
+        """Two screens post to this endpoint. The Provider step sends the
+        checkbox only while its row is VISIBLE — hidden for a non-Gemini CLOUD
+        provider — and the Local step never sends it at all. An explicit
+        `false` from either would unset conforming for a user whose cloud runs
+        on OpenAI while their local eval and tailoring run on a free Gemini
+        key, with no control left anywhere to turn it back on. Omission means
+        "didn't mention it"."""
+        client, root, server = env
+        _post(client, batch_provider="gemini", gemini_free_tier=True)
+        assert dotenv_values(root / ".env")["GEMINI_FREE_TIER"] == "true"
+        r = _post(client, batch_provider="openai")          # no mention of the flag
+        assert r.status_code == 200
+        assert "GEMINI_FREE_TIER" not in r.json()["updated"]
+        assert dotenv_values(root / ".env")["GEMINI_FREE_TIER"] == "true"
+        assert os.environ["GEMINI_FREE_TIER"] == "true"
+
+    def test_an_explicit_false_still_clears_it(self, env):
+        """The screen that SHOWS the box clears it by sending false — omission
+        is the only thing that means "leave it alone"."""
+        client, root, server = env
+        _post(client, batch_provider="gemini", gemini_free_tier=True)
+        _post(client, batch_provider="gemini", gemini_free_tier=False)
+        assert "GEMINI_FREE_TIER" not in dotenv_values(root / ".env")
 
     def test_null_row_clears(self, env):
         client, root, server = env

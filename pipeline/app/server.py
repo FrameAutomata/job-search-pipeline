@@ -1281,12 +1281,20 @@ class LocalConfigRequest(BaseModel):
     # Resume tailoring can use a different (usually stronger) model — and even a
     # different provider — than bulk evaluation. Blank tailor_* = inherit the eval
     # model/provider. tailor_api_key (optional) is the tailor provider's key.
-    tailor_provider: str = ""
-    tailor_model: str = ""
+    #
+    # None (absent) leaves the key alone, the same rule as gemini_free_tier above
+    # and for the same reason: TWO screens post here. The Provider step posts on
+    # the way past with only its own fields, and a blank string means "unset", so
+    # a `str = ""` default made walking forward through the wizard wipe a
+    # cross-provider tailoring model and a handoff folder the user had set on the
+    # Local step. Only the screen that SHOWS a field may clear it, and it clears
+    # it by sending "".
+    tailor_provider: str | None = None
+    tailor_model: str | None = None
     tailor_api_key: str = ""
     # Where the browser-agent work-orders land (blank = output/handoff default).
     # Point it at a folder your agent can reach; setting it creates + seeds the dir.
-    handoff_out_dir: str = ""
+    handoff_out_dir: str | None = None
     # What the browser agent does at the Submit button: a handoff.SUBMIT_POLICIES
     # id (aliases accepted, the canonical id is written); blank unsets the key,
     # which is the default policy.
@@ -1319,7 +1327,8 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
             status_code=400,
             detail=f"Unknown CLI {cli!r}. Valid: {', '.join(_KNOWN_CLIS)}",
         )
-    tailor_provider = _validate_provider(req.tailor_provider, "tailoring provider")
+    tailor_provider = (None if req.tailor_provider is None
+                       else _validate_provider(req.tailor_provider, "tailoring provider"))
     submit_policy = req.handoff_submit_policy.strip()
     if submit_policy:
         # canonical_policy accepts the aliases the env reader accepts and hands
@@ -1396,17 +1405,23 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
 
     # Tailoring model/provider (blank = inherit the eval model/provider). Write the
     # tailor provider's API key too when given, so a cross-provider tailor (e.g.
-    # evaluate on Gemini, tailor on Anthropic) can authenticate.
-    _set("TAILOR_PROVIDER", tailor_provider)
-    _set("TAILOR_MODEL", req.tailor_model.strip())
+    # evaluate on Gemini, tailor on Anthropic) can authenticate. An ABSENT field
+    # (None) is left alone — see LocalConfigRequest for why the two posting
+    # screens need that distinction.
+    if tailor_provider is not None:
+        _set("TAILOR_PROVIDER", tailor_provider)
+    if req.tailor_model is not None:
+        _set("TAILOR_MODEL", req.tailor_model.strip())
     tailor_key = req.tailor_api_key.strip()
     if tailor_key and tailor_provider and tailor_provider in onboard.PROVIDER_SECRETS:
         _set(onboard.PROVIDER_SECRETS[tailor_provider], tailor_key)
 
     # Where the browser-agent work-orders land. Setting it creates + seeds the dir
-    # (the agent README); blank clears it so run() falls back to output/handoff.
-    handoff_dir = req.handoff_out_dir.strip()
-    _set("HANDOFF_OUT_DIR", handoff_dir)
+    # (the agent README); blank clears it so run() falls back to output/handoff;
+    # absent leaves whatever is configured.
+    handoff_dir = "" if req.handoff_out_dir is None else req.handoff_out_dir.strip()
+    if req.handoff_out_dir is not None:
+        _set("HANDOFF_OUT_DIR", handoff_dir)
     # The submit policy is written BEFORE the folder is seeded: bootstrap
     # rewrites HANDOFF-README.md from the active policy on every call, so the
     # README a Save leaves behind states the policy that Save chose.
@@ -1692,8 +1707,19 @@ async def onboard_submit(
                 model = gemini_limits.batch_recommendation() or ""
             if model:
                 gh.set_variable("BATCH_MODEL", model)
-            if provider == "gemini":
-                _write_gemini_free_tier_variables(payload)
+        # The free-tier answer is NOT gated on the key, and that asymmetry is
+        # the point. BATCH_PROVIDER/BATCH_MODEL say which provider the cloud
+        # calls and with what, so a blank key — "keep the saved one" — must not
+        # re-point them (`has_provider` is true for ANY provider secret, so the
+        # select can read `gemini` on a copy whose cloud runs on something
+        # else). GEMINI_FREE_TIER only decides whether Gemini calls are paced
+        # and capped, and is inert on every other provider. Edit mode is the
+        # normal path once a secret is on the repo: leaving it inside the key
+        # block meant the default-CHECKED box wrote nothing on almost every
+        # real Save, and the cloud daily then ran a free key unpaced into the
+        # 429 the box exists to prevent, while the wizard reported success.
+        if provider == "gemini":
+            _write_gemini_free_tier_variables(payload)
         # Delivery secrets for the daily digest: each non-blank value is written
         # under the name the sender reads; blank keeps the existing secret, the
         # same rule as the API key (edit mode must not need the webhook pasted

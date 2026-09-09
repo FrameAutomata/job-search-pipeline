@@ -30,8 +30,12 @@ $reading = if ($env:CAREER_OPS_PATH) { $env:CAREER_OPS_PATH } else { "./career-o
 $hostArgs = @()
 if ($Lan) {
     if (-not $env:UI_PASSWORD) {
-        Write-Error ("-Lan needs UI_PASSWORD: this puts the UI on every interface of " +
-                     "this machine, so it refuses to start without one. Try: " +
+        # -ErrorAction Continue so the refusal's exit CODE comes from the line
+        # below rather than from $ErrorActionPreference = "Stop" terminating the
+        # script here: the observable behaviour was already right, but `exit 1`
+        # was dead, and a dead statement is one nobody notices going wrong.
+        Write-Error -ErrorAction Continue ("-Lan needs UI_PASSWORD: this puts the UI on every " +
+                     "interface of this machine, so it refuses to start without one. Try: " +
                      "`$env:UI_PASSWORD = 'something long'; ./run-ui.ps1 -Lan")
         exit 1
     }
