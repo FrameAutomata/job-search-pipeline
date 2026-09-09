@@ -280,8 +280,12 @@ def _isolate_handoff_env(monkeypatch):
     the developer's actual applied/skipped roles (run() reads HANDOFF_JOB_LOG
     when no job_log is passed), and a real out-dir would make run() read/write
     outside tmp_path. Clear both before every test; tests that need them set them
-    explicitly via monkeypatch.setenv."""
-    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR"):
+    explicitly via monkeypatch.setenv. The submit policy is cleared the same way
+    (its name comes from the module constant, so a rename can't leave a stale
+    string here): a developer's .env set to submit-all would flip every README /
+    prompt / fallback-row assertion that pins the stop-before-submit default."""
+    from pipeline.handoff import SUBMIT_POLICY_ENV
+    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR", SUBMIT_POLICY_ENV):
         monkeypatch.delenv(var, raising=False)
 
 
