@@ -432,18 +432,19 @@ def _split_models(model: str) -> list[str]:
 
 
 def _build_failover_caller(provider: str, models: list[str], *,
-                           disable_thinking: bool = False, wrap=None) -> Caller:
+                           disable_thinking: bool = False) -> Caller:
     """Try each model in order, falling over to the next when one is overloaded
     (429 / "engine_overloaded"). Raises the last overload error if ALL are busy —
     which _call_with_retry then backs off and retries (re-trying the whole chain).
     Non-overload errors (e.g. a bad model id) raise immediately and aren't masked.
 
-    `wrap(model, caller)` decorates each member's caller before it joins the
-    chain — how `_build_caller` paces each member on its OWN limits (#147),
-    so the request that actually goes out is the one that is paced, and to the
-    row of the model it goes to."""
-    wrap = wrap or (lambda _model, caller: caller)
-    built = [(m, wrap(m, _build_single_caller(provider, m, disable_thinking=disable_thinking)))
+    Each member is paced on its OWN limits before it joins the chain (#147), so
+    the request that actually goes out is the one that is paced, to the row of
+    the model it goes to — and each real attempt is charged to the model that
+    served it, rather than N attempts to the lead as one. `paced_caller` is a
+    no-op for a model outside the free-tier table."""
+    built = [(m, gemini_limits.paced_caller(
+                  _build_single_caller(provider, m, disable_thinking=disable_thinking), m))
              for m in models]
 
     def call(system: str, user: str) -> str:
@@ -474,17 +475,13 @@ def _build_caller(provider: str, model: str, *, disable_thinking: bool = False) 
     # documented chain "gemini-2.5-flash,gemma-4-26b-a4b-it" spends flash's 20
     # RPD in its first 20 evaluations and then answers from gemma — 16,000 TPM —
     # which lead-pacing held to flash's 250,000 budget, 15x over, for the rest
-    # of the run. Wrapping inside the chain also charges each real request to
-    # the model that served it, rather than N attempts to the lead as one.
-    def paced(m: str, caller: Caller) -> Caller:
-        return gemini_limits.paced_caller(caller, m)
-
+    # of the run. So the chain builder paces each member as it builds it.
     if len(models) > 1:
-        caller = _build_failover_caller(provider, models, disable_thinking=disable_thinking,
-                                        wrap=paced)
+        caller = _build_failover_caller(provider, models, disable_thinking=disable_thinking)
     else:
         only = models[0] if models else model
-        caller = paced(only, _build_single_caller(provider, only, disable_thinking=disable_thinking))
+        caller = gemini_limits.paced_caller(
+            _build_single_caller(provider, only, disable_thinking=disable_thinking), only)
     # Warn HERE rather than at the eval stage, because this is where the no-op
     # happens: every caller in the repo is built through this function
     # (resume_tailor, cover_letters, article_digest and handoff's --handoff-tailor

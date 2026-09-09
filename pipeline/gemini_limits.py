@@ -603,10 +603,9 @@ class TokenBudget:
             # (and a 429 is recoverable; a hang is not).
             self._charges.append((start, tokens))
             wait = start - now
-        if wait > 0:
+        if wait > 0:                # never negative: `start` is at or after `now`
             self._sleep(wait)
-            return wait
-        return 0.0
+        return wait
 
     def charge(self, tokens: int) -> None:
         """Record tokens already spent, without waiting — the response
@@ -643,10 +642,9 @@ class RateLimiter:
             start = max(now, self._next)
             self._next = start + self._interval
             wait = start - now
-        if wait > 0:
+        if wait > 0:                # never negative: `start` is at or after `now`
             self._sleep(wait)
-            return wait
-        return 0.0
+        return wait
 
 
 # ── Pacer wait accounting (#148) ─────────────────────────────────────────────
@@ -660,18 +658,21 @@ class RateLimiter:
 # with no backoff — the very fallback the soft token estimate leans on. The
 # pacers record what they slept, per thread (one job per worker thread), and
 # the retry loop credits it back. Taking resets, so a job's credit is its own.
-_pacer_wait = threading.local()
+class _PacerWait(threading.local):
+    total = 0.0         # a threading.local subclass re-applies its class defaults per thread
+
+
+_pacer_wait = _PacerWait()
 
 
 def _record_pacer_wait(seconds: float) -> None:
-    if seconds and seconds > 0:
-        _pacer_wait.total = getattr(_pacer_wait, "total", 0.0) + seconds
+    if seconds > 0:
+        _pacer_wait.total += seconds
 
 
 def take_pacer_wait() -> float:
     """Seconds this thread's pacers have slept since the last take; resets."""
-    total = getattr(_pacer_wait, "total", 0.0)
-    _pacer_wait.total = 0.0
+    total, _pacer_wait.total = _pacer_wait.total, 0.0
     return total
 
 
@@ -730,19 +731,18 @@ def paced_caller(caller, model: str):
     have their own rows, and pacing the chain on its lead's limits paced the
     member actually answering on the wrong numbers — a 16K-TPM fallback against
     the lead's 250K budget, 15x over, for the whole rest of the run once the
-    lead's 20 RPD were spent. `_build_caller` wraps per member."""
+    lead's 20 RPD were spent. `_build_failover_caller` wraps per member."""
+    if not conforming_enabled():        # the env read first: off means no stat() of the override file
+        return caller
     limits = effective_limits()
-    if not conforming_enabled() or model not in limits:
+    if model not in limits:
         return caller
     limiter, budget = _pacer_for(model, limits[model])
 
     def wrapped(*args, **kwargs):
         prompt = sum(estimate_tokens(v) for v in (*args, *kwargs.values())
                      if isinstance(v, str))
-        # `or 0.0`: a test's stand-in pacer may return None from acquire.
-        waited = (budget.acquire(prompt + _RESERVED_OUTPUT_TOKENS) or 0.0)
-        waited += (limiter.acquire() or 0.0)
-        _record_pacer_wait(waited)
+        _record_pacer_wait(budget.acquire(prompt + _RESERVED_OUTPUT_TOKENS) + limiter.acquire())
         result = caller(*args, **kwargs)
         # Reconcile the reservation upward when the response was bigger than it.
         # Only upward: a smaller response leaves the window slightly conservative,

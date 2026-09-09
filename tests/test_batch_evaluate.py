@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from pipeline import batch_evaluate as eval_mod
+from pipeline import gemini_limits as gl
+from tests.conftest import fake_clock, real_pacers_on_fake_clock
 from pipeline.batch_evaluate import (
     _build_caller,
     _call_with_retry,
@@ -682,44 +684,35 @@ class TestCallWithRetry:
     def test_pacer_wait_is_not_charged_to_the_job_budget(self):
         """#148: a job that queued 599.6s on OUR token budget, then met a
         transient 429, still gets its backoff — the wait is credited back."""
-        import pipeline.gemini_limits as gl
-        clock = {"t": 0.0}
+        st, mono, _ = fake_clock()
         calls = []
 
         def paced_then_busy(system, user):
             calls.append(1)
             if len(calls) == 1:
-                clock["t"] += 599.6                   # the pacer slept this long…
+                st["t"] += 599.6                      # the pacer slept this long…
                 gl._record_pacer_wait(599.6)          # …and said so
                 raise Exception("429 Too Many Requests")
             return "ok"
         out = _call_with_retry(paced_then_busy, "s", "u", budget=600.0, base_delay=1.0,
-                               sleep=lambda s: None, monotonic=lambda: clock["t"])
+                               sleep=lambda s: None, monotonic=mono)
         assert out == "ok" and len(calls) == 2
 
-    def test_provider_slowness_still_counts_against_the_budget(self):
-        # The control: the same elapsed time with NO pacer wait recorded is the
-        # provider's, and the deadline holds.
-        clock = {"t": 0.0}
+    @pytest.mark.parametrize("stale_credit", [0.0, 10_000.0],
+                             ids=["control", "a previous job's wait is not inherited"])
+    def test_provider_slowness_still_counts_against_the_budget(self, stale_credit):
+        # The control: the same elapsed time with NO pacer wait recorded for
+        # THIS job is the provider's, and the deadline holds — also when a
+        # paced call that succeeded earlier on this thread left a credit behind.
+        gl._record_pacer_wait(stale_credit)
+        st, mono, _ = fake_clock()
 
         def slow_then_busy(system, user):
-            clock["t"] += 599.6
+            st["t"] += 599.6
             raise Exception("429 Too Many Requests")
         with pytest.raises(Exception, match="429"):
             _call_with_retry(slow_then_busy, "s", "u", budget=600.0, base_delay=1.0,
-                             sleep=lambda s: None, monotonic=lambda: clock["t"])
-
-    def test_a_previous_jobs_wait_is_not_inherited(self):
-        import pipeline.gemini_limits as gl
-        gl._record_pacer_wait(10_000.0)               # left behind by a paced call that succeeded
-        clock = {"t": 0.0}
-
-        def slow_then_busy(system, user):
-            clock["t"] += 599.6
-            raise Exception("429 Too Many Requests")
-        with pytest.raises(Exception, match="429"):
-            _call_with_retry(slow_then_busy, "s", "u", budget=600.0, base_delay=1.0,
-                             sleep=lambda s: None, monotonic=lambda: clock["t"])
+                             sleep=lambda s: None, monotonic=mono)
 
     def test_non_rate_limit_error_raises_immediately(self):
         calls = []
@@ -883,15 +876,8 @@ class TestFreeTierPacing:
         flash is spent; lead-pacing held gemma (16K TPM) to flash's 250K budget.
         Real pacers on a fake clock: the second 8K-token evaluation must wait
         out gemma's token window (t=60), not flash's RPM spacing (t=12)."""
-        import pipeline.gemini_limits as gl
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
-        st = {"t": 0.0, "sleeps": []}
-
-        def sleep(s):
-            st["sleeps"].append(s); st["t"] += s
-        real_rl, real_tb = gl.RateLimiter, gl.TokenBudget
-        monkeypatch.setattr(gl, "RateLimiter", lambda rpm: real_rl(rpm, monotonic=lambda: st["t"], sleep=sleep))
-        monkeypatch.setattr(gl, "TokenBudget", lambda tpm: real_tb(tpm, monotonic=lambda: st["t"], sleep=sleep))
+        st = real_pacers_on_fake_clock(monkeypatch)
 
         def overloaded(system, user):
             raise Exception("429 Too Many Requests")
@@ -907,7 +893,6 @@ class TestFreeTierPacing:
         assert st["sleeps"] == [12.0, 48.0] and st["t"] == 60.0
 
     def test_each_member_gets_its_own_pacer(self, monkeypatch):
-        import pipeline.gemini_limits as gl
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
         monkeypatch.setattr(eval_mod, "_build_single_caller", lambda *a, **k: (lambda s, u: "R"))
         paced_for = []
