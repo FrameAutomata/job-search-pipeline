@@ -824,3 +824,17 @@ class TestTheGuardsCatchWhatTheyForbid:
         monkeypatch.setitem(CACHED_PATHS, "career-ops/data/something-new.tsv", "local")
         with pytest.raises(AssertionError, match="diverged"):
             TestNoUploadCarriesAccumulatedState().test_every_cached_path_is_classified()
+
+
+class TestEditTrackerAppliesThroughTheRowEditor:
+    """edit-tracker.yml's status apply carried its own positional copy of the
+    row edit (`parts[6]` for Status — one cell off on a Via-layout tracker)
+    that could only carry a status, so the Notes mark a re-check Discard or a
+    merge reopen sends (#163) was dropped on the way to the cloud. It runs the
+    repo's own editor now; this pins that it keeps doing so."""
+
+    def test_the_apply_step_runs_apply_cloud_overrides(self):
+        steps = _steps("edit-tracker.yml", "apply-edit")
+        step = next(s for s in steps if s.get("name") == "Apply status overrides")
+        assert "apply_cloud_overrides" in step["run"]
+        assert "parts[6]" not in step["run"]

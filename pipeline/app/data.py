@@ -92,6 +92,14 @@ def override_identity(value) -> tuple[str, str] | None:
     return None
 
 
+def override_note(value) -> str:
+    """The Notes text an override carries — the re-check's Closed mark or the
+    merge's Reopened mark (#163) — or "" for one that carries none."""
+    if isinstance(value, dict):
+        return str(value.get("note") or "")
+    return ""
+
+
 def clear_status_overrides(keys, path: Path | None = None) -> None:
     """Remove the given keys from the override map (used after a push). Re-reads
     under the lock and removes ONLY those keys, so anything written between the
@@ -122,12 +130,20 @@ def override_matches_row(value, row: dict) -> bool:
     return not want_role or normalize_company(row.get("role", "")) == want_role
 
 
-def _override_value(status: str, company: str | None, role: str | None):
+def _override_value(status: str, company: str | None, role: str | None,
+                    note: str | None = None):
     """An override-map value: a bare status string, or a {status, company, role}
     record carrying an identity anchor when company/role are known — so consumers
-    re-resolve the right row even if the num differs across trackers."""
-    if company or role:
-        return {"status": status, "company": company or "", "role": role or ""}
+    re-resolve the right row even if the num differs across trackers. A `note`
+    rides in the record when the change carries a Notes mark (#163): the status
+    alone reached the cloud, so a re-check Discard minted locally arrived there
+    as a person's — which the cloud never reopens — and the next Refresh (cloud
+    wins verbatim) erased the mark here as well."""
+    if company or role or note:
+        value = {"status": status, "company": company or "", "role": role or ""}
+        if note:
+            value["note"] = note
+        return value
     return status
 
 
@@ -187,7 +203,7 @@ def record_status_changes(applications_md: Path, changes, *, notes: dict | None 
         with _status_lock:
             overrides = load_status_overrides()
             for num, status, company, role in items:
-                overrides[num] = _override_value(status, company, role)
+                overrides[num] = _override_value(status, company, role, notes.get(num))
             save_status_overrides(overrides)
     except OSError:
         pass
@@ -236,9 +252,12 @@ def resolve_overrides_for_push(applications_md_text: str, overrides: dict,
     base tracker.
 
     Returns (new_text, cloud_payload, unresolved):
-      - new_text: the base with each applied override's Status cell rewritten
-        (identical to the input when build_text is False).
-      - cloud_payload: {num: status} for edit-tracker.yml (always num-keyed).
+      - new_text: the base with each applied override's Status cell rewritten,
+        and its Notes mark appended when it carries one (identical to the input
+        when build_text is False).
+      - cloud_payload: {num: status}, or {num: {status, note}} for an override
+        carrying a Notes mark (#163) — edit-tracker.yml's input, always
+        num-keyed; `apply_cloud_overrides` reads both shapes.
       - unresolved: keys of identity-anchored overrides whose company/role isn't
         in THIS base. Those are NOT applied and NOT dispatched — falling back to
         the (foreign) num would mark a different company that merely shares it,
@@ -251,10 +270,10 @@ def resolve_overrides_for_push(applications_md_text: str, overrides: dict,
     edits don't affect identity resolution, so the payload is unchanged.
     """
     new_text = applications_md_text
-    cloud_payload: dict[str, str] = {}
+    cloud_payload: dict[str, str | dict] = {}
     unresolved: list[str] = []
-    # The layout can't change under us — set_status_in_text only rewrites Status
-    # cells — so derive it once rather than per override.
+    # The layout can't change under us — the row editor only rewrites Status
+    # and Notes cells — so derive it once rather than per override.
     columns = _header_columns(applications_md_text)
     for key, value in overrides.items():
         status = override_status(value)
@@ -266,10 +285,29 @@ def resolve_overrides_for_push(applications_md_text: str, overrides: dict,
                 continue
         else:
             num = key
+        note = override_note(value)
         if build_text:
-            new_text = set_status_in_text(new_text, num, status)
-        cloud_payload[num] = status
+            new_text = _edit_row_cells(new_text, num, status=status, note=note or None)
+        cloud_payload[num] = {"status": status, "note": note} if note else status
     return new_text, cloud_payload, unresolved
+
+
+def apply_cloud_overrides(applications_md_text: str, overrides: dict) -> tuple[str, int]:
+    """Apply a Push payload — {num: status} or {num: {status, note}} — to the
+    tracker text through the same row editor every local write uses. This is
+    what edit-tracker.yml runs against the cloud's cached tracker. It replaced
+    an inline copy that read fixed slots (`parts[6]` for Status: one cell off on
+    a Via-layout tracker) and could only carry a status, so a Discard the local
+    re-check minted arrived at the cloud as a person's (#163). Returns
+    (new_text, rows changed); a dispatch applied twice changes nothing twice."""
+    applied = 0
+    for num, value in overrides.items():
+        edited = _edit_row_cells(applications_md_text, num, status=override_status(value),
+                                 note=override_note(value) or None)
+        if edited != applications_md_text:
+            applied += 1
+            applications_md_text = edited
+    return applications_md_text, applied
 
 
 # Canonical applications.md statuses (mirror of career-ops templates/states.yml
@@ -858,8 +896,12 @@ def _edit_row_cells(applications_md_text: str, num: str, *, status: str | None =
                     parts[status_idx_default + shift] = f" {status} "
                 if note and notes_idx_default is not None:
                     idx = notes_idx_default + shift
-                    if idx < len(parts) - 1:          # the last part is the trailing pipe's ""
-                        existing = parts[idx].strip()
+                    # The last part is the trailing pipe's "". And a mark already
+                    # in the cell (as its own ` — ` clause) is not appended again:
+                    # a Push applied twice (a cancelled, re-run dispatch) must
+                    # not stack it.
+                    existing = parts[idx].strip() if idx < len(parts) - 1 else None
+                    if existing is not None and note not in [c.strip() for c in existing.split(" — ")]:
                         parts[idx] = f" {existing} — {note} " if existing else f" {note} "
                 line = "|".join(parts)
                 changed = True

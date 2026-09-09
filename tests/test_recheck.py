@@ -215,9 +215,9 @@ class TestRecheckMarking:
         co, apps = tracker
         fake_fetch["results"] = {"666": ("expired", "body: applications? closed")}
         recheck.run(co, applications_md=apps)
-        assert _overrides()["6"] == {
-            "status": "Discarded", "company": "Vandelay", "role": "Importer",
-        }
+        override = _overrides()["6"]
+        assert override.pop("note").startswith("Closed ")   # the mark rides to the cloud (#163)
+        assert override == {"status": "Discarded", "company": "Vandelay", "role": "Importer"}
 
     def test_only_expired_among_mixed_results(self, tracker, fake_fetch):
         co, apps = tracker
@@ -316,9 +316,9 @@ class TestIndeedRecheck:
         assert summary["discarded"] == 1
         assert [d["num"] for d in summary["dead"]] == ["8"]
         # Identity-anchored override, same channel the LinkedIn path writes.
-        assert _overrides()["8"] == {
-            "status": "Discarded", "company": "Globo Gym", "role": "Trainer",
-        }
+        override = _overrides()["8"]
+        assert override.pop("note").startswith("Closed ")
+        assert override == {"status": "Discarded", "company": "Globo Gym", "role": "Trainer"}
 
     def test_removed_indeed_marked_discarded(self, tmp_path, fake_fetch):
         """A key absent from a batch that returned others = removed from Indeed

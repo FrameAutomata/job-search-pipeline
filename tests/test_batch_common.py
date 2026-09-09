@@ -1565,8 +1565,9 @@ class TestReopenRepostedDiscards:
         assert row["status_canonical"] == "Evaluated"
         assert "Reopened" in row["notes"] and not closed_by_recheck(row["notes"])
         assert data.extract_url(row["notes"]) == "https://new"          # the next re-check verifies the LIVE posting
-        assert json.loads(data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))["5"] == {
-            "status": "Evaluated", "company": "Acme", "role": "Nurse"}   # Push carries it to the cloud
+        override = json.loads(data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))["5"]
+        assert override.pop("note").startswith("Reopened ")   # the mark rides to the cloud with the status
+        assert override == {"status": "Evaluated", "company": "Acme", "role": "Nurse"}
         assert "reopened 1 role" in capsys.readouterr().out
 
     def test_reopens_under_the_older_notes_replacing_merge(self, tmp_path, mocker):

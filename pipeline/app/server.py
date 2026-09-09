@@ -279,8 +279,10 @@ def push_status() -> JSONResponse:
     Clobber guard: we first pull the latest pipeline artifact and MERGE it into
     the local tracker (so rows the pipeline added since the last Refresh are
     present), then apply the pending status overrides onto the local base and
-    dispatch the resolved {num: status} to edit-tracker. Offline (no runs / gh
-    error) → push against the last-synced local tracker."""
+    dispatch the resolved {num: status} — {num: {status, note}} for a re-check
+    Discard or a merge reopen, whose Notes mark must reach the cloud too (#163)
+    — to edit-tracker. Offline (no runs / gh error) → push against the
+    last-synced local tracker."""
     overrides = _load_overrides()
     if not overrides:
         raise HTTPException(status_code=400, detail="No pending status changes to push.")
@@ -313,8 +315,9 @@ def push_status() -> JSONResponse:
     # Resolve each identity-anchored override to the correct num IN THIS base. An
     # override whose company isn't in the tracker is returned in `unresolved` —
     # NOT applied and NOT dispatched, so we never mark a different company that
-    # merely shares the num. cloud_payload is {num: status} (edit-tracker.yml's
-    # input). We do NOT write the status into applications.md: that file is the
+    # merely shares the num. cloud_payload is {num: status}, or {num: {status,
+    # note}} when a Notes mark rides along (edit-tracker.yml's input). We do NOT
+    # write the status into applications.md: that file is the
     # last-synced CLOUD mirror, and the pending edit lives in the pushed-override
     # overlay (below) until a real cloud run incorporates it — only then does the
     # self-clean in list_jobs fire. Writing it here would self-clean immediately
@@ -348,7 +351,8 @@ def push_status() -> JSONResponse:
         # Persist dispatched overrides so they survive Refresh and restarts until
         # the pipeline produces a new artifact that already has the correct statuses.
         pushed = _load_pushed_overrides()
-        pushed.update(cloud_payload)
+        # The overlay is status-only: the board compares a row's status to it.
+        pushed.update({num: data.override_status(v) for num, v in cloud_payload.items()})
         _save_pushed_overrides(pushed)
     elif stale_discards:
         # Nothing resolved to dispatch, but still drop the dead Discard overrides.

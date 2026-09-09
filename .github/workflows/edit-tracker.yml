@@ -30,7 +30,7 @@ on:
         required: false
         type: string
       status_overrides_json:
-        description: "Status-only changes: JSON object of {\"num\": \"Status\"} pairs (e.g. {\"1\":\"Applied\",\"3\":\"SKIP\"}). Used by the UI push button — much smaller than a full-file dispatch, avoids the GitHub input size limit."
+        description: "Status changes: JSON object of {\"num\": \"Status\"} pairs (e.g. {\"1\":\"Applied\",\"3\":\"SKIP\"}); a value may also be {\"status\": ..., \"note\": ...} to append a Notes mark (the liveness re-check's Closed mark, the merge's Reopened mark). Used by the UI push button — much smaller than a full-file dispatch, avoids the GitHub input size limit."
         required: false
         type: string
       applications_md_release_tag:
@@ -198,36 +198,28 @@ jobs:
         env:
           STATUS_OVERRIDES_JSON: ${{ inputs.status_overrides_json }}
         run: |
+          # Through the repo's own row editor (stdlib-only imports, so no pip
+          # install), not a positional copy of it: it finds Status and Notes by
+          # the table's header, so a Via-layout tracker is edited in the right
+          # cell, and it carries the Notes mark a re-check Discard or a merge
+          # reopen sends along (#163) — a status-only apply delivered those to
+          # the cloud as a person's Discard, which the cloud never reopens.
           python3 - << 'PYEOF'
           import json, os, sys
+          sys.path.insert(0, os.getcwd())
+          from pipeline.app.data import apply_cloud_overrides
           overrides = json.loads(os.environ['STATUS_OVERRIDES_JSON'])
           path = 'career-ops/data/applications.md'
           if not os.path.exists(path):
               print('::error::applications.md not found in the pipeline state cache.')
               print('::error::Run the pipeline at least once before pushing status changes.')
               sys.exit(1)
-          with open(path) as f:
+          with open(path, encoding='utf-8') as f:
               text = f.read()
-          for num, status in overrides.items():
-              want = str(num).strip()
-              out_lines = []
-              changed = False
-              for line in text.splitlines():
-                  if not changed and line.lstrip().startswith('|'):
-                      parts = line.split('|')
-                      cells = [p.strip() for p in parts]
-                      if len(parts) >= 10 and cells[1] == want and cells[1] not in ('#', ''):
-                          parts[6] = ' ' + status + ' '
-                          line = '|'.join(parts)
-                          changed = True
-                  out_lines.append(line)
-              result = '\n'.join(out_lines)
-              if text.endswith('\n') and not result.endswith('\n'):
-                  result += '\n'
-              text = result
-          with open(path, 'w') as f:
+          text, applied = apply_cloud_overrides(text, overrides)
+          with open(path, 'w', encoding='utf-8') as f:
               f.write(text)
-          print(f'Applied {len(overrides)} status override(s) to {path}')
+          print(f'Applied {applied} of {len(overrides)} status override(s) to {path}')
           PYEOF
 
       - name: Save pipeline state cache
