@@ -1639,6 +1639,9 @@ def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool)
         _finish_handoff(job_id, status="done", result={
             "sessions": sessions,
             "total_fresh": sum(s["fresh"] for s in sessions),
+            # Rows re-emitted ready-to-submit — forms waiting on the person's
+            # click, not on the agent — counted apart from the fresh ones.
+            "total_ready": sum(s["ready"] for s in sessions),
         })
     except Exception as exc:  # surface, never wedge the slot in "running"
         _finish_handoff(job_id, status="failed", error=str(exc))
