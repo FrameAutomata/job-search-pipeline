@@ -14,8 +14,8 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from pipeline._batch_common import parse_date_posted, read_url_set
-from pipeline.app.data import _load_states, recheck_discarded
+from pipeline._batch_common import parse_date_posted, read_url_set, recheck_discarded
+from pipeline.app.data import _load_states
 from pipeline.rowio import read_rows
 from pipeline.tracker_layout import data_rows
 from pipeline.stdio import line_buffer_stdout

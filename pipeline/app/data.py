@@ -14,7 +14,6 @@ from pathlib import Path
 from pipeline._batch_common import (
     ADDITION_COLUMNS,
     atomic_write_text,
-    closed_by_recheck,
     normalize_company,
     read_url_set,
     score_value,
@@ -371,18 +370,6 @@ def canonical_status(raw: str, vocabulary: tuple | None = None) -> str:
         if s.lower() == lower:
             return s
     return aliases.get(lower, clean)
-
-
-def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:
-    """True when a row's Discard is the liveness re-check's, not a person's:
-    its status is Discarded AND the newest mark in its Notes is the re-check's
-    Closed one (#163). Both halves in one place, so no reader — bridge's dedup,
-    the merge's reopen, the next one — can drop the status half and read a
-    stale Closed mark on an Evaluated row as provisional. `vocabulary` is
-    `canonical_status`'s: a caller walking many rows resolves it once."""
-    return (canonical_status(status, vocabulary) == "Discarded"
-            and closed_by_recheck(notes))
-
 
 # Canonical applications.md column order (see career-ops AGENTS.md):
 #   | # | Date | Company | Role | Score | Status | PDF | Report | Notes |

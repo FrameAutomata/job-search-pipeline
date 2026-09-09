@@ -1062,11 +1062,24 @@ def reopened_mark(date: str) -> str:
 def closed_by_recheck(notes: str) -> bool:
     """True when the newest mark in `notes` is the re-check's Closed one — the
     row's Discard is the re-check's, not a person's. Only meaningful on a row
-    whose status IS Discarded; `app.data.recheck_discarded` asks both halves."""
+    whose status IS Discarded; `recheck_discarded` asks both halves."""
     notes = notes or ""
     last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes)), default=-1)
     last_reopened = max((m.end() for m in REOPENED_RE.finditer(notes)), default=-1)
     return last_closed > last_reopened
+
+
+def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:
+    """True when a row's Discard is the liveness re-check's, not a person's:
+    its status is Discarded AND the newest mark in its Notes is the re-check's
+    Closed one (#163). Both halves in one place, so no reader — bridge's dedup,
+    the merge's reopen, the next one — can drop the status half and read a
+    stale Closed mark on an Evaluated row as provisional. `vocabulary` is
+    `canonical_status`'s (`app.data._load_states()`): a caller walking many
+    rows resolves it once instead of per row."""
+    from pipeline.app.data import canonical_status   # lazy: app.data imports this module
+    return (canonical_status(status, vocabulary) == "Discarded"
+            and closed_by_recheck(notes))
 
 
 def _tracker_rows(applications_md: Path):
@@ -1084,11 +1097,11 @@ def _tracker_rows(applications_md: Path):
 
 def _liveness_closed_rows(applications_md: Path) -> dict[str, dict]:
     """{num: {company, role, report}} for every row the liveness re-check
-    Discarded (`app.data.recheck_discarded`). Taken BEFORE a merge: the older
+    Discarded (`recheck_discarded`). Taken BEFORE a merge: the older
     merge-tracker replaces Notes on an update, so afterwards the mark may be
     gone, while the newer one keeps them — the snapshot reads the same either
     way. A person's Discard carries no mark and is not here."""
-    from pipeline.app.data import _load_states, recheck_discarded   # lazy: app.data imports this module
+    from pipeline.app.data import _load_states   # lazy: app.data imports this module
     vocabulary = _load_states()             # once per walk, not per row
     out: dict[str, dict] = {}
     for row in _tracker_rows(applications_md):
