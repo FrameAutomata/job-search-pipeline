@@ -571,6 +571,7 @@ async function promptForRoleCriteria(autoMode) {
       .filter(r => r);
   } else {
     criteria.targetRoles = ['Software Engineer', 'Full-Stack Engineer'];
+    criteria.targetRolesDefaulted = true;   // a search term, not the candidate's role
   }
 
   // Negative roles (roles to avoid)
@@ -791,7 +792,7 @@ async function promptForCareerNarrative(autoMode, _info, criteria, resumeText = 
   };
 
   if (autoMode) {
-    warn('Skipping career narrative (auto mode). Edit career-ops/modes/_profile.md later.');
+    warn('Skipping career narrative (auto mode). Headline and story are derived from your résumé; edit career-ops/config/profile.yml (narrative:) and career-ops/modes/_profile.md later.');
     return resolveNarrative(narrative, criteria, resumeText);
   }
 
@@ -814,16 +815,11 @@ async function promptForCareerNarrative(autoMode, _info, criteria, resumeText = 
   // Deal-breakers
   console.log('\n🚫 Deal-breakers (non-negotiables):');
   const dealBreakerInput = await prompt(
-    'What are you NOT interested in? (comma-separated)\nExample: "Legacy codebases only, Startup <10 people, Manager roles"\n→ '
+    'What are you NOT interested in? (comma-separated, optional)\nExample: "Night shifts, Fully on-site, Manager roles"\n→ '
   );
-  if (dealBreakerInput) {
-    narrative.dealBreakers = dealBreakerInput
-      .split(',')
-      .map(d => d.trim())
-      .filter(d => d);
-  } else {
-    narrative.dealBreakers = ['Legacy codebases only (no greenfield)', 'Startup with <10 people'];
-  }
+  narrative.dealBreakers = dealBreakerInput
+    ? dealBreakerInput.split(',').map(d => d.trim()).filter(d => d)
+    : [];                                    // none, as the wizard sends — never a job family's
 
   // Location preferences — preferred already captured in role criteria
   console.log('\n🌍 Location Policy:');
@@ -1054,16 +1050,40 @@ function extractResumeSections(resumeText) {
 // candidate's own material — the résumé's summary, and the first target role —
 // and nothing below assumes a job family.
 
+// A period after one of these does not end a sentence: a title or degree
+// (Sr., Dr., B.S.), a unit (yrs., mos.), a lone initial or list number, or a
+// dotted abbreviation (e.g., Ph.D). Résumé summaries open with them routinely,
+// and cutting there made "Sr." the candidate's headline.
+const NOT_A_SENTENCE_END_RE = /^(?:[A-Za-z]|\d+|(?:[A-Za-z]\.)+[A-Za-z]|sr|jr|dr|mr|mrs|ms|st|vs|etc|approx|dept|inc|ltd|co|corp|yrs?|mos?|hrs?|exp|no|e\.g|i\.e|ph\.d|b\.s|m\.s|b\.a|m\.a|r\.n)$/i;
+
 function firstSentence(text, max = 240) {
-  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  // One line; a bulleted or numbered summary contributes its first item.
+  const t = String(text || '').replace(/\s+/g, ' ').trim()
+    .replace(/^(?:[-•*]|\d+[.)])\s+/, '').split(/\s+[•·▪]\s+/)[0];
   if (!t) return '';
-  const m = t.match(/^(.+?[.!?])(\s|$)/);
-  const sentence = (m ? m[1] : t).trim();
-  return sentence.length > max ? sentence.slice(0, max - 1).trimEnd() + '…' : sentence;
+  let sentence = t;
+  const end = /[.!?]+(?=\s|$)/g;
+  let m;
+  while ((m = end.exec(t))) {
+    const candidate = t.slice(0, m.index + m[0].length);
+    const words = candidate.split(' ');
+    const last = words[words.length - 1].replace(/[.!?]+$/, '');
+    // A couple of words ending in an abbreviation-shaped token is an opening,
+    // not a sentence; keep reading to the next stop.
+    if (words.length >= 3 && !NOT_A_SENTENCE_END_RE.test(last)) { sentence = candidate; break; }
+  }
+  if (sentence.length <= max) return sentence;
+  const cut = sentence.slice(0, max - 1);
+  return (cut.includes(' ') ? cut.slice(0, cut.lastIndexOf(' ')) : cut).trimEnd() + '…';
 }
 
 function firstTargetRole(criteria) {
-  return (criteria && criteria.targetRoles && criteria.targetRoles[0]) || '';
+  // Only a role the candidate TYPED: both entry points default targetRoles to
+  // a job family so the search config has a term, and deriving the narrative
+  // from that made a candidate who skipped the field a "Software Engineer
+  // candidate" — the persona #161 removes.
+  if (!criteria || criteria.targetRolesDefaulted) return '';
+  return (criteria.targetRoles && criteria.targetRoles[0]) || '';
 }
 
 /**
@@ -1464,6 +1484,7 @@ async function runFromJson(jsonPath) {
   const c = payload.criteria || {};
   const criteria = {
     targetRoles: (c.targetRoles && c.targetRoles.length) ? c.targetRoles : ['Software Engineer'],
+    targetRolesDefaulted: !(c.targetRoles && c.targetRoles.length),   // a search term, not the candidate's role
     negativeRoles: c.negativeRoles || [],
     compensationTarget: c.compensationTarget || '$130K-170K',
     compensationMin: c.compensationMin || '$110K',

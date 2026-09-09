@@ -351,6 +351,29 @@ class TestNarrativeDefaults:
         assert narrative["exit_story"] == "Seeking Patient Access Representative roles that build on my experience."
         assert narrative["headline"] == "Patient Access Representative candidate"
 
+    def test_an_abbreviation_does_not_end_the_derived_sentence(self, tmp_path):
+        # "Sr." / "yrs." are openings, not sentences; the headline was "Sr.".
+        resume = ("Pat Lee\nPROFESSIONAL SUMMARY\nSr. Registrar with 8 yrs. of hospital "
+                  "front-desk work. Fluent in Epic.\nSKILLS\nEpic\nEXPERIENCE\nMercy")
+        _, narrative, _ = self._generate(tmp_path, self.FORM, resume)
+        assert narrative["headline"] == "Sr. Registrar with 8 yrs. of hospital front-desk work."
+        assert narrative["exit_story"] == narrative["headline"]
+
+    def test_a_numbered_summary_contributes_its_first_item(self, tmp_path):
+        resume = ("Pat Lee\nPROFESSIONAL SUMMARY\n1. Patient-focused registrar with 5 years "
+                  "at Mercy.\n2. Epic superuser.\nSKILLS\nEpic\nEXPERIENCE\nMercy")
+        _, narrative, _ = self._generate(tmp_path, self.FORM, resume)
+        assert narrative["headline"] == "Patient-focused registrar with 5 years at Mercy."
+
+    def test_blank_target_roles_do_not_make_the_candidate_an_engineer(self, tmp_path):
+        """The wizard does not require target roles, and the generator defaults
+        them to a job family so the search config has a term. That default is
+        not the candidate's role, so the narrative must not read it."""
+        form = {k: v for k, v in self.FORM.items() if k != "target_roles"}
+        _, narrative, _ = self._generate(tmp_path, form, "Pat Lee\nSKILLS\nEpic\nEXPERIENCE\nMercy")
+        assert narrative["headline"] == "Candidate"
+        assert narrative["exit_story"] == "Seeking roles that build on my experience."
+
     def test_a_filled_narrative_reaches_profile_yml_and_profile_md(self, tmp_path):
         form = {**self.FORM, "headline": "Front-desk lead who keeps registration moving",
                 "exit_story": "Moving into patient access where my Epic scheduling work carries the most weight."}
@@ -520,6 +543,9 @@ voluntary_disclosures:
   data_processing_consent: true
   save_answers: false
   share_answers: false
+narrative:
+  headline: Hands-on backend engineer
+  exit_story: Moving to platform work.
 """
 
 
