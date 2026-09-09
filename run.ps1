@@ -32,7 +32,11 @@ while ($i -lt $args.Count) {
 if ($runBatch) {
     # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
     # writes) and owns the default — no second copy of it here.
-    $batchCli = (& "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --resolved | Select-Object -Last 1)
+    # From $root: `pipeline` is not pip-installed, so `-m` finds it by cwd.
+    Push-Location $root
+    try {
+        $batchCli = (& "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --resolved | Select-Object -Last 1)
+    } finally { Pop-Location }
     if (-not $batchCli) {
         Write-Host "run.ps1: could not resolve the agent CLI (python -m pipeline.agent_cli --resolved printed nothing)."
         exit 1

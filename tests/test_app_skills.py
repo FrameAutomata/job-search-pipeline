@@ -315,6 +315,15 @@ def test_launch_writes_cmd_script_and_spawns(client, mocker, monkeypatch):
     assert "chcp 65001" in script
     assert "pause" in script
     assert body["command"] in script
+    # The command is the cmd.exe rendering, not the POSIX one: shell_command
+    # reads os.name at call time, so this patch reaches it. The default CLI's
+    # own seed flag inside a double-quoted prompt, its key-stripping prefix in
+    # cmd's spelling, and no `env -u`.
+    cli = agent_cli.AGENT_CLIS[agent_cli.DEFAULT_CLI]
+    assert f'{cli.binary} {cli.prompt_flag} "' in body["command"]
+    for name in cli.env_unset:
+        assert f"set {name}=&& " in body["command"]
+    assert "env -u" not in body["command"]
 
 
 def test_launch_refused_when_no_cli(client, mocker, monkeypatch):

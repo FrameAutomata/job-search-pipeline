@@ -53,7 +53,8 @@ fi
 if [[ "$run_batch" == "true" ]]; then
   # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
   # writes) and owns the default — no second copy of it here.
-  batch_cli="$("$root/.venv/bin/python" -m pipeline.agent_cli --resolved)"
+  # From $root: `pipeline` is not pip-installed, so `-m` finds it by cwd.
+  batch_cli="$(cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --resolved)"
   if [[ -z "$batch_cli" ]]; then
     echo "run.sh: could not resolve the agent CLI (python -m pipeline.agent_cli --resolved printed nothing)." >&2
     exit 1

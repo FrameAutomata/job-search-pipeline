@@ -31,8 +31,10 @@ changing a shape:
   `skills.launch_in_terminal`).
 - Playwright MCP registration has two forms: an argv (`<cli> mcp add …`) and a
   JSON config merge for OpenCode, whose `mcp add` has no non-interactive form
-  for a local server. Gemini's `mcp add` scope DEFAULTS to `project`, so `-s
-  user` is required or the registration lands in the cwd's `.gemini/settings.json`.
+  for a local server. Gemini's `mcp add` scope DEFAULTS to `project`, and
+  Claude Code's to `local` (per cwd), so `-s user` is required on both or the
+  registration lands in the directory setup ran from and `cd career-ops &&
+  <cli> …` — a separate checkout — never sees it.
 """
 
 import argparse
@@ -61,6 +63,11 @@ PLAYWRIGHT_MCP_COMMAND = ("npx", "-y", "@playwright/mcp@latest")
 GOOGLE_KEY_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 REGISTER_MCP_CMD = "python -m pipeline.agent_cli --register-mcp"
+
+# Where OpenCode's config lives when set (default `~/.config`). Read from the
+# process env by `mcp_registration` — and so cleared by tests/conftest.py's
+# provider-env fixture, like `BATCH_CLI`.
+XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
 
 _PRIVACY_NOTICE_URL = (
     "https://developers.google.com/gemini-code-assist/resources/"
@@ -123,7 +130,7 @@ class AgentCli:
             return McpRegistration(argv=(self.binary, *self.mcp_add_args))
         home = Path.home() if home is None else Path(home)
         env = os.environ if env is None else env
-        xdg = (env.get("XDG_CONFIG_HOME") or "").strip()
+        xdg = (env.get(XDG_CONFIG_HOME_ENV) or "").strip()
         config_dir = Path(xdg) if xdg else home / ".config"
         return McpRegistration(
             config_path=config_dir / self.mcp_config_rel,
@@ -152,8 +159,9 @@ AGENT_CLIS: dict = {c.id: c for c in (
             "that key's tier, so the launcher strips GEMINI_API_KEY/GOOGLE_API_KEY "
             "before starting it. Under the individual free tier Google may use "
             "prompts (your profile) to improve its products unless you opt out "
-            "(the Usage Statistics setting, `usageStatisticsEnabled` in "
-            f"~/.gemini/settings.json — see {_PRIVACY_NOTICE_URL})."
+            "(`privacy.usageStatisticsEnabled: false` in ~/.gemini/settings.json; "
+            "`usageStatisticsEnabled` at the top level in older releases — see "
+            f"{_PRIVACY_NOTICE_URL})."
         ),
         install_hint="npm install -g @google/gemini-cli   (then run `gemini` once and sign in with a personal Google account)",
         docs_url="https://geminicli.com/docs/",
@@ -188,7 +196,10 @@ AGENT_CLIS: dict = {c.id: c for c in (
         ),
         install_hint="npm install -g @anthropic-ai/claude-code",
         docs_url="https://docs.claude.com/en/docs/claude-code",
-        mcp_add_args=("mcp", "add", PLAYWRIGHT_MCP_SERVER, "--", *PLAYWRIGHT_MCP_COMMAND),
+        # Its scope DEFAULT is `local` — keyed on the cwd — so a server added
+        # from the repo root is invisible to `cd career-ops && claude …`, a
+        # separate checkout. `-s user` makes it seen from everywhere.
+        mcp_add_args=("mcp", "add", "-s", "user", PLAYWRIGHT_MCP_SERVER, "--", *PLAYWRIGHT_MCP_COMMAND),
     ),
     AgentCli(
         id="qwen",
@@ -249,18 +260,34 @@ def _collapse(prompt: str) -> str:
 
 
 def shell_command(cli: AgentCli, prompt: str, *, cwd_hint: str = "career-ops",
-                  os_name: str = os.name) -> str:
+                  os_name: str | None = None) -> str:
     """The string the UI shows and "Run in terminal" executes.
 
     `cd <cwd_hint> && ` + the CLI's `interactive_argv` rendered for the server's
     shell — `shlex.join` on POSIX, `subprocess.list2cmdline` on Windows — with
     the `env_unset` prefix in that shell's spelling. Newlines are collapsed
-    first: a prompt is one line to every shell here."""
-    argv = cli.interactive_argv(_collapse(prompt))
+    first: a prompt is one line to every shell here.
+
+    `os_name` is read at CALL time (not bound as a default at import), so a
+    test that patches `os.name` to fake Windows reaches this branch.
+
+    The Windows rendering is for cmd.exe — the shell "Run in terminal" opens.
+    cmd toggles its quote state on EVERY `"` and reads backslash as a literal,
+    so the `\"` list2cmdline would emit for an embedded quote ends the quoted
+    region as far as cmd is concerned, and a `&`/`|`/`<`/`>` after it splits
+    the command (`Acme "Bob & Sons"` started the CLI with a truncated prompt
+    and ran `Sons…` as a second command). Embedded `"` are therefore turned
+    into `'` on this branch — the prompt is prose for the model, so nothing is
+    lost — and the rendering never contains `\"`. (Pasted into PowerShell, the
+    `set NAME=&&` prefix does not unset anything; Run in terminal launches cmd.)"""
+    os_name = os.name if os_name is None else os_name
+    prompt = _collapse(prompt)
     if os_name == "nt":
+        argv = cli.interactive_argv(prompt.replace('"', "'"))
         prefix = "".join(f"set {v}=&& " for v in cli.env_unset)
         rendered = subprocess.list2cmdline(argv)
     else:
+        argv = cli.interactive_argv(prompt)
         prefix = ("env " + " ".join(f"-u {v}" for v in cli.env_unset) + " ") if cli.env_unset else ""
         rendered = shlex.join(argv)
     return f"cd {cwd_hint} && {prefix}{rendered}"
@@ -336,7 +363,8 @@ def register_playwright_mcp(cli: AgentCli, *, run=None,
     `run` defaults to `subprocess.run` at CALL time (not in the signature), so
     a test patching `subprocess.run` reaches the command-line entry points."""
     run = subprocess.run if run is None else run
-    if not cli_available(cli):
+    exe = shutil.which(cli.binary)
+    if exe is None:
         return f"{cli.label} is not installed — install it first: {cli.install_hint}"
     reg = cli.mcp_registration(home=home, env=env)
     if not reg.is_argv:
@@ -344,8 +372,14 @@ def register_playwright_mcp(cli: AgentCli, *, run=None,
             return _merge_config(reg)
         except OSError as e:
             return f"Could not write {_display_path(reg.config_path)}: {e}"
+    # argv[0] is the RESOLVED path, not the bare name the registration
+    # displays: on Windows npm installs these CLIs as `gemini.cmd` shims, which
+    # `shutil.which` finds through PATHEXT but CreateProcess (what a shell-less
+    # `subprocess.run` uses) does not — it appends only `.exe`, so the bare
+    # name raised WinError 2 for every npm-installed CLI and setup.ps1's
+    # registration did nothing. A full path to a `.cmd` file does run.
     try:
-        proc = run(list(reg.argv), capture_output=True, text=True)
+        proc = run([exe, *reg.argv[1:]], capture_output=True, text=True)
     except OSError as e:
         return f"Could not run `{shlex.join(reg.argv)}`: {e}"
     output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()

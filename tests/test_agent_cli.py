@@ -92,15 +92,19 @@ class TestRegistry:
 
     def test_module_is_a_stdlib_leaf(self):
         # The jobspy-free UI venv imports it; dotenv is deferred into main().
+        # Full dotted names, so a `pipeline.batch_evaluate` (provider clients)
+        # or `pipeline.app.server` import can't pass as "pipeline".
         tree = ast.parse((ROOT / "pipeline" / "agent_cli.py").read_text(encoding="utf-8"))
         top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
         names = set()
         for n in top:
             if isinstance(n, ast.Import):
-                names |= {a.name.split(".")[0] for a in n.names}
+                names |= {a.name for a in n.names}
             else:
-                names.add((n.module or "").split(".")[0])
-        assert names - set(sys.stdlib_module_names) == {"pipeline"}
+                names.add(n.module or "")
+        ours = {n for n in names if n.startswith("pipeline")}
+        assert ours == {"pipeline.stdio"}   # itself stdlib-only
+        assert {n.split(".")[0] for n in names - ours} <= set(sys.stdlib_module_names)
 
 
 # ── resolve_cli ──────────────────────────────────────────────────────────────
@@ -164,10 +168,12 @@ class TestShellCommand:
         )
 
     def test_nt_exact_string_for_claude(self):
+        # Embedded `"` become `'` (cmd would read list2cmdline's `\"` as the
+        # end of the quoted region — see the `&` case below).
         got = shell_command(AGENT_CLIS["claude"], PROMPT, os_name="nt")
         assert got == (
             'cd career-ops && claude "use apply mode to help me fill out the '
-            "application for Acme \\\"Bob\\\" & Sons 'Ltd' $tore / Rep\""
+            "application for Acme 'Bob' & Sons 'Ltd' $tore / Rep\""
         )
 
     def test_posix_exact_string_for_gemini_carries_the_unset_prefix(self):
@@ -180,10 +186,39 @@ class TestShellCommand:
 
     def test_nt_exact_string_for_gemini_carries_the_unset_prefix(self):
         got = shell_command(AGENT_CLIS["gemini"], PROMPT, os_name="nt")
-        assert got.startswith(
-            "cd career-ops && set GEMINI_API_KEY=&& set GOOGLE_API_KEY=&& gemini -i \""
+        assert got == (
+            "cd career-ops && set GEMINI_API_KEY=&& set GOOGLE_API_KEY=&& gemini -i "
+            '"use apply mode to help me fill out the application for '
+            "Acme 'Bob' & Sons 'Ltd' $tore / Rep\""
         )
-        assert got.endswith("$tore / Rep\"")
+
+    @pytest.mark.parametrize("cid", list(AGENT_CLIS))
+    def test_nt_never_emits_an_escaped_quote_so_cmd_keeps_the_prompt_whole(self, cid):
+        # cmd.exe toggles its quote state on EVERY `"` and reads `\` as a
+        # literal, so list2cmdline's `\"` closes the quoted region for it and
+        # an `&` between two embedded quotes split the command — the CLI got a
+        # truncated prompt and cmd ran `Sons…` as a second command.
+        got = shell_command(AGENT_CLIS[cid], 'use apply mode for Acme "Bob & Sons" / Rep', os_name="nt")
+        assert '\\"' not in got
+        assert "Acme 'Bob & Sons' / Rep" in got
+        # Walk cmd's quote state: no `&`, `|`, `<`, `>` outside a quoted
+        # region except the `&&` separators the prefix and `cd` emit.
+        quoted, bare = False, []
+        for ch in got:
+            if ch == '"':
+                quoted = not quoted
+            elif ch in "&|<>" and not quoted:
+                bare.append(ch)
+        assert not quoted
+        assert bare == ["&", "&"] * (1 + len(AGENT_CLIS[cid].env_unset))
+
+    def test_os_name_is_read_at_call_time(self):
+        # A default bound at import (`os_name=os.name`) can't see a test's
+        # `monkeypatch.setattr("os.name", "nt")`, so the Windows launcher test
+        # on CI would render the POSIX branch into a .cmd and pass anyway.
+        assert shell_command.__kwdefaults__["os_name"] is None
+        assert shell_command(AGENT_CLIS["claude"], "x") == \
+            shell_command(AGENT_CLIS["claude"], "x", os_name=agent_cli.os.name)
 
     @pytest.mark.parametrize("cid", list(AGENT_CLIS))
     def test_posix_round_trips_to_interactive_argv(self, cid):
@@ -222,10 +257,18 @@ class TestShellCommand:
 # ── MCP registration ─────────────────────────────────────────────────────────
 
 class TestMcpRegistration:
-    def test_claude_argv(self):
+    def test_claude_argv_forces_user_scope(self):
+        # Its scope DEFAULT is `local` (per cwd): a server added from the repo
+        # root is invisible to `cd career-ops && claude …`, a separate checkout.
         reg = AGENT_CLIS["claude"].mcp_registration()
         assert reg.is_argv
-        assert list(reg.argv) == ["claude", "mcp", "add", "playwright", "--", *PLAYWRIGHT_MCP_COMMAND]
+        assert list(reg.argv) == ["claude", "mcp", "add", "-s", "user", "playwright", "--", *PLAYWRIGHT_MCP_COMMAND]
+
+    def test_every_argv_registration_is_user_scoped(self):
+        for c in AGENT_CLIS.values():
+            reg = c.mcp_registration(home=Path("/h"), env={})
+            if reg.is_argv:
+                assert reg.argv[1:5] == ("mcp", "add", "-s", "user"), c.id
 
     def test_gemini_argv_forces_user_scope(self):
         # Its scope DEFAULT is `project` — without -s user the registration
@@ -269,9 +312,19 @@ class TestRegisterPlaywrightMcp:
             return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
         msg = register_playwright_mcp(AGENT_CLIS["gemini"], run=run)
-        assert seen["argv"] == list(AGENT_CLIS["gemini"].mcp_registration().argv)
+        # argv[0] is the RESOLVED path: on Windows the npm shim is `gemini.cmd`,
+        # which `which` finds through PATHEXT and a bare-name CreateProcess
+        # (only `.exe` appended) does not — WinError 2 for every npm CLI.
+        argv = list(AGENT_CLIS["gemini"].mcp_registration().argv)
+        assert seen["argv"] == ["/usr/bin/gemini", *argv[1:]]
         assert seen["kw"].get("capture_output") is True
         assert "Registered" in msg and "Gemini CLI" in msg
+
+    def test_failure_message_shows_the_bare_command_not_the_resolved_path(self, mocker):
+        mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"claude"}))
+        run = lambda argv, **kw: SimpleNamespace(returncode=2, stdout="", stderr="boom\n")  # noqa: E731
+        msg = register_playwright_mcp(AGENT_CLIS["claude"], run=run)
+        assert "`claude mcp add" in msg and "/usr/bin/" not in msg
 
     def test_claude_already_registered_is_success(self, mocker):
         mocker.patch("pipeline.agent_cli.shutil.which", side_effect=_which({"claude"}))
@@ -391,7 +444,7 @@ class TestMain:
                             return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         assert agent_cli.main(["--register-mcp-all-installed"]) == 0
         ran = [c.args[0][0] for c in fake.call_args_list]
-        assert ran == ["gemini", "claude"]
+        assert ran == ["/usr/bin/gemini", "/usr/bin/claude"]   # resolved, in order
         out = capsys.readouterr().out
         assert "Gemini CLI" in out and "Claude Code" in out
 
@@ -401,7 +454,7 @@ class TestMain:
         fake = mocker.patch("pipeline.agent_cli.subprocess.run",
                             return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
         assert agent_cli.main(["--register-mcp"]) == 0
-        assert fake.call_args.args[0][0] == "qwen"
+        assert fake.call_args.args[0][0] == "/usr/bin/qwen"
 
     def test_register_mcp_unknown_id_is_a_usage_error(self, capsys):
         assert agent_cli.main(["--register-mcp", "copilot"]) == 2

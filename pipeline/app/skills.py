@@ -159,10 +159,13 @@ def _launch_env() -> dict:
 def _launch_windows(command: str, cwd: str) -> dict:
     """Windows: a .cmd wrapper run via CREATE_NEW_CONSOLE so it pops a new
     visible window. UTF-8 codepage so accented role/company names render."""
+    # `%%` is a literal `%` in a batch file (a bare `%VAR%`/`%1` would be
+    # expanded); the copied command needs no doubling, cmd's interactive
+    # parser leaves `%%` alone but a .cmd file collapses it.
     script = (
         "@echo off\r\n"
         "chcp 65001 >nul\r\n"
-        f"{command}\r\n"
+        f"{command.replace('%', '%%')}\r\n"
         "echo.\r\n"
         "echo (You can close this window when done.)\r\n"
         "pause >nul\r\n"
