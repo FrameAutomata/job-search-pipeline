@@ -146,8 +146,13 @@ _CLOSED_FULL_RE = re.compile(
     LIVENESS_CLOSED_RE.pattern + r"(?:[^()]|\([^()]*\))*\)?", re.I)
 _MENTION_RE = re.compile(r"@(everyone|here)\b")
 
+# The fence may sit a few prose lines below the heading (a model that adds a
+# sentence there is drift, not a different shape): any non-fence lines are
+# skipped, or `final_decision: Skip` would parse as no summary and a Skip
+# above min_score would be digested.
 _MACHINE_SUMMARY_RE = re.compile(
-    r"##\s*Machine Summary\s*\n+\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```", re.S)
+    r"##\s*Machine Summary[^\n]*\n(?:(?!\s*```)[^\n]*\n)*?\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```",
+    re.S)
 _DECISION_RE = re.compile(r"^\s*final_decision:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", re.M)
 
 
@@ -205,13 +210,18 @@ def load_manifest(manifest: Path, root: Path) -> dict | None:
     """The pre-run manifest's files, or None when it cannot be trusted.
 
     `run_artifact._read_manifest` refuses (SystemExit) a missing manifest and a
-    manifest taken of a different --root/--delta. Both mean the diff below would
-    call every restored report new, so "no new reports" is the honest reading —
-    the failure notice / heartbeat still goes out."""
+    manifest taken of a different --root/--delta; a truncated or unreadable
+    file raises out of `json.loads`/`open` instead. All of them mean the diff
+    below would call every restored report new, so "no new reports" is the
+    honest reading — and none of them may stop the failure notice / heartbeat,
+    which is the one thing a half-written run must not silence."""
     try:
         return run_artifact._read_manifest(Path(manifest), Path(root), [DELTA])
     except SystemExit as exc:
         _log(str(exc))
+        return None
+    except Exception as exc:
+        _log(f"manifest unreadable ({exc!r}); treating as no new reports")
         return None
 
 
@@ -345,6 +355,7 @@ class Digest:
     min_score: float
     limit: int
     evaluated: int
+    evaluated_known: bool       # False when the manifest was refused: 0 is not a fact then
     qualifying: int
     open: int
     run_url: str
@@ -360,9 +371,13 @@ class Digest:
     attachment_text: str = ""
 
     @property
+    def evaluated_text(self) -> str:
+        return f"{self.evaluated}" if self.evaluated_known else "? (manifest unreadable)"
+
+    @property
     def health(self) -> str:
-        line = (f"{self.evaluated} evaluated this run · {self.qualifying} at "
-                f"≥ {self.min_score:g} · {self.open} open in your queue")
+        line = (f"{self.evaluated_text} evaluated this run · {self.qualifying} at "
+                f"≥ {self.min_score:.1f} · {self.open} open in your queue")
         if self.duration_min is not None and self.monthly_estimate is not None:
             line += (f" · run took {self.duration_min:.0f} min ≈ "
                      f"{self.monthly_estimate:,} min/month of {MONTHLY_MINUTES:,} at this pace")
@@ -373,7 +388,7 @@ class Digest:
 
     @property
     def heartbeat(self) -> str:
-        return f"nothing at ≥ {self.min_score:g} today; {self.evaluated} evaluated"
+        return f"nothing at ≥ {self.min_score:.1f} today; {self.evaluated_text} evaluated"
 
     @property
     def should_send(self) -> bool:
@@ -448,8 +463,16 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
     now = now or datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
 
-    new_files = report_number_map(new_report_files(root, load_manifest(manifest, root)))
-    rows = data.parse_applications(root / "data" / "applications.md")
+    manifest_files = load_manifest(manifest, root)
+    new_files = report_number_map(new_report_files(root, manifest_files))
+    tracker = root / "data" / "applications.md"
+    try:
+        rows = data.parse_applications(tracker)
+    except Exception as exc:
+        # A tracker the run left half-written is exactly the case where the
+        # run failed and the notice matters; read it as empty and carry on.
+        _log(f"tracker unreadable ({tracker}: {exc!r}); treating as no rows")
+        rows = []
     shown, dropped = select_items(rows, new_files, root, min_score=min_score, limit=limit)
     open_count = sum(1 for r in rows if r.get("status_canonical") == "Evaluated")
 
@@ -458,7 +481,8 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
     outcome = (run_outcome or "").strip().lower()
     digest = Digest(
         date=date, min_score=float(min_score), limit=int(limit),
-        evaluated=len(new_files), qualifying=len(shown) + len(dropped),
+        evaluated=len(new_files), evaluated_known=manifest_files is not None,
+        qualifying=len(shown) + len(dropped),
         open=open_count, run_url=run_url or "", run_outcome=outcome,
         failed=bool(outcome) and outcome != "success",
         duration_min=duration, monthly_estimate=monthly,
@@ -472,7 +496,7 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
     for item in shown:
         _log(f"  {item.title}")
     if dropped:
-        _log(f"{len(dropped)} more at ≥ {min_score:g} not shown (limit {limit}): "
+        _log(f"{len(dropped)} more at ≥ {min_score:.1f} not shown (limit {limit}): "
              + "; ".join(f"{d.company} — {d.role} ({d.score:.1f})" for d in dropped))
     return digest
 
@@ -651,7 +675,7 @@ def send_email(digest: Digest, settings: dict, *, smtp_cls=None) -> bool:
     msg = EmailMessage()
     n = len(digest.items)
     subject = (f"Run failed — job digest {digest.date}" if digest.failed
-               else f"Job digest {digest.date}: {n} role{'s' if n != 1 else ''} at ≥ {digest.min_score:g}")
+               else f"Job digest {digest.date}: {n} role{'s' if n != 1 else ''} at ≥ {digest.min_score:.1f}")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = to
@@ -763,5 +787,12 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     line_buffer_stdout()
-
+    # `.env` is loaded HERE and not in main(): tests call main() after
+    # tests/conftest.py has cleared every DIGEST_* name, and load_dotenv
+    # (override=False) would put a developer's real webhook straight back —
+    # the exact hazard the isolation exists for. The cloud step has no .env,
+    # so this is only the local `python -m pipeline.daily_digest` path that
+    # .env.example documents.
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     raise SystemExit(main())

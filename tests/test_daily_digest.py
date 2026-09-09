@@ -13,6 +13,7 @@ import email.policy
 import io
 import json
 import re
+import subprocess
 import sys
 import urllib.error
 from datetime import datetime, timezone
@@ -112,15 +113,33 @@ def _build(root, manifest, **kw):
 
 # ── Import shape ─────────────────────────────────────────────────────────────
 
-def test_importable_without_ui_deps(monkeypatch):
+def test_importable_without_ui_deps():
     """Not a leaf, but it must import wherever pipeline.app.data does — the
-    UI-free venv the daily runs in has no fastapi and no markdown."""
-    monkeypatch.setitem(sys.modules, "fastapi", None)
-    monkeypatch.setitem(sys.modules, "markdown", None)
-    monkeypatch.delitem(sys.modules, "pipeline.daily_digest", raising=False)
-    import importlib
-    mod = importlib.import_module("pipeline.daily_digest")
-    assert mod.SECRET_VARS and mod.SETTING_VARS and mod.DELTA == "reports"
+    UI-free venv the daily runs in has no fastapi and no markdown. A fresh
+    interpreter, because conftest has already imported pipeline.app.data,
+    server and onboard into THIS one: blocking the two names here and
+    re-importing only the digest would let a fastapi import added to data.py,
+    or a `from pipeline.app import onboard` (→ batch_evaluate → provider
+    SDKs), pass while the cloud step (requirements.txt only) broke."""
+    probe = ("import sys; sys.modules['fastapi'] = None; sys.modules['markdown'] = None; "
+             "import pipeline.daily_digest as m; "
+             "assert m.SECRET_VARS and m.SETTING_VARS and m.DELTA == 'reports'")
+    res = subprocess.run([sys.executable, "-c", probe], cwd=ROOT,
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+
+
+def test_dotenv_is_loaded_only_by_the_main_block():
+    """`.env.example` says a local `python -m pipeline.daily_digest` reads the
+    names from `.env`, so the __main__ block loads it — and ONLY there: main()
+    is what the tests call after conftest cleared every DIGEST_* name, and
+    load_dotenv (override=False) would put a developer's real webhook back
+    for `test_no_secrets_is_a_no_op_that_exits_zero` to post to."""
+    src = (ROOT / "pipeline" / "daily_digest.py").read_text(encoding="utf-8")
+    head, _, tail = src.partition('if __name__ == "__main__":')
+    assert tail, "no __main__ block"
+    assert "load_dotenv" not in head
+    assert re.search(r"load_dotenv\(.*\.env", tail), tail
 
 
 def test_no_third_party_imports_of_its_own():
@@ -180,7 +199,7 @@ class TestSelection:
         assert [i.company for i in d.dropped] == ["Globex"]
         assert d.qualifying == 2
         out = capsys.readouterr().out
-        assert "1 more at ≥ 4 not shown (limit 1): Globex — Platform Engineer (4.2)" in out
+        assert "1 more at ≥ 4.0 not shown (limit 1): Globex — Platform Engineer (4.2)" in out
 
     def test_sorted_by_score_then_company(self, world):
         root, manifest = world
@@ -226,7 +245,8 @@ class TestManifest:
     def test_missing_manifest_means_no_new_reports_not_a_crash(self, world, capsys):
         root, _ = world
         d = _build(root, root / "nope.json")
-        assert d.items == [] and d.evaluated == 0
+        assert d.items == [] and d.evaluated == 0 and d.evaluated_known is False
+        assert d.health.startswith("? (manifest unreadable) evaluated this run")
         assert "[digest] run_artifact: no manifest" in capsys.readouterr().out
         assert d.should_send      # the heartbeat still goes out
 
@@ -236,8 +256,17 @@ class TestManifest:
         run_artifact._main(["snapshot", "--root", str(root), "--manifest", str(other),
                             "--delta", "batch"])
         d = _build(root, other)
-        assert d.evaluated == 0
+        assert d.evaluated == 0 and d.evaluated_known is False
         assert "same --root and --delta" in capsys.readouterr().out
+
+    def test_a_truncated_manifest_is_no_new_reports_not_a_crash(self, world, capsys):
+        """`_read_manifest` raises SystemExit for the cases it recognises and
+        lets `json.loads` raise for the rest; both must reach the senders."""
+        root, manifest = world
+        manifest.write_text(manifest.read_text(encoding="utf-8")[:40], encoding="utf-8")
+        d = _build(root, manifest)
+        assert d.items == [] and d.evaluated_known is False and d.should_send
+        assert "[digest] manifest unreadable" in capsys.readouterr().out
 
 
 # ── Verdict cleaning + Machine Summary ───────────────────────────────────────
@@ -278,6 +307,17 @@ class TestVerdict:
     def test_no_block_is_empty(self):
         assert dd.parse_machine_summary("# nothing here") == {}
 
+    def test_prose_between_heading_and_fence_is_skipped(self):
+        """A model that adds a sentence under the heading is drift, not a
+        different shape; reading it as "no summary" would fail OPEN — a Skip
+        above min_score would be digested."""
+        text = ("## Machine Summary\n\nHere is the structured summary.\n\n"
+                "```yaml\nfinal_decision: Skip\nhard_stops: [\"On-site\"]\n```\n")
+        assert dd.parse_machine_summary(text) == {"final_decision": "Skip",
+                                                  "hard_stops": ["On-site"]}
+        # But a later fence is not this block's: nothing between them is YAML.
+        assert dd.parse_machine_summary("## Machine Summary\n\nno fence at all\n") == {}
+
 
 # ── Content + health ─────────────────────────────────────────────────────────
 
@@ -285,7 +325,7 @@ class TestContent:
     def test_health_line(self, world):
         root, manifest = world
         d = _build(root, manifest, run_url="https://gh/run/1")
-        assert d.health == "3 evaluated this run · 2 at ≥ 4 · 5 open in your queue"
+        assert d.health == "3 evaluated this run · 2 at ≥ 4.0 · 5 open in your queue"
         assert "https://gh/run/1" in d.content()
         assert dd.DEFAULT_NEXT_STEP in d.content()
 
@@ -320,7 +360,7 @@ class TestContent:
         d = _build(root, manifest, min_score=5.0)
         assert d.items == []
         assert d.should_send                  # DIGEST_ALWAYS defaults on
-        assert d.content().startswith("nothing at ≥ 5 today; 3 evaluated")
+        assert d.content().startswith("nothing at ≥ 5.0 today; 3 evaluated")
         assert not _build(root, manifest, min_score=5.0, always=False).should_send
 
     def test_next_step_override_and_mention_scrub(self, world):
@@ -384,7 +424,7 @@ def _item(n, score=4.6, url="https://x/%d", title_len=20, desc_len=100):
 
 def _digest(items, **kw):
     d = dd.Digest(date="2026-09-09", min_score=4.0, limit=10, evaluated=len(items),
-                  qualifying=len(items), open=3, run_url="https://gh/run/1", run_outcome="success",
+                  evaluated_known=True, qualifying=len(items), open=3, run_url="https://gh/run/1", run_outcome="success",
                   failed=False, duration_min=None, monthly_estimate=None, items=items)
     for k, v in kw.items():
         setattr(d, k, v)
@@ -471,7 +511,7 @@ class TestDiscord:
         calls = []
         dd.send_discord(_digest([]), "https://discord.test/hook", urlopen=_fake_urlopen(calls))
         payload, _ = _payload(calls[0][0])
-        assert payload["embeds"] == [] and payload["content"].startswith("nothing at ≥ 4 today")
+        assert payload["embeds"] == [] and payload["content"].startswith("nothing at ≥ 4.0 today")
 
 
 # ── Email ────────────────────────────────────────────────────────────────────
@@ -518,7 +558,7 @@ class TestEmail:
         assert s.calls == ["ehlo", "starttls", "ehlo", ("login", "me@gmail.com", "app-pass"), "send"]
         msg = s.msg
         assert msg["To"] == "me@example.com" and msg["From"] == "me@gmail.com"
-        assert msg["Subject"] == "Job digest 2026-09-09: 1 role at ≥ 4"
+        assert msg["Subject"] == "Job digest 2026-09-09: 1 role at ≥ 4.0"
         types = [p.get_content_type() for p in msg.walk()]
         assert "multipart/alternative" in types and "text/plain" in types and "text/html" in types
         attachments = [p for p in msg.walk() if p.get_filename()]
@@ -616,11 +656,34 @@ class TestMain:
         payload, _ = _payload(calls[0][0])
         assert payload["content"].startswith("Today's run failed — open")
 
-    def test_exit_zero_on_a_corrupt_tracker(self, world, capsys):
+    def test_exit_zero_on_a_corrupt_tracker(self, world, monkeypatch, capsys):
+        """A tracker the run left half-written is the case where the run
+        failed and the notice matters most — exiting 0 is not enough, the
+        failure line must still go out."""
         root, manifest = world
         (root / "data" / "applications.md").write_bytes(b"\xff\xfe| garbage |\n| more |")
+        monkeypatch.setenv("RUN_OUTCOME", "failure")
+        monkeypatch.setenv("DIGEST_DISCORD_WEBHOOK", "https://discord.test/hook")
+        calls = []
+        monkeypatch.setattr(dd.urllib.request, "urlopen", _fake_urlopen(calls))
         assert dd.main(["--root", str(root), "--manifest", str(manifest)]) == 0
-        assert "[digest]" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "[digest] tracker unreadable" in out
+        assert len(calls) == 1
+        payload, _ = _payload(calls[0][0])
+        assert payload["content"].startswith("Today's run failed — open")
+
+    def test_exit_zero_on_a_corrupt_manifest_and_the_notice_still_goes(self, world, monkeypatch):
+        root, manifest = world
+        manifest.write_text("{not json", encoding="utf-8")
+        monkeypatch.setenv("RUN_OUTCOME", "failure")
+        monkeypatch.setenv("DIGEST_DISCORD_WEBHOOK", "https://discord.test/hook")
+        calls = []
+        monkeypatch.setattr(dd.urllib.request, "urlopen", _fake_urlopen(calls))
+        assert dd.main(["--root", str(root), "--manifest", str(manifest)]) == 0
+        payload, _ = _payload(calls[0][0])
+        assert payload["content"].startswith("Today's run failed — open")
+        assert "? (manifest unreadable) evaluated this run" in payload["content"]
 
     def test_exit_zero_on_a_missing_manifest(self, world):
         root, _ = world
@@ -681,6 +744,10 @@ def test_conftest_isolates_every_name_the_module_reads():
     read |= set(re.findall(r'_env_bool\("([A-Z_]+)"', src))
     known = set(dd.SECRET_VARS) | set(dd.SETTING_VARS) | set(dd.RUN_VARS)
     assert read <= known, read - known
+    # The three shapes above are the only ones the scan sees, so they are the
+    # only ones allowed: an `os.environ["X"]` or `os.getenv("X")` would be
+    # invisible to it, and a guard with a blind spot is not a guard.
+    assert not re.search(r"os\.getenv\(|os\.environ\[", src)
     conftest = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
     for const in ("SECRET_VARS", "SETTING_VARS", "RUN_VARS"):
         assert f"daily_digest.{const}" in conftest

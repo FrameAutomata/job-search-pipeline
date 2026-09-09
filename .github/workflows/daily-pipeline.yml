@@ -121,10 +121,19 @@ jobs:
     runs-on: ubuntu-latest
     # A hung LinkedIn scrape or a stalled provider would otherwise run to
     # GitHub's 360-minute default, and one such day is 18% of the account's
-    # 2,000 free minutes a month. A real run takes 30–60 minutes; the digest
-    # step below reports what this run cost against that budget.
-    # tests/test_workflow_env.py keeps this at or under 120.
-    timeout-minutes: 90
+    # 2,000 free minutes a month. The value sits ABOVE the real run length,
+    # not at the budget: on Gemini's free tier the recommended row is 16,000
+    # TPM at ~9,500 tokens a call ≈ 1.7 evaluations a minute, so the 160–190
+    # roles a real copy evaluates take ~95–115 minutes of evaluation alone,
+    # before checkout, pip, scrape, screen and the liveness re-check. A cancel
+    # here costs more than a slow day: the batch's interrupt handler saves its
+    # state and exits BEFORE the merge, tracker-additions is not cached, and
+    # the always() cache save then stores the reports beside a state that
+    # marks their jobs done — the day's evaluations never reach
+    # applications.md, the UI or the digest. The budget guard is the digest's
+    # health line ("≈ N min/month of 2,000"), not this clock.
+    # tests/test_workflow_env.py keeps this at or under 180.
+    timeout-minutes: 150
 
     steps:
       # First, before anything is checked out or installed: the digest step at

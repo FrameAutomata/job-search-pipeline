@@ -36,10 +36,16 @@ from tests.test_workflow_artifacts import (
 
 JOB = "scrape-and-evaluate"
 
-# The daily's job may not exceed this. A real run is 30–60 minutes; the value
-# in the workflow (90) leaves room for a slow provider without letting a hang
-# cost a week of the budget. Raising it is a decision about minutes.
-DAILY_TIMEOUT_CEILING = 120
+# The daily's job may not exceed this. The workflow's value (150) sits above
+# the real run length rather than at the budget: on Gemini's free tier the
+# recommended row (16,000 TPM, ~9,500 tokens a call) paces 160–190 evaluations
+# to ~95–115 minutes on their own, and a timeout cancel does not delay those
+# evaluations, it loses them — the batch exits before the merge and
+# tracker-additions is not cached (see the comment on the job). The budget is
+# guarded by the digest's health line, not this clock. Raising the ceiling is
+# a decision about minutes; lowering it below a real run is a decision to
+# throw evaluations away.
+DAILY_TIMEOUT_CEILING = 180
 
 
 def _job_steps():
