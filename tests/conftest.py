@@ -265,10 +265,16 @@ def _isolate_provider_env(monkeypatch):
     # developer's `.env` naming claude would flip every default-CLI assertion.
     # XDG_CONFIG_HOME: the registry reads it (through the process env) to
     # place OpenCode's config, and the prereq note renders that path.
+    # The digest's delivery secrets, settings and run facts derive from its
+    # own constants for the same reason: a webhook URL in a developer's .env
+    # would otherwise make a test post to a real Discord channel.
+    from pipeline import daily_digest
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "COVER_MODEL",
                 "TAILOR_PROVIDER", "TAILOR_MODEL", BATCH_CLI_ENV, XDG_CONFIG_HOME_ENV,
                 *_PROVIDER_KEYS.values(),
-                "OLLAMA_BASE_URL"):
+                "OLLAMA_BASE_URL",
+                *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS,
+                *daily_digest.RUN_VARS):
         monkeypatch.delenv(var, raising=False)
 
 

@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from pipeline.batch_evaluate import _PROVIDER_KEYS
+from pipeline.daily_digest import SECRET_VARS as _DIGEST_SECRET_VARS
 # Borrowed from handoff, which reads the same career-ops/config/profile.yml for
 # the browser agent's standing answers: how to tolerate a half-written file
 # (_load_yaml_or_empty), how to read a sub-section (_dsect), and what a yes/no in
@@ -49,6 +50,11 @@ _REMOTE_RE = re.compile(r"\bremote\b", re.I)
 # reaches the wizard (this used to be a hand-copy that had to be edited in
 # lockstep — the DeepSeek addition proved the drift risk).
 PROVIDER_SECRETS = dict(_PROVIDER_KEYS)
+
+# The daily digest's delivery secrets (Discord webhook, SMTP), by the same rule:
+# the names are the digest module's own, so the wizard's status check and the
+# workflow's env cannot drift from what the sender reads.
+DIGEST_SECRET_NAMES = tuple(_DIGEST_SECRET_VARS)
 
 # Generated file -> secret name. The first four are required by the workflow;
 # PROFILE_MD_B64 is optional but always generated, so we include it.

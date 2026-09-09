@@ -58,8 +58,14 @@ def client(tmp_path, monkeypatch):
     # Key vars derive from the provider table so a new provider can't slip past
     # a hand-copied list (the DeepSeek addition did exactly that — review bug).
     from pipeline.batch_evaluate import _PROVIDER_KEYS
+    # The digest's delivery secrets too: the reload above re-ran load_dotenv,
+    # so a developer's real DIGEST_DISCORD_WEBHOOK is back in the env here
+    # even though conftest cleared it — and a server route that reads it
+    # would post to a real channel from a test.
+    from pipeline import daily_digest
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "BATCH_CLI", "SKILL_PATH_DEFAULT",
-                *_PROVIDER_KEYS.values()):
+                *_PROVIDER_KEYS.values(),
+                *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS):
         monkeypatch.delenv(var, raising=False)
     # status-overrides is isolated by the autouse _isolate_status_overrides
     # conftest fixture; isolate the pushed-overrides + cache paths here so no

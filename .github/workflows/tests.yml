@@ -8,6 +8,9 @@ jobs:
   test:
     name: "py${{ matrix.python-version }} / ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
+    # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
+    # the account's 2,000 free Actions minutes a month.
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false
