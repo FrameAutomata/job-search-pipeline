@@ -5,6 +5,8 @@
 LLM build/tailor loop that drives them to the 92–96% target is 3c. docx→PDF reuses
 resume_tailor.render_pdf/page_count.
 """
+from pathlib import Path
+
 import pytest
 
 from pipeline import resume_build, resume_fit, resume_render
@@ -261,6 +263,76 @@ class TestFitToPage:
         self._skip_if_no_soffice()
         r = resume_build.fit_to_page(_CONTENT, tmp_path)
         assert r.pdf.exists() and r.fit.pages == 1 and 0.9 <= r.scale <= 1.35
+        # And the real toolchain end to end leaves nothing else: every non-chosen
+        # render and every docx is gone when fit_to_page returns (#164). The
+        # fake-toolchain class below pins the same rule without LibreOffice.
+        assert [p.name for p in tmp_path.iterdir()] == [r.pdf.name]
+
+
+class TestFitScratchFiles:
+    """The search renders up to `steps`+2 docx/PDF pairs to find the scale, and
+    exactly one is the answer. They used to be written straight into out_dir —
+    career-ops/output/, the folder the UI serves résumés from — and only the
+    chosen PDF was ever moved out, so every rebuild left ~13 scratch files
+    beside the product, some of them two pages long under near-identical names
+    (#164). docx→PDF and the page measurement are faked here so the file
+    accounting is testable without LibreOffice."""
+
+    def _fake_toolchain(self, monkeypatch):
+        from pipeline import resume_tailor
+        calls = []
+
+        def fake_render_pdf(docx, out_dir):
+            pdf = Path(out_dir) / (Path(docx).stem + ".pdf")
+            pdf.write_bytes(b"%PDF fake " + Path(docx).stem.encode())
+            return pdf
+
+        def fake_measure(pdf):
+            calls.append(Path(pdf))
+            # The first render (the `hi` probe) spills, every later one fits —
+            # so the search bisects through all `steps` and renders the maximum
+            # number of candidates.
+            pages = 2 if len(calls) == 1 else 1
+            return resume_fit.Measurement(pages, 0.9, 0.5)
+
+        monkeypatch.setattr(resume_tailor, "render_pdf", fake_render_pdf)
+        monkeypatch.setattr(resume_fit, "measure", fake_measure)
+        return calls
+
+    def test_only_the_chosen_pdf_survives(self, tmp_path, monkeypatch):
+        calls = self._fake_toolchain(monkeypatch)
+        r = resume_build.fit_to_page(_CONTENT, tmp_path, steps=6)
+        assert len(calls) == 8                                   # hi, lo, and 6 bisections
+        assert r.pdf.exists() and r.pdf.parent == tmp_path
+        assert [p.name for p in tmp_path.iterdir()] == [r.pdf.name]   # no docx, no scratch dir
+
+    def test_chosen_pdf_does_not_sort_beside_the_product(self, tmp_path, monkeypatch):
+        # Dot-prefixed: a human picking a file from career-ops/output/ sees the
+        # products, and the UI's directory listing skips it.
+        self._fake_toolchain(monkeypatch)
+        r = resume_build.fit_to_page(_CONTENT, tmp_path)
+        assert r.pdf.name.startswith(".") and r.pdf.suffix == ".pdf"
+
+    def test_scratch_is_removed_even_when_a_render_fails(self, tmp_path, monkeypatch):
+        from pipeline import resume_tailor
+        monkeypatch.setattr(resume_tailor, "render_pdf", lambda docx, out_dir: None)
+        with pytest.raises(RuntimeError):
+            resume_build.fit_to_page(_CONTENT, tmp_path)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_two_fits_in_one_dir_keep_their_own_pdf(self, tmp_path, monkeypatch):
+        self._fake_toolchain(monkeypatch)
+        a = resume_build.fit_to_page(_CONTENT, tmp_path)
+        b = resume_build.fit_to_page({**_CONTENT, "name": "Someone Else"}, tmp_path)
+        assert a.pdf != b.pdf and a.pdf.exists() and b.pdf.exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == sorted([a.pdf.name, b.pdf.name])
+
+    def test_discard_removes_the_pdf_and_tolerates_a_second_call(self, tmp_path, monkeypatch):
+        self._fake_toolchain(monkeypatch)
+        r = resume_build.fit_to_page(_CONTENT, tmp_path)
+        r.discard()
+        assert list(tmp_path.iterdir()) == []
+        r.discard()                                              # already gone: not an error
 
 
 class TestRenderToPdfIntegration:

@@ -4,6 +4,7 @@ resume_content turns PROFILE.md + a JD into a GROUNDED content-JSON for the 3b
 renderer/fit. The LLM is injected as a fake caller so these run with no provider;
 fit_to_page is patched so they need no LibreOffice.
 """
+import itertools
 import json
 from pathlib import Path
 
@@ -120,13 +121,18 @@ class TestCorrectiveTrim:
     build_for_job retries the LLM with 'trim' feedback instead of giving up — so a
     too-long tailoring is trimmed to fit rather than dropped for the default."""
 
-    def _fit_by_name(self, name_to_pages, pdf):
+    def _fit_by_name(self, name_to_pages):
         # fit_to_page stub keyed on content['name'] so a test can make the first
-        # render overflow and the corrected one fit.
+        # render overflow and the corrected one fit. Each fake fit writes a real
+        # file into out_dir, as fit_to_page does, so the file accounting is real.
         from pipeline import resume_build, resume_fit
+        n = itertools.count()
 
         def fake(content, out_dir, **kw):
-            pages = name_to_pages.get(content.get("name"), 1)
+            name = content.get("name")
+            pages = name_to_pages.get(name, 1)
+            pdf = Path(out_dir) / f".fit-{name}-{next(n)}.pdf"
+            pdf.write_bytes(b"%PDF")
             fit = resume_fit.FitResult(ok=(pages == 1), code=(0 if pages == 1 else 3),
                                        verdict=("OK" if pages == 1 else "OVERFULL"),
                                        fill=0.95, pages=pages, notes=[])
@@ -144,7 +150,7 @@ class TestCorrectiveTrim:
 
     def test_trim_round_recovers_from_overflow(self, tmp_path, monkeypatch):
         monkeypatch.setattr("pipeline.resume_build.fit_to_page",
-                            self._fit_by_name({"Big": 2, "Trimmed": 1}, tmp_path / "r.pdf"))
+                            self._fit_by_name({"Big": 2, "Trimmed": 1}))
         caller = self._caller(["Big", "Trimmed"])
         r = resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=caller, trim_rounds=1)
         assert r.fit.pages == 1 and len(caller.seen) == 2            # one corrective round fixed it
@@ -152,7 +158,7 @@ class TestCorrectiveTrim:
 
     def test_no_trim_when_first_render_fits(self, tmp_path, monkeypatch):
         monkeypatch.setattr("pipeline.resume_build.fit_to_page",
-                            self._fit_by_name({"Fits": 1}, tmp_path / "r.pdf"))
+                            self._fit_by_name({"Fits": 1}))
         caller = self._caller(["Fits"])
         r = resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=caller)
         assert r.fit.pages == 1 and len(caller.seen) == 1           # no wasted corrective call
@@ -161,10 +167,20 @@ class TestCorrectiveTrim:
         # Still overflowing after the budget → return the last result; generate_for_job's
         # overflow guard then falls back to the default résumé.
         monkeypatch.setattr("pipeline.resume_build.fit_to_page",
-                            self._fit_by_name({"Big": 2}, tmp_path / "r.pdf"))
+                            self._fit_by_name({"Big": 2}))
         caller = self._caller(["Big"])
         r = resume_content.build_for_job(_PROFILE, _JD, tmp_path, caller=caller, trim_rounds=1)
         assert r.fit.pages == 2 and len(caller.seen) == 2           # 1 initial + 1 trim
+
+    def test_overflowing_render_is_discarded_before_the_trim_round(self, tmp_path, monkeypatch):
+        """The two-page render that triggered the trim is not the answer, so it
+        must not be left in out_dir beside the one that fits (#164)."""
+        monkeypatch.setattr("pipeline.resume_build.fit_to_page",
+                            self._fit_by_name({"Big": 2, "Trimmed": 1}))
+        r = resume_content.build_for_job(_PROFILE, _JD, tmp_path,
+                                         caller=self._caller(["Big", "Trimmed"]), trim_rounds=1)
+        assert r.fit.pages == 1 and r.pdf.exists()
+        assert [p.name for p in tmp_path.iterdir()] == [r.pdf.name]   # the overflow is gone
 
 
 class TestGenerateForJob:
@@ -217,6 +233,24 @@ class TestGenerateForJob:
         _, pdf_out = resume_tailor.resume_paths(co, "Acme")
         assert resume_content.generate_for_job(co, self._job(), profile_dir=pd) is None
         assert not pdf_out.exists()                           # a 2-page résumé is never cached
+        assert not winner.exists()                            # …and the rejected render is removed (#164)
+
+    def test_output_dir_holds_exactly_the_product_and_its_role_marker(self, tmp_path, monkeypatch):
+        """After a build, career-ops/output/ holds the product PDF and its .role
+        sidecar and nothing else — the fit's scratch renders used to pile up
+        there, ~13 per résumé (#164). The fake build writes its result INTO
+        out_dir, as fit_to_page does, so the accounting is real."""
+        from pipeline import resume_build
+        co, pd = self._dirs(tmp_path)
+
+        def fake_build(profile_md, jd, out_dir, **kw):
+            pdf = Path(out_dir) / ".fit-abc123-xyz.pdf"
+            pdf.write_bytes(b"%PDF built")
+            return resume_build.BuildResult(pdf=pdf, scale=1.1, fit=None)
+        monkeypatch.setattr(resume_content, "build_for_job", fake_build)
+        out = Path(resume_content.generate_for_job(co, self._job(), profile_dir=pd,
+                                                   caller=lambda s, u: ""))
+        assert sorted(p.name for p in out.parent.iterdir()) == sorted([out.name, out.name + ".role"])
 
     def test_reuses_cached_pdf_newer_than_profile_and_role(self, tmp_path, monkeypatch):
         from pipeline import resume_tailor

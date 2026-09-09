@@ -109,8 +109,8 @@ def build_for_job(profile_md: str, jd: str, out_dir, *, report: str = "",
         caller = _resolve_caller(provider, model)
     from pipeline.batch_evaluate import _call_with_retry
 
-    feedback, result = "", None
-    for _ in range(trim_rounds + 1):
+    feedback = ""
+    for round_no in range(trim_rounds + 1):
         try:
             raw = _call_with_retry(caller, system, user + feedback,
                                    max_attempts=max_attempts, base_delay=base_delay)
@@ -123,10 +123,15 @@ def build_for_job(profile_md: str, jd: str, out_dir, *, report: str = "",
             print(f"[build] model output wasn't usable JSON ({e}) — using default")
             return None
         result = resume_build.fit_to_page(content, out_dir)
-        if result.fit.pages == 1:
-            return result                     # fits one page (the scale handled the fill)
-        feedback = _TRIM_FEEDBACK             # overflowed even at min scale → trim and retry
-    return result                             # still overflowing; the caller's guard falls back
+        if result.fit.pages == 1 or round_no == trim_rounds:
+            # Fits one page (the scale handled the fill) — or still overflowing
+            # with the trim budget spent, in which case the caller's guard
+            # falls back. Either way the result handed back owns a live file.
+            return result
+        # Overflowed even at min scale → trim and retry. The overflowing render
+        # is not the answer, so it must not be left in out_dir (#164).
+        result.discard()
+        feedback = _TRIM_FEEDBACK
 
 
 def generate_for_job(career_ops, job, *, profile_dir, caller=None,
@@ -175,11 +180,13 @@ def generate_for_job(career_ops, job, *, profile_dir, caller=None,
     if result is None:
         return None
     if result.fit is not None and result.fit.pages > 1:
-        # Overflowed one page even at the smallest scale — a 2-page résumé is worse
-        # than the default. Fall back for now; 3c-3 adds a corrective trim round.
+        # Overflowed one page even after the trim round — a 2-page résumé is
+        # worse than the default. Fall back, and remove the render: left in
+        # career-ops/output/ it sits beside the one-page products under a
+        # near-identical name, the wrong file for a human to pick (#164).
         print(f"[build] {job.company}: built résumé spills to {result.fit.pages} pages — using default")
+        result.discard()
         return None
-    pdf_out.parent.mkdir(parents=True, exist_ok=True)
     os.replace(result.pdf, pdf_out)         # atomic: never leaves a truncated cache
     role_marker.write_text(role, encoding="utf-8")
     return pdf_out

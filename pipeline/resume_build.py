@@ -10,8 +10,8 @@ this decides how big to render it. docx→PDF is resume_tailor's job.
 """
 from __future__ import annotations
 
-import hashlib
-import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +23,13 @@ class BuildResult:
     pdf: Path
     scale: float
     fit: resume_fit.FitResult
+
+    def discard(self) -> None:
+        """Remove the rendered PDF — for a result the caller has REJECTED (an
+        overflow the trim loop retries, or one generate_for_job's two-page guard
+        turns down). A result the caller accepts is consumed by `os.replace`
+        into its final name instead, so either way nothing is left behind."""
+        self.pdf.unlink(missing_ok=True)
 
 
 def _search_scale(measure_at, *, lo: float = 0.9, hi: float = 1.35, steps: int = 6,
@@ -51,24 +58,42 @@ def _search_scale(measure_at, *, lo: float = 0.9, hi: float = 1.35, steps: int =
 def fit_to_page(content: dict, out_dir, *, lo: float = 0.9, hi: float = 1.35,
                 steps: int = 6) -> BuildResult:
     """Render `content` at the fitted scale and return the chosen PDF + scale +
-    FitResult. Requires LibreOffice (resume_tailor.render_pdf)."""
+    FitResult. Requires LibreOffice (resume_tailor.render_pdf).
+
+    The search renders up to `steps`+2 docx/PDF pairs and exactly one of them
+    is the answer. They go into a private scratch directory that is removed
+    before this returns, whichever scale won: `out_dir` is career-ops/output/,
+    the folder the UI serves résumés out of, and the non-chosen renders — some
+    of them two pages long — used to be left there beside the product under
+    near-identical names, ~13 files per résumé and a fresh set on every rebuild
+    (#164). The scratch dir lives UNDER out_dir so the caller's `os.replace` of
+    the chosen PDF into place stays a same-filesystem rename, i.e. atomic.
+
+    What survives is the one chosen PDF, under a dot-prefixed name that neither
+    sorts beside the product nor is served as one, and it is the caller's to
+    consume (`os.replace`) or `discard()`."""
     out_dir = Path(out_dir)
-    # A content-derived prefix keeps fits of DIFFERENT résumés in the same out_dir
-    # from colliding on the same rounded-scale filename (and overwriting a prior
-    # BuildResult's PDF).
-    tag = hashlib.sha1(json.dumps(content, sort_keys=True, default=str).encode()).hexdigest()[:10]
-    cache: dict[float, tuple[Path, resume_fit.Measurement]] = {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # A fresh scratch dir per call (mkdtemp's unique name), so two fits in the
+    # same out_dir — a parallel build, or two résumés — can never consume or
+    # discard the other's PDF.
+    with tempfile.TemporaryDirectory(prefix=".fit-", dir=out_dir,
+                                     ignore_cleanup_errors=True) as td:
+        scratch = Path(td)
+        cache: dict[float, tuple[Path, resume_fit.Measurement]] = {}
 
-    def measure_at(scale: float) -> resume_fit.Measurement:
-        key = round(scale, 4)
-        if key not in cache:
-            docx = resume_render.render_docx(content, out_dir / f"_fit_{tag}_{key}.docx", scale=scale)
-            pdf = resume_tailor.render_pdf(docx, out_dir)
-            if pdf is None:
-                raise RuntimeError("LibreOffice (soffice) is required to fit a résumé to one page")
-            cache[key] = (pdf, resume_fit.measure(pdf))
-        return cache[key][1]
+        def measure_at(scale: float) -> resume_fit.Measurement:
+            key = round(scale, 4)
+            if key not in cache:
+                docx = resume_render.render_docx(content, scratch / f"{key}.docx", scale=scale)
+                pdf = resume_tailor.render_pdf(docx, scratch)
+                if pdf is None:
+                    raise RuntimeError("LibreOffice (soffice) is required to fit a résumé to one page")
+                cache[key] = (pdf, resume_fit.measure(pdf))
+            return cache[key][1]
 
-    scale = _search_scale(measure_at, lo=lo, hi=hi, steps=steps)
-    pdf, m = cache[round(scale, 4)]
-    return BuildResult(pdf=pdf, scale=scale, fit=resume_fit.result_from(m, content))
+        scale = _search_scale(measure_at, lo=lo, hi=hi, steps=steps)
+        pdf, m = cache[round(scale, 4)]
+        chosen = out_dir / f"{scratch.name}.pdf"
+        os.replace(pdf, chosen)
+    return BuildResult(pdf=chosen, scale=scale, fit=resume_fit.result_from(m, content))
