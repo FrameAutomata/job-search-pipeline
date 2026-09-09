@@ -501,3 +501,46 @@ def test_same_origin_post_allowed(client):
 def test_get_unaffected_by_origin(client):
     r = client.get("/api/jobs", headers={"Origin": "http://evil.example"})
     assert r.status_code == 200
+
+
+# The same three questions again with UI_LAN on. The guard is one middleware
+# with two modes, and the mode is read per request, so the loopback-only rules
+# above are only half the contract — the other half is that turning LAN mode on
+# does not quietly widen them. `testserver` is the Host TestClient sends; the
+# default peer address is not an IP at all, which the peer rule reads as remote,
+# so these use /api/status — one of the two routes the LAN view may change.
+
+_LAN_PW = "a-long-passphrase"
+
+
+@pytest.fixture
+def lan_env(monkeypatch):
+    from pipeline.app import server
+    monkeypatch.setenv(server.UI_LAN_ENV, "1")
+    monkeypatch.setenv(server.UI_PASSWORD_ENV, _LAN_PW)
+    monkeypatch.setenv(server.UI_ALLOWED_HOSTS_ENV, "testserver")
+    import base64
+    return {"Authorization": "Basic " + base64.b64encode(
+        f"me:{_LAN_PW}".encode()).decode()}
+
+
+def test_lan_still_refuses_a_foreign_origin(client, lan_env):
+    r = client.post("/api/status", json={"num": "1", "status": "Applied"},
+                    headers={**lan_env, "Origin": "http://evil.example"})
+    assert r.status_code == 403
+
+
+def test_lan_accepts_the_loopback_origin(client, lan_env):
+    """Loopback never stops working: the same machine's browser is how the UI
+    is used even while it is also served to the network."""
+    r = client.post("/api/status", json={"num": "1", "status": "Applied"},
+                    headers={**lan_env, "Origin": "http://localhost:8000",
+                             "Host": "localhost:8000"})
+    assert r.status_code == 200, r.text
+
+
+def test_lan_makes_reads_need_the_password(client, lan_env):
+    """Outside LAN mode a GET is unguarded — only this machine can send one.
+    Under LAN mode the tracker is on the network, and it is read with a GET."""
+    assert client.get("/api/jobs").status_code == 401
+    assert client.get("/api/jobs", headers=lan_env).status_code == 200

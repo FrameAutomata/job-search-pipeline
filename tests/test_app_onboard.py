@@ -14,8 +14,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from pipeline import daily_digest
 from pipeline.agent_cli import AGENT_CLIS
 from pipeline.app import onboard
+from pipeline.handoff import SUBMIT_POLICIES
 from pipeline.sites import SUPPORTED_SITES
 
 
@@ -492,6 +494,32 @@ class TestSidecar:
         # Belt-and-braces: the raw file shouldn't contain the key either.
         raw = (tmp_path / ".ui-cache" / "onboarding.json").read_text(encoding="utf-8")
         assert "secret-xyz" not in raw
+
+    def test_save_strips_every_credential_field(self, tmp_path):
+        """The webhook URL is a bearer credential — whoever holds it can post
+        into the channel — and the SMTP password is a password. Both go to
+        GitHub Secrets; neither may sit in a plain-text sidecar. The address,
+        host, port and user are configuration and DO come back, so a revisit
+        doesn't make the user retype the whole block."""
+        onboard.save_sidecar(tmp_path, {
+            "name": "Jane",
+            "api_key": "secret-xyz",
+            "digest_discord_webhook": "https://discord.com/api/webhooks/1/tok-abc",
+            "digest_smtp_pass": "app-pass-def",
+            "digest_email_to": "jane@example.com",
+            "digest_smtp_host": "smtp.example.com",
+            "digest_smtp_port": "587",
+            "digest_smtp_user": "jane@example.com",
+        })
+        loaded = onboard.load_sidecar(tmp_path)
+        for field in onboard.SECRET_FORM_FIELDS:
+            assert field not in loaded, field
+        assert loaded["digest_email_to"] == "jane@example.com"
+        assert loaded["digest_smtp_host"] == "smtp.example.com"
+        assert loaded["digest_smtp_port"] == "587"
+        assert loaded["digest_smtp_user"] == "jane@example.com"
+        raw = (tmp_path / ".ui-cache" / "onboarding.json").read_text(encoding="utf-8")
+        assert "tok-abc" not in raw and "app-pass-def" not in raw and "secret-xyz" not in raw
 
     def test_load_returns_none_on_corrupt_file(self, tmp_path):
         # If someone hand-edits the sidecar into invalid JSON, fall back to
@@ -1113,6 +1141,56 @@ class TestOnboardHtmlAgentClis:
         assert m, "no #local-cli-select in onboard.html"
         offered = set(re.findall(r'<option\b[^>]*\bvalue="([^"]+)"', m.group(1)))
         assert offered == set(AGENT_CLIS)
+
+
+class TestOnboardHtmlSubmitPolicy:
+    """The wizard's submit-policy select restates handoff.SUBMIT_POLICIES. Only
+    the three canonical ids — `review`/`easy-apply`/`all` are accepted on READ
+    (an .env a user hand-wrote) but never offered, because the id the wizard
+    writes is the id the README and the prompts render."""
+
+    def test_policy_select_options_equal_the_policy_ids(self, html):
+        m = re.search(r'<select id="local-submit-policy">(.*?)</select>', html, re.S)
+        assert m, "no #local-submit-policy in onboard.html"
+        offered = set(re.findall(r'<option\b[^>]*\bvalue="([^"]+)"', m.group(1)))
+        assert offered == set(SUBMIT_POLICIES)
+
+
+class TestDigestFormFields:
+    """The digest's delivery secrets reach the cloud through wizard fields whose
+    names are the secret names lowercased (onboard.DIGEST_FORM_SECRETS), so the
+    form, the endpoint's write loop and pipeline/daily_digest.py's reader cannot
+    name different things. Two drift risks, one guard each."""
+
+    def test_every_digest_secret_has_a_field_in_the_markup(self, html):
+        named = set(re.findall(r'<input\b[^>]*\bname="(digest_[a-z_]+)"', html))
+        # EMAIL_FROM is deliberately not asked for: it defaults to the SMTP user,
+        # and one more box for a value that is right by default is one more box.
+        expected = {f for f in onboard.DIGEST_FORM_SECRETS} - {"digest_email_from"}
+        assert expected <= named, sorted(expected - named)
+
+    def test_the_form_names_are_the_secret_names(self):
+        assert onboard.DIGEST_FORM_SECRETS == {
+            n.lower(): n for n in daily_digest.SECRET_VARS}
+
+    def test_every_credential_field_is_stripped_from_the_sidecar(self):
+        """A field whose SECRET name reads as a credential must be in
+        SECRET_FORM_FIELDS. Not every digest secret is one — the address, host,
+        port and user are configuration and are kept so a revisit prefills them
+        — so the rule is on the name, which is what a new digest secret arrives
+        with."""
+        credential = {field for field, name in onboard.DIGEST_FORM_SECRETS.items()
+                      if re.search(r"(WEBHOOK|PASS|TOKEN|KEY|SECRET)", name)}
+        assert credential, "no digest secret reads as a credential — check the regex"
+        assert credential <= onboard.SECRET_FORM_FIELDS, sorted(
+            credential - onboard.SECRET_FORM_FIELDS)
+
+    def test_no_stripped_field_is_invented(self):
+        """The other direction: a name in SECRET_FORM_FIELDS that no form field
+        carries would strip nothing and quietly stop protecting whatever it was
+        renamed from."""
+        known = set(onboard.DIGEST_FORM_SECRETS) | {"api_key"}
+        assert onboard.SECRET_FORM_FIELDS <= known
 
 
 class TestSupportedSitesMirror:

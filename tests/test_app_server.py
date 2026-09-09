@@ -909,3 +909,530 @@ class TestStaticNoCache:
         r = client.get("/onboard")
         assert r.status_code == 200
         assert "no-cache" in r.headers.get("cache-control", "").lower()
+
+
+# ── Agent CLI: the registry reaches the wizard, and the bridge button ────────
+
+class TestAgentCliSurface:
+    """The wizard's CLI choice is pipeline/agent_cli.py's registry rendered, not
+    a second list. `name`/`available` stay because onboard.js read those first;
+    the tier fields are what let the select say "free" or "paid" and quote the
+    real cost, which is the whole point of choosing between them."""
+
+    def test_providers_payload_carries_every_registry_field(self, client):
+        from pipeline import agent_cli
+        body = client.get("/api/onboard/providers").json()
+        tools = body["cli_tools"]
+        assert [c["id"] for c in tools] == list(agent_cli.AGENT_CLIS)
+        for c in tools:
+            reg = agent_cli.AGENT_CLIS[c["id"]]
+            assert c["name"] == reg.id            # the old field, still read
+            assert c["available"] == c["installed"]
+            assert (c["label"], c["tier"]) == (reg.label, reg.tier)
+            assert c["tier_note"] == reg.tier_note
+            assert c["install_hint"] == reg.install_hint
+        assert [c["id"] for c in tools if c["default"]] == [agent_cli.DEFAULT_CLI]
+
+    def test_providers_payload_carries_the_submit_policies(self, client):
+        from pipeline import handoff
+        body = client.get("/api/onboard/providers").json()
+        policies = body["submit_policies"]
+        assert [p["id"] for p in policies] == list(handoff.SUBMIT_POLICIES)
+        assert all(p["gloss"] == handoff.SUBMIT_POLICIES[p["id"]] for p in policies)
+        assert [p["id"] for p in policies if p["default"]] == [handoff.DEFAULT_SUBMIT_POLICY]
+        # What the wizard prefills the select with, so a hand-set .env shows.
+        assert body["current"]["handoff_submit_policy"] == handoff.submit_policy()
+
+    def test_providers_payload_carries_the_free_tier_recommendation(self, client):
+        """The cloud model placeholder promises a specific model for a blank
+        box; it is computed from the limits table, so the payload has to carry
+        the same call onboard_submit writes rather than a string in the markup."""
+        from pipeline import gemini_limits
+        body = client.get("/api/onboard/providers").json()
+        assert body["free_tier_recommendation"] == (gemini_limits.batch_recommendation() or "")
+
+    def test_register_bridge_uses_the_registry(self, client, mocker):
+        from pipeline.app import server
+        reg = mocker.patch.object(server.agent_cli, "register_playwright_mcp",
+                                  return_value="Registered playwright with OpenCode.")
+        r = client.post("/api/agent-cli/register", json={"cli": "claude"})
+        assert r.status_code == 200, r.text
+        assert r.json()["cli"] == "claude"
+        assert r.json()["message"] == "Registered playwright with OpenCode."
+        assert reg.call_args[0][0] is server.agent_cli.AGENT_CLIS["claude"]
+
+    def test_register_bridge_defaults_to_the_resolved_cli(self, client, mocker):
+        from pipeline.app import server
+        mocker.patch.object(server.agent_cli, "register_playwright_mcp", return_value="ok")
+        r = client.post("/api/agent-cli/register", json={})
+        assert r.status_code == 200, r.text
+        assert r.json()["cli"] == server.agent_cli.resolve_cli().id
+
+    def test_register_bridge_rejects_an_unknown_cli(self, client, mocker):
+        from pipeline.app import server
+        reg = mocker.patch.object(server.agent_cli, "register_playwright_mcp")
+        r = client.post("/api/agent-cli/register", json={"cli": "notacli"})
+        assert r.status_code == 400
+        assert "notacli" in r.json()["detail"]
+        reg.assert_not_called()
+
+
+class TestSubmitPolicySave:
+    """The Local step writes HANDOFF_SUBMIT_POLICY into .env. Aliases are
+    accepted because the env reader accepts them, but the CANONICAL id is what
+    lands — the README, the kickoff prompt and the work-order header all render
+    from the value in the file."""
+
+    def _save(self, client, **kw):
+        payload = {"batch_provider": "", "batch_model": "", "batch_cli": ""}
+        payload.update(kw)
+        return client.post("/api/onboard/local-config", json=payload)
+
+    def test_canonical_id_is_written(self, client, tmp_path, mocker):
+        from pipeline import handoff
+        from pipeline.app import server
+        mocker.patch.object(server, "ROOT", tmp_path)
+        r = self._save(client, handoff_submit_policy="submit-easy-apply")
+        assert r.status_code == 200, r.text
+        env = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert f"{handoff.SUBMIT_POLICY_ENV}=submit-easy-apply" in env
+
+    def test_an_alias_is_written_as_the_canonical_id(self, client, tmp_path, mocker):
+        from pipeline import handoff
+        from pipeline.app import server
+        mocker.patch.object(server, "ROOT", tmp_path)
+        r = self._save(client, handoff_submit_policy="easy-apply")
+        assert r.status_code == 200, r.text
+        env = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert f"{handoff.SUBMIT_POLICY_ENV}=submit-easy-apply" in env
+
+    def test_unknown_policy_is_refused(self, client, tmp_path, mocker):
+        from pipeline.app import server
+        mocker.patch.object(server, "ROOT", tmp_path)
+        r = self._save(client, handoff_submit_policy="yolo")
+        assert r.status_code == 400
+        assert "yolo" in r.json()["detail"]
+
+
+# ── Daily digest + cloud free-tier defaults (the wizard's cloud half) ────────
+
+def _digest_form(**kw):
+    form = {"name": "Jane", "provider": "gemini", "api_key": "key-123"}
+    form.update(kw)
+    return form
+
+
+@pytest.fixture
+def cloud_wizard(client, tmp_path, mocker):
+    """The wizard's submit path with gh stubbed: returns the two recorders so a
+    test can assert on exactly what reached the repo."""
+    from pipeline.app import server
+    mocker.patch.object(server, "ROOT", tmp_path)
+    mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+    mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+    mocker.patch.object(server.onboard, "extract_resume_text", return_value="resume text")
+    mocker.patch.object(server.onboard, "run_generation", return_value={"ok": True})
+    mocker.patch.object(server.onboard, "collect_secret_blobs", return_value={
+        "SEARCH_CONFIG_B64": "AA", "RESUME_TXT_B64": "BB",
+        "CV_MD_B64": "CC", "PROFILE_YML_B64": "DD",
+    })
+    return {
+        "client": client,
+        "set_secret": mocker.patch.object(server.gh, "set_secret"),
+        "set_variable": mocker.patch.object(server.gh, "set_variable"),
+    }
+
+
+def _vars_written(recorder):
+    return {c.args[0]: c.args[1] for c in recorder.call_args_list}
+
+
+def _secrets_written(recorder):
+    return {c.args[0]: c.args[1] for c in recorder.call_args_list}
+
+
+class TestDigestSecrets:
+    """Delivery is a secret, so it is write-only: the wizard can offer to
+    replace it and can report that one exists, and nothing more. A blank field
+    therefore has to mean KEEP — the same rule as the API key — or every
+    revisit to change the minimum score would silently unhook the digest."""
+
+    def test_non_blank_fields_are_written_under_the_digest_names(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            digest_discord_webhook="https://discord.com/api/webhooks/1/tok",
+            digest_email_to="jane@example.com",
+            digest_smtp_host="smtp.example.com",
+            digest_smtp_port="587",
+            digest_smtp_user="jane@example.com",
+            digest_smtp_pass="app-pass",
+        ))
+        assert r.status_code == 200, r.text
+        written = _secrets_written(cloud_wizard["set_secret"])
+        assert written["DIGEST_DISCORD_WEBHOOK"] == "https://discord.com/api/webhooks/1/tok"
+        assert written["DIGEST_EMAIL_TO"] == "jane@example.com"
+        assert written["DIGEST_SMTP_PASS"] == "app-pass"
+        assert "DIGEST_DISCORD_WEBHOOK" in r.json()["secrets_written"]
+
+    def test_blank_fields_keep_the_existing_secret(self, cloud_wizard):
+        from pipeline import daily_digest
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            digest_discord_webhook="", digest_email_to=""))
+        assert r.status_code == 200, r.text
+        written = _secrets_written(cloud_wizard["set_secret"])
+        assert not [n for n in written if n in daily_digest.SECRET_VARS]
+
+    def test_status_reports_each_channel_from_the_secrets_that_run_it(self, client, mocker):
+        from pipeline.app import server
+        mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+        mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+        mocker.patch.object(server.gh, "list_variables", return_value={})
+        mocker.patch.object(server.gh, "list_secret_names", return_value=[
+            "GEMINI_API_KEY", "DIGEST_DISCORD_WEBHOOK", "DIGEST_EMAIL_TO"])
+        body = client.get("/api/onboard/status").json()
+        assert body["has_digest_discord"] is True
+        # Email needs an address AND a host — an address alone sends nowhere.
+        assert body["has_digest_email"] is False
+
+    def test_status_reports_email_once_both_halves_exist(self, client, mocker):
+        from pipeline.app import server
+        mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+        mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+        mocker.patch.object(server.gh, "list_variables", return_value={})
+        mocker.patch.object(server.gh, "list_secret_names", return_value=[
+            "DIGEST_EMAIL_TO", "DIGEST_SMTP_HOST"])
+        body = client.get("/api/onboard/status").json()
+        assert body["has_digest_email"] is True
+        assert body["has_digest_discord"] is False
+
+    def test_status_carries_the_readable_variables_for_edit_mode(self, client, mocker):
+        from pipeline.app import server
+        mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+        mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+        mocker.patch.object(server.gh, "list_secret_names", return_value=[])
+        mocker.patch.object(server.gh, "list_variables",
+                            return_value={"DIGEST_MIN_SCORE": "4.5"})
+        body = client.get("/api/onboard/status").json()
+        assert body["variables"]["DIGEST_MIN_SCORE"] == "4.5"
+
+    def test_status_survives_a_gh_that_cannot_list_variables(self, client, mocker):
+        from pipeline.app import server
+        mocker.patch.object(server.gh, "current_repo", return_value="me/private")
+        mocker.patch.object(server.gh, "repo_visibility", return_value="PRIVATE")
+        mocker.patch.object(server.gh, "list_secret_names", return_value=[])
+        mocker.patch.object(server.gh, "list_variables",
+                            side_effect=server.gh.GhError("no gh"))
+        body = client.get("/api/onboard/status").json()
+        assert body["variables"] == {}
+
+
+class TestDigestAndUpdateVariables:
+    """The thresholds and the weekly-update box are repository VARIABLES, not
+    secrets: readable, so edit mode can show them, and defaulted in the
+    workflow, so a blank field must write nothing and leave that default."""
+
+    def test_thresholds_are_written_when_filled(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            digest_min_score="4.5", digest_limit="25"))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert written["DIGEST_MIN_SCORE"] == "4.5"
+        assert written["DIGEST_LIMIT"] == "25"
+
+    def test_blank_thresholds_leave_the_workflow_default(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            digest_min_score="", digest_limit=""))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert "DIGEST_MIN_SCORE" not in written and "DIGEST_LIMIT" not in written
+
+    def test_weekly_update_box_writes_the_exact_gate_value(self, cloud_wizard):
+        """update-from-template.yml's schedule proceeds only on the string
+        "true", so the checked box has to write exactly that."""
+        r = _onboard_post(cloud_wizard["client"], _digest_form(auto_update_weekly="yes"))
+        assert r.status_code == 200, r.text
+        assert _vars_written(cloud_wizard["set_variable"])["AUTO_UPDATE_FROM_TEMPLATE"] == "true"
+
+    def test_unticking_weekly_update_writes_something_other_than_true(self, cloud_wizard):
+        """An unticked box must overwrite an earlier "true" rather than be
+        absent — leaving the variable standing would keep merging every Monday
+        after the user said stop."""
+        r = _onboard_post(cloud_wizard["client"], _digest_form(auto_update_weekly="no"))
+        assert r.status_code == 200, r.text
+        assert _vars_written(cloud_wizard["set_variable"])["AUTO_UPDATE_FROM_TEMPLATE"] != "true"
+
+    def test_a_form_that_never_mentions_the_box_leaves_it_alone(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form())
+        assert r.status_code == 200, r.text
+        assert "AUTO_UPDATE_FROM_TEMPLATE" not in _vars_written(cloud_wizard["set_variable"])
+
+
+class TestCloudFreeTierDefaults:
+    """A blank model on Gemini is not the provider default. PROVIDER_DEFAULTS'
+    Flash row is ~20 requests a day on a free key — a 180-role daily exhausts it
+    before the first coffee — so a blank box resolves to the highest-capacity
+    row the limits table knows, computed, never a baked string."""
+
+    def test_blank_gemini_model_resolves_to_the_recommendation(self, cloud_wizard):
+        from pipeline import gemini_limits
+        r = _onboard_post(cloud_wizard["client"], _digest_form(batch_model=""))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert written["BATCH_MODEL"] == gemini_limits.batch_recommendation()
+
+    def test_an_explicit_model_is_written_as_given(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(batch_model="gemini-2.5-flash"))
+        assert r.status_code == 200, r.text
+        assert _vars_written(cloud_wizard["set_variable"])["BATCH_MODEL"] == "gemini-2.5-flash"
+
+    def test_another_provider_with_a_blank_model_writes_none(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"],
+                          _digest_form(provider="openai", batch_model=""))
+        assert r.status_code == 200, r.text
+        assert "BATCH_MODEL" not in _vars_written(cloud_wizard["set_variable"])
+
+    def test_free_tier_flag_and_limits_reach_the_cloud(self, cloud_wizard):
+        import json as _json
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            gemini_free_tier="yes",
+            gemini_limits={"gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 500}}))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert written["GEMINI_FREE_TIER"] == "true"
+        assert _json.loads(written["GEMINI_LIMITS_JSON"]) == {
+            "gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 500}}
+
+    def test_unticking_the_free_tier_clears_the_variable(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(gemini_free_tier="no"))
+        assert r.status_code == 200, r.text
+        assert _vars_written(cloud_wizard["set_variable"])["GEMINI_FREE_TIER"] == ""
+
+    def test_no_limits_written_when_every_box_is_blank(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            gemini_free_tier="yes", gemini_limits={"gemini-3.1-flash-lite": None}))
+        assert r.status_code == 200, r.text
+        assert "GEMINI_LIMITS_JSON" not in _vars_written(cloud_wizard["set_variable"])
+
+    def test_a_non_gemini_provider_writes_no_gemini_variables(self, cloud_wizard):
+        r = _onboard_post(cloud_wizard["client"], _digest_form(
+            provider="openai", gemini_free_tier="yes"))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        assert "GEMINI_FREE_TIER" not in written and "GEMINI_LIMITS_JSON" not in written
+
+    def test_a_blank_key_writes_no_variables_at_all(self, cloud_wizard):
+        """Nothing in the provider block runs without a key: an edit-mode
+        revisit that only changed the search settings must not re-point
+        BATCH_PROVIDER or re-derive a model."""
+        r = _onboard_post(cloud_wizard["client"],
+                          _digest_form(api_key="", gemini_free_tier="yes"))
+        assert r.status_code == 200, r.text
+        written = _vars_written(cloud_wizard["set_variable"])
+        for name in ("BATCH_PROVIDER", "BATCH_MODEL", "GEMINI_FREE_TIER", "GEMINI_LIMITS_JSON"):
+            assert name not in written
+
+
+# ── LAN mode ────────────────────────────────────────────────────────────────
+
+def _basic(password, user="phone"):
+    import base64
+    return {"Authorization": "Basic " + base64.b64encode(
+        f"{user}:{password}".encode()).decode()}
+
+
+LAN_PASSWORD = "a-long-passphrase"
+LAN_PEER = ("192.168.1.20", 51234)
+LOOPBACK_PEER = ("127.0.0.1", 51234)
+
+
+@pytest.fixture
+def lan(client, monkeypatch):
+    """LAN mode turned on over the same tmp career-ops the `client` fixture
+    builds. UI_LAN / UI_PASSWORD / UI_ALLOWED_HOSTS are read from os.environ at
+    REQUEST time, so setting them here reaches the guard without another
+    reload — and `testserver` is in the allowed set because that is the Host
+    TestClient sends."""
+    from pipeline.app import server
+    monkeypatch.setenv(server.UI_LAN_ENV, "1")
+    monkeypatch.setenv(server.UI_PASSWORD_ENV, LAN_PASSWORD)
+    monkeypatch.setenv(server.UI_ALLOWED_HOSTS_ENV, "testserver,192.168.1.10")
+
+    class _Lan:
+        module = server
+        auth = _basic(LAN_PASSWORD)
+
+        def peer(self, addr):
+            return TestClient(server.app, client=addr, headers=dict(self.auth))
+
+    return _Lan()
+
+
+class TestLanStartupRefusal:
+    """The password is not optional under UI_LAN, and this is the half of the
+    refusal the shell wrapper cannot make: run-ui.sh checks the exported
+    environment, this module has also loaded .env. Neither alone covers both
+    ways a user sets a variable."""
+
+    def test_import_refuses_when_the_password_is_empty(self, monkeypatch):
+        import importlib
+        from pipeline.app import server
+        monkeypatch.setenv(server.UI_LAN_ENV, "1")
+        # Empty rather than deleted: load_dotenv(override=False) would re-add a
+        # deleted name from a developer's own .env mid-reload.
+        monkeypatch.setenv(server.UI_PASSWORD_ENV, "")
+        with pytest.raises(SystemExit) as e:
+            importlib.reload(server)
+        assert server.UI_PASSWORD_ENV in str(e.value)
+        # Leave the module whole for whatever runs next.
+        monkeypatch.setenv(server.UI_LAN_ENV, "")
+        importlib.reload(server)
+
+
+class TestLanBasicAuth:
+    """Anyone on the network can reach the port, so every request carries the
+    password — GETs included. The tracker is the thing being protected, and it
+    is read with a GET."""
+
+    def test_no_credentials_is_401_with_a_challenge(self, lan):
+        c = TestClient(lan.module.app, client=LOOPBACK_PEER)
+        r = c.get("/api/jobs")
+        assert r.status_code == 401
+        assert r.headers["www-authenticate"].startswith("Basic ")
+
+    def test_a_wrong_password_is_401(self, lan):
+        c = TestClient(lan.module.app, client=LOOPBACK_PEER,
+                       headers=_basic("not-the-password"))
+        assert c.get("/api/jobs").status_code == 401
+
+    def test_any_username_with_the_right_password_is_accepted(self, lan):
+        c = TestClient(lan.module.app, client=LAN_PEER,
+                       headers=_basic(LAN_PASSWORD, user="whoever"))
+        assert c.get("/api/jobs").status_code == 200
+
+    def test_garbage_credentials_do_not_raise(self, lan):
+        c = TestClient(lan.module.app, client=LAN_PEER,
+                       headers={"Authorization": "Basic not-base64!!"})
+        assert c.get("/api/jobs").status_code == 401
+
+
+class TestLanPeerMatrix:
+    """From the LAN the board is usable and nothing else is. The allowlist is
+    two routes; everything else is loopback-only BY DEFAULT, so a POST route
+    added next month is refused until someone adds it here on purpose."""
+
+    def test_loopback_reaches_a_loopback_only_route(self, lan):
+        c = lan.peer(LOOPBACK_PEER)
+        r = c.post("/api/agent-cli/register", json={"cli": "notacli"})
+        # 400 for the unknown id — the point is that the peer rule let it in.
+        assert r.status_code == 400
+
+    def test_the_board_is_reachable_from_the_lan(self, lan):
+        c = lan.peer(LAN_PEER)
+        r = c.post("/api/status", json={"num": "1", "status": "Applied"})
+        assert r.status_code == 200, r.text
+
+    def test_push_is_reachable_from_the_lan(self, lan):
+        c = lan.peer(LAN_PEER)
+        # 400 "nothing pending" is fine; 403 would mean the phone can move a
+        # card and then never get it to the cloud.
+        assert c.post("/api/push-status", json={}).status_code != 403
+
+    def test_every_other_post_is_loopback_only(self, lan):
+        from starlette.routing import Route
+        c = lan.peer(LAN_PEER)
+        checked = 0
+        for route in lan.module.app.routes:
+            if not isinstance(route, Route) or "POST" not in (route.methods or ()):
+                continue
+            if route.path in lan.module._LAN_MUTABLE or "{" in route.path:
+                continue
+            r = c.post(route.path, json={})
+            assert r.status_code == 403, f"{route.path} -> {r.status_code}"
+            assert "loopback-only" in r.json()["detail"], route.path
+            checked += 1
+        assert checked > 5, "the matrix stopped covering anything"
+
+    def test_reads_are_unrestricted_from_the_lan(self, lan):
+        c = lan.peer(LAN_PEER)
+        assert c.get("/api/jobs").status_code == 200
+        assert c.get("/api/health").status_code == 200
+
+    def test_lan_mutable_names_real_post_routes(self, lan):
+        """A typo here would silently make the board unreachable from the phone
+        — and, worse, read as if the rule were being applied."""
+        from starlette.routing import Route
+        posts = {r.path for r in lan.module.app.routes
+                 if isinstance(r, Route) and "POST" in (r.methods or ())}
+        assert lan.module._LAN_MUTABLE <= posts
+
+
+class TestLanOriginAndHost:
+    """Origin alone is not enough. A page the user opened elsewhere can send an
+    Origin the guard likes only if it can also make the browser send this
+    machine's Host — so both are checked, and they must agree."""
+
+    def test_a_genuine_lan_request_is_accepted(self, lan):
+        c = lan.peer(LAN_PEER)
+        r = c.post("/api/status", json={"num": "1", "status": "Applied"},
+                   headers={"Origin": "http://192.168.1.10:8000",
+                            "Host": "192.168.1.10:8000"})
+        assert r.status_code == 200, r.text
+
+    def test_a_rebound_hostname_is_refused(self, lan):
+        """The DNS-rebinding shape: a name the attacker controls, resolved to
+        this machine, with the user's own credentials attached."""
+        c = lan.peer(LAN_PEER)
+        r = c.post("/api/status", json={"num": "1", "status": "Applied"},
+                   headers={"Origin": "http://evil.example:8000",
+                            "Host": "evil.example:8000"})
+        assert r.status_code == 403
+        assert "evil.example" in r.json()["detail"]
+
+    def test_an_origin_that_disagrees_with_the_host_is_refused(self, lan):
+        c = lan.peer(LAN_PEER)
+        r = c.post("/api/status", json={"num": "1", "status": "Applied"},
+                   headers={"Origin": "http://evil.example:8000",
+                            "Host": "192.168.1.10:8000"})
+        assert r.status_code == 403
+
+    def test_a_port_mismatch_is_refused(self, lan):
+        c = lan.peer(LAN_PEER)
+        r = c.post("/api/status", json={"num": "1", "status": "Applied"},
+                   headers={"Origin": "http://192.168.1.10:9999",
+                            "Host": "192.168.1.10:8000"})
+        assert r.status_code == 403
+
+    def test_loopback_is_still_accepted_under_lan(self, lan):
+        c = lan.peer(LOOPBACK_PEER)
+        r = c.post("/api/status", json={"num": "1", "status": "Applied"},
+                   headers={"Origin": "http://localhost:8000",
+                            "Host": "localhost:8000"})
+        assert r.status_code == 200, r.text
+
+    def test_allowed_hosts_defaults_to_this_machine(self, lan, monkeypatch):
+        """Unset, the set is computed once at startup from the machine's own
+        names. It must never be empty of loopback, and it must never be a
+        lookup at request time — so the computed set is cached."""
+        monkeypatch.delenv(lan.module.UI_ALLOWED_HOSTS_ENV, raising=False)
+        first = lan.module._allowed_hosts()
+        assert lan.module._allowed_hosts() is first     # cached, not re-resolved
+        assert not any(lan.module._is_loopback_host(h) for h in first)
+
+
+class TestLanEnvExampleMirror:
+    """.env.example is where a user learns a variable exists. The three LAN
+    names are the ones a person has to set by hand (the launcher sets UI_LAN
+    itself, but a user who exports it needs to know the password rule), so a
+    name added to LAN_ENV_VARS and not documented is a feature nobody finds."""
+
+    def test_every_lan_variable_is_documented(self):
+        from pipeline.app import server
+        text = (Path(__file__).resolve().parent.parent / ".env.example").read_text(
+            encoding="utf-8")
+        for name in server.LAN_ENV_VARS:
+            assert name in text, name
+
+    def test_the_password_rule_is_stated(self):
+        text = (Path(__file__).resolve().parent.parent / ".env.example").read_text(
+            encoding="utf-8")
+        block = text[text.index("UI_LAN"):]
+        assert "REQUIRED" in block
