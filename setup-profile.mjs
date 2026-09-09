@@ -1230,18 +1230,12 @@ function splitRoleAlternatives(role) {
   const out = [];
   for (const slashPart of String(role).split(/\s+\/\s+/)) {
     const orParts = slashPart.split(/\s+or\s+/i).map(s => s.trim()).filter(Boolean);
-    if (orParts.length <= 1) {
-      if (orParts.length) out.push(orParts[0]);
-      continue;
-    }
-    const tail = orParts[orParts.length - 1].split(/\s+/);
+    // The last alternative's tail (everything after its first word), borrowed
+    // by any earlier one-word alternative; empty when there is nothing to borrow.
+    const tail = orParts.length ? orParts[orParts.length - 1].split(/\s+/).slice(1) : [];
     for (let i = 0; i < orParts.length; i++) {
-      const words = orParts[i].split(/\s+/);
-      if (i < orParts.length - 1 && words.length === 1 && tail.length > 1) {
-        out.push([words[0], ...tail.slice(1)].join(' '));
-      } else {
-        out.push(orParts[i]);
-      }
+      const oneWord = i < orParts.length - 1 && !/\s/.test(orParts[i]);
+      out.push(oneWord ? [orParts[i], ...tail].join(' ') : orParts[i]);
     }
   }
   return out;
@@ -1284,14 +1278,16 @@ const GENERIC_ROLE_SUFFIXES = new Set([
  * The `filter.target_titles` list: what earns the +5 title bonus when a
  * posting's title contains it. A good query and a good title fragment are
  * different things (#160) — the query wants the whole phrase, the bonus wants
- * the part a title actually keeps — so alongside each (split, expanded) role
- * this adds its stem without a generic trailing suffix when the role is long
- * enough to still name a job family without it. The filter compiles these
- * longest-first and counts one hit per title, so the pair never double-scores.
+ * the part a title actually keeps — so alongside each search term (the split,
+ * expanded roles, so the list is a superset of every board query by
+ * construction) this adds its stem without a generic trailing suffix when the
+ * role is long enough to still name a job family without it. The filter
+ * compiles these longest-first and counts one hit per title, so the pair never
+ * double-scores.
  */
-function titleFragments(targetRoles) {
+function titleFragments(searchTerms) {
   const out = [];
-  for (const term of expandSearchTerms(targetRoles)) {
+  for (const term of searchTerms) {
     out.push(term);
     const words = term.split(/\s+/);
     if (words.length >= 3 && GENERIC_ROLE_SUFFIXES.has(words[words.length - 1])) {
@@ -1394,7 +1390,7 @@ function updateSearchConfig(targetRoles, negativeRoles, searchSettings) {
   // ── filter: ────────────────────────────────────────────────────────────
   // Title fragments, not the board queries: see titleFragments (#160).
   if (!config.filter) config.filter = {};
-  config.filter.target_titles = titleFragments(targetRoles);
+  config.filter.target_titles = titleFragments(searchTerms);
   if (negativeRoles && negativeRoles.length > 0) {
     config.filter.negative_titles = negativeRoles.flatMap(splitRoleAlternatives);
   }

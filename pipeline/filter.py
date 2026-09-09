@@ -204,9 +204,9 @@ def _compile_alternation(terms: list[str]) -> re.Pattern | None:
 _GROUPED_TITLE_RE = re.compile(r"\s/\s|\bor\b", re.IGNORECASE)
 
 
-def _warn_unmatchable_titles(target_titles: list) -> list[str]:
+def _warn_unmatchable_titles(target_titles: list[str | None]) -> list[str]:
     """Print one warning per grouped `target_titles` entry; return them."""
-    grouped = [str(t) for t in target_titles if t and _GROUPED_TITLE_RE.search(str(t))]
+    grouped = [t for t in target_titles if t and _GROUPED_TITLE_RE.search(t)]
     for t in grouped:
         print(f'[filter] WARNING: target_titles entry "{t}" groups alternatives with '
               '" / " or " or " — no posting title contains that literally, so it can '

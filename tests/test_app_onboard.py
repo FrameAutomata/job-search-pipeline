@@ -5,6 +5,7 @@ extraction are guarded so the suite still passes without node / pdfplumber.
 """
 
 import base64
+import functools
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ def html():
     return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
 
 
+@functools.cache
 def _node_deps_available() -> bool:
     """True only if node AND the npm packages setup-profile.mjs imports
     (yaml, pdf-parse) resolve. CI has node but doesn't `npm install`, so the
@@ -194,6 +196,18 @@ class TestCollectSecretBlobs:
             onboard.collect_secret_blobs(tmp_path)
 
 
+def _node_workdir(tmp_path) -> Path:
+    """An isolated cwd for the real generator — only the example config and
+    the empty career-ops dirs it writes into — so a run never touches the
+    real config/career-ops."""
+    repo = Path(__file__).resolve().parent.parent
+    (tmp_path / "config").mkdir()
+    shutil.copy(repo / "config" / "search.example.yml", tmp_path / "config" / "search.example.yml")
+    (tmp_path / "career-ops" / "config").mkdir(parents=True)
+    (tmp_path / "career-ops" / "modes").mkdir(parents=True)
+    return tmp_path
+
+
 @pytest.mark.skipif(not _node_deps_available(),
                     reason="node or its npm deps (yaml/pdf-parse) not installed")
 class TestNodeRoundTrip:
@@ -201,14 +215,7 @@ class TestNodeRoundTrip:
     real generator on a fixture and assert the four artifacts appear."""
 
     def test_from_json_produces_artifacts(self, tmp_path):
-        repo = Path(__file__).resolve().parent.parent
-        # Run node in an isolated cwd with only the example config available, so
-        # we don't touch the real config/career-ops.
-        work = tmp_path
-        (work / "config").mkdir()
-        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
-        (work / "career-ops" / "config").mkdir(parents=True)
-        (work / "career-ops" / "modes").mkdir(parents=True)
+        work = _node_workdir(tmp_path)
 
         payload = onboard.build_onboarding_json(
             {"name": "Jane Dev", "target_roles": "Backend Engineer",
@@ -227,7 +234,6 @@ class TestNodeRoundTrip:
         assert (work / "config" / "search.yml").exists()
 
         # Work-authorization answers flow form -> JSON -> generated profile.yml.
-        import yaml
         profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
         wa = profile["work_authorization"]
         assert wa["citizenship"] == "Canadian"
@@ -250,12 +256,7 @@ class TestNodeRoundTrip:
         back can. Asserted over the keys the input actually set — Node fills
         defaults the form left blank, and those are not drift.
         """
-        repo = Path(__file__).resolve().parent.parent
-        work = tmp_path
-        (work / "config").mkdir()
-        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
-        (work / "career-ops" / "config").mkdir(parents=True)
-        (work / "career-ops" / "modes").mkdir(parents=True)
+        work = _node_workdir(tmp_path)
 
         form = {
             "name": "Jane Dev", "email": "jane@example.com", "phone": "+1 (555) 123-4567",
@@ -293,65 +294,55 @@ class TestGroupedRoles:
     ever contain — the +5 title bonus had never fired on either (#160).
     Driven through the real generator, like the round trip above."""
 
-    def _generate(self, tmp_path, form):
-        repo = Path(__file__).resolve().parent.parent
-        work = tmp_path
-        (work / "config").mkdir()
-        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
-        (work / "career-ops" / "config").mkdir(parents=True)
-        (work / "career-ops" / "modes").mkdir(parents=True)
+    FORM = {"name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"]}
+
+    def _generate(self, tmp_path, target_roles, **extra):
+        """The search.yml the real generator writes for these target roles."""
+        work = _node_workdir(tmp_path)
+        form = {**self.FORM, "target_roles": target_roles, **extra}
         result = onboard.run_generation(work, onboard.build_onboarding_json(form, "Jane\nSKILLS\nx"))
         assert result.get("ok") is True, result
-        import yaml
-        return work, yaml.safe_load((work / "config" / "search.yml").read_text(encoding="utf-8"))
+        return yaml.safe_load((work / "config" / "search.yml").read_text(encoding="utf-8"))
 
     def test_slash_and_or_groups_become_separate_queries(self, tmp_path):
-        _, cfg = self._generate(tmp_path, {
-            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
-            "target_roles": "Patient Access / Patient Registration Representative, "
-                            "research assistant / policy or program analyst"})
+        cfg = self._generate(tmp_path, "Patient Access / Patient Registration Representative, "
+                                       "research assistant / policy or program analyst")
         terms = cfg["searches"][0]["search_terms"]
         assert terms == ["patient access", "patient registration representative",
                          "research assistant", "policy analyst", "program analyst"]
 
     def test_title_fragments_are_what_a_title_keeps(self, tmp_path):
-        _, cfg = self._generate(tmp_path, {
-            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
-            "target_roles": "Patient Access Representative / Patient Registration Representative"})
+        from pipeline import filter as filter_mod
+        cfg = self._generate(tmp_path, "Patient Access Representative / Patient Registration Representative")
         titles = cfg["filter"]["target_titles"]
-        assert not any(" / " in t or " or " in t for t in titles)
+        # The writer never emits what the reader warns about — the filter's own
+        # rule, not a re-spelling of it.
+        assert filter_mod._warn_unmatchable_titles(titles) == []
         # The stem without the generic suffix: "Patient Access Rep II" earns the bonus.
         assert {"patient access representative", "patient access",
                 "patient registration representative", "patient registration"} <= set(titles)
 
     def test_the_bonus_actually_fires_on_a_real_title(self, tmp_path):
         from pipeline import filter as filter_mod
-        _, cfg = self._generate(tmp_path, {
-            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
-            "target_roles": "Patient Access / Patient Registration Representative"})
+        cfg = self._generate(tmp_path, "Patient Access / Patient Registration Representative")
         row = {"title": "Patient Access Rep II", "description": ""}
         score, matched = filter_mod.score_job(row, {}, cfg["filter"]["target_titles"], [])
         assert score == filter_mod.SCORE_TITLE_MATCH and matched == ["title:patient access"]
 
     def test_compound_slash_and_coordinator_are_one_title(self, tmp_path):
-        _, cfg = self._generate(tmp_path, {
-            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
-            "target_roles": "UI/UX Designer, Patient Care Coordinator"})
+        cfg = self._generate(tmp_path, "UI/UX Designer, Patient Care Coordinator")
         assert cfg["searches"][0]["search_terms"] == ["ui/ux designer", "patient care coordinator"]
 
     def test_negative_roles_split_the_same_way(self, tmp_path):
-        _, cfg = self._generate(tmp_path, {
-            "name": "Jane", "locations": "Dallas, TX", "sites": ["indeed"],
-            "target_roles": "Nurse", "negative_roles": "Intern, Manager / Director"})
+        cfg = self._generate(tmp_path, "Nurse", negative_roles="Intern, Manager / Director")
         assert cfg["filter"]["negative_titles"] == ["Intern", "Manager", "Director"]
 
     def test_the_form_reads_back_what_was_typed(self, tmp_path):
         # profile.yml keeps the user's own text (archetypes), so the wizard shows
         # "Patient Access / Patient Registration Representative", not the split.
         typed = "Patient Access / Patient Registration Representative"
-        work, _ = self._generate(tmp_path, {"name": "Jane", "locations": "Dallas, TX",
-                                            "sites": ["indeed"], "target_roles": typed})
-        assert onboard.derive_form(work, work / "career-ops")["target_roles"] == typed
+        self._generate(tmp_path, typed)
+        assert onboard.derive_form(tmp_path, tmp_path / "career-ops")["target_roles"] == typed
 
 
 class TestExtractResumeText:
