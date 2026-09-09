@@ -26,6 +26,7 @@ class ApplyJob:
     url: str
     score: float | None
     report_path: str = ""
+    report_num: str = ""     # the row's `[N]`: resolves a dead link the path alone cannot (#162)
 
 
 def select(
@@ -61,6 +62,7 @@ def select(
             url=url,
             score=score,
             report_path=row.get("report_path", ""),
+            report_num=row.get("report_num", ""),
         ))
 
     jobs.sort(key=lambda j: j.score, reverse=True)   # None scores were filtered above

@@ -397,10 +397,15 @@ class TestNarrativeDefaults:
               "SKILLS\nEpic, Scheduling\nEXPERIENCE\nMercy Hospital")
 
     def test_blank_narrative_derives_from_the_resume_summary(self, tmp_path):
-        _, narrative, md = self._generate(tmp_path, self.FORM, self.RESUME)
+        work, narrative, md = self._generate(tmp_path, self.FORM, self.RESUME)
         summary = "Patient-focused registration professional with 5 years in hospital front-desk operations."
         assert narrative["exit_story"] == summary
         assert narrative["headline"] == summary
+        # Recorded as derived, so the wizard shows them blank rather than as
+        # answers that would survive a résumé change.
+        assert narrative["derived"] == ["headline", "exit_story"]
+        derived = onboard.derive_form(work, work / "career-ops")
+        assert "headline" not in derived and "exit_story" not in derived
         assert narrative["superpowers"] == []
         block = " ".join(str(v) for v in narrative.values()).lower()
         assert not any(w in block for w in self.ENGINEERING)
@@ -440,6 +445,7 @@ class TestNarrativeDefaults:
         work, narrative, md = self._generate(tmp_path, form, self.RESUME)
         assert narrative["headline"] == form["headline"]
         assert narrative["exit_story"] == form["exit_story"]
+        assert narrative["derived"] == []
         assert form["exit_story"] in md
         derived = onboard.derive_form(work, work / "career-ops")
         assert derived["headline"] == form["headline"] and derived["exit_story"] == form["exit_story"]
@@ -628,6 +634,11 @@ class TestDeriveFromProfile:
     @pytest.fixture
     def derived(self, profile):
         return onboard.derive_from_profile(profile)
+
+    def test_derived_narrative_fields_are_not_answers(self, profile):
+        profile["narrative"]["derived"] = ["headline"]
+        out = onboard.derive_from_profile(profile)
+        assert "headline" not in out and out["exit_story"] == "Moving to platform work."
 
     def test_maps_contact_and_address_fields(self, derived):
         assert derived["name"] == "Jane Dev"

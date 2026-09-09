@@ -36,8 +36,8 @@ from pipeline._batch_common import (
     write_job_result,
 )
 from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
-    _liveness_closed_rows, _reopen_reposted, closed_by_recheck, liveness_closed_mark,
-    reopened_mark,
+    _liveness_closed_rows, _reopen_reposted, by_hand_mark, closed_by_recheck,
+    liveness_closed_mark, reopened_mark,
 )
 from tests.conftest import tracker_row
 
@@ -1374,6 +1374,14 @@ class TestReadReport:
         assert read_report(co, "reports/999-gone.md", label="cover") == ""
         assert "[cover] report reports/999-gone.md not found" in capsys.readouterr().out
 
+    def test_the_rows_number_resolves_a_dead_link_that_lost_its_own(self, tmp_path, capsys):
+        # A slug so mangled it lost its numeric prefix: the UI and the merge-time
+        # repair resolve it from the row's `[N]`; the readers can too, given it.
+        co = _reports(tmp_path, **{"271-acme-2026.md": "PROOF"})
+        assert read_report(co, "reports/acme.md", num_text="271") == "PROOF"
+        assert "is dead — using 271-acme-2026.md" in capsys.readouterr().out
+        assert read_report(co, "reports/acme.md") == ""
+
     def test_two_reports_with_the_number_read_the_companys_or_nothing(self, tmp_path, capsys):
         co = _reports(tmp_path, **{"042-globex-2026-05-27.md": "GLOBEX",
                                    "042-zeta-corp-2026-08-25.md": "ZETA"})
@@ -1507,6 +1515,15 @@ class TestLivenessMarks:
 
     def test_empty_reason_still_marks(self):
         assert closed_by_recheck(liveness_closed_mark("2026-09-06", ""))
+
+    def test_a_by_hand_mark_after_closed_makes_the_discard_a_persons(self):
+        # A person's write leaves this mark on a re-check-Closed row (#163 follow-up);
+        # newest still wins, so a later re-check Closed is the re-check's again.
+        closed = liveness_closed_mark("2026-09-06", "HTTP 404")
+        notes = f"https://x — APPLY — {closed} — {by_hand_mark('2026-09-08', 'Discarded')}"
+        assert not closed_by_recheck(notes)
+        assert closed_by_recheck(notes + f" — {liveness_closed_mark('2026-09-10', 'HTTP 410')}")
+        assert by_hand_mark("2026-09-08", "Discarded | x") == "Set Discarded x 2026-09-08 (by hand)"
 
 
 _APPS_HEADER = ("# Applications Tracker\n\n"

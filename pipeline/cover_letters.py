@@ -178,7 +178,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
     # artifact's reports/ when applying against cloud evaluations).
     report_text = read_report(Path(report_base or career_ops),
                               getattr(job, "report_path", ""), label="cover",
-                              company=getattr(job, "company", ""))
+                              company=getattr(job, "company", ""),
+                              num_text=getattr(job, "report_num", ""))
     system, user = build_prompt(profile, cv, job, report_text,
                                 jd_text=jd_text_for_job(career_ops, report_base, job))
     from pipeline.batch_evaluate import _call_with_retry

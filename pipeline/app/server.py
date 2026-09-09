@@ -265,9 +265,15 @@ def set_status(change: StatusChange) -> JSONResponse:
             status_code=400,
             detail=f"Unknown status {change.status!r}. Valid: {', '.join(states)}",
         )
+    # A write on a row whose newest mark is the re-check's Closed one carries a
+    # by-hand mark, so the decision reads as a person's downstream (#163) —
+    # bridge keeps deduping the role and the merge does not bounce it.
+    rows = data.load_jobs(_career_ops())["rows"]
+    row = next((r for r in rows if str(r.get("num")) == str(change.num)), None)
+    note = data.by_hand_note_for(row.get("notes", ""), change.status) if row else ""
     # Through the locked read/modify/write accessor so a concurrent push or
     # recheck discard can't lose this drag (or be lost by it).
-    data.record_status_override(str(change.num), change.status)
+    data.record_status_override(str(change.num), change.status, note=note or None)
     return JSONResponse({"ok": True, "pending": len(_load_overrides())})
 
 

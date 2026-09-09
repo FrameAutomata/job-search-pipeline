@@ -449,15 +449,17 @@ def resolve_report(base: Path, report_path: str, *, num_text: str = "",
 
 
 def read_report(base: Path, report_path: str, *, label: str = "report",
-                company: str = "") -> str:
+                company: str = "", num_text: str = "") -> str:
     """The text of the report a tracker row links to, or "" — resolving a dead
     link by its number (`resolve_report`, with the row's `company` to tell two
-    same-numbered reports apart) and SAYING so either way, since the consumers
-    (cover letters, both tailors) otherwise build from the JD alone in silence,
-    which is the failure this exists to end."""
+    same-numbered reports apart, and its `[N]` text as `num_text` for a dead
+    path that lost its own number, as the UI and the merge-time repair already
+    could) and SAYING so either way, since the consumers (cover letters, both
+    tailors) otherwise build from the JD alone in silence, which is the failure
+    this exists to end."""
     if not (report_path or "").strip():
         return ""
-    found = resolve_report(base, report_path, company=company)
+    found = resolve_report(base, report_path, num_text=num_text, company=company)
     if found is None:
         print(f"[{label}] report {report_path} not found — building from the JD alone")
         return ""
@@ -1257,6 +1259,7 @@ def run_merge_tracker(career_ops: Path) -> bool:
 # its Closed one, so a person Discarding it afterwards is read as a person.
 LIVENESS_CLOSED_RE = re.compile(r"\bClosed \d{4}-\d{2}-\d{2} \(liveness re-check", re.I)
 REOPENED_RE = re.compile(r"\bReopened \d{4}-\d{2}-\d{2} \(re-posted", re.I)
+BY_HAND_RE = re.compile(r"\bSet [A-Za-z]+ \d{4}-\d{2}-\d{2} \(by hand\)", re.I)
 # What must never reach a Notes cell: a `|` is a cell boundary in the markdown
 # table, and a URL would be read back by `extract_url` as the posting — so the
 # URL half IS the pattern `extract_url` reads with, not a re-spelling of it.
@@ -1281,14 +1284,24 @@ def reopened_mark(date: str) -> str:
     return f"Reopened {date} (re-posted and re-evaluated)"
 
 
+def by_hand_mark(date: str, status: str) -> str:
+    """The Notes mark a person's status write leaves on a row whose newest mark
+    is the re-check's Closed one — what makes the decision a person's (#163).
+    `app.data.by_hand_note_for` decides when one is needed."""
+    return f"Set {_note_safe(status) or 'status'} {date} (by hand)"
+
+
 def closed_by_recheck(notes: str) -> bool:
-    """True when the newest mark in `notes` is the re-check's Closed one — the
-    row's Discard is the re-check's, not a person's. Only meaningful on a row
-    whose status IS Discarded; `recheck_discarded` asks both halves."""
+    """True when the newest mark in `notes` is the re-check's Closed one — newer
+    than any Reopened mark the merge left and any by-hand mark a person's write
+    left — so the row's Discard is the re-check's, not a person's. Only
+    meaningful on a row whose status IS Discarded; `recheck_discarded` asks
+    both halves."""
     notes = notes or ""
     last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes)), default=-1)
-    last_reopened = max((m.end() for m in REOPENED_RE.finditer(notes)), default=-1)
-    return last_closed > last_reopened
+    last_person = max((m.end() for r in (REOPENED_RE, BY_HAND_RE) for m in r.finditer(notes)),
+                      default=-1)
+    return last_closed > last_person
 
 
 def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:

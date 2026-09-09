@@ -1096,14 +1096,21 @@ function resolveNarrative(narrative, criteria, resumeText) {
   const n = { ...(narrative || {}) };
   const summary = extractResumeSections(resumeText).summary;
   const role = firstTargetRole(criteria);
-  n.headline = String(n.headline || '').trim()
+  const typedHeadline = String(n.headline || '').trim();
+  const typedStory = String(n.exitStory || '').trim();
+  n.headline = typedHeadline
     || firstSentence(summary, 120)
     || (role ? `${role} candidate` : 'Candidate');
-  n.exitStory = String(n.exitStory || '').trim()
+  n.exitStory = typedStory
     || firstSentence(summary)
     || (role ? `Seeking ${role} roles that build on my experience.`
              : 'Seeking roles that build on my experience.');
   n.superpowers = Array.isArray(n.superpowers) ? n.superpowers.filter(Boolean) : [];
+  // Which of the two the generator filled. profile.yml records it so the
+  // wizard's read-back leaves them blank — a derived value is not an answer —
+  // and the next Save re-derives them from the résumé then on file, instead of
+  // the old sentence prefilling the step and surviving a résumé change.
+  n.derived = [...(typedHeadline ? [] : ['headline']), ...(typedStory ? [] : ['exit_story'])];
   return n;
 }
 
@@ -1225,6 +1232,7 @@ function generateProfile(info, criteria, narrative) {
       exit_story: narrative.exitStory,
       superpowers: narrative.superpowers,
       proof_points: [],
+      derived: narrative.derived || [],   // the fields above the generator filled, not the wizard
     },
     compensation: {
       target_range: criteria.compensationTarget,

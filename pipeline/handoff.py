@@ -140,6 +140,7 @@ class QueueRole:
     url: str
     status: str = ""
     report: str = ""         # career-ops-relative eval report path; feeds tailoring
+    report_num: str = ""     # the row's `[N]`, for a dead link the path alone can't resolve
 
     @property
     def board(self) -> str:
@@ -160,6 +161,7 @@ class WorkOrderItem:
     status: str = ""         # agent writes back: claimed | applied | handoff | skip:<reason>
     resume_pdf: str = ""     # optional: pre-tailored resume file (--tailor enrichment)
     report: str = ""         # career-ops-relative eval report path (proof-points for tailoring)
+    report_num: str = ""     # the row's `[N]`, so the readers resolve a dead link the UI can
 
 
 # ── Normalization / keys ───────────────────────────────────────────────────────
@@ -556,6 +558,7 @@ def load_queue(path: Path) -> list[QueueRole]:
             url=str(o.get("url") or "").strip(),
             status=str(o.get("status") or "").strip(),
             report=str(o.get("report") or "").strip(),
+            report_num=str(o.get("report_num") or "").strip(),
         ))
     return out
 
@@ -589,6 +592,7 @@ def load_queue_from_tracker(career_ops: Path) -> list[QueueRole]:
             url=url,
             status=str(row.get("status_canonical") or "").strip(),
             report=str(row.get("report_path") or "").strip(),
+            report_num=str(row.get("report_num") or "").strip(),
         ))
     return out
 
@@ -838,7 +842,7 @@ def build_work_order(
         WorkOrderItem(
             rank=i + 1, num=q.num, score=q.score, company=q.company, role=q.role,
             board=q.board, url=q.url, resume_base=suggest_resume_base(q.role),
-            report=q.report,
+            report=q.report, report_num=q.report_num,
         )
         for i, q in enumerate(fresh)
     ]
@@ -957,7 +961,8 @@ def _make_tailor_fn(career_ops: Path, out_dir=None):
         # defaults to career_ops, where the path is rooted) so tailoring uses the
         # evaluation report, not JD text alone.
         job = ApplyJob(num=item.num, company=item.company, role=item.role,
-                       url=item.url, score=item.score, report_path=item.report)
+                       url=item.url, score=item.score, report_path=item.report,
+                       report_num=item.report_num)
         return resume_content.generate_for_job(career_ops, job, profile_dir=out_dir,
                                                caller=shared_caller)
 
