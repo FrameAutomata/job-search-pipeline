@@ -137,7 +137,7 @@ Keywords are extracted from the resume (`resumes/resume.{pdf,docx,odt}`, no hard
 
 - YAKE 1–3 gram extraction (weight 1) + explicit Skills-section tokens (weight 2)
 - `score_job()` matches keywords against title + description + skills fields
-- Target title match → +5 bonus; negative title match → hard-exclude (score = None)
+- Target title match → +5 bonus; negative title match → hard-exclude (score = None). An entry is matched **literally** against the title, so one that groups alternatives — `Patient Access / Patient Registration Representative`, `policy or program analyst` — can never fire, and the stage log's `target_titles: N` still counts it; both real wizard-configured copies had every entry in that shape (#160). `setup-profile.mjs` now splits a typed role on ` / ` (with spaces — `UI/UX Designer` is one title) and on a word-bounded `or` (a one-word left side borrows the right side's tail, so `policy or program analyst` becomes `policy analyst` + `program analyst`) before expanding it into queries, and writes **title fragments** rather than the queries into `target_titles` — each split term plus its stem without a generic trailing suffix (`patient access representative` → `patient access`), since a query wants the whole phrase and the bonus wants the part a title keeps (`Patient Access Rep II`). `filter.run` warns once per grouped entry (`_warn_unmatchable_titles`) for configs written any other way. The wizard's Target roles field still reads back the user's own text, from `profile.yml`'s archetypes.
 - Jobs sorted descending by `relevance_score`
 
 ---

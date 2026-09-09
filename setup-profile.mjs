@@ -1210,13 +1210,46 @@ function writeProfile(profile) {
 // ============================================================
 
 /**
+ * Split one typed role into the alternatives it groups (#160).
+ *
+ * The wizard says "comma-separated", but grouping alternatives with a slash
+ * ("Patient Access / Patient Registration Representative") or an "or"
+ * ("policy or program analyst") is simply how people write, and both real
+ * copies did. Passed through verbatim, each string became one board query —
+ * keyword soup that is neither title the user meant — and one `target_titles`
+ * entry that no posting's title ever contains, so the +5 title bonus never
+ * fired on either copy while the stage log still counted the entries.
+ *
+ * Only a slash WITH spaces splits: "UI/UX Designer" and "CI/CD Engineer" are
+ * one title. An "or" whose left side is a single word borrows the right side's
+ * tail, so "policy or program analyst" reads as "policy analyst" and
+ * "program analyst" rather than a bare "policy" — a heuristic, but the one
+ * that matches how the phrase is meant; a multi-word left side is kept as is.
+ */
+function splitRoleAlternatives(role) {
+  const out = [];
+  for (const slashPart of String(role).split(/\s+\/\s+/)) {
+    const orParts = slashPart.split(/\s+or\s+/i).map(s => s.trim()).filter(Boolean);
+    // The last alternative's tail (everything after its first word), borrowed
+    // by any earlier one-word alternative; empty when there is nothing to borrow.
+    const tail = orParts.length ? orParts[orParts.length - 1].split(/\s+/).slice(1) : [];
+    for (let i = 0; i < orParts.length; i++) {
+      const oneWord = i < orParts.length - 1 && !/\s/.test(orParts[i]);
+      out.push(oneWord ? [orParts[i], ...tail].join(' ') : orParts[i]);
+    }
+  }
+  return out;
+}
+
+/**
  * Convert a user's target-role list into JobSpy-friendly search terms.
- * Adds lowercase variants for "full-stack" / "fullstack" / non-senior forms
- * so we cover the common job-board phrasings.
+ * Splits grouped alternatives first (see splitRoleAlternatives), then adds
+ * lowercase variants for "full-stack" / "fullstack" / non-senior forms so we
+ * cover the common job-board phrasings.
  */
 function expandSearchTerms(targetRoles) {
   const out = [];
-  for (const role of targetRoles) {
+  for (const role of targetRoles.flatMap(splitRoleAlternatives)) {
     const lower = role.toLowerCase();
     out.push(lower);
     if (lower.includes('full-stack') || lower.includes('full stack')) {
@@ -1226,6 +1259,39 @@ function expandSearchTerms(targetRoles) {
     if (lower.includes('senior')) {
       const withoutSenior = lower.replace(/senior\s+/i, '').trim();
       if (withoutSenior) out.push(withoutSenior);
+    }
+  }
+  return [...new Set(out)];
+}
+
+// Suffixes a real posting title routinely swaps, shortens or drops — "Patient
+// Access Representative" is posted as "Patient Access Rep II", "Patient Access
+// Specialist", "Patient Access Coordinator". The part BEFORE them is what the
+// title keeps. Deliberately not "engineer"/"analyst"/"nurse": those carry the
+// job family, and "senior software" is no fragment of anything.
+const GENERIC_ROLE_SUFFIXES = new Set([
+  'representative', 'rep', 'specialist', 'coordinator', 'associate', 'assistant',
+  'technician', 'tech', 'clerk', 'agent', 'officer',
+]);
+
+/**
+ * The `filter.target_titles` list: what earns the +5 title bonus when a
+ * posting's title contains it. A good query and a good title fragment are
+ * different things (#160) — the query wants the whole phrase, the bonus wants
+ * the part a title actually keeps — so alongside each search term (the split,
+ * expanded roles, so the list is a superset of every board query by
+ * construction) this adds its stem without a generic trailing suffix when the
+ * role is long enough to still name a job family without it. The filter
+ * compiles these longest-first and counts one hit per title, so the pair never
+ * double-scores.
+ */
+function titleFragments(searchTerms) {
+  const out = [];
+  for (const term of searchTerms) {
+    out.push(term);
+    const words = term.split(/\s+/);
+    if (words.length >= 3 && GENERIC_ROLE_SUFFIXES.has(words[words.length - 1])) {
+      out.push(words.slice(0, -1).join(' '));
     }
   }
   return [...new Set(out)];
@@ -1322,10 +1388,11 @@ function updateSearchConfig(targetRoles, negativeRoles, searchSettings) {
   delete config.search;
 
   // ── filter: ────────────────────────────────────────────────────────────
+  // Title fragments, not the board queries: see titleFragments (#160).
   if (!config.filter) config.filter = {};
-  config.filter.target_titles = searchTerms;
+  config.filter.target_titles = titleFragments(searchTerms);
   if (negativeRoles && negativeRoles.length > 0) {
-    config.filter.negative_titles = negativeRoles;
+    config.filter.negative_titles = negativeRoles.flatMap(splitRoleAlternatives);
   }
 
   // ── screen: ────────────────────────────────────────────────────────────
