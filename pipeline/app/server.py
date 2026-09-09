@@ -1719,6 +1719,7 @@ def handoff_role_prompt(num: str) -> JSONResponse:
         company, row.get("role", ""), url,
         report=report,
         resume=find_existing(career_ops, company),
+        easy_apply=row.get("easy_apply"),   # so submit-easy-apply's first line/fallback fit THIS row
     )
     return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})
 

@@ -310,6 +310,18 @@ class TestRolePrompt:
         assert "resume" in prompt.lower()
         assert "Acme - resume.pdf" not in prompt
 
+    def test_easy_apply_flag_reaches_the_prompt(self, client, tmp_path, monkeypatch):
+        # parse_applications flags a row whose URL is in easy-apply-urls.txt; under
+        # submit-easy-apply the route passes that flag so the first line and the
+        # fallback row fit THIS role rather than stating both cases.
+        monkeypatch.setenv(handoff.SUBMIT_POLICY_ENV, "submit-easy-apply")
+        before = client.get("/api/handoff/role-prompt/1").json()["prompt"]
+        assert before.startswith("This is not a board-hosted") and '"status": "applied"' not in before
+        (tmp_path / "career-ops" / "data" / "easy-apply-urls.txt").write_text(
+            "https://www.linkedin.com/jobs/view/101\n", encoding="utf-8")
+        after = client.get("/api/handoff/role-prompt/1").json()["prompt"]
+        assert after.startswith("This is a board-hosted") and '"status": "applied"' in after
+
     def test_unknown_num_404(self, client):
         assert client.get("/api/handoff/role-prompt/999").status_code == 404
 

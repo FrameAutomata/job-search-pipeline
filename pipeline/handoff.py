@@ -837,15 +837,38 @@ def merge_tracked(*groups: list[TrackedRole]) -> list[TrackedRole]:
     return list(by_key.values())
 
 
+def _supersede_ready(tracker: list[TrackedRole], newer: list[TrackedRole]) -> list[TrackedRole]:
+    """Drop from `tracker` every READY_STATUS entry whose key `newer` carries
+    under a DIFFERENT status. merge_tracked resolves a collision by precedence,
+    and ready-to-submit (4) outranks skipped (1), claimed (2) and drafted (3) —
+    right when both are fresh reports, wrong when the ready entry is the
+    previous run's ledger and the other is what the person just typed over the
+    pre-fill. A status recorded on a re-emitted row is by construction newer
+    than the pre-fill it replaced, so it must win whatever its rank; without
+    this the ledger kept `ready-to-submit` over a `skip:<reason>`, and on the
+    scored-export path (where the queue row stays Evaluated) the row was dropped
+    one run and re-emitted ready the next — the oscillation drop_late_writeback
+    exists to prevent, reached from the precedence side. `applied`/`handoff`
+    already outrank READY_STATUS, so for them this is a no-op. Only READY_STATUS
+    entries are dropped: every other tracked status is terminal or in-progress
+    and never re-emitted, so nothing else can be typed over."""
+    moved = {t.key for t in newer if t.status != READY_STATUS}
+    return [t for t in tracker if not (t.status == READY_STATUS and t.key in moved)]
+
+
 def reconcile(
     job_log_text: str,
     existing: list[TrackedRole],
     writeback: list[TrackedRole] | None = None,
     known_companies: set[str] | None = None,
 ) -> list[TrackedRole]:
-    """Fold JOB_LOG.md + any agent writeback into the existing tracker."""
+    """Fold JOB_LOG.md + any agent writeback into the existing tracker. A
+    ready-to-submit entry in `existing` that the writeback moved on (skip,
+    claimed, drafted — not just the higher-ranked applied/handoff) is dropped
+    first, since the writeback overwrote the pre-fill (_supersede_ready)."""
     parsed = parse_job_log(job_log_text, known_companies=known_companies)
-    return merge_tracked(existing, parsed, writeback or [])
+    writeback = writeback or []
+    return merge_tracked(_supersede_ready(existing, writeback), parsed, writeback)
 
 
 # Agent writeback statuses that surface in career-ops' applications.md (the UI
@@ -937,9 +960,15 @@ def build_work_order(
     # Secondary index: paren-stripped key → the qualifier sets seen for it.
     # A queue role matches a tracked one when the stripped keys agree AND the
     # parenthetical qualifiers don't CONFLICT (one side subtitle-free matches;
-    # "(Backend)" vs "(Frontend)" stays two distinct roles).
+    # "(Backend)" vs "(Frontend)" stays two distinct roles). Built from the
+    # EXCLUDED entries only: a ready form is matched on its exact key below, and
+    # indexing it here made a queue title re-worded since the form was filled
+    # ("SWE" → "SWE (Remote)") its fuzzy cousin — dropped, and counted as
+    # neither "to finish" nor "excluded". It is emitted fresh instead.
     touched_stripped: dict[str, list[frozenset[str]]] = {}
     for t in tracker:
+        if t.status == READY_STATUS:
+            continue
         touched_stripped.setdefault(_stripped_key(t.company, t.role), []).append(
             _paren_texts(t.role))
 
@@ -1158,8 +1187,19 @@ def _status_legend_md() -> list[str]:
 # it is re-emitted at the top until the person records applied.
 _WRITEBACK_FOLD_NOTE = (
     "The next pipeline run folds these statuses into the tracker, so recorded roles "
-    f"never reappear — except `{READY_STATUS}`, which comes back at the top until you "
-    "record `applied`."
+    f"never reappear — except `{READY_STATUS}`, which comes back at the top until the "
+    "candidate clicks Submit and `applied` is recorded."
+)
+
+# The instruction beside every re-emitted ready-to-submit row, addressed to the
+# AGENT: the row is waiting on the candidate, and the one thing the policy that
+# produced it forbids is the click. The md is headed "for a browser agent" and
+# read top-down, so a ready block that only said "click Submit" told the agent
+# to do exactly that. Stated once so the md and the README can't disagree.
+READY_AGENT_NOTE = (
+    "Agent: leave these rows alone — do not submit them. They are waiting on the "
+    "candidate, who checks the form, clicks Submit and records `applied` (or "
+    "`skip:<reason>`)."
 )
 
 
@@ -1214,8 +1254,8 @@ def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
             READY_HEADING,
             "",
             f"These rows carry `status: {READY_STATUS}` already — the form is filled and",
-            "reviewed. Nothing was sent. Open the URL, check the form, click Submit, then set",
-            "the row to `applied` (or `skip:<reason>`).",
+            "reviewed. Nothing was sent.",
+            READY_AGENT_NOTE,
             "",
             *_MD_TABLE_HEAD,
             *(_md_row(i) for i in ready),
@@ -1257,7 +1297,8 @@ def render_handoff_readme(*, policy: str | None = None) -> str:
         "",
         f"A row stopped before Submit carries `status: {READY_STATUS}` and comes back at",
         "the TOP of its site's work-order on every run, under the heading",
-        f"\"{READY_HEADING[3:]}\", until you click Submit and record `applied`.",
+        f"\"{READY_HEADING[3:]}\", until the candidate clicks Submit and records `applied`.",
+        READY_AGENT_NOTE,
         "Rows marked `easy_apply` are board-hosted one-click applications (Indeed",
         "Apply, LinkedIn Easy Apply) — the ones `submit-easy-apply` submits.",
         "",
@@ -1707,7 +1748,8 @@ def _writeback_contract(work_order: Path) -> str:
         f"Record each outcome in {work_order} by setting that row's \"status\" "
         f"field: {statuses}. The pipeline folds these statuses into its tracker "
         f"on the next run, so recorded roles never reappear — except \"{READY_STATUS}\", "
-        "which comes back at the top until you record \"applied\"."
+        "which comes back at the top until the candidate clicks Submit and \"applied\" "
+        "is recorded."
     )
 
 
@@ -1765,39 +1807,66 @@ def session_summaries(out_dir) -> list[dict]:
 
 
 # The per-role prompt's opening instruction, by policy. Under submit-easy-apply
-# the prompt does not know whether THIS posting is board-hosted (the row's
-# easy_apply flag is the UI route's to pass), so it states the rule for both cases.
-_ROLE_PROMPT_LEAD: dict[str, str] = {
-    "stop-before-submit": ("Prepare this application through the browser and stop before "
-                           f"Submit; record `{READY_STATUS}`."),
-    "submit-easy-apply": ("Apply to this role through the browser if it is a board-hosted "
-                          "one-click application (Indeed Apply, LinkedIn Easy Apply); "
-                          "otherwise prepare it and stop before Submit, recording "
-                          f"`{READY_STATUS}`."),
-    "submit-all": "Apply to this role through the browser, then record the outcome.",
-}
-assert set(_ROLE_PROMPT_LEAD) == set(SUBMIT_POLICIES)
+# the instruction depends on whether THIS posting is board-hosted: the UI route
+# passes the row's easy_apply flag (parse_applications computes it), and when
+# no caller knows it the prompt states the rule for both cases.
+_LEAD_STOP = ("Prepare this application through the browser and stop before "
+              f"Submit; record `{READY_STATUS}`.")
+_LEAD_SUBMIT = "Apply to this role through the browser, then record the outcome."
+_LEAD_EASY_APPLY_UNKNOWN = ("Apply to this role through the browser if it is a board-hosted "
+                            "one-click application (Indeed Apply, LinkedIn Easy Apply); "
+                            "otherwise prepare it and stop before Submit, recording "
+                            f"`{READY_STATUS}`.")
+_LEAD_EASY_APPLY_YES = ("This is a board-hosted one-click application (Indeed Apply, LinkedIn "
+                        "Easy Apply): apply to it through the browser, then record the outcome.")
+_LEAD_EASY_APPLY_NO = ("This is not a board-hosted one-click application (Indeed Apply, "
+                       "LinkedIn Easy Apply): prepare it through the browser and stop before "
+                       f"Submit; record `{READY_STATUS}`.")
+
+
+def _role_prompt_lead(policy: str, easy_apply: bool | None) -> tuple[str, str]:
+    """(first line, fallback-row status) for the per-role prompt. The agent
+    submits — and the fallback row says `applied` — only when the policy says
+    so for THIS role: always under submit-all, under submit-easy-apply only for
+    a row known to be easy_apply. Unknown (None) under submit-easy-apply keeps
+    the two-case instruction and falls back to the safe status, since a prompt
+    that says "stop unless board-hosted" must not append a row that says
+    `applied` for a role it told the agent to stop on."""
+    if policy == "submit-all":
+        return _LEAD_SUBMIT, "applied"
+    if policy == "submit-easy-apply":
+        if easy_apply is None:
+            return _LEAD_EASY_APPLY_UNKNOWN, READY_STATUS
+        return (_LEAD_EASY_APPLY_YES, "applied") if easy_apply else (_LEAD_EASY_APPLY_NO, READY_STATUS)
+    return _LEAD_STOP, READY_STATUS
+
+
+assert {_role_prompt_lead(p, None)[0] for p in SUBMIT_POLICIES} == {
+    _LEAD_STOP, _LEAD_SUBMIT, _LEAD_EASY_APPLY_UNKNOWN}
 
 
 def role_prompt(company: str, role: str, url: str, *,
                 report: Path | None = None,
                 profile: Path | None = None,
                 resume: Path | None = None,
-                policy: str | None = None) -> str:
+                policy: str | None = None,
+                easy_apply: bool | None = None) -> str:
     """The paste-ready prompt for handing ONE role to a browser agent. The
     caller (the UI route) gathers the facts/paths; this module renders them so
     the writeback contract and the appended-row schema — which must mirror the
     keys load_writeback() reads — live beside their parser. The first line and
-    the fallback row's status follow the submit policy: under stop-before-submit
-    the agent's terminal outcome is ready-to-submit, not applied."""
+    the fallback row's status follow the submit policy AND, under
+    submit-easy-apply, the row's `easy_apply` flag (None = unknown): the
+    fallback says `applied` only for a role the agent is told to submit."""
     policy = _resolve_policy(policy)
+    lead, fallback_status = _role_prompt_lead(policy, easy_apply)
     # The role's writeback target — and its living profile — live in the same
     # handoff dir as its own site's session file.
     out_dir = default_out_dir()
     work_order = work_order_paths(out_dir, board_of(url))[0]
     profile = profile or out_dir / HANDOFF_PROFILE
     lines = [
-        _ROLE_PROMPT_LEAD[policy],
+        lead,
         policy_line(policy),
         "",
         f"Company: {company}",
@@ -1813,8 +1882,7 @@ def role_prompt(company: str, role: str, url: str, *,
         lines.append("Resume: no tailored copy cached — tailor one from "
                      "resumes/resume.docx, or apply with your default resume.")
     fallback_row = json.dumps({
-        "company": company, "role": role, "url": url,
-        "status": READY_STATUS if policy == "stop-before-submit" else "applied",
+        "company": company, "role": role, "url": url, "status": fallback_status,
     })
     lines += [
         "",
@@ -1913,7 +1981,9 @@ def run(
     for b in list(sessions):
         sessions[b], _ = drop_late_writeback(sessions[b], out_dir, late=late)
     if late:
-        tracked = merge_tracked(tracked, late)   # already deduped by load_all_writeback
+        # Same newer-wins rule as reconcile: a ready pre-fill the agent moved on
+        # during the window must not outrank the status it typed over it.
+        tracked = merge_tracked(_supersede_ready(tracked, late), late)   # late already deduped
         write_tracker(tracker_path, tracked)
 
     # Reflect newly applied/skipped roles into career-ops' applications.md so they
