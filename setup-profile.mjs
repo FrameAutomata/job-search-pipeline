@@ -803,13 +803,13 @@ async function promptForCareerNarrative(autoMode, _info, criteria, resumeText = 
   const headlineInput = await prompt(
     '\nOne-line headline (how you would introduce yourself professionally)?\n→ '
   );
-  narrative.headline = headlineInput || defaultHeadline(criteria, resumeText);
+  narrative.headline = headlineInput;
 
   // Exit story
   const exitStoryInput = await prompt(
     '\nTell me your career transition story (what brings you to these roles?).\nExample: "Moving into patient access roles where my scheduling and insurance-verification experience carries the most weight"\n→ '
   );
-  narrative.exitStory = exitStoryInput || defaultExitStory(criteria, resumeText);
+  narrative.exitStory = exitStoryInput;
 
   // Deal-breakers
   console.log('\n🚫 Deal-breakers (non-negotiables):');
@@ -846,7 +846,7 @@ async function promptForCareerNarrative(autoMode, _info, criteria, resumeText = 
       .filter(p => p);
   }
 
-  return narrative;
+  return resolveNarrative(narrative, criteria, resumeText);
 }
 
 // ============================================================
@@ -1066,24 +1066,24 @@ function firstTargetRole(criteria) {
   return (criteria && criteria.targetRoles && criteria.targetRoles[0]) || '';
 }
 
-function defaultExitStory(criteria, resumeText) {
-  const summary = firstSentence(extractResumeSections(resumeText).summary);
-  const role = firstTargetRole(criteria);
-  return summary || (role ? `Seeking ${role} roles that build on my experience.`
-                          : 'Seeking roles that build on my experience.');
-}
-
-function defaultHeadline(criteria, resumeText) {
-  const summary = firstSentence(extractResumeSections(resumeText).summary, 120);
-  const role = firstTargetRole(criteria);
-  return summary || (role ? `${role} candidate` : 'Candidate');
-}
-
-/** Fill whatever the Narrative step left blank from the candidate's own material. */
+/**
+ * Fill whatever the Narrative step left blank from the candidate's own material:
+ * the résumé's summary sentence, else the first target role. The one place the
+ * rule lives — both entry points resolve once, here, and the generators trust
+ * what they are handed.
+ */
 function resolveNarrative(narrative, criteria, resumeText) {
   const n = { ...(narrative || {}) };
-  n.headline = String(n.headline || '').trim() || defaultHeadline(criteria, resumeText);
-  n.exitStory = String(n.exitStory || '').trim() || defaultExitStory(criteria, resumeText);
+  const summary = extractResumeSections(resumeText).summary;
+  const role = firstTargetRole(criteria);
+  n.headline = String(n.headline || '').trim()
+    || firstSentence(summary, 120)
+    || (role ? `${role} candidate` : 'Candidate');
+  n.exitStory = String(n.exitStory || '').trim()
+    || firstSentence(summary)
+    || (role ? `Seeking ${role} roles that build on my experience.`
+             : 'Seeking roles that build on my experience.');
+  n.superpowers = Array.isArray(n.superpowers) ? n.superpowers.filter(Boolean) : [];
   return n;
 }
 
@@ -1136,8 +1136,7 @@ function generateCV(resumeText, info) {
 // Generate Profile YAML
 // ============================================================
 
-function generateProfile(info, criteria, narrative = {}, resumeText = '') {
-  const n = resolveNarrative(narrative, criteria, resumeText);
+function generateProfile(info, criteria, narrative) {
   // Detect seniority level from target and negative roles
   const targetRolesLower = criteria.targetRoles.map(r => r.toLowerCase()).join(' ');
   const negativeRolesLower = criteria.negativeRoles.map(r => r.toLowerCase()).join(' ');
@@ -1202,9 +1201,9 @@ function generateProfile(info, criteria, narrative = {}, resumeText = '') {
     // From the Narrative step (or derived from the résumé and target roles —
     // see resolveNarrative). These used to be engineering constants (#161).
     narrative: {
-      headline: n.headline,
-      exit_story: n.exitStory,
-      superpowers: Array.isArray(n.superpowers) ? n.superpowers.filter(Boolean) : [],
+      headline: narrative.headline,
+      exit_story: narrative.exitStory,
+      superpowers: narrative.superpowers,
       proof_points: [],
     },
     compensation: {
@@ -1485,15 +1484,13 @@ async function runFromJson(jsonPath) {
 
   const n = payload.narrative || {};
   const narrative = resolveNarrative({
-    headline: n.headline || '',
-    exitStory: n.exitStory || '',
-    superpowers: Array.isArray(n.superpowers) ? n.superpowers : [],
-  }, criteria, resumeText);
-  Object.assign(narrative, {
+    headline: n.headline,
+    exitStory: n.exitStory,
+    superpowers: n.superpowers,
     dealBreakers: n.dealBreakers || [],
     locationPolicy: n.locationPolicy || { preferred: criteria.locationFlexibility, flexibility: 'Flexible for right opportunity' },
     portfolio: n.portfolio || [],
-  });
+  }, criteria, resumeText);
 
   // Ensure the output directories exist (fresh setup may lack them).
   fs.mkdirSync(path.join(CAREER_OPS_PATH, 'config'), { recursive: true });
@@ -1508,7 +1505,7 @@ async function runFromJson(jsonPath) {
     fs.copyFileSync(examplePath, searchPath);
   }
 
-  const profile = generateProfile(info, criteria, narrative, resumeText);
+  const profile = generateProfile(info, criteria, narrative);
   const cv = generateCV(resumeText, info);
   const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
 
@@ -1613,7 +1610,7 @@ async function main() {
 
   // Generate files
   log('Generating profile.yml, cv.md, and _profile.md...');
-  const profile = generateProfile(info, criteria, narrative, resumeText);
+  const profile = generateProfile(info, criteria, narrative);
   const cv = generateCV(resumeText, info);
   const profileMarkdown = generateProfileMarkdown(info, criteria, narrative);
 

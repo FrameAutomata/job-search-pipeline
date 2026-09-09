@@ -5,6 +5,7 @@ extraction are guarded so the suite still passes without node / pdfplumber.
 """
 
 import base64
+import functools
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ def html():
     return (root / "pipeline" / "app" / "static" / "onboard.html").read_text(encoding="utf-8")
 
 
+@functools.cache
 def _node_deps_available() -> bool:
     """True only if node AND the npm packages setup-profile.mjs imports
     (yaml, pdf-parse) resolve. CI has node but doesn't `npm install`, so the
@@ -199,6 +201,18 @@ class TestCollectSecretBlobs:
             onboard.collect_secret_blobs(tmp_path)
 
 
+def _node_workdir(tmp_path) -> Path:
+    """An isolated cwd for the real generator — only the example config and
+    the empty career-ops dirs it writes into — so a run never touches the
+    real config/career-ops."""
+    repo = Path(__file__).resolve().parent.parent
+    (tmp_path / "config").mkdir()
+    shutil.copy(repo / "config" / "search.example.yml", tmp_path / "config" / "search.example.yml")
+    (tmp_path / "career-ops" / "config").mkdir(parents=True)
+    (tmp_path / "career-ops" / "modes").mkdir(parents=True)
+    return tmp_path
+
+
 @pytest.mark.skipif(not _node_deps_available(),
                     reason="node or its npm deps (yaml/pdf-parse) not installed")
 class TestNodeRoundTrip:
@@ -206,14 +220,7 @@ class TestNodeRoundTrip:
     real generator on a fixture and assert the four artifacts appear."""
 
     def test_from_json_produces_artifacts(self, tmp_path):
-        repo = Path(__file__).resolve().parent.parent
-        # Run node in an isolated cwd with only the example config available, so
-        # we don't touch the real config/career-ops.
-        work = tmp_path
-        (work / "config").mkdir()
-        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
-        (work / "career-ops" / "config").mkdir(parents=True)
-        (work / "career-ops" / "modes").mkdir(parents=True)
+        work = _node_workdir(tmp_path)
 
         payload = onboard.build_onboarding_json(
             {"name": "Jane Dev", "target_roles": "Backend Engineer",
@@ -232,7 +239,6 @@ class TestNodeRoundTrip:
         assert (work / "config" / "search.yml").exists()
 
         # Work-authorization answers flow form -> JSON -> generated profile.yml.
-        import yaml
         profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
         wa = profile["work_authorization"]
         assert wa["citizenship"] == "Canadian"
@@ -255,12 +261,7 @@ class TestNodeRoundTrip:
         back can. Asserted over the keys the input actually set — Node fills
         defaults the form left blank, and those are not drift.
         """
-        repo = Path(__file__).resolve().parent.parent
-        work = tmp_path
-        (work / "config").mkdir()
-        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
-        (work / "career-ops" / "config").mkdir(parents=True)
-        (work / "career-ops" / "modes").mkdir(parents=True)
+        work = _node_workdir(tmp_path)
 
         form = {
             "name": "Jane Dev", "email": "jane@example.com", "phone": "+1 (555) 123-4567",
@@ -322,15 +323,9 @@ class TestNarrativeDefaults:
                    "excels in this domain", "impactful products")
 
     def _generate(self, tmp_path, form, resume):
-        repo = Path(__file__).resolve().parent.parent
-        work = tmp_path
-        (work / "config").mkdir()
-        shutil.copy(repo / "config" / "search.example.yml", work / "config" / "search.example.yml")
-        (work / "career-ops" / "config").mkdir(parents=True)
-        (work / "career-ops" / "modes").mkdir(parents=True)
+        work = _node_workdir(tmp_path)
         result = onboard.run_generation(work, onboard.build_onboarding_json(form, resume))
         assert result.get("ok") is True, result
-        import yaml
         profile = yaml.safe_load((work / "career-ops" / "config" / "profile.yml").read_text(encoding="utf-8"))
         md = (work / "career-ops" / "modes" / "_profile.md").read_text(encoding="utf-8")
         return work, profile["narrative"], md
