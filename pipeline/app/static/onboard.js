@@ -18,6 +18,14 @@ const isChain = (spec) => (spec || "").split(",").filter((m) => m.trim()).length
 // apply this fallback in only one of the two places, so limits typed against the
 // shown default were dropped while the UI still reported "Saved".
 let geminiDefaultModel = "";
+// What a blank BATCH_MODEL resolves to in the CLOUD on Gemini: the server
+// computes it from the limits table (/api/onboard/providers), because the
+// provider default is a ~20-requests-a-day row on a free key and a day's worth
+// of roles would exhaust it. Shown in the model field's hint and used as the
+// model the rate-limit boxes describe when the field is left blank.
+let geminiFreeTierPick = "";
+// The model the three rate-limit boxes were last seeded for — see showLimits.
+let limitsShownModel = null;
 
 const form = document.getElementById("wizard");
 const steps = [...document.querySelectorAll(".step")];
@@ -111,6 +119,63 @@ function showBanner(text, kind) {
 // default-on), and restored by .checked rather than .value.
 const CONSENT_TOGGLES = ["data_processing_consent", "save_answers", "share_answers"];
 
+// The two Provider-step checkboxes that write a repository VARIABLE, serialized
+// the same explicit way and for the same reason: an unchecked box is simply
+// absent from FormData, which the server would read as "the form never
+// mentioned it" and leave the variable as it is — so unticking either in edit
+// mode would silently do nothing. Both default ON, so "no" is the answer that
+// has to survive the trip.
+const VARIABLE_TOGGLES = ["gemini_free_tier", "auto_update_weekly"];
+
+// ── Gemini free-tier limits ──────────────────────────────────────────────────
+// The checkbox and the three AI Studio boxes live on the Provider step, beside
+// the model they describe, and one read of them feeds three writers: the
+// repository variables GEMINI_FREE_TIER / GEMINI_LIMITS_JSON (the wizard's
+// submit), and .env + config/gemini-limits.json (the local-config save as the
+// user leaves that step). Reading them in one place is what keeps the cloud and
+// the local run conforming to the same numbers.
+
+// Is the opt-in on AND applicable? The row is hidden for an explicit non-Gemini
+// provider, where the flag would be a no-op, and a hidden box must not be read
+// as an answer.
+function geminiFreeTierOn() {
+  const row = document.getElementById("gemini-free-tier-row");
+  const cb = form.querySelector('input[name="gemini_free_tier"]');
+  return !!(cb && cb.checked && row && !row.hidden);
+}
+
+// The model the boxes describe: whatever is in the cloud model field, else what
+// a blank field resolves to. Chains are edited one model at a time (lead only).
+function geminiLimitsModel() {
+  const field = form.querySelector('[name="batch_model"]');
+  return leadModel((field && field.value) || geminiFreeTierPick || geminiDefaultModel);
+}
+
+// {} = nothing to say; {limits} = a payload to send; {error} = a half-filled row.
+// RPM and RPD are the pair pacing and the daily cap need, so one without the
+// other is an error the user can see rather than a silent drop. A blank TPM
+// OMITS the key: sending null would read as "unlimited" and merge over the
+// built-in number, turning the token budget off through the only UI it has.
+function readGeminiLimits() {
+  if (!geminiFreeTierOn()) return {};
+  const model = geminiLimitsModel();
+  if (!model) return {};
+  const num = (id) => {
+    const raw = document.getElementById(id)?.value.trim();
+    return raw === "" || raw === undefined ? null : Number(raw);
+  };
+  const rpm = num("gemini-rpm"), tpm = num("gemini-tpm"), rpd = num("gemini-rpd");
+  if (rpm === null && tpm === null && rpd === null) {
+    return { limits: { [model]: null } };   // cleared → back to the built-in table
+  }
+  if (rpm === null || rpd === null) {
+    return { error: "Enter both RPM and RPD (TPM may be blank to keep the built-in value)." };
+  }
+  const row = { rpm, rpd };
+  if (tpm !== null) row.tpm = tpm;
+  return { limits: { [model]: row } };
+}
+
 // Collect the form into a plain object (sites -> array of checked values).
 function collectForm() {
   const fd = new FormData(form);
@@ -121,9 +186,14 @@ function collectForm() {
   }
   obj.sites = [...form.querySelectorAll('input[name="sites"]:checked')].map((c) => c.value);
   obj.include_easy_apply = form.querySelector('input[name="include_easy_apply"]').checked;
-  for (const name of CONSENT_TOGGLES) {
-    obj[name] = form.querySelector(`input[name="${name}"]`).checked ? "yes" : "no";
+  for (const name of [...CONSENT_TOGGLES, ...VARIABLE_TOGGLES]) {
+    const cb = form.querySelector(`input[name="${name}"]`);
+    if (cb) obj[name] = cb.checked ? "yes" : "no";
   }
+  // The AI Studio numbers ride with the submit so the cloud's GEMINI_LIMITS_JSON
+  // and the local override file are written from one set of boxes.
+  const limits = readGeminiLimits();
+  if (limits.limits) obj.gemini_limits = limits.limits;
   return obj;
 }
 
@@ -169,6 +239,24 @@ function renderReview() {
   const keyLabel = f.api_key
     ? "•".repeat(Math.min(12, f.api_key.length)) + " (will be written)"
     : apiKeyRequired() ? "(none — required)" : "(keeping your saved key)";
+  // The Provider step's free-tier answer and the digest channels are the two
+  // things a user can leave configured without seeing them again, so Review is
+  // where they are restated — a webhook typed into a password field and never
+  // echoed is otherwise unverifiable before Save.
+  const freeTierLabel = f.provider !== "gemini" ? "(n/a — not Gemini)"
+    : f.gemini_free_tier === "no" ? "no — full-rate requests"
+    : "yes — pace and cap to the free-tier limits";
+  const channels = [];
+  if (f.digest_discord_webhook) channels.push("Discord (new webhook)");
+  if (f.digest_email_to) channels.push(`email → ${f.digest_email_to}`);
+  const digestLabel = channels.length ? channels.join(" · ")
+    : "(unchanged — whatever this repo already has)";
+  // The two Local-step selects have no form name (they save to .env on their
+  // own button), so Review reads them from the DOM.
+  const cliSelectEl = document.getElementById("local-cli-select");
+  const cliLabel = cliSelectEl
+    ? (cliSelectEl.selectedOptions[0]?.textContent || cliSelectEl.value) : "(default)";
+  const policyLabel = document.getElementById("local-submit-policy")?.value || "(default)";
   const lines = [
     `Resume:        ${resumeLabel}`,
     `Name:          ${f.name || "(default)"}`,
@@ -184,6 +272,11 @@ function renderReview() {
     `Easy Apply:    ${f.include_easy_apply ? "yes" : "no"}`,
     `Provider:      ${f.provider}${f.batch_model ? " · " + f.batch_model : ""}`,
     `API key:       ${keyLabel}`,
+    `Free tier:     ${freeTierLabel}`,
+    `Daily digest:  ${digestLabel}`,
+    `Weekly update: ${f.auto_update_weekly === "no" ? "no" : "yes"}`,
+    `Agent CLI:     ${cliLabel}`,
+    `At Submit:     ${policyLabel}`,
   ];
   // Review is the last screen before Save rewrites `searches:`, so the warning
   // has to be here too — not only on a step the user may never open.
@@ -219,6 +312,7 @@ function prefillForm(saved) {
   for (const [k, v] of Object.entries(saved)) {
     if (k === "sites" || k === "include_easy_apply") continue;
     if (CONSENT_TOGGLES.includes(k)) continue;
+    if (VARIABLE_TOGGLES.includes(k)) continue;
     if (v === undefined || v === null || v === "") continue;
     const el = form.querySelector(`[name="${k}"]`);
     if (el && el.tagName !== "FIELDSET") el.value = v;
@@ -234,6 +328,12 @@ function prefillForm(saved) {
   CONSENT_TOGGLES.forEach((name) => {
     const cb = form.querySelector(`input[name="${name}"]`);
     if (cb) cb.checked = name in saved ? saved[name] === "yes" : name === "data_processing_consent";
+  });
+  // Both default ON in the markup, so an absent answer keeps that default —
+  // only an explicit "no" from a previous submit unticks them.
+  VARIABLE_TOGGLES.forEach((name) => {
+    const cb = form.querySelector(`input[name="${name}"]`);
+    if (cb && name in saved) cb.checked = saved[name] === "yes";
   });
 }
 
@@ -267,6 +367,8 @@ nextBtn.addEventListener("click", async () => {
     const cloudModel    = form.querySelector('[name="batch_model"]')?.value;
     const apiKey        = form.querySelector('[name="api_key"]')?.value?.trim();
     const hasKey        = !!apiKey || !apiKeyRequired();
+    const limits        = readGeminiLimits();
+    if (limits.error) { showAction(limits.error, "error"); return; }
     if (cloudProvider && hasKey) {
       await fetch("/api/onboard/local-config", {
         method: "POST",
@@ -276,6 +378,17 @@ nextBtn.addEventListener("click", async () => {
           batch_model:    cloudModel || "",
           batch_cli:      "",
           api_key:        apiKey || "",
+          // The free-tier answers belong to THIS step, so this is where they
+          // reach .env and config/gemini-limits.json — the same values the
+          // submit writes as repository variables, so a local run and the
+          // cloud daily conform to one set of numbers.
+          gemini_free_tier: geminiFreeTierOn(),
+          gemini_limits:    limits.limits,
+          // Not this step's field, but a blank one UNSETS the key: carry the
+          // Local step's current selection through rather than clear it on the
+          // way past.
+          handoff_submit_policy:
+            document.getElementById("local-submit-policy")?.value || "",
         }),
       }).catch(() => {});
     }
@@ -330,6 +443,8 @@ form.addEventListener("submit", async (e) => {
   if (apiKeyRequired() && !f.api_key) {
     showAction("An API key is required to evaluate jobs.", "error"); showStep(5); return;
   }
+  const limitsCheck = readGeminiLimits();
+  if (limitsCheck.error) { showAction(limitsCheck.error, "error"); showStep(5); return; }
 
   const fd = new FormData();
   // Only attach the resume when one is actually selected. The server treats
@@ -356,6 +471,47 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
+// Which digest channels the repo already has, by secret. Secrets are
+// write-only, so this is the only way an edit-mode visit can say "you already
+// have this" — without it the blank webhook field reads as "not set up" and the
+// user pastes it again every visit.
+function showDigestStatus(s) {
+  const el = document.getElementById("digest-status");
+  if (!el) return;
+  const have = [];
+  if (s.has_digest_discord) have.push("Discord");
+  if (s.has_digest_email) have.push("email");
+  el.hidden = false;
+  el.textContent = have.length
+    ? `${have.join(" + ")} digest: configured — leave the fields blank to keep it.`
+    : "No digest configured yet — either channel below is enough.";
+}
+
+// Repository VARIABLES are readable, so edit mode prefills the digest
+// thresholds and the two checkboxes from what the cloud actually runs on.
+// Once, from loadStatus: the fields are user-editable and re-applying them
+// later would undo typing. Absent names leave the markup defaults alone,
+// which is what makes "checked unless you said otherwise" hold.
+let cloudVariablesApplied = false;
+function prefillCloudVariables(vars) {
+  if (cloudVariablesApplied) return;
+  cloudVariablesApplied = true;
+  const put = (field, name) => {
+    const el = form.querySelector(`[name="${field}"]`);
+    if (el && vars[name] !== undefined && vars[name] !== "") el.value = vars[name];
+  };
+  put("digest_min_score", "DIGEST_MIN_SCORE");
+  put("digest_limit", "DIGEST_LIMIT");
+  const tick = (field, name, on) => {
+    const cb = form.querySelector(`input[name="${field}"]`);
+    if (cb && vars[name] !== undefined) cb.checked = on(vars[name]);
+  };
+  // update-from-template.yml's schedule proceeds only on the exact string
+  // "true", so that is the only value that reads as checked.
+  tick("auto_update_weekly", "AUTO_UPDATE_FROM_TEMPLATE", (v) => v === "true");
+  tick("gemini_free_tier", "GEMINI_FREE_TIER", (v) => v === "true");
+}
+
 // Load repo status up front so the user knows where secrets will go (and whether
 // the repo is private).
 async function loadStatus() {
@@ -367,6 +523,8 @@ async function loadStatus() {
     reviewRepo.textContent = s.repo;
     providerKeyOnFile = !!s.has_provider;
     refreshApiKeyHint();
+    showDigestStatus(s);
+    prefillCloudVariables(s.variables || {});
     if (s.visibility === "PUBLIC") {
       showBanner(
         "⚠ This repo is PUBLIC. Make your fork private before onboarding — " +
@@ -498,8 +656,12 @@ async function loadLocalProviders() {
 
     // Current Gemini free-tier opt-in.
     const freeTierCb = document.getElementById("gemini-free-tier");
-    const freeTierRow = document.getElementById("gemini-free-tier-row");
-    if (freeTierCb) freeTierCb.checked = !!d.current.gemini_free_tier;
+    // Only an explicit "on" in .env is applied. `current.gemini_free_tier` is a
+    // bool, so it cannot tell "the key says false" from "there is no key", and
+    // the box is checked in the markup on purpose — an unpaced free key 429s on
+    // its first busy run. An explicit OFF comes back through the sidecar or the
+    // repository variable, both of which do carry the distinction.
+    if (freeTierCb && d.current.gemini_free_tier) freeTierCb.checked = true;
 
     // Rate limits for whichever model is in the box. Re-read on every model
     // change: the numbers are per-model, so fields left showing the previous
@@ -510,11 +672,17 @@ async function loadLocalProviders() {
       rpd: document.getElementById("gemini-rpd"),
     };
     const limitStatus = document.getElementById("gemini-limits-status");
+    const cloudProvider = form.querySelector('[name="provider"]');
+    const cloudModel    = form.querySelector('[name="batch_model"]');
+    const cloudHint     = document.getElementById("cloud-model-hint");
     geminiDefaultModel = d.provider_defaults.gemini || "";
+    geminiFreeTierPick = d.free_tier_recommendation || "";
 
     function showLimits() {
       if (!limitEls.rpm) return;
-      const m = leadModel(modelInput.value || geminiDefaultModel);
+      // The boxes sit beside the CLOUD model field now, so that field names the
+      // model they describe (blank → what a blank field resolves to).
+      const m = geminiLimitsModel();
       const mine = (d.current.gemini_limits_user || {})[m];
       const eff = (d.current.gemini_limits || {})[m];
       // VALUES come only from the user's own row; the baked numbers are shown as
@@ -522,9 +690,15 @@ async function loadLocalProviders() {
       // frozen copy of the built-in table into the override file — which then
       // shadows every future template update to those numbers, silently, and
       // made onboard.html's "leave all three blank" instruction unreachable.
-      limitEls.rpm.value = mine?.rpm ?? "";
-      limitEls.tpm.value = mine?.tpm ?? "";
-      limitEls.rpd.value = mine?.rpd ?? "";
+      // Only when the model they describe changed: loadLocalProviders re-runs
+      // every time the Local step is opened, and re-seeding here would wipe
+      // numbers the user typed on the Provider step on the way past.
+      if (limitsShownModel !== m) {
+        limitsShownModel = m;
+        limitEls.rpm.value = mine?.rpm ?? "";
+        limitEls.tpm.value = mine?.tpm ?? "";
+        limitEls.rpd.value = mine?.rpd ?? "";
+      }
       limitEls.rpm.placeholder = eff?.rpm ?? "e.g. 15";
       limitEls.tpm.placeholder = eff?.tpm ?? "e.g. 250000";
       limitEls.rpd.placeholder = eff?.rpd ?? "e.g. 1000";
@@ -542,45 +716,105 @@ async function loadLocalProviders() {
       // BATCH_MODEL accepts a comma-separated failover chain whose daily
       // capacity is the SUM across members, but these three fields edit one
       // model. Say so, rather than let a chain user think they've covered it.
-      if (isChain(modelInput.value)) {
+      if (isChain(cloudModel && cloudModel.value)) {
         limitStatus.textContent +=
           " (Chain detected — these fields edit the first model only; add the others"
           + " to config/gemini-limits.json by hand.)";
       }
     }
-    showLimits();
-    modelInput.addEventListener("input", showLimits);
 
-    // Update model hint + the Gemini-only free-tier checkbox when provider changes.
+    // The cloud Provider step owns the free-tier row and the model placeholder.
+    // A blank model on Gemini is not the provider default — the server computes
+    // the free tier's best row — so the hint has to say which, or the user reads
+    // "leave blank for provider default" and gets something else.
+    function updateCloudProvider() {
+      const pName = cloudProvider ? cloudProvider.value : "";
+      const row = document.getElementById("gemini-free-tier-row");
+      if (row) row.hidden = pName !== "gemini";
+      if (cloudHint) {
+        const isGemini = pName === "gemini";
+        const rec = geminiFreeTierPick;
+        cloudHint.hidden = !(isGemini && rec);
+        cloudHint.textContent = isGemini && rec
+          ? `Blank = ${rec} on Gemini's free tier (the highest-capacity row your limits allow); `
+            + "other providers use their own default."
+          : "";
+      }
+      showLimits();
+    }
+    if (cloudProvider) cloudProvider.addEventListener("change", updateCloudProvider);
+    if (cloudModel) cloudModel.addEventListener("input", showLimits);
+    updateCloudProvider();
+
+    // Update the LOCAL model hint when the local provider changes.
     function updateModelHint() {
       const pName = select.value;
       const def = d.provider_defaults[pName] || "";
       modelHint.hidden = !def;
       modelHint.textContent = def ? `Default for ${pName}: ${def}` : "";
-      // Gemini-only — show for Gemini and auto-detect (which may resolve to Gemini),
-      // hide only when an explicit non-Gemini provider is chosen.
-      if (freeTierRow) freeTierRow.hidden = pName !== "" && pName !== "gemini";
     }
     select.addEventListener("change", updateModelHint);
     updateModelHint();
 
-    // Populate CLI select — mark unavailable ones.
-    for (const opt of cliSelect.options) {
-      const found = d.cli_tools.find((c) => c.name === opt.value);
-      if (found && !found.available) opt.textContent = opt.value + " (not installed)";
+    // The CLI select is RENDERED from the registry (id, label, tier, installed)
+    // rather than relabelled in place: the tier is what the choice turns on, and
+    // free-first order is the registry's, not the markup's. The static options
+    // in onboard.html stay as the no-JS fallback and as the drift guard's
+    // subject (tests/test_app_onboard.py::TestOnboardHtmlAgentClis).
+    if (Array.isArray(d.cli_tools) && d.cli_tools.length) {
+      cliSelect.innerHTML = "";
+      for (const c of d.cli_tools) {
+        const opt = document.createElement("option");
+        opt.value = c.id || c.name;
+        opt.textContent = `${c.label || opt.value} — ${c.tier || "?"}`
+          + (c.installed ? " ✓ installed" : " (not installed)");
+        cliSelect.appendChild(opt);
+      }
     }
-    if (d.current.batch_cli) cliSelect.value = d.current.batch_cli;
+    cliSelect.value = d.current.batch_cli
+      || (d.cli_tools.find((c) => c.default) || {}).id
+      || cliSelect.value;
 
-    // CLI hint.
+    // The hint is the registry's own tier note, verbatim — it is where the free
+    // tier's real cost lives (daily/weekly quota, data use) — plus the install
+    // line when the CLI isn't on PATH.
     function updateCliHint() {
-      const name = cliSelect.value;
-      const found = d.cli_tools.find((c) => c.name === name);
-      cliHint.textContent = found && !found.available
-        ? `${name} is not on PATH — install it or pick an available CLI.`
-        : "";
+      const found = d.cli_tools.find((c) => (c.id || c.name) === cliSelect.value);
+      if (!found) { cliHint.textContent = ""; return; }
+      const parts = [];
+      if (found.tier_note) parts.push(found.tier_note);
+      if (!found.installed && found.install_hint) {
+        parts.push(`Not on PATH — install it: ${found.install_hint}`);
+      }
+      cliHint.textContent = parts.join(" ");
     }
     cliSelect.addEventListener("change", updateCliHint);
     updateCliHint();
+
+    // Submit policy: options and glosses are the server's copy of
+    // handoff.SUBMIT_POLICIES, so the wizard can't offer a policy a run would
+    // reject. The static options stay as the no-JS fallback and the guard's
+    // subject (TestOnboardHtmlSubmitPolicy).
+    const policySelect = document.getElementById("local-submit-policy");
+    const policyHint   = document.getElementById("local-submit-policy-hint");
+    if (policySelect && Array.isArray(d.submit_policies) && d.submit_policies.length) {
+      const chosen = d.current.handoff_submit_policy
+        || (d.submit_policies.find((p) => p.default) || {}).id || "";
+      policySelect.innerHTML = "";
+      for (const p of d.submit_policies) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = p.id + (p.default ? " (default)" : "");
+        policySelect.appendChild(opt);
+      }
+      if (chosen) policySelect.value = chosen;
+      const showPolicy = () => {
+        const found = d.submit_policies.find((p) => p.id === policySelect.value);
+        if (policyHint) policyHint.textContent = found ? found.gloss : "";
+      };
+      policySelect.addEventListener("change", showPolicy);
+      showPolicy();
+    }
   } catch (e) {
     detection.textContent = "Could not detect providers: " + (e.message || e);
   }
@@ -592,52 +826,18 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   const provider = document.getElementById("local-provider-select").value;
   const model    = document.getElementById("local-model-input").value.trim();
   const cli      = document.getElementById("local-cli-select").value;
-  // Gemini-only: don't persist the flag for an explicit non-Gemini provider
-  // (it'd be a no-op anyway). Allowed for Gemini + auto-detect.
-  const geminiFreeTier = (provider === "" || provider === "gemini")
-    && document.getElementById("gemini-free-tier").checked;
+  const policy   = document.getElementById("local-submit-policy")?.value || "";
   const apiKey         = document.getElementById("local-api-key")?.value || "";
   const tailorProvider = document.getElementById("local-tailor-provider")?.value || "";
   const tailorModel    = document.getElementById("local-tailor-model")?.value.trim() || "";
   const tailorKey      = document.getElementById("local-tailor-key")?.value || "";
   const handoffDir     = document.getElementById("local-handoff-dir")?.value.trim() || "";
 
-  // Gemini rate limits for the lead model. Sent only when the row is complete
-  // (rpm + rpd) or explicitly cleared — a half-filled row is neither saved nor
-  // silently dropped, it's an error the user can see. Omitting the field
-  // entirely leaves any previously-saved limits alone.
-  let geminiLimits;
-  // Same empty-box fallback the prefill uses — see geminiDefaultModel.
-  const limitsModel = geminiFreeTier ? leadModel(model || geminiDefaultModel) : "";
-  if (limitsModel) {
-    const num = (id) => {
-      const raw = document.getElementById(id)?.value.trim();
-      return raw === "" || raw === undefined ? null : Number(raw);
-    };
-    const rpm = num("gemini-rpm"), tpm = num("gemini-tpm"), rpd = num("gemini-rpd");
-    if (rpm === null && tpm === null && rpd === null) {
-      geminiLimits = { [limitsModel]: null };          // cleared → back to the built-in table
-    } else if (rpm === null || rpd === null) {
-      // Returns before the button is disabled below, so there's nothing to
-      // re-enable here — the form stays live for the user to complete the row.
-      msgEl.hidden = false;
-      // className too, or this validation error inherits the previous save's
-      // green "ok" styling and reads as a success.
-      msgEl.className = "action-msg error";
-      msgEl.textContent = "Enter both RPM and RPD (TPM may be blank to keep the built-in value).";
-      return;
-    } else {
-      // A blank TPM OMITS the key; it does not send null. null means
-      // "unlimited" to _clean_entry, which merges over the built-in row — so a
-      // user who copied their RPM and RPD off AI Studio and skipped TPM would
-      // erase the 16,000 the Gemma rows are paced by and turn the token budget
-      // off, through the only UI this feature has. Omitted keeps whatever the
-      // table already knows.
-      const row = { rpm, rpd };
-      if (tpm !== null) row.tpm = tpm;
-      geminiLimits = { [limitsModel]: row };
-    }
-  }
+  // The Gemini free-tier answers are NOT sent from here. The checkbox and the
+  // three rate-limit boxes moved to the Provider step, which posts them as the
+  // user leaves it; omitting both fields is what tells the server to leave
+  // GEMINI_FREE_TIER and config/gemini-limits.json exactly as that step wrote
+  // them, rather than unsetting a flag this step never showed.
   btn.disabled = true;
   msgEl.hidden = true;
   try {
@@ -646,11 +846,10 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ batch_provider: provider, batch_model: model, batch_cli: cli,
                              api_key: apiKey,
-                             gemini_free_tier: geminiFreeTier,
-                             gemini_limits: geminiLimits,
                              tailor_provider: tailorProvider, tailor_model: tailorModel,
                              tailor_api_key: tailorKey,
-                             handoff_out_dir: handoffDir }),
+                             handoff_out_dir: handoffDir,
+                             handoff_submit_policy: policy }),
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || "save failed");
@@ -662,6 +861,34 @@ document.getElementById("save-local-btn")?.addEventListener("click", async () =>
   }
   msgEl.hidden = false;
   btn.disabled = false;
+});
+
+// "Register browser bridge": tells the selected agent CLI where the Playwright
+// MCP server is, which is what lets it drive a real browser. Safe to press
+// before the CLI is installed — the registry answers with the install hint
+// instead of failing, so the button is also how you find out you need one.
+document.getElementById("register-bridge-btn")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const msg = document.getElementById("register-bridge-msg");
+  const cli = document.getElementById("local-cli-select")?.value || "";
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Registering…";
+  try {
+    const resp = await fetch("/api/agent-cli/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cli }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `registration failed (${resp.status})`);
+    if (msg) msg.textContent = body.message || "Registered.";
+  } catch (err) {
+    if (msg) msg.textContent = String(err.message || err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 });
 
 // "Browse…" beside the handoff-folder field: the server pops a native OS folder
