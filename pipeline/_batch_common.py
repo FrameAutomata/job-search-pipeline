@@ -285,22 +285,160 @@ def max_report_num(reports_dir: Path, state: dict) -> int:
     A `NNN-RESERVED.md` lock counts, deliberately: claiming the number is the
     lock's whole purpose, so skipping it would hand out a number career-ops has
     already reserved. This is the OPPOSITE of the rule in
-    `pipeline/app/data.py:find_report_file`, which must skip locks because it
+    `find_report_file` below, which must skip locks because it
     resolves a number to a file to render. Do not "make them consistent" —
     they answer different questions.
     """
     max_num = 0
     if reports_dir.exists():
         for f in reports_dir.glob("*.md"):
-            m = re.match(r"^(\d+)-", f.name)
-            if m:
-                max_num = max(max_num, int(m.group(1)))
+            num = _report_num_prefix(f.name)
+            if num:
+                max_num = max(max_num, int(num))
     for job in state.get("jobs", {}).values():
         try:
             max_num = max(max_num, int(job.get("report_num", 0)))
         except (ValueError, TypeError):
             pass
     return max_num
+
+
+# The leading `NNN-` of a report filename (`{num}-{company-slug}-{date}.md`):
+# the one thing `max_report_num`, `find_report_file`, the Report-cell writer and
+# the dead-link resolver all key on, so it is spelled once.
+_REPORT_PREFIX_RE = re.compile(r"^(\d+)-")
+
+
+def _report_num_prefix(name: str) -> str:
+    """The leading number of a report filename, or "" when it has none."""
+    m = _REPORT_PREFIX_RE.match(name)
+    return m.group(1) if m else ""
+
+
+# `NNN-RESERVED.md` is career-ops' report-number LOCK, not a report: a JSON body
+# ({"pid","token","created_at"}) dropped to claim a number, which survives any
+# run killed before the real report replaces it. It carries the `NNN-` prefix
+# the resolver below keys on, so a first-match glob handed the UI the lock and
+# the report pane rendered raw JSON where the evaluation belongs — silently,
+# reading as a corrupt report rather than the wrong file.
+#
+# Only `find_report_file` skips locks. The other readers of a report number ask
+# "is this number taken?" and must keep counting them — see `max_report_num`.
+RESERVED_REPORT_SUFFIX = "-RESERVED.md"
+
+
+def _report_int(value) -> int | None:
+    """A report number as an int, or None if it isn't one."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
+    """Locate a report file by its number. Reports are named
+    `{num}-{company-slug}-{date}.md`; the tracker stores the zero-padded num
+    (e.g. "042"). Match on the leading numeric segment, tolerating padding
+    differences (42 vs 042). Reservation locks are skipped (see above).
+
+    Iterated in sorted order so that a number matching two REAL reports resolves
+    to the same one on every request — `app/data._rename_report_file` records
+    when that happens ("a number matches two files"). That is stability, not
+    correctness: the tie is decided by filename, and nothing here knows which
+    report the row meant. Every UI caller looks up by NUMBER (server.py
+    deliberately: "not the link target — tolerant of report renames"), so there
+    is no authority to defer to; `read_report` below asks the link first and
+    falls back here only when the link is dead.
+
+    Lives here rather than in `app/data.py` because the merge-time sanitizer and
+    the three report readers need the same lookup and cannot import the UI."""
+    # No `Path(reports_dir)` re-wrap: callers pass a Path, and constructing a
+    # new one reads `os.name` at call time (3.12's Path.__new__), which the
+    # skills launcher's tests patch to "posix" — on Windows that is a PosixPath
+    # nothing can instantiate, and the UI's report lookup sits on that path.
+    wanted = _report_int(report_num)
+    if wanted is None or not reports_dir.exists():
+        return None
+    for f in sorted(reports_dir.glob("*.md")):
+        if f.name.endswith(RESERVED_REPORT_SUFFIX):
+            continue
+        if _report_int(_report_num_prefix(f.name)) == wanted:
+            return f
+    return None
+
+
+# The `[N](path)` of a Report cell, and the two things every reader needs from
+# it: the number, and the career-ops-relative path. merge-tracker.mjs
+# normalizes the Report link relative to the tracker FILE
+# (tracker-links.mjs:normalizeReportLink), and the pipeline seeds the tracker at
+# career-ops/data/applications.md — so a link the pipeline emitted as
+# `reports/042-x.md` comes back as `../reports/042-x.md`. The older
+# merge-tracker copied the cell verbatim, so both shapes are in circulation
+# within one file. Every consumer of `report_path` (the UI's two parsers in
+# app/data, cover letters, both tailors) resolves it as `career_ops /
+# report_path`, which the `../` form escapes — and `read_text` returns "" on the
+# miss, so tailoring and cover letters silently lose the evaluation report's
+# proof points. Strip the ascent HERE, the single point every parser extracts
+# it through (app/data imports these rather than keeping a copy), so the stored
+# value is career-ops-relative whichever shape the file holds.
+_REPORT_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_REPORT_ASCENT_RE = re.compile(r"^(?:\.\./)+")
+
+
+def _report_link(cell: str) -> tuple[str, str]:
+    """(report_num, career-ops-relative report_path) from a Report cell."""
+    m = _REPORT_LINK_RE.search(cell or "")
+    if not m:
+        return "", ""
+    return m.group(1).strip(), _REPORT_ASCENT_RE.sub("", m.group(2).strip())
+
+
+def _linked_report(base: Path, report_path: str) -> Path | None:
+    """The file a Report link names taken literally (ascent stripped), or None
+    for an empty link. Whether it exists is the caller's question."""
+    report_path = _REPORT_ASCENT_RE.sub("", (report_path or "").strip())
+    return base / report_path if report_path else None
+
+
+def resolve_report(base: Path, report_path: str, *, num_text: str = "") -> Path | None:
+    """The file a tracker row's Report link actually names — the link target
+    when it exists, else the report in `base/reports/` with the link's number:
+    the filename's own `NNN-` prefix, or failing that `num_text` (the link's
+    `[N]` text, which a model that mangled the slug may have padded differently).
+
+    The link is model-authored (#162): the prompt gives the model only the
+    SHAPE `[N](reports/N-company-slug-DATE.md)` and it invents the slug — keeps
+    an `&`, appends the role, uses an en-dash — while `write_job_result` names
+    the file by its own slug. Six of 230 rows in a real tracker linked a file
+    that never existed. The UI copes, resolving by number; the readers that
+    resolved `base / report_path` got "" from `read_text` and built from the JD
+    alone with no log line. Writers now own the cell, but rows already merged
+    keep the link they were merged with, so the readers resolve the same way
+    the UI does. The link is asked FIRST: a number can match two files and only
+    the link knows which was meant."""
+    direct = _linked_report(base, report_path)
+    if direct is None:
+        return None
+    if direct.is_file():
+        return direct
+    num = _report_num_prefix(direct.name) or num_text
+    return find_report_file(base / "reports", num) if num else None
+
+
+def read_report(base: Path, report_path: str, *, label: str = "report") -> str:
+    """The text of the report a tracker row links to, or "" — resolving a dead
+    link by its number (`resolve_report`) and SAYING so either way, since the
+    consumers (cover letters, both tailors) otherwise build from the JD alone
+    in silence, which is the failure this exists to end."""
+    if not (report_path or "").strip():
+        return ""
+    found = resolve_report(base, report_path)
+    if found is None:
+        print(f"[{label}] report {report_path} not found — building from the JD alone")
+        return ""
+    if found != _linked_report(base, report_path):
+        print(f"[{label}] report link {report_path} is dead — using {found.name} (same number)")
+    return read_text(found)
 
 
 def max_tracker_num(applications_md: Path, state: dict) -> int:
@@ -708,6 +846,29 @@ def _inject_req_id_into_notes(tracker_tsv: str, req_id: str) -> str:
                           for m in _NOTES_REQ_ID_RE.finditer(notes)))
 
 
+def _set_report_link(tracker_tsv: str, report_file: str) -> str:
+    """Point the Report cell at `report_file`, the report that actually exists.
+
+    The cell is `[N](reports/N-slug-DATE.md)` where N is the file's own leading
+    number, so the two agree by construction. `report_file` is a bare filename
+    under `reports/`; empty means "nothing known" and leaves the cell alone —
+    a row whose report was never written (a `failed` evaluation) keeps whatever
+    the model put there, which is no worse than before. Declined on a row whose
+    columns are not in place, like every positional step (`_row_parts`)."""
+    report_file = (report_file or "").strip()
+    num = _report_num_prefix(report_file)
+    if not num:
+        return tracker_tsv
+    parts = _row_parts(tracker_tsv)
+    if parts is None:
+        return tracker_tsv
+    cell = f"[{num}](reports/{report_file})"
+    if parts[_REPORT_IDX].strip() == cell:
+        return tracker_tsv
+    parts[_REPORT_IDX] = cell
+    return "\t".join(parts)
+
+
 def write_job_result(
     response_text: str,
     job_meta: dict,
@@ -725,16 +886,20 @@ def write_job_result(
     company = summary.get("company") or job_meta.get("company") or "unknown"
     company_slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
     report_name = f"{report_num}-{company_slug}-{today}.md"
+    report_file = report_name if report_content else None
 
     if report_content:
         (reports_dir / report_name).write_text(report_content, encoding="utf-8")
     if tracker_tsv:
+        # The Report cell names the file THIS function wrote, not the one the
+        # model guessed at (#162): the prompt gives it only the link's shape.
         tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
-                                        job_meta.get("jd_text", ""))
+                                        job_meta.get("jd_text", ""),
+                                        report_file=report_file or "")
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {
-        "report_file": report_name if report_content else None,
+        "report_file": report_file,
         "tracker_file": f"{job_id}.tsv" if tracker_tsv else None,
         "summary": summary,
     }
@@ -846,7 +1011,8 @@ def ensure_applications_md(career_ops: Path) -> Path:
     return apps_md
 
 
-def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "") -> str:
+def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "",
+                      report_file: str = "") -> str:
     """Turn a model's tracker row into one merge-tracker can read, and read
     correctly. The whole chain, in the one order that works.
 
@@ -855,15 +1021,20 @@ def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "") -> str
     below counts columns; the role's pipe suffix goes before anything reads the
     role; the score is normalized before merge-tracker has to tell it from the
     status; and the req id is prepended AFTER the URL so it ends up ahead of it
-    in the cell, where `extractReqNumber`'s first-match rule finds it.
+    in the cell, where `extractReqNumber`'s first-match rule finds it. The
+    Report link is set from `report_file` — the report that exists on disk,
+    which the writer knows and the merge-time pass looks up by number — because
+    the model authors that cell from a shape alone and invents the slug (#162).
 
     **Idempotent**, which is what lets it run at two points without a second
     mechanism: padding a nine-column row does nothing, the pipe strip has nothing
-    left to strip, a normalized score re-normalizes to itself, and both injectors
-    bail when their content is already present."""
+    left to strip, a normalized score re-normalizes to itself, a link already
+    pointing at the file is rewritten to itself, and both injectors bail when
+    their content is already present."""
     row = _restore_trailing_cells(tracker_tsv)
     row = _strip_role_pipe(row)
     row = _normalize_score_cell(row)
+    row = _set_report_link(row, report_file)
     # The URL the pipeline QUEUED first, the row's own trailing field second.
     # Everything downstream routes by the notes URL — handoff picks the site
     # session from it — so it should be the board URL the run searched from, not
@@ -927,6 +1098,21 @@ def _trailing_url(tracker_tsv: str) -> str:
     return ""
 
 
+def _dead_link_repair(career_ops: Path, tracker_tsv: str) -> str:
+    """The filename to point a row's Report link at, or "" to leave it alone:
+    only a link whose target does NOT exist is repaired, and only when a report
+    with its number does — resolved exactly as the readers resolve it
+    (`resolve_report`), with the `[N]` text as the fallback number."""
+    parts = _row_parts(tracker_tsv)
+    if parts is None:
+        return ""
+    num_text, path = _report_link(parts[_REPORT_IDX])
+    found = resolve_report(career_ops, path, num_text=num_text)
+    if found is None or found == _linked_report(career_ops, path):
+        return ""
+    return found.name
+
+
 def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     """Apply `sanitize_addition` to every un-merged addition on disk, whoever
     wrote it, and say so when something was repaired.
@@ -953,6 +1139,12 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     career-ops' batch prompt, but not for its other writers, whose
     `{num}-{slug}.tsv` names simply find nothing and keep the score repair.
 
+    A dead Report link — the model's slug, not the writer's (#162) — is pointed
+    at the report in `reports/` that carries its number, via the same lookup the
+    UI resolves by. A link that resolves is left as written, whichever of the
+    two relative shapes it has: it is the one cell that knows which of two
+    same-numbered files the row meant.
+
     A pipe-delimited row is left alone. merge-tracker parses that shape natively,
     while every step here splits on tabs and no-ops on it — rewriting it would
     change which of upstream's two parsers reads the row, for no gain."""
@@ -968,7 +1160,8 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
         except (OSError, UnicodeDecodeError):
             continue        # one unreadable row must not hold up the other nine
         fixed = sanitize_addition(raw, urls.get(f.stem, ""),
-                                  read_text(jd_cache_path(career_ops, f.stem)))
+                                  read_text(jd_cache_path(career_ops, f.stem)),
+                                  report_file=_dead_link_repair(career_ops, raw))
         if fixed == raw:
             continue
         try:

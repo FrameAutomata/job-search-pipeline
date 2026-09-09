@@ -12,8 +12,12 @@ import threading
 from pathlib import Path
 
 from pipeline._batch_common import (
+    _REPORT_LINK_RE,
+    _report_int,
+    _report_link,
     ADDITION_COLUMNS,
     atomic_write_text,
+    find_report_file,
     normalize_company,
     read_url_set,
     score_value,
@@ -384,30 +388,11 @@ _COLUMNS = list(CANONICAL_COLUMNS)
 # import, so the sanitizers would keep enforcing the old width.
 _TRACKER_COLUMNS = list(ADDITION_COLUMNS)
 
-# Pull the report number + relative path out of the Report cell, which holds a
-# markdown link like: [042](reports/042-acme-2026-05-27.md)
-_REPORT_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-
-# merge-tracker.mjs now normalizes the Report link relative to the tracker FILE
-# (tracker-links.mjs:normalizeReportLink), and the pipeline seeds the tracker at
-# career-ops/data/applications.md — so a link the pipeline emitted as
-# `reports/042-x.md` comes back as `../reports/042-x.md`. The older
-# merge-tracker copied the cell verbatim, so both shapes are now in circulation
-# within one file. Every consumer of `report_path` (cover_letters, resume_tailor,
-# resume_content, via handoff) resolves it as `career_ops / report_path`, which
-# the `../` form escapes — and `read_text` returns "" on the miss, so tailoring
-# and cover letters silently lose the evaluation report's proof points. Strip the
-# ascent here, at the single point both parsers extract it, so the stored value
-# is career-ops-relative whichever shape the file holds.
-_REPORT_ASCENT_RE = re.compile(r"^(?:\.\./)+")
-
-
-def _report_link(cell: str) -> tuple[str, str]:
-    """(report_num, career-ops-relative report_path) from a Report cell."""
-    m = _REPORT_LINK_RE.search(cell or "")
-    if not m:
-        return "", ""
-    return m.group(1).strip(), _REPORT_ASCENT_RE.sub("", m.group(2).strip())
+# The Report cell's `[042](reports/042-acme-2026-05-27.md)` is read by
+# `_report_link` / `_REPORT_LINK_RE`, imported above from `pipeline._batch_common`
+# — one definition for both parsers here, the merge-time sanitizer and the
+# report readers, including the `../` ascent strip merge-tracker's relativised
+# links need (the rationale is written there).
 
 # Report link cell: [num](path). Used to re-anchor columns when extra cells
 # shift the layout (e.g. LLM writes "Role | Remote" and the pipe splits the cell).
@@ -541,14 +526,6 @@ def _row_identity(row: dict) -> str:
     bridge and merge-tracker.mjs dedup on. Cloud and local trackers number rows
     independently, so the number can't be the identity."""
     return f"{normalize_company(row.get('company', ''))}::{normalize_company(row.get('role', ''))}"
-
-
-def _report_int(value) -> int | None:
-    """A report number as an int, or None if it isn't one."""
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _report_ints(values) -> set[int]:
@@ -869,43 +846,11 @@ def load_jobs(career_ops: Path) -> dict:
     return {"rows": [], "source": "none"}
 
 
-# `NNN-RESERVED.md` is career-ops' report-number LOCK, not a report: a JSON body
-# ({"pid","token","created_at"}) dropped to claim a number, which survives any
-# run killed before the real report replaces it. It carries the `NNN-` prefix
-# this resolver keys on, so a first-match glob handed the UI the lock and the
-# report pane rendered raw JSON where the evaluation belongs — silently, reading
-# as a corrupt report rather than the wrong file.
-#
-# Only this resolver skips locks. The other readers of a report number ask
-# "is this number taken?" and must keep counting them — see the note on
-# `_batch_common.max_report_num`.
-_RESERVED_REPORT_SUFFIX = "-RESERVED.md"
-
-
-def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
-    """Locate a report file by its number. Reports are named
-    `{num}-{company-slug}-{date}.md`; the tracker stores the zero-padded num
-    (e.g. "042"). Match on the leading numeric segment, tolerating padding
-    differences (42 vs 042). Reservation locks are skipped (see above).
-
-    Iterated in sorted order so that a number matching two REAL reports resolves
-    to the same one on every request — `_rename_report_file` records when that
-    happens ("a number matches two files"). That is stability, not correctness:
-    the tie is decided by filename, and nothing here knows which report the row
-    meant. Every caller looks up by NUMBER (server.py deliberately: "not the
-    link target — tolerant of report renames"), so there is no authority to
-    defer to; resolving the ambiguity properly would mean passing the row's own
-    Report link down."""
-    wanted = _report_int(report_num)
-    if wanted is None or not reports_dir.exists():
-        return None
-    for f in sorted(reports_dir.glob("*.md")):
-        if f.name.endswith(_RESERVED_REPORT_SUFFIX):
-            continue
-        m = re.match(r"^(\d+)-", f.name)
-        if m and int(m.group(1)) == wanted:
-            return f
-    return None
+# `find_report_file` is imported above from `pipeline._batch_common` and
+# re-exported here for server.py: the merge-time sanitizer and the report
+# readers share the one lookup (#162), as they share `_report_link` and
+# `_report_int`. The lock-vs-report distinction — that resolver SKIPS
+# `NNN-RESERVED.md`, `max_report_num` must COUNT it — is written down there.
 
 
 def render_report_html(report_path: Path) -> str:

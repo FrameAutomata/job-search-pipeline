@@ -50,7 +50,7 @@ from pathlib import Path
 
 import yaml
 
-from pipeline._batch_common import parse_json_loose, read_text
+from pipeline._batch_common import parse_json_loose, read_report, read_text
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -713,8 +713,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
     work_docx = docx_out.parent / (docx_out.stem + ".work.docx")
     work_pdf = docx_out.parent / (docx_out.stem + ".work.pdf")
 
-    report_path = getattr(job, "report_path", "") or ""
-    report_text = read_text(Path(report_base or career_ops) / report_path) if report_path else ""
+    report_text = read_report(Path(report_base or career_ops),
+                              getattr(job, "report_path", ""), label="tailor")
     jd_text = jd_text_for_job(career_ops, report_base, job)
     instructions = _tailoring_instructions(career_ops)   # candidate's own setup guidance
 
