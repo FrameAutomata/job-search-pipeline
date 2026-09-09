@@ -262,7 +262,11 @@ filter:
 #      false during scrape and pay the per-job fetch only for surviving rows.
 #   4. Dead-URL recording: URLs that fail liveness get appended to
 #      scan-history.tsv with status `screened-dead` so future runs skip them
-#      at step (1) instead of refetching.
+#      at step (1) instead of refetching. The remote guard above writes rows it
+#      drops there too, as `screened-offsite` — the third and last status the
+#      file may carry. `added` and `screened-dead` are permanent; an off-site
+#      line stops counting as seen after 60 days, so broadening your locations
+#      later can bring those roles back.
 
 screen:
   liveness: true

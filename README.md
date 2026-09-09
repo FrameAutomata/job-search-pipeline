@@ -22,6 +22,8 @@ This repo is set up to be cloned into your own private copy. The public template
 
 GitHub creates a standalone private repo with the same files. It's *not* listed as a fork of this template, so there's no cross-reference and no fork-network visibility back to your account.
 
+> **One copy per GitHub account.** The Actions Free plan gives **2,000 Linux minutes a month per account** for private repositories — per *account*, not per repository. A daily run of this pipeline is long enough (see [Running it for free](#running-it-for-free)) that two copies under the same account will run out of minutes before the month does, and GitHub then stops creating workflow runs at all. If two people want their own searches, put the second copy under a second account. The digest that arrives after each run tells you what the month is costing at the current pace.
+
 ### Configure your private copy
 
 You need to (a) get your profile + API key into the repo's **GitHub secrets**, and (b) **enable Actions**. The guided wizard does (a) for you; there's also a manual path.
@@ -38,7 +40,7 @@ cd <your-private-copy>
 
 1. Install the [GitHub CLI](https://cli.github.com) and run `gh auth login` (the wizard uses it to write secrets).
 2. From inside your private copy, run `./run-ui.sh` (Windows: `.\run-ui.ps1`), open http://localhost:8000, and click **⚙ Setup**.
-3. Walk through the wizard (resume → about → roles/comp → search settings → optional narrative → provider + API key → review). On submit it generates your profile and writes every required secret to *this* repo. It refuses to write to a public repo.
+3. Walk through the wizard (resume → about → roles/comp → search settings → optional narrative → provider + API key + [daily digest](#the-daily-digest) → local settings, including your [agent CLI](#choosing-an-agent-cli) and [submit policy](#applying-to-jobs) → review). On submit it generates your profile and writes every required secret to *this* repo. It refuses to write to a public repo.
 
 See [Guided onboarding](#guided-onboarding-onboard) below and the [QUICKSTART setup steps](QUICKSTART.md#step-2--create-your-profile) for the full walkthrough.
 
@@ -111,7 +113,7 @@ A local, fully automated pipeline that runs the complete job-search loop end to 
 5. **Batch prep** — writes the evaluation queue (`batch/batch-input.tsv`) and caches job descriptions (`batch/jds/{id}.txt`) for the evaluator.
 
 Evaluation has two paths, pick whichever fits:
-- `--batch` — interactive agent CLI (Claude Code / OpenCode / Gemini CLI / Qwen / your choice). Generates PDFs, can WebSearch in real time.
+- `--batch` — interactive agent CLI (whichever you picked — see [Choosing an agent CLI](#choosing-an-agent-cli); free options first). Generates PDFs, can WebSearch in real time.
 - `--evaluate-batch` — synchronous parallel API calls (auto-detects Gemini / Groq / DeepInfra / OpenRouter / DeepSeek / OpenAI / Anthropic / Ollama). Immediate results. Used by the cloud workflows.
 
 ## Quickstart
@@ -123,7 +125,7 @@ cd job-search-pipeline
 .\setup.ps1                  # creates venv, installs deps (incl. UI), clones career-ops, copies example configs
 node setup-profile.mjs       # generate your profile from your resume (or use the UI wizard — see below)
 # setup-profile.mjs writes config\search.yml; tweak it if you like, then pick an evaluation mode:
-.\run.ps1 --batch            # interactive CLI agent (default: claude)
+.\run.ps1 --batch            # interactive CLI agent (BATCH_CLI; free OpenCode by default)
 .\run.ps1 --evaluate-batch   # API-driven (free Gemini if GEMINI_API_KEY set in .env)
 ```
 
@@ -151,13 +153,17 @@ For unattended cloud runs, see [Using this template](#using-this-template) above
 | `CAREER_OPS_PATH` | `./career-ops` | Path to career-ops directory |
 | `RESUME_PATH` | auto-detected | Path to your resume (DOCX / ODT / PDF; DOCX/ODT recommended). Unset → auto-discovers `resumes/resume.{pdf,docx,odt}` |
 | `SEARCH_CONFIG` | `config/search.yml` | Path to search config |
-| `BATCH_CLI` | `claude` | CLI used by `--batch` (claude / opencode / gemini / qwen) |
+| `BATCH_CLI` | `opencode` | The agent CLI that applies for you and runs `--batch`. See [Choosing an agent CLI](#choosing-an-agent-cli); `python -m pipeline.agent_cli --list` prints the ids, tiers and what's installed. |
+| `AGENT_MODEL` | per-CLI | Model the agent CLI starts with, on both paths (the hand-off command and `--batch`). Unset, each CLI uses its own default — except `gemini`, which gets a model with a workable free-tier quota. |
+| `HANDOFF_SUBMIT_POLICY` | `stop-before-submit` | What the browser agent does at the Submit button. See [Applying to jobs](#applying-to-jobs). |
 | `BATCH_PROVIDER` | auto-detect | LLM provider for `--evaluate-batch` (overrides auto-detection) |
 | `BATCH_MODEL` | per-provider default | Model override for `--evaluate-batch` |
 | `OLLAMA_MODEL` | `qwen2.5:32b` | Model name passed as `--model` to whichever CLI `--batch` uses (works with any `BATCH_CLI`) |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` / `DEEPINFRA_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | LLM provider keys. Auto-detect order: Gemini → Groq → DeepInfra → OpenRouter → DeepSeek → OpenAI → Anthropic. See [QUICKSTART](QUICKSTART.md#which-provider-should-i-pick) for picking one. |
 | `OPENAI_BASE_URL` | OpenAI's default | Escape hatch — point the `openai` provider at any OpenAI-compatible endpoint. |
 | `SKILL_PATH_DEFAULT` | `ask` | Default path for career-ops skills run from the UI: `ask` (choose each time), `api`, or `cli`. |
+| `UI_LAN` / `UI_PASSWORD` / `UI_ALLOWED_HOSTS` | off | Serve the triage UI to your home network. See [Triaging from your phone](#triaging-from-your-phone-lan-mode). |
+| `DIGEST_*` | — | Where the daily digest is delivered and how much of it. See [The daily digest](#the-daily-digest). In the cloud these are repository secrets and variables, not `.env`. |
 
 ## Screening (opt-in)
 
@@ -173,14 +179,14 @@ What the screen step does when `liveness: true`:
 - **Pre-screen dedup**: drops URLs already in `scan-history.tsv` / `pipeline.md` / `applications.md` *before* fetching. With 100-result scrapes on a daily cadence ~80% of rows are repeats — this is the biggest cost saving.
 - **Liveness check**: HTTP GET per remaining URL; drops 404/410, "no longer available" / "position filled" pages, listing pages, etc.
 - **Description backfill**: extracts the JD from the same fetched page (LinkedIn / Indeed selectors + `<body>` fallback). Lets you set `linkedin_fetch_description: false` and skip thousands of sequential per-job fetches during scrape.
-- **Dead URL recording**: URLs that fail liveness get written to `scan-history.tsv` with status `screened-dead` so future runs skip them at the pre-screen step too.
+- **Dead URL recording**: URLs that fail liveness get written to `scan-history.tsv` with status `screened-dead` so future runs skip them at the pre-screen step too. `scan-history.tsv` has three statuses in all — `added`, `screened-dead`, and `screened-offsite` for a row a remote search pass returned whose description is plainly on-site somewhere else. The first two are permanent; `screened-offsite` expires after 60 days, so widening your locations later can bring those roles back.
 
 When `liveness: false` the screen stage is a no-op (no dedup, no fetches, no backfill — bridge still does its own dedup pass).
 
 ## Evaluation flags
 
 ```powershell
-.\run.ps1 --batch                              # interactive: agent CLI per BATCH_CLI (default: claude)
+.\run.ps1 --batch                              # interactive: agent CLI per BATCH_CLI (default: opencode)
 .\run.ps1 --evaluate-batch                     # sync API: auto-detected provider, ~3 parallel workers
 .\run.ps1 --evaluate-batch --batch-provider gemini --batch-concurrency 5
 ```
@@ -221,6 +227,70 @@ These flags are for ad-hoc local runs; the daily cloud workflow runs **every** p
 > appears. The same caveat applies to `--skip-filter` and `output/filtered_jobs.csv`,
 > which is truncated whenever nothing survives the filter.
 
+## Applying to jobs
+
+The pipeline finds and evaluates roles. **It never submits an application.** When
+you're ready to apply, it builds a *work-order* — one file per job board, holding
+that board's best-scoring roles with the posting link, the score and a tailored
+résumé — and hands it to a browser agent that works through them in *your*
+logged-in browser:
+
+```bash
+./run.sh --skip-scrape --skip-filter --handoff        # or the UI's 🤝 Hand off button
+```
+
+The files land in `output/handoff/` (`HANDOFF_OUT_DIR`): `next-roles-linkedin.jsonl`,
+`next-roles-indeed.jsonl`, one session per board, plus a `HANDOFF-README.md` the
+agent follows and a `PROFILE.md` it keeps growing as it learns your answers.
+
+### What happens at the Submit button — your call
+
+By default **the agent does not submit anything.** It opens the posting, fills the
+form, checks it against your profile, and then stops and marks the row
+`ready-to-submit`. You open that row, read what it wrote, click Submit yourself,
+and set the row to `applied`. Until you do, that role comes back at the **top** of
+its board's work-order every time — under a heading that says *"Waiting for you:
+form filled — open it, check it, click Submit"* — so a half-finished application
+can't quietly disappear.
+
+Set `HANDOFF_SUBMIT_POLICY` in `.env` (or on the wizard's Local settings step) to
+change that:
+
+| Policy | What the agent does |
+|---|---|
+| `stop-before-submit` *(default)* | Fills and reviews every application, stops before Submit, records `ready-to-submit`. You click Submit and record `applied`. |
+| `submit-easy-apply` | Submits the one-click board applications (Indeed Apply, LinkedIn Easy Apply) on its own; everything else stops before Submit as `ready-to-submit`. |
+| `submit-all` | Submits everything it prepares. |
+
+The other statuses an agent writes back are `claimed` (in progress), `handoff`
+(blocked on something only you can do — a login, a CAPTCHA, a verification code)
+and `skip:<reason>`. Anything recorded is remembered across every board, so a role
+you applied to on LinkedIn never resurfaces on Indeed — `ready-to-submit` being
+the single deliberate exception.
+
+### Choosing an agent CLI
+
+`BATCH_CLI` picks the agent CLI used for applying and for `--batch` evaluation.
+Free options come first, and the default needs no API key at all:
+
+| CLI | Tier | What that means | Install |
+|---|---|---|---|
+| `opencode` — OpenCode **(default)** | free | Its Zen gateway's rotating free hosted models need no key at all; or bring a free AI Studio Gemini key (`gemini-3.1-flash-lite`, ~500 requests/day ≈ 6–12 prepared applications). A paid Anthropic or OpenAI key plugs into the same CLI, so this is also the upgrade path. `--prompt` pre-fills the prompt and you press Enter. | `curl -fsSL https://opencode.ai/install \| bash` (or `npm install -g opencode-ai`) |
+| `agy` — Antigravity CLI | free | Google's successor to Gemini CLI for individuals. The free Individual tier has a **weekly** agent quota (small — reports of ~20 requests/day and multi-day cooldowns), so expect a few prepared applications a week, not a day. Google may use your prompts — which include your profile — to improve its products unless you opt out in Antigravity's privacy settings. | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` (Windows: `irm https://antigravity.google/cli/install.ps1 \| iex`) |
+| `gemini` — Gemini CLI | free | Google stopped serving **personal logins** on 2026-06-18; the CLI still runs on a `GEMINI_API_KEY` from AI Studio at the API's free-tier limits. The launcher starts it on `gemini-3.1-flash-lite` (~500 requests/day) because the CLI's own default Flash model gets ~20 a day on a free key. Free-tier prompts may be used to improve Google's products. | `npm install -g @google/gemini-cli`, then put a key from [aistudio.google.com](https://aistudio.google.com) in `.env` |
+| `claude` — Claude Code | paid | A Claude Pro subscription or API credits; no free tier. The strongest at driving a browser through a long application form. | `npm install -g @anthropic-ai/claude-code` |
+| `qwen` — Qwen Code | paid | The free login ended 2026-04-15, so it needs a paid API key now. | `npm install -g @qwen-code/qwen-code` |
+
+`python -m pipeline.agent_cli --list` prints this table with what's installed
+marked; `--check` tells you whether the one you configured is on your PATH and
+how to install it if not. Set `AGENT_MODEL` to start any of them on a specific
+model. Before the agent can drive a browser it needs the Playwright MCP server
+registered — one command, whichever CLI you use:
+
+```bash
+python -m pipeline.agent_cli --register-mcp
+```
+
 ## Local triage UI
 
 A local web app for reading and triaging evaluation results, instead of scrolling raw markdown reports. Runs entirely on your machine (FastAPI on localhost) — nothing leaves your computer.
@@ -253,6 +323,30 @@ Point it at either your local `career-ops/` directory (if you run the pipeline l
 
 `gh` targets the repo of the directory you launch from; set `JOB_SEARCH_REPO=owner/name` to override.
 
+### Triaging from your phone (LAN mode)
+
+The UI binds `127.0.0.1` and refuses cross-origin POSTs, so only this machine can
+reach it and it needs no password. To read the board from a phone on the same
+network:
+
+```bash
+UI_PASSWORD='a long passphrase' ./run-ui.sh --lan     # Windows: .\run-ui.ps1 -Lan
+```
+
+- **`UI_PASSWORD` is required.** LAN mode puts the UI on every interface of this
+  machine, so both the launcher and the server refuse to start without one (each
+  checks it, because the launcher can't read `.env` and the server can). Any
+  username works; the password is what's checked, on every request.
+- Basic auth over plain HTTP is for a network you trust. **Stop the server before
+  joining another one.**
+- From the LAN the UI can move a card between columns and push that to the cloud —
+  and nothing else. Reset, Update, running the pipeline, the Setup wizard,
+  launching an agent and building a hand-off stay loopback-only: they run programs
+  and rewrite config, which isn't what a phone is for.
+- `UI_ALLOWED_HOSTS` is the comma-separated list of names/addresses a browser may
+  use in the URL bar. Left unset the server works them out at startup and prints
+  what it accepted; set it when that guess is wrong.
+
 ### Running career-ops skills from the UI
 
 After the cloud pipeline has scraped and scored, open a role's report in the side panel — each report has a row of **skill actions** that run the matching career-ops mode for that role:
@@ -267,7 +361,7 @@ After the cloud pipeline has scraped and scored, open a role's report in the sid
 Each skill runs one of two ways, and you choose per action:
 
 - **API** — a bounded, synchronous provider call (uses the LLM keys you already configured). Zero install, finishes in place, returns a downloadable file. No live web research or back-and-forth — so only the résumé-markdown skill offers it.
-- **CLI** — hands you a ready-to-run command for your agent (`BATCH_CLI`, default `claude`). Interactive, can pull the live JD, search the web, and drive a browser. The result panel shows the command with **Copy command** and **▶ Run in terminal**, which opens a new console window with the command pre-loaded (Windows → `cmd`, macOS → `Terminal.app`, Linux → the first emulator on PATH from a known list, or whatever `$TERMINAL` names). The agent always runs in *your* terminal, where its tools and cost are visible — we never run it inside the UI process. Every skill supports this path.
+- **CLI** — hands you a ready-to-run command for your agent (`BATCH_CLI`, default `opencode` — see [Choosing an agent CLI](#choosing-an-agent-cli)). Interactive, can pull the live JD, search the web, and drive a browser. The result panel shows the command with **Copy command** and **▶ Run in terminal**, which opens a new console window with the command pre-loaded (Windows → `cmd`, macOS → `Terminal.app`, Linux → the first emulator on PATH from a known list, or whatever `$TERMINAL` names). The agent always runs in *your* terminal, where its tools and cost are visible — we never run it inside the UI process. Every skill supports this path.
 
 The UI shows whichever paths each skill can use (an agent CLI on your PATH, an API key, or both). Set **`SKILL_PATH_DEFAULT=api|cli`** in `.env` to skip the chooser; leave it `ask` (default) to pick each time — handy if you'd rather spend an agent-CLI membership than API credits, or use the API for batch scoring and the CLI for tailoring.
 
@@ -276,13 +370,15 @@ The UI shows whichever paths each skill can use (an agent CLI on your PATH, an A
 - *CLI* — interactive, with live web research and a real browser. Required for **PDF**, **interview-prep**, and the live **apply** assistant (they need tools the API path can't provide), and best when you want to iterate or pull the freshest JD.
 - *Both* — API for quick tailoring, CLI for depth and the browser-driven skills. Recommended for an active search.
 
-**One-time setup for the browser-driven skills** (Apply assistant + PDF résumé). `setup.ps1` / `setup.sh` does both of these for you now; the steps below are the manual fallback if setup couldn't (no `claude` on PATH, install failure, etc.) — the UI also surfaces them inline when you run the affected skill.
+**One-time setup for the browser-driven skills** (Apply assistant + PDF résumé). `setup.ps1` / `setup.sh` does both of these for you now; the steps below are the manual fallback if setup couldn't (no agent CLI on PATH yet, install failure, etc.) — the UI also surfaces them inline when you run the affected skill, and the Setup wizard has a **Register browser bridge** button beside the CLI picker.
 
-- **Apply assistant** drives a live browser; your agent needs the **Playwright MCP server** registered. For Claude Code:
+- **Apply assistant** drives a live browser; your agent needs the **Playwright MCP server** registered. Each CLI registers it differently — some take a command, some want an entry merged into a config file — so one command covers whichever you use:
   ```bash
-  claude mcp add playwright -- npx -y @playwright/mcp@latest
+  python -m pipeline.agent_cli --register-mcp                    # the CLI you configured
+  python -m pipeline.agent_cli --register-mcp opencode           # a specific one
+  python -m pipeline.agent_cli --register-mcp-all-installed      # what setup runs
   ```
-  Other agents have an equivalent — check their MCP docs. Without this, claude says it "doesn't have Playwright in this session" and falls back to asking for a screenshot.
+  It is safe to run before the CLI is installed — you get the install line instead of an error — and safe to run twice. Without it the agent says it "doesn't have Playwright in this session" and falls back to asking you for a screenshot.
 - **PDF résumé** (and the Apply assistant the first time it drives the browser) need **Chromium installed locally**, from inside the career-ops clone:
   ```bash
   cd career-ops
@@ -297,7 +393,9 @@ The UI shows whichever paths each skill can use (an agent CLI on your PATH, an A
 Instead of running the CLI setup + `base64` + `gh secret set` by hand, the
 **⚙ Setup** wizard does it from the browser. Walk through a short form — upload
 your resume (DOCX, ODT, or PDF — DOCX/ODT recommended), enter target roles /
-compensation / locations / boards, pick an LLM provider and paste its API key —
+compensation / locations / boards, pick an LLM provider and paste its API key,
+say where the [daily digest](#the-daily-digest) should be delivered, and pick
+your [agent CLI](#choosing-an-agent-cli) and [submit policy](#applying-to-jobs) —
 and on submit the server:
 
 1. extracts your resume text (`pipeline/resume_text.py` dispatches by format:
@@ -305,23 +403,97 @@ and on submit the server:
 2. generates `profile.yml`, `cv.md`, `_profile.md`, and `search.yml` via
    `setup-profile.mjs --from-json` (same generators as the CLI — one source of truth),
 3. base64-encodes them and writes all required **GitHub secrets** (`gh secret set`,
-   value piped via stdin so keys never hit argv/logs), plus your provider key and
-   `BATCH_PROVIDER` / `BATCH_MODEL` variables.
+   value piped via stdin so keys never hit argv/logs), plus your provider key, the
+   digest's delivery secrets, and the repository variables the daily reads —
+   `BATCH_PROVIDER` / `BATCH_MODEL`, the digest's thresholds, your Gemini free-tier
+   limits, and whether to merge template updates weekly.
+
+Re-opening it later prefills from the files a run actually uses, so it doubles as
+an editor: change one answer and Save. A blank secret field means "keep the one I
+already saved", never "unset it".
 
 It **refuses to write to a public repo** (same privacy guard as the workflows),
 and the status line up top shows the target repo, its visibility, and whether
 it's already configured. After onboarding, click **▶ Run now** to kick off your
 first cloud run.
 
+## The daily digest
+
+Nobody wants to open the Actions tab every morning to find out whether anything
+happened. After every cloud run — success or failure — the pipeline sends one
+message naming the roles worth your attention: score, the evaluator's verdict
+(`Apply` / `Consider` / `Research first`), the one line of reasoning, a link
+straight to the posting, and the full reports attached as a single file. If the
+run failed you get one line saying so, with a link to the run. If nothing scored
+high enough you get a one-line heartbeat, so silence always means something is
+broken rather than "a quiet day".
+
+**Discord, in about two minutes** (no account beyond the server you already have):
+
+1. In your Discord server: **Server Settings → Integrations → Webhooks → New
+   Webhook**.
+2. Pick the channel it should post to, then **Copy Webhook URL**.
+3. Paste it into the Setup wizard's **Daily digest** block (Provider step), or add
+   it by hand as the repository secret `DIGEST_DISCORD_WEBHOOK` under **Settings →
+   Secrets and variables → Actions**.
+
+**Email instead, or as well:** set `DIGEST_EMAIL_TO` plus `DIGEST_SMTP_HOST`,
+`DIGEST_SMTP_PORT` (587, STARTTLS), `DIGEST_SMTP_USER` and `DIGEST_SMTP_PASS`.
+Gmail needs an [App Password](https://support.google.com/accounts/answer/185833)
+with 2-step verification on — your normal password will not work. `From` defaults
+to the SMTP user.
+
+Either channel alone is enough, and an unset one is skipped. Tuning lives in
+repository **variables** (same page, Variables tab) and each has a working
+default: `DIGEST_MIN_SCORE` (4.0), `DIGEST_LIMIT` (10 roles), `DIGEST_ALWAYS`
+(send the heartbeat), `DIGEST_ATTACH_REPORTS`, `DIGEST_NEXT_STEP` (replace the
+closing "open the UI, Refresh, Hand off" line). The digest can never fail a run —
+it exits 0 whatever happens.
+
+To see what it would send, without sending anything:
+
+```bash
+python -m pipeline.daily_digest --root career-ops --dump /tmp/digest.json
+```
+
+## Running it for free
+
+The default configuration costs nothing: GitHub Actions' free minutes, Gemini's
+free API tier for evaluation, a Discord webhook for delivery, and a free agent CLI
+for applying. Each of those has a ceiling, and the ones that bite are these:
+
+- **Evaluation capacity** isn't the requests-per-day number. On the recommended
+  free-tier model the tokens-per-minute budget binds first — an evaluation is a
+  whole job description plus your profile — which works out to roughly **2,400
+  evaluations a day**, ten times what a daily scrape produces. That is not the
+  constraint.
+- **Actions minutes are.** The Free plan gives **2,000 Linux minutes a month per
+  account**, and staying inside Gemini's free-tier token budget means pacing:
+  160–190 evaluations take **95–115 minutes** of runner time, so a daily at that
+  length is around 3,000 minutes a month and doesn't fit. Two copies under one
+  account certainly don't.
+- **The fix is your own numbers.** The built-in rate-limit table is a hand-copied
+  snapshot of the free tier and is only the fallback. Put your project's real
+  limits from [aistudio.google.com/rate-limit](https://aistudio.google.com/rate-limit)
+  into the Setup wizard's RPM/TPM/RPD boxes — they're usually more generous than
+  the snapshot, and a looser token budget is a shorter run at the same quota.
+  Failing that, shrink the run: fewer search passes, a smaller `results_wanted`, a
+  higher `min_score`. `python -m pipeline.gemini_limits --show` prints what's in
+  effect and which limit is binding.
+- **The digest does the arithmetic for you**, quoting each run's minutes and the
+  monthly projection at that pace, and warning inside the last 10%.
+
+**What paying buys**, in the order it's worth buying: a paid evaluation key removes
+the pacing, and with it most of the minutes problem; paid Actions minutes (or a
+Team plan) remove the budget; a paid agent CLI is better at driving a browser
+through a long application form. None of the three is needed for the loop to run
+end to end.
+
 ## Requirements
 
 - Python 3.12 (jobspy pins `numpy==1.26.3`, which has no Python 3.13 wheel; setup scripts auto-select 3.12 via `py -3.12` / `python3.12`)
 - Node.js 20+ (career-ops and profile setup — career-ops pins `playwright@1.62.1`, which requires Node 20)
-- The agent CLI of your choice for `--batch` — whichever you have installed:
-  - `claude` (default): [Claude Code](https://claude.ai/code)
-  - `opencode`: [OpenCode](https://opencode.ai)
-  - `gemini`: [Gemini CLI](https://github.com/google-gemini/gemini-cli)
-  - `qwen`: Qwen CLI
+- An agent CLI, for applying and for `--batch` — see [Choosing an agent CLI](#choosing-an-agent-cli). The default is free and needs no API key.
 
 ## License
 

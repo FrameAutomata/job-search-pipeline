@@ -803,6 +803,84 @@ class TestWrapperMirror:
         assert "claude mcp add" not in src
 
 
+class TestDocsMirror:
+    """README.md and QUICKSTART.md are the fourth mirror, and the one a person
+    reads before they have anything installed.
+
+    They carried "default: claude" in five places and a `claude mcp add` line
+    while the registry's default was free and its MCP registration differed per
+    CLI — prose that is wrong in the direction that costs money, since a reader
+    following it installs the paid CLI. So the docs restate the registry in a
+    fixed table shape — a backticked id, then a tier cell — and two rules are
+    parsed back out of it: every id appears with its own tier word, and exactly
+    one row is marked the default. A third rule reaches the loose prose those
+    tables do not cover — any line that both claims a default AND names a CLI
+    must name the default one.
+
+    The tier word is the load-bearing half. "Free" is why a reader picks a row,
+    and the two entries that stopped being free did so on a date, not a
+    release, so the guard has to hold against the docs drifting back."""
+
+    DOCS = ("README.md", "QUICKSTART.md")
+    _ROW = re.compile(r"^\|\s*`(\w+)`([^|]*)\|([^|]*)\|", re.M)
+
+    @classmethod
+    def _text(cls, name):
+        return (ROOT / name).read_text(encoding="utf-8")
+
+    @classmethod
+    def _rows(cls, name):
+        """The agent table's rows as {id: (name cell, tier cell)}; other tables'
+        rows don't start with a backticked registry id, so they don't match."""
+        return {m.group(1): (m.group(2), m.group(3))
+                for m in cls._ROW.finditer(cls._text(name))
+                if m.group(1) in AGENT_CLIS}
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_every_registry_id_has_a_row(self, name):
+        assert set(self._rows(name)) == set(AGENT_CLIS)
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_each_row_states_that_cli_s_tier(self, name):
+        for cid, (_, tier_cell) in self._rows(name).items():
+            word = tier_cell.strip().strip("*").split()[0].lower()
+            assert word == AGENT_CLIS[cid].tier, (name, cid, tier_cell)
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_exactly_one_row_is_marked_default(self, name):
+        marked = [cid for cid, (cell, _) in self._rows(name).items()
+                  if "default" in cell.lower()]
+        assert marked == [DEFAULT_CLI], (name, marked)
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_no_line_claims_a_default_that_is_another_cli(self, name):
+        # The shapes the stale prose took: "(default: claude)", "`claude`
+        # (default)", "default `claude`". A line that names no CLI at all (the
+        # AGENT_MODEL note's "its own default") is not making this claim.
+        names = {c.id.lower(): c.id for c in AGENT_CLIS.values()}
+        names.update({c.label.lower(): c.id for c in AGENT_CLIS.values()})
+        for line in self._text(name).splitlines():
+            low = line.lower()
+            if "(default" not in low and "default:" not in low and "default `" not in low:
+                continue
+            named = {cid for spelling, cid in names.items() if spelling in low}
+            if named:
+                assert DEFAULT_CLI in named, (name, line)
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_env_table_row_carries_the_registry_default(self, name):
+        m = re.search(r"^\|\s*`BATCH_CLI`\s*\|\s*`?(\w+)`?\s*\|", self._text(name), re.M)
+        assert m, f"no BATCH_CLI row in {name}'s env table"
+        assert m.group(1) == DEFAULT_CLI, (name, m.group(1))
+
+    @pytest.mark.parametrize("name", DOCS)
+    def test_registration_is_the_one_command_not_one_cli_s(self, name):
+        text = self._text(name)
+        assert REGISTER_MCP_CMD in text, name
+        # The retired line told every reader to run the paid CLI's form.
+        assert "claude mcp add" not in text, name
+
+
 class TestNoKeyStrippingAnywhere:
     """The M1 rule that stripped GEMINI_API_KEY/GOOGLE_API_KEY from the CLI's
     environment is retired: the key is the only way an individual runs Gemini
