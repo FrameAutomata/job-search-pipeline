@@ -222,6 +222,23 @@ filter:
   #   - "TS/SCI"                 #   vocabulary (UK "vetting", FR "habilitation", etc.)
   #   - "polygraph"
 
+  # Remote-consistency guard. A remote pass (`is_remote: true`) returns rows
+  # the board flags remote whose description is plainly an on-site job in
+  # another state — the flag is the employer's checkbox, not the posting. When
+  # this is true (the default), a row flagged remote whose description never
+  # mentions remote work (remote, work from home, telecommute, home office,
+  # distributed team, ...) is treated as on-site: its is_remote is corrected,
+  # and it is dropped when a remote pass alone returned it — unless its
+  # location is one of your non-remote passes' (the city as a whole word, or a
+  # state/country-level pass location), in which case it is kept as an on-site
+  # row and meets the location checks above. A hybrid description that
+  # mentions remote work passes. Dropped rows are logged, listed in
+  # output/remote-dropped.csv, and recorded by the screen stage in
+  # scan-history.tsv as `screened-offsite` for 60 days. A remote posting that
+  # restricts residency to one state is not caught here. Set false to turn
+  # the guard off in both stages.
+  remote_requires_mention: true
+
   # Minimum score to keep. With YAKE defaults (base weight=1, skills-section
   # boost=2, title-match=5), a score of 5 means roughly one target_titles hit
   # OR several resume-keyword matches. Raise to be pickier, lower to see more.
