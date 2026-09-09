@@ -11,6 +11,7 @@ import os
 import pytest
 
 from pipeline import gemini_limits as gl
+from tests.conftest import fake_clock, real_pacers_on_fake_clock
 
 
 @pytest.fixture(autouse=True)
@@ -40,20 +41,6 @@ def point_at(tmp_path, monkeypatch, text=None):
     return f
 
 
-def fake_clock(advance=True):
-    """A (state, monotonic, sleep) triple for the pacers.
-
-    `advance=True` moves the clock forward by each sleep, which is what a real
-    run does — use it when the assertion is about when calls actually land.
-    `advance=False` leaves the clock still, so the sleeps recorded are the
-    schedule the pacer computed rather than one the test drove into it."""
-    state = {"t": 0.0, "sleeps": []}
-
-    def sleep(s):
-        state["sleeps"].append(s)
-        if advance:
-            state["t"] += s
-    return state, (lambda: state["t"]), sleep
 
 
 class TestTable:
@@ -330,22 +317,6 @@ class TestTokenBudget:
 
 
 class TestPacedCaller:
-    @staticmethod
-    def _real_clock_injected(monkeypatch):
-        """Swap in the REAL limiter and budget bound to a clock that advances on
-        sleep, so these assert the pacing that a run would get rather than a
-        stand-in's bookkeeping."""
-        st, mono, sleep = fake_clock()
-        # Bind the real classes before patching: the replacements construct them,
-        # and reading gl.RateLimiter from inside the lambda would find the
-        # replacement itself.
-        real_rl, real_tb = gl.RateLimiter, gl.TokenBudget
-        monkeypatch.setattr(gl, "RateLimiter",
-                            lambda rpm: real_rl(rpm, monotonic=mono, sleep=sleep))
-        monkeypatch.setattr(gl, "TokenBudget",
-                            lambda tpm: real_tb(tpm, monotonic=mono, sleep=sleep))
-        return st
-
     def test_acquires_then_calls_when_conforming(self, monkeypatch):
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
         events = []
@@ -356,6 +327,7 @@ class TestPacedCaller:
 
             def acquire(self):
                 events.append(("rpm-acquire",))
+                return 0.0
 
         class FakeTB:
             def __init__(self, tpm):
@@ -363,6 +335,7 @@ class TestPacedCaller:
 
             def acquire(self, tokens):
                 events.append(("tpm-acquire", tokens))
+                return 0.0
 
             def charge(self, tokens):
                 events.append(("tpm-charge", tokens))
@@ -390,7 +363,7 @@ class TestPacedCaller:
         """#143 in one assertion: gemma grants 30 RPM (a call every 2s) and
         16,000 TPM. At ~8K tokens a call, the second call waits out a window."""
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
-        st = self._real_clock_injected(monkeypatch)
+        st = real_pacers_on_fake_clock(monkeypatch)
         prompt = "x" * 32_000                          # 8,000 tokens
         wrapped = gl.paced_caller(lambda s, u: "ok", "gemma-4-26b-a4b-it")
         wrapped("", prompt)
@@ -401,7 +374,7 @@ class TestPacedCaller:
         # The Flash rows: 250K TPM against 5 RPM is slack no prompt can use up,
         # so pacing is exactly what it was before TPM entered the picture.
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
-        st = self._real_clock_injected(monkeypatch)
+        st = real_pacers_on_fake_clock(monkeypatch)
         wrapped = gl.paced_caller(lambda s, u: "ok", "gemini-2.5-flash")
         for _ in range(3):
             wrapped("", "x" * 32_000)
@@ -415,7 +388,7 @@ class TestPacedCaller:
         whole 16,000 TPM — two clicks, double the budget, the 429 the pacing
         exists to prevent."""
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
-        st = self._real_clock_injected(monkeypatch)
+        st = real_pacers_on_fake_clock(monkeypatch)
         prompt = "x" * 32_000
         a = gl.paced_caller(lambda s, u: "ok", "gemma-4-26b-a4b-it")
         b = gl.paced_caller(lambda s, u: "ok", "gemma-4-26b-a4b-it")
@@ -438,7 +411,7 @@ class TestPacedCaller:
         returns far more than it must not go uncounted — otherwise a run of long
         answers paces to a budget it is quietly three times over."""
         monkeypatch.setenv("GEMINI_FREE_TIER", "true")
-        st = self._real_clock_injected(monkeypatch)
+        st = real_pacers_on_fake_clock(monkeypatch)
         big = "y" * 40_000                             # 10,000 tokens back
         wrapped = gl.paced_caller(lambda s, u: big, "gemma-4-26b-a4b-it")
         for _ in range(3):
@@ -448,6 +421,27 @@ class TestPacedCaller:
         # third call lands a full window after the first; RPM alone would have
         # put it at t=4.0.
         assert st["t"] == 60.0
+
+    def test_wait_is_recorded_for_the_retry_loop(self, monkeypatch):
+        """The queue wait is ours, not the provider's (#148): the wrapper records
+        it per thread so _call_with_retry can credit it back to the job budget."""
+        monkeypatch.setenv("GEMINI_FREE_TIER", "true")
+        real_pacers_on_fake_clock(monkeypatch)
+        prompt = "x" * 32_000
+        wrapped = gl.paced_caller(lambda s, u: "ok", "gemma-4-26b-a4b-it")
+        wrapped("", prompt)
+        assert gl.take_pacer_wait() == 0.0             # first call: no wait
+        wrapped("", prompt)
+        assert gl.take_pacer_wait() == 60.0            # the token-window wait
+        assert gl.take_pacer_wait() == 0.0             # taking resets
+
+    def test_acquire_reports_its_wait(self, monkeypatch):
+        st, mono, sleep = fake_clock()
+        rl = gl.RateLimiter(5, monotonic=mono, sleep=sleep)
+        assert rl.acquire() == 0.0 and rl.acquire() == 12.0
+        tb = gl.TokenBudget(1_000, monotonic=mono, sleep=sleep)
+        assert tb.acquire(800) == 0.0 and tb.acquire(800) == 60.0
+        assert gl.TokenBudget(None).acquire(5) == 0.0   # unlimited: no wait, no crash
 
     def test_noop_when_conforming_off(self, monkeypatch):
         monkeypatch.delenv("GEMINI_FREE_TIER", raising=False)

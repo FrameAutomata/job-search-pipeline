@@ -575,10 +575,11 @@ class TokenBudget:
     def _floor(self, now: float) -> float:
         return max(now, self._charges[-1][0]) if self._charges else now
 
-    def acquire(self, tokens: int) -> None:
-        """Wait until `tokens` fits, then charge them. No-op when unlimited."""
+    def acquire(self, tokens: int) -> float:
+        """Wait until `tokens` fits, then charge them; returns the seconds
+        waited (0.0 when none). No-op when unlimited."""
         if not self._tpm or tokens <= 0:
-            return
+            return 0.0
         with self._lock:
             now = self._monotonic()
             # Prune at the earliest start this charge could take, not at `now`:
@@ -602,8 +603,9 @@ class TokenBudget:
             # (and a 429 is recoverable; a hang is not).
             self._charges.append((start, tokens))
             wait = start - now
-        if wait > 0:
+        if wait > 0:                # never negative: `start` is at or after `now`
             self._sleep(wait)
+        return wait
 
     def charge(self, tokens: int) -> None:
         """Record tokens already spent, without waiting — the response
@@ -633,14 +635,45 @@ class RateLimiter:
         self._next = 0.0
         self._lock = threading.Lock()
 
-    def acquire(self) -> None:
+    def acquire(self) -> float:
+        """Wait for the next slot; returns the seconds waited (0.0 when none)."""
         with self._lock:
             now = self._monotonic()
             start = max(now, self._next)
             self._next = start + self._interval
             wait = start - now
-        if wait > 0:
+        if wait > 0:                # never negative: `start` is at or after `now`
             self._sleep(wait)
+        return wait
+
+
+# ── Pacer wait accounting (#148) ─────────────────────────────────────────────
+#
+# A paced call can sleep for minutes on the token budget before its request
+# goes out — at 16,000 TPM and ~9,500 tokens a call, the 16th concurrent worker
+# queues ~9 minutes. `_call_with_retry`'s per-job deadline (LLM_JOB_BUDGET,
+# default 600s) is about how long the PROVIDER may take, and a wait on our own
+# budget is not that: charged to it, a transient 429 after the queue came back
+# to a retry loop whose deadline had already passed, so it raised on attempt 1
+# with no backoff — the very fallback the soft token estimate leans on. The
+# pacers record what they slept, per thread (one job per worker thread), and
+# the retry loop credits it back. Taking resets, so a job's credit is its own.
+class _PacerWait(threading.local):
+    total = 0.0         # a threading.local subclass re-applies its class defaults per thread
+
+
+_pacer_wait = _PacerWait()
+
+
+def _record_pacer_wait(seconds: float) -> None:
+    if seconds > 0:
+        _pacer_wait.total += seconds
+
+
+def take_pacer_wait() -> float:
+    """Seconds this thread's pacers have slept since the last take; resets."""
+    total, _pacer_wait.total = _pacer_wait.total, 0.0
+    return total
 
 
 # The pacers, keyed on the model rather than held per caller. See _pacer_for.
@@ -692,17 +725,24 @@ def paced_caller(caller, model: str):
     TPM is acquired BEFORE the RPM slot. When the token budget is the binding
     limit — the case this exists for — that wait is the long one, and taking it
     first means the RPM spacing is measured between calls that actually happen
-    rather than between slots reserved and then sat on."""
+    rather than between slots reserved and then sat on.
+
+    Wrap ONE model's caller, never a failover chain (#147): the chain's members
+    have their own rows, and pacing the chain on its lead's limits paced the
+    member actually answering on the wrong numbers — a 16K-TPM fallback against
+    the lead's 250K budget, 15x over, for the whole rest of the run once the
+    lead's 20 RPD were spent. `_build_failover_caller` wraps per member."""
+    if not conforming_enabled():        # the env read first: off means no stat() of the override file
+        return caller
     limits = effective_limits()
-    if not conforming_enabled() or model not in limits:
+    if model not in limits:
         return caller
     limiter, budget = _pacer_for(model, limits[model])
 
     def wrapped(*args, **kwargs):
         prompt = sum(estimate_tokens(v) for v in (*args, *kwargs.values())
                      if isinstance(v, str))
-        budget.acquire(prompt + _RESERVED_OUTPUT_TOKENS)
-        limiter.acquire()
+        _record_pacer_wait(budget.acquire(prompt + _RESERVED_OUTPUT_TOKENS) + limiter.acquire())
         result = caller(*args, **kwargs)
         # Reconcile the reservation upward when the response was bigger than it.
         # Only upward: a smaller response leaves the window slightly conservative,

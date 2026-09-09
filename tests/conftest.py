@@ -24,8 +24,42 @@ def _reset_gemini_pacers():
     registry is what let it reach the other one.
     """
     gemini_limits_mod._pacers.clear()
+    gemini_limits_mod.take_pacer_wait()     # the per-thread wait ledger is global the same way
     yield
     gemini_limits_mod._pacers.clear()
+    gemini_limits_mod.take_pacer_wait()
+
+
+def fake_clock(advance=True):
+    """A (state, monotonic, sleep) triple for the pacers.
+
+    `advance=True` moves the clock forward by each sleep, which is what a real
+    run does — use it when the assertion is about when calls actually land.
+    `advance=False` leaves the clock still, so the sleeps recorded are the
+    schedule the pacer computed rather than one the test drove into it."""
+    state = {"t": 0.0, "sleeps": []}
+
+    def sleep(s):
+        state["sleeps"].append(s)
+        if advance:
+            state["t"] += s
+    return state, (lambda: state["t"]), sleep
+
+
+def real_pacers_on_fake_clock(monkeypatch) -> dict:
+    """Swap in the REAL limiter and budget bound to a clock that advances on
+    sleep, so a test asserts the pacing a run would get rather than a stand-in's
+    bookkeeping. Returns the clock state ({"t", "sleeps"})."""
+    st, mono, sleep = fake_clock()
+    # Bind the real classes before patching: the replacements construct them,
+    # and reading gemini_limits.RateLimiter from inside the lambda would find
+    # the replacement itself.
+    real_rl, real_tb = gemini_limits_mod.RateLimiter, gemini_limits_mod.TokenBudget
+    monkeypatch.setattr(gemini_limits_mod, "RateLimiter",
+                        lambda rpm: real_rl(rpm, monotonic=mono, sleep=sleep))
+    monkeypatch.setattr(gemini_limits_mod, "TokenBudget",
+                        lambda tpm: real_tb(tpm, monotonic=mono, sleep=sleep))
+    return st
 
 
 # Synthetic resume used by filter tests. Includes a Skills section so
