@@ -16,6 +16,12 @@ parallel page fetch (guest-endpoint mapping), Indeed roles the batched jobData
 API (the posting page is Cloudflare-walled but the scraper's API isn't); the
 Discards are one batched dual-write.
 
+A Discard made here is PROVISIONAL, and says so with a `Closed <date>
+(liveness re-check: …)` mark in the row's Notes: the posting died, the opening
+may not have. bridge's stage-2 dedup lets a same-titled re-post of such a row
+through, and the merge resets the row to Evaluated when a re-evaluation lands
+on it — neither of which touches a Discard a person made (#163).
+
 Wired into orchestrate via the opt-in `--recheck-liveness` flag (off by default)
 and exposed in the UI as a background sweep. Both go through `run()`.
 """
@@ -28,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pipeline import screen
-from pipeline._batch_common import atomic_write_text, env_float
+from pipeline._batch_common import atomic_write_text, env_float, liveness_closed_mark
 from pipeline.app import data
 
 # Per-run defaults (env-overridable). A once-daily run re-checking the entire
@@ -250,11 +256,16 @@ def run(
             progress(checked, total, len(dead))
 
     # One batched dual-write for all Discards (the tracker file + the override
-    # channel are each rewritten once, not once per dead role).
+    # channel are each rewritten once, not once per dead role). Each carries a
+    # Closed mark in Notes: a Discard made here means "the POSTING died", not
+    # "we decided against it", and that is the difference that lets a re-post
+    # of the opening back in — bridge's dedup and the merge both read it (#163).
     discarded = 0
     if dead and not dry_run:
+        today = now.date().isoformat()
         data.record_status_changes(
-            apps, [(d["num"], "Discarded", d["company"], d["role"]) for d in dead])
+            apps, [(d["num"], "Discarded", d["company"], d["role"]) for d in dead],
+            notes={d["num"]: liveness_closed_mark(today, d["reason"]) for d in dead})
         discarded = len(dead)
 
     if not dry_run:

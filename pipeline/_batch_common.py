@@ -1188,6 +1188,8 @@ def run_merge_tracker(career_ops: Path) -> bool:
     _recover_refused_additions(career_ops, tracker_dir)
     _sanitize_pending_additions(career_ops, tracker_dir)
     before = _pending_additions(tracker_dir)
+    # The re-check's Discards, read before the merge can rewrite their Notes.
+    closed = _liveness_closed_rows(career_ops / "data" / "applications.md")
     print("[batch] running merge-tracker.mjs...")
     r = subprocess.run(["node", "merge-tracker.mjs"], cwd=career_ops, capture_output=True, text=True, encoding="utf-8")
     if r.returncode == 0:
@@ -1199,10 +1201,146 @@ def run_merge_tracker(career_ops: Path) -> bool:
         # addition's disappearance.
         _warn_on_lost_additions(before, career_ops, tracker_dir,
                                 f"{r.stdout}\n{r.stderr}")
+        _reopen_reposted(closed, career_ops)
         return True
     print(f"[batch] merge-tracker failed:\n{r.stderr.strip()}")
     _hint_missing_node_modules(r.stderr)
     return False
+
+
+# ── "Discarded" is two different things (#163) ───────────────────────────────
+#
+# A person drags a card to Discarded because they decided against the role.
+# The liveness re-check writes Discarded because a POSTING died. The tracker
+# spells both the same, and every reader treated both as final — so when an
+# employer re-posted an opening the re-check had Discarded, bridge's stage-2
+# dedup dropped the same-titled re-post outright, and a re-worded one was
+# evaluated and then folded by merge-tracker's fuzzy tier onto the Discarded
+# row, which keeps its status. Six rows in a real tracker sat at 4.2–4.8 under
+# Discarded with a fresh report dated after the Discard, invisible to the UI,
+# the work-order and the next re-check. A re-check Discard is therefore
+# PROVISIONAL, and the re-check says so in the row's Notes, where the mark
+# rides along in the cached cloud tracker and through every Refresh with no
+# new state file — a new cache path would change the cache's version key and
+# orphan every copy's history (see the runtime-state note in CLAUDE.md).
+#
+# The newest mark wins: a row the merge reopened carries a Reopened mark after
+# its Closed one, so a person Discarding it afterwards is read as a person.
+LIVENESS_CLOSED_RE = re.compile(r"\bClosed \d{4}-\d{2}-\d{2} \(liveness re-check", re.I)
+REOPENED_RE = re.compile(r"\bReopened \d{4}-\d{2}-\d{2} \(re-posted", re.I)
+# What must never reach a Notes cell: a `|` is a cell boundary in the markdown
+# table, and a URL would be read back by `extract_url` as the posting — so the
+# URL half IS the pattern `extract_url` reads with, not a re-spelling of it.
+_NOTE_UNSAFE_RE = re.compile(_NOTES_URL_RE.pattern + r"|\|")
+
+
+def _note_safe(text: str) -> str:
+    """`text` fit to sit inside a Notes cell: no `|`, no URL, one-line, capped.
+    The re-check's reasons include a regex pattern (`body: (?:closed|filled)`)
+    and a redirect URL, either of which would corrupt the row or hijack it."""
+    text = " ".join(_NOTE_UNSAFE_RE.sub(" ", text or "").split())
+    return text[:80].rstrip()
+
+
+def liveness_closed_mark(date: str, reason: str) -> str:
+    """The Notes mark the liveness re-check leaves with its Discard."""
+    return f"Closed {date} (liveness re-check: {_note_safe(reason) or 'posting gone'})"
+
+
+def reopened_mark(date: str) -> str:
+    """The Notes mark the merge leaves when it reopens a re-posted role."""
+    return f"Reopened {date} (re-posted and re-evaluated)"
+
+
+def closed_by_recheck(notes: str) -> bool:
+    """True when the newest mark in `notes` is the re-check's Closed one — the
+    row's Discard is the re-check's, not a person's. Only meaningful on a row
+    whose status IS Discarded; `recheck_discarded` asks both halves."""
+    notes = notes or ""
+    last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes)), default=-1)
+    last_reopened = max((m.end() for m in REOPENED_RE.finditer(notes)), default=-1)
+    return last_closed > last_reopened
+
+
+def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:
+    """True when a row's Discard is the liveness re-check's, not a person's:
+    its status is Discarded AND the newest mark in its Notes is the re-check's
+    Closed one (#163). Both halves in one place, so no reader — bridge's dedup,
+    the merge's reopen, the next one — can drop the status half and read a
+    stale Closed mark on an Evaluated row as provisional. `vocabulary` is
+    `canonical_status`'s (`app.data._load_states()`): a caller walking many
+    rows resolves it once instead of per row."""
+    from pipeline.app.data import canonical_status   # lazy: app.data imports this module
+    return (canonical_status(status, vocabulary) == "Discarded"
+            and closed_by_recheck(notes))
+
+
+def _tracker_rows(applications_md: Path):
+    """Every data row of the tracker as {column: cell}, read by NAME the way
+    every tracker reader here does: the optional Via column shifts Role right
+    by one, and read positionally the agency lands where the role belongs.
+    Zipping is also the width guard — a row too short to reach Role has no
+    Role key and is skipped (Report/Notes are optional columns). A missing
+    file reads as no rows."""
+    for columns, cells in data_rows(read_text(applications_md)):
+        row = dict(zip(columns, cells))
+        if "role" in row:
+            yield row
+
+
+def _liveness_closed_rows(applications_md: Path) -> dict[str, dict]:
+    """{num: {company, role, report}} for every row the liveness re-check
+    Discarded (`recheck_discarded`). Taken BEFORE a merge: the older
+    merge-tracker replaces Notes on an update, so afterwards the mark may be
+    gone, while the newer one keeps them — the snapshot reads the same either
+    way. A person's Discard carries no mark and is not here."""
+    from pipeline.app.data import _load_states   # lazy: app.data imports this module
+    vocabulary = _load_states()             # once per walk, not per row
+    out: dict[str, dict] = {}
+    for row in _tracker_rows(applications_md):
+        if not recheck_discarded(row.get("status", ""), row.get("notes", ""), vocabulary):
+            continue
+        out[row.get("num", "").strip()] = {
+            "company": row["company"], "role": row["role"],
+            "report": row_report_num(row.get("report", ""), row.get("notes", "")),
+        }
+    return out
+
+
+def _reopen_reposted(closed_before: dict[str, dict], career_ops: Path) -> None:
+    """After a merge: a row the liveness re-check had Discarded whose report
+    number this merge changed was just re-evaluated — the opening is back under
+    a new posting, folded onto the old row by merge-tracker's update tier, which
+    writes score, report, date and notes through but keeps the status. Reset it
+    to Evaluated (the next re-check verifies the new posting; `extract_url`
+    reads the newest evaluation's URL) and leave a Reopened mark so a later
+    Discard by a person is read as a person's.
+
+    What this cannot reach: the OLDER merge-tracker skips a re-eval that scored
+    lower than the dead posting's evaluation, so under it that re-post is lost
+    and the row stays Discarded. The fork the cloud runs writes through in both
+    directions (its #2411), and `tests/test_merge_tracker_contract.py` drives
+    the higher-score case that both accept."""
+    if not closed_before:
+        return
+    from pipeline.app.data import record_status_changes   # lazy, as above
+    apps = career_ops / "data" / "applications.md"
+    after: dict[str, str] = {}
+    for row in _tracker_rows(apps):
+        num = row.get("num", "").strip()
+        if num in closed_before:
+            after[num] = row_report_num(row.get("report", ""), row.get("notes", ""))
+    today = datetime.now().date().isoformat()
+    changes = [(num, "Evaluated", was["company"], was["role"])
+               for num, was in closed_before.items()
+               if after.get(num) and after[num] != was["report"]]
+    if not changes:
+        return
+    record_status_changes(apps, changes, notes={num: reopened_mark(today) for num, *_ in changes})
+    print(f"[batch] reopened {len(changes)} role(s) the liveness re-check had Discarded — "
+          "re-posted and re-evaluated in this merge, so back to Evaluated:")
+    for num, _, company, role in changes:
+        print(f"[batch]   #{num} {company} — {role}")
 
 
 def _addition_key(company: str, role: str) -> str:
@@ -1454,16 +1592,7 @@ def _tracker_identities(applications_md: Path) -> tuple[set[str], dict[str, str]
     was right."""
     keys: set[str] = set()
     role_by_report: dict[str, str] = {}
-    if not applications_md.exists():
-        return keys, role_by_report
-    for columns, cells in data_rows(read_text(applications_md)):
-        # By name, as every tracker reader here does: the optional Via column
-        # shifts Role right by one, and read positionally the agency lands where
-        # the role belongs. Zipping is also the width guard — a row too short to
-        # reach Role has no Role key, and Report/Notes are optional columns.
-        row = dict(zip(columns, cells))
-        if "role" not in row:
-            continue
+    for row in _tracker_rows(applications_md):
         company, role = row["company"], row["role"]
         keys.add(_addition_key(company, role))
         num = row_report_num(row.get("report", ""), row.get("notes", ""))

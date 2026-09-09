@@ -35,6 +35,11 @@ from pipeline._batch_common import (
     tail_text,
     write_job_result,
 )
+from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
+    _liveness_closed_rows, _reopen_reposted, closed_by_recheck, liveness_closed_mark,
+    reopened_mark,
+)
+from tests.conftest import tracker_row
 
 
 class TestTailText:
@@ -1414,3 +1419,155 @@ class TestRecoverRefusedAdditions:
         mocker.patch("pipeline._batch_common.subprocess.run", side_effect=snapshot)
         run_merge_tracker(co)
         assert seen["pending"] == ["7.tsv"]         # back in the queue when node ran
+
+
+class TestLivenessMarks:
+    """'Discarded' is two things (#163): a person's decision, or the liveness
+    re-check's verdict that a POSTING died. The re-check marks its own in Notes;
+    the newest mark decides."""
+
+    def test_closed_mark_is_recognised(self):
+        assert closed_by_recheck("https://x — APPLY — " + liveness_closed_mark("2026-09-06", "HTTP 404"))
+
+    def test_no_mark_is_a_persons_discard(self):
+        assert not closed_by_recheck("https://x — APPLY — not for me")
+        assert not closed_by_recheck("")
+
+    def test_reopened_after_closed_is_a_persons_discard_again(self):
+        notes = liveness_closed_mark("2026-09-01", "HTTP 404") + " — " + reopened_mark("2026-09-08")
+        assert not closed_by_recheck(notes)
+
+    def test_closed_again_after_reopened_is_the_rechecks(self):
+        notes = (liveness_closed_mark("2026-09-01", "HTTP 404") + " — " + reopened_mark("2026-09-08")
+                 + ". Re-eval 2026-09-09 (4→4.5): https://y — " + liveness_closed_mark("2026-09-20", "HTTP 410"))
+        assert closed_by_recheck(notes)
+
+    def test_mark_survives_upstreams_notes_merge(self):
+        # The fork keeps existing Notes first and appends the re-eval clause.
+        notes = ("https://old — APPLY — " + liveness_closed_mark("2026-09-06", "HTTP 404")
+                 + ". Re-eval 2026-09-08 (4.1→4.7): https://new — APPLY")
+        assert closed_by_recheck(notes)
+
+    def test_reason_cannot_break_the_cell_or_hijack_the_url(self):
+        # A `|` is a cell boundary; a URL would be read back as the posting.
+        from pipeline.app.data import extract_url
+        mark = liveness_closed_mark("2026-09-06", "error redirect: https://x.com/jobs?expired=1|foo")
+        assert "|" not in mark and "http" not in mark
+        assert extract_url("https://posting — APPLY — " + mark) == "https://posting"
+
+    def test_reason_is_capped_and_one_line(self):
+        mark = liveness_closed_mark("2026-09-06", "body: (?:closed|filled)" + " x\n" * 200)
+        assert "\n" not in mark and len(mark) < 140
+
+    def test_empty_reason_still_marks(self):
+        assert closed_by_recheck(liveness_closed_mark("2026-09-06", ""))
+
+
+_APPS_HEADER = ("# Applications Tracker\n\n"
+                "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+                "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+
+
+def _apps_row(num, status, report, notes, score="4.0/5", role="Nurse"):
+    return (f"| {num} | 2026-09-01 | Acme | {role} | {score} | {status} | ❌ "
+            f"| [{report}](../reports/{report}-acme.md) | {notes} |\n")
+
+
+class TestReopenRepostedDiscards:
+    """A re-post of a role the liveness re-check Discarded: its re-eval lands on
+    the Discarded row (merge-tracker's update tier writes score, report, date
+    and notes through but keeps the status), and nothing ever surfaced it
+    again (#163). After a merge, a re-check Discard whose report number changed
+    goes back to Evaluated. A person's Discard is never bounced."""
+
+    CLOSED = liveness_closed_mark("2026-09-06", "HTTP 404")
+
+    def _co(self, tmp_path, rows):
+        co = tmp_path / "co"
+        (co / "data").mkdir(parents=True)
+        (co / "batch" / "tracker-additions").mkdir(parents=True)
+        (co / "merge-tracker.mjs").write_text("// noop", encoding="utf-8")
+        (co / "data" / "applications.md").write_text(_APPS_HEADER + "".join(rows), encoding="utf-8")
+        return co
+
+    @staticmethod
+    def _merge_that(mocker, co, rewrite):
+        """Stand in for merge-tracker: rewrite the tracker as its update tier would."""
+        apps = co / "data" / "applications.md"
+
+        def run(*a, **kw):
+            apps.write_text(rewrite(apps.read_text(encoding="utf-8")), encoding="utf-8")
+            return mocker.MagicMock(returncode=0, stdout="", stderr="")
+        mocker.patch("pipeline._batch_common.subprocess.run", side_effect=run)
+
+    @staticmethod
+    def _row(co, num):
+        return tracker_row(co / "data" / "applications.md", num)
+
+    def _fork_update(self, text):
+        # Score/report/date through, status kept, existing notes first + re-eval clause.
+        return (text.replace("[050](../reports/050-acme.md)", "[070](../reports/070-acme.md)")
+                    .replace("4.0/5", "4.7/5")
+                    .replace(f"{self.CLOSED} |", f"{self.CLOSED}. Re-eval 2026-09-08 (4→4.7): https://new — APPLY |"))
+
+    def test_reopens_a_recheck_discard_whose_report_changed(self, tmp_path, mocker, capsys):
+        from pipeline.app import data
+        co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", f"https://old — APPLY — {self.CLOSED}")])
+        self._merge_that(mocker, co, self._fork_update)
+        assert run_merge_tracker(co)
+        row = self._row(co, "5")
+        assert row["status_canonical"] == "Evaluated"
+        assert "Reopened" in row["notes"] and not closed_by_recheck(row["notes"])
+        assert data.extract_url(row["notes"]) == "https://new"          # the next re-check verifies the LIVE posting
+        assert json.loads(data.STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))["5"] == {
+            "status": "Evaluated", "company": "Acme", "role": "Nurse"}   # Push carries it to the cloud
+        assert "reopened 1 role" in capsys.readouterr().out
+
+    def test_reopens_under_the_older_notes_replacing_merge(self, tmp_path, mocker):
+        """The vendored merge-tracker REPLACES Notes on an update, so the mark
+        is gone afterwards — which is why the snapshot is taken before."""
+        co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", f"https://old — APPLY — {self.CLOSED}")])
+        self._merge_that(mocker, co, lambda t: (
+            t.replace("[050](../reports/050-acme.md)", "[070](../reports/070-acme.md)")
+             .replace(f"https://old — APPLY — {self.CLOSED}", "Re-eval 2026-09-08 (4→4.7). https://new — APPLY")))
+        assert run_merge_tracker(co)
+        assert self._row(co, "5")["status_canonical"] == "Evaluated"
+
+    def test_a_persons_discard_is_not_bounced(self, tmp_path, mocker):
+        co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", "https://old — APPLY — not for me")])
+        self._merge_that(mocker, co, lambda t: t.replace("[050](../reports/050-acme.md)",
+                                                         "[070](../reports/070-acme.md)"))
+        assert run_merge_tracker(co)
+        assert self._row(co, "5")["status_canonical"] == "Discarded"
+
+    def test_a_discard_after_a_reopen_is_a_persons(self, tmp_path, mocker):
+        notes = f"https://old — APPLY — {self.CLOSED} — {reopened_mark('2026-09-08')} — no thanks"
+        co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", notes)])
+        self._merge_that(mocker, co, lambda t: t.replace("[050](../reports/050-acme.md)",
+                                                         "[070](../reports/070-acme.md)"))
+        assert run_merge_tracker(co)
+        assert self._row(co, "5")["status_canonical"] == "Discarded"
+
+    def test_no_re_eval_means_no_reopen(self, tmp_path, mocker, capsys):
+        co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", f"https://old — APPLY — {self.CLOSED}")])
+        self._merge_that(mocker, co, lambda t: t)
+        assert run_merge_tracker(co)
+        assert self._row(co, "5")["status_canonical"] == "Discarded"
+        assert "reopened" not in capsys.readouterr().out
+
+    def test_snapshot_keys_on_status_and_mark(self, tmp_path):
+        co = self._co(tmp_path, [
+            _apps_row(1, "Discarded", "010", f"x — {self.CLOSED}"),                # the re-check's
+            _apps_row(2, "Descartada", "020", f"x — {self.CLOSED}"),               # alias spelling counts
+            _apps_row(3, "Discarded", "030", "x — not for me"),                    # a person's
+            _apps_row(4, "Evaluated", "040", f"x — {self.CLOSED}"),                # already reopened by hand
+            _apps_row(5, "Discarded", "050", f"x — {self.CLOSED} — {reopened_mark('2026-09-08')}"),
+        ])
+        closed = _liveness_closed_rows(co / "data" / "applications.md")
+        assert set(closed) == {"1", "2"}
+        assert closed["1"] == {"company": "Acme", "role": "Nurse", "report": "10"}   # row_report_num int-normalizes
+
+    def test_reopen_is_a_no_op_without_a_snapshot(self, tmp_path):
+        co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", "x")])
+        _reopen_reposted({}, co)
+        assert self._row(co, "5")["status_canonical"] == "Discarded"

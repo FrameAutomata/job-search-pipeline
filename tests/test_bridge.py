@@ -706,3 +706,52 @@ class TestSectionHeadingVariants:
         text = pipe.read_text(encoding="utf-8")
         assert [l for l in text.splitlines() if l.startswith("## ")] == [heading]
         assert "j/9" in text
+
+
+class TestRecheckDiscardsAreProvisional:
+    """Stage-2 dedup drops a new URL whose company::role is already in the
+    tracker, whatever the status — right for a decision (Applied, Rejected,
+    SKIP, a person's Discard), wrong for the liveness re-check's Discard, which
+    means the POSTING died. A same-titled re-post of that opening never reached
+    evaluation (#163). The re-check marks its Discards in Notes; those rows
+    don't dedup."""
+
+    HEADER = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|---|---|---|---|---|---|---|---|\n")
+
+    @staticmethod
+    def _closed(date="2026-09-06"):
+        from pipeline._batch_common import liveness_closed_mark
+        return liveness_closed_mark(date, "HTTP 404")
+
+    def _md(self, status, notes):
+        return self.HEADER + f"| 1 | 2026-08-25 | Acme | Nurse | 4/5 | {status} | null | [1](reports/1.md) | {notes} |\n"
+
+    def test_a_recheck_discard_does_not_dedup_a_re_post(self):
+        md = self._md("Discarded", "https://a/old — APPLY — " + self._closed())
+        assert bridge_mod._parse_applications_md(md)[1] == set()
+
+    def test_a_persons_discard_still_does(self):
+        assert bridge_mod._parse_applications_md(self._md("Discarded", "https://a/old — not for me"))[1] == {"acme::nurse"}
+
+    def test_a_discard_after_a_reopen_is_a_persons(self):
+        from pipeline._batch_common import reopened_mark
+        md = self._md("Discarded", f"x — {self._closed()} — {reopened_mark('2026-09-08')}")
+        assert bridge_mod._parse_applications_md(md)[1] == {"acme::nurse"}
+
+    def test_the_mark_on_another_status_is_ignored(self):
+        assert bridge_mod._parse_applications_md(self._md("SKIP", "x — " + self._closed()))[1] == {"acme::nurse"}
+
+    def test_alias_spelling_of_discarded_counts(self):
+        assert bridge_mod._parse_applications_md(self._md("Descartada", "x — " + self._closed()))[1] == set()
+
+    def test_run_bridges_the_re_post(self, career_ops_dir, monkeypatch, tmp_path):
+        """End to end: a new URL for a role the re-check Discarded is queued."""
+        (career_ops_dir / "data" / "applications.md").write_text(
+            "# Applications Tracker\n\n" + self._md("Discarded", "https://a/old — APPLY — " + self._closed()),
+            encoding="utf-8")
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text("title,company,job_url,relevance_score,description,date_posted\n"
+                            "Nurse,Acme,https://a/new,7,desc,2026-09-08\n", encoding="utf-8")
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+        assert [o["url"] for o in bridge_mod.run(career_ops_dir)] == ["https://a/new"]

@@ -36,6 +36,7 @@ import pytest
 
 from pipeline import recheck, screen
 from pipeline.app import data as app_data
+from tests.conftest import tracker_row
 
 
 # A tracker covering every selection branch. Liveness re-check is verifiable-site
@@ -131,10 +132,10 @@ def fake_fetch(monkeypatch):
 
 def _status_cell(apps_md, num):
     """The Status cell text for tracker row `num` (e.g. 'Evaluated')."""
-    for row in app_data.parse_applications(apps_md):
-        if row.get("num") == str(num):
-            return row.get("status_canonical")
-    return None
+    try:
+        return tracker_row(apps_md, num)["status_canonical"]
+    except KeyError:
+        return None
 
 
 def _overrides():
@@ -232,6 +233,41 @@ class TestRecheckMarking:
         assert _status_cell(apps, "8") == "Evaluated"   # Indeed, live by default
         assert summary["checked"] == 4 and summary["discarded"] == 1
         assert summary["skipped"] == 1   # row 4 (Evaluated, no URL)
+
+
+class TestDiscardMark:
+    """A Discard made here is provisional — the POSTING died — and says so in
+    Notes, which is what lets a re-post of the opening back in (#163)."""
+
+    def test_discard_leaves_a_closed_mark_in_notes(self, tracker, fake_fetch):
+        from pipeline._batch_common import closed_by_recheck
+        co, apps = tracker
+        fake_fetch["results"] = {"111": ("expired", "HTTP 404")}
+        recheck.run(co, applications_md=apps)
+        row = tracker_row(apps, 1)
+        assert row["status_canonical"] == "Discarded"
+        assert closed_by_recheck(row["notes"]) and "HTTP 404" in row["notes"]
+        # The posting URL is still the posting URL, and the rest of the note survived.
+        assert app_data.extract_url(row["notes"]) == "https://www.linkedin.com/jobs/view/111"
+        assert "strong fit" in row["notes"]
+
+    def test_mark_cannot_break_the_row(self, tracker, fake_fetch):
+        # A reason carrying a `|` (a regex alternation) or a redirect URL must
+        # neither split the cell nor become the row's posting URL.
+        co, apps = tracker
+        fake_fetch["results"] = {"111": ("expired", "error redirect: https://www.linkedin.com/jobs/expired?a=1|b")}
+        recheck.run(co, applications_md=apps)
+        row = tracker_row(apps, 1)
+        assert row["status_canonical"] == "Discarded"
+        assert app_data.extract_url(row["notes"]) == "https://www.linkedin.com/jobs/view/111"
+        assert _status_cell(apps, "2") == "Evaluated"                # the table still parses
+
+    def test_dry_run_writes_no_mark(self, tracker, fake_fetch):
+        co, apps = tracker
+        fake_fetch["results"] = {"111": ("expired", "HTTP 404")}
+        before = apps.read_text(encoding="utf-8")
+        recheck.run(co, applications_md=apps, dry_run=True)
+        assert apps.read_text(encoding="utf-8") == before
 
 
 # ── run: fetch routing ───────────────────────────────────────────────────────
