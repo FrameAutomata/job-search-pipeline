@@ -410,6 +410,21 @@ class TestRecordStatusOverride:
         assert data.override_status("Applied") == "Applied"
         assert data.override_identity("Applied") is None
 
+    def test_a_by_hand_note_only_when_the_newest_mark_is_the_rechecks(self):
+        closed = "https://x — APPLY — Closed 2026-09-06 (liveness re-check: HTTP 404)"
+        assert data.by_hand_note_for(closed, "Discarded", "2026-09-08") == "Set Discarded 2026-09-08 (by hand)"
+        assert data.by_hand_note_for("https://x — APPLY", "Discarded", "2026-09-08") == ""
+        reopened = closed + " — Reopened 2026-09-07 (re-posted and re-evaluated)"
+        assert data.by_hand_note_for(reopened, "Discarded", "2026-09-08") == ""
+
+    def test_record_status_override_carries_a_note(self, tmp_path):
+        import json
+        p = tmp_path / "overrides.json"
+        data.record_status_override("7", "Discarded", p, note="Set Discarded 2026-09-08 (by hand)")
+        v = json.loads(p.read_text(encoding="utf-8"))["7"]
+        assert data.override_note(v) == "Set Discarded 2026-09-08 (by hand)"
+        assert data.override_identity(v) is None                   # still keyed by num
+
     def test_a_note_rides_in_the_override(self):
         """The re-check's Closed mark and the merge's Reopened mark must reach
         the cloud with the status (#163): a status-only Push made the cloud read

@@ -248,6 +248,28 @@ def test_reset_succeeds_even_if_cloud_clear_fails(client, mocker):
     assert "cloud_error" in r.json()
 
 
+def test_status_write_on_a_recheck_closed_row_carries_a_by_hand_mark(client):
+    """A person's Discard after a re-check Discard read as the re-check's —
+    bridge let the re-post through and the merge bounced it (#163). The write
+    now leaves a by-hand mark, through the same channel Push carries."""
+    from pipeline.app import data, server
+    apps = server._career_ops() / "data" / "applications.md"
+    apps.write_text(apps.read_text(encoding="utf-8").replace(
+        "| APPLY |", "| APPLY — Closed 2026-09-06 (liveness re-check: HTTP 404) |"), encoding="utf-8")
+    assert client.post("/api/status", json={"num": "1", "status": "Discarded"}).status_code == 200
+    override = data.load_status_overrides()["1"]
+    assert data.override_status(override) == "Discarded"
+    note = data.override_note(override)
+    assert note.startswith("Set Discarded ") and note.endswith("(by hand)")
+    assert client.get("/api/jobs").json()["rows"][0]["status_canonical"] == "Discarded"
+
+
+def test_an_ordinary_drag_stays_unmarked(client):
+    from pipeline.app import data
+    client.post("/api/status", json={"num": "1", "status": "Applied"})
+    assert data.load_status_overrides()["1"] == "Applied"
+
+
 def test_push_status_400_when_nothing_pending(client):
     r = client.post("/api/push-status")
     assert r.status_code == 400

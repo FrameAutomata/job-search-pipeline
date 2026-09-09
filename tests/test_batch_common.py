@@ -36,8 +36,8 @@ from pipeline._batch_common import (
     write_job_result,
 )
 from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
-    _liveness_closed_rows, _reopen_reposted, closed_by_recheck, liveness_closed_mark,
-    reopened_mark,
+    _liveness_closed_rows, _reopen_reposted, by_hand_mark, closed_by_recheck,
+    liveness_closed_mark, reopened_mark,
 )
 from tests.conftest import tracker_row
 
@@ -1507,6 +1507,15 @@ class TestLivenessMarks:
 
     def test_empty_reason_still_marks(self):
         assert closed_by_recheck(liveness_closed_mark("2026-09-06", ""))
+
+    def test_a_by_hand_mark_after_closed_makes_the_discard_a_persons(self):
+        # A person's write leaves this mark on a re-check-Closed row (#163 follow-up);
+        # newest still wins, so a later re-check Closed is the re-check's again.
+        closed = liveness_closed_mark("2026-09-06", "HTTP 404")
+        notes = f"https://x — APPLY — {closed} — {by_hand_mark('2026-09-08', 'Discarded')}"
+        assert not closed_by_recheck(notes)
+        assert closed_by_recheck(notes + f" — {liveness_closed_mark('2026-09-10', 'HTTP 410')}")
+        assert by_hand_mark("2026-09-08", "Discarded | x") == "Set Discarded x 2026-09-08 (by hand)"
 
 
 _APPS_HEADER = ("# Applications Tracker\n\n"

@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import threading
+from datetime import date
 from pathlib import Path
 
 from pipeline._batch_common import (
@@ -17,6 +18,8 @@ from pipeline._batch_common import (
     _report_link,
     ADDITION_COLUMNS,
     atomic_write_text,
+    by_hand_mark,
+    closed_by_recheck,
     find_report_file,
     normalize_company,
     read_url_set,
@@ -148,7 +151,8 @@ def _override_value(status: str, company: str | None, role: str | None,
 
 
 def record_status_override(num: str, status: str, path: Path | None = None,
-                           *, company: str | None = None, role: str | None = None) -> None:
+                           *, company: str | None = None, role: str | None = None,
+                           note: str | None = None) -> None:
     """Record a pending status change in the UI's override file — the same
     channel a kanban drag uses. Best-effort: a failure here must never break
     the caller (the tracker-file write is the primary record).
@@ -157,15 +161,30 @@ def record_status_override(num: str, status: str, path: Path | None = None,
     stage, whose num comes from a refreshed-or-local tracker that may use
     different numbering than the one this override is later applied against):
     the value then carries an identity anchor so consumers mark the RIGHT row,
-    not whichever row coincidentally shares the num."""
+    not whichever row coincidentally shares the num. `note` is a Notes mark to
+    append with the status (`by_hand_note_for`); Push carries it along."""
     p = path or STATUS_OVERRIDES_FILE
     try:
         with _status_lock:
             overrides = load_status_overrides(p)
-            overrides[str(num)] = _override_value(status, company, role)
+            overrides[str(num)] = _override_value(status, company, role, note)
             save_status_overrides(overrides, p)
     except OSError:
         pass
+
+
+def by_hand_note_for(row_notes: str, status: str, today: str | None = None) -> str:
+    """The Notes mark a person's status write must carry, or "" when none is
+    needed. A person's write leaves no mark of its own, so on a row whose newest
+    mark is the re-check's Closed one a later Discard by hand still read as the
+    re-check's (#163): bridge let a re-post of the role through and the merge
+    bounced the person's Discard back to Evaluated, and nothing could confirm a
+    re-check Discard as final. Only such a row gets the mark — re-selecting
+    Discarded on it IS the confirmation — and an ordinary drag stays unmarked,
+    so Notes do not grow a clause per drag."""
+    if not closed_by_recheck(row_notes or ""):
+        return ""
+    return by_hand_mark(today or date.today().isoformat(), status)
 
 
 def record_status_changes(applications_md: Path, changes, *, notes: dict | None = None) -> None:

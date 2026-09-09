@@ -1257,6 +1257,7 @@ def run_merge_tracker(career_ops: Path) -> bool:
 # its Closed one, so a person Discarding it afterwards is read as a person.
 LIVENESS_CLOSED_RE = re.compile(r"\bClosed \d{4}-\d{2}-\d{2} \(liveness re-check", re.I)
 REOPENED_RE = re.compile(r"\bReopened \d{4}-\d{2}-\d{2} \(re-posted", re.I)
+BY_HAND_RE = re.compile(r"\bSet [A-Za-z]+ \d{4}-\d{2}-\d{2} \(by hand\)", re.I)
 # What must never reach a Notes cell: a `|` is a cell boundary in the markdown
 # table, and a URL would be read back by `extract_url` as the posting — so the
 # URL half IS the pattern `extract_url` reads with, not a re-spelling of it.
@@ -1281,14 +1282,24 @@ def reopened_mark(date: str) -> str:
     return f"Reopened {date} (re-posted and re-evaluated)"
 
 
+def by_hand_mark(date: str, status: str) -> str:
+    """The Notes mark a person's status write leaves on a row whose newest mark
+    is the re-check's Closed one — what makes the decision a person's (#163).
+    `app.data.by_hand_note_for` decides when one is needed."""
+    return f"Set {_note_safe(status) or 'status'} {date} (by hand)"
+
+
 def closed_by_recheck(notes: str) -> bool:
-    """True when the newest mark in `notes` is the re-check's Closed one — the
-    row's Discard is the re-check's, not a person's. Only meaningful on a row
-    whose status IS Discarded; `recheck_discarded` asks both halves."""
+    """True when the newest mark in `notes` is the re-check's Closed one — newer
+    than any Reopened mark the merge left and any by-hand mark a person's write
+    left — so the row's Discard is the re-check's, not a person's. Only
+    meaningful on a row whose status IS Discarded; `recheck_discarded` asks
+    both halves."""
     notes = notes or ""
     last_closed = max((m.end() for m in LIVENESS_CLOSED_RE.finditer(notes)), default=-1)
-    last_reopened = max((m.end() for m in REOPENED_RE.finditer(notes)), default=-1)
-    return last_closed > last_reopened
+    last_person = max((m.end() for r in (REOPENED_RE, BY_HAND_RE) for m in r.finditer(notes)),
+                      default=-1)
+    return last_closed > last_person
 
 
 def recheck_discarded(status: str, notes: str, vocabulary: tuple | None = None) -> bool:
