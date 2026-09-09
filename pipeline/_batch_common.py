@@ -163,6 +163,12 @@ def normalize_company(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+def _company_slug(company: str) -> str:
+    """The hyphenated company slug a report filename carries
+    (`{num}-{company-slug}-{date}.md`), as `write_job_result` builds it."""
+    return re.sub(r"[^a-z0-9]+", "-", (company or "").lower()).strip("-")
+
+
 # ── Cross-process lock ────────────────────────────────────────────────────────
 # One mechanism for every pid-based guard (the batch-eval single-flight lock and
 # the UI local-run orphan guard). A lock file holds "pid timestamp". It is
@@ -356,15 +362,22 @@ def find_report_file(reports_dir: Path, report_num: str) -> Path | None:
     # new one reads `os.name` at call time (3.12's Path.__new__), which the
     # skills launcher's tests patch to "posix" — on Windows that is a PosixPath
     # nothing can instantiate, and the UI's report lookup sits on that path.
+    files = _reports_numbered(reports_dir, report_num)
+    return files[0] if files else None
+
+
+def _reports_numbered(reports_dir: Path, report_num: str) -> list[Path]:
+    """Every real report (locks skipped) whose leading number is `report_num`,
+    in filename order. More than one is a real state: local holds both a synced
+    cloud report and a local-only one that shares the number (see
+    `app/data._rename_report_file`), so a caller that WRITES a binding must
+    not pick by sort order — `resolve_report` asks the company."""
     wanted = _report_int(report_num)
     if wanted is None or not reports_dir.exists():
-        return None
-    for f in sorted(reports_dir.glob("*.md")):
-        if f.name.endswith(RESERVED_REPORT_SUFFIX):
-            continue
-        if _report_int(_report_num_prefix(f.name)) == wanted:
-            return f
-    return None
+        return []
+    return [f for f in sorted(reports_dir.glob("*.md"))
+            if not f.name.endswith(RESERVED_REPORT_SUFFIX)
+            and _report_int(_report_num_prefix(f.name)) == wanted]
 
 
 # The `[N](path)` of a Report cell, and the two things every reader needs from
@@ -400,11 +413,17 @@ def _linked_report(base: Path, report_path: str) -> Path | None:
     return base / report_path if report_path else None
 
 
-def resolve_report(base: Path, report_path: str, *, num_text: str = "") -> Path | None:
+def resolve_report(base: Path, report_path: str, *, num_text: str = "",
+                   company: str = "") -> Path | None:
     """The file a tracker row's Report link actually names — the link target
     when it exists, else the report in `base/reports/` with the link's number:
-    the filename's own `NNN-` prefix, or failing that `num_text` (the link's
-    `[N]` text, which a model that mangled the slug may have padded differently).
+    `num_text` (the link's `[N]` text — the row's identity everywhere else in
+    the pipeline, so it wins when the dead filename's own prefix disagrees), or
+    failing that the filename's `NNN-` prefix. When two reports carry the
+    number (a synced cloud report beside a local-only one), `company` — the
+    row's — picks the one whose filename slug names it, and no company or no
+    match declines rather than guesses: binding a row to another company's
+    evaluation is worse than building from the JD alone.
 
     The link is model-authored (#162): the prompt gives the model only the
     SHAPE `[N](reports/N-company-slug-DATE.md)` and it invents the slug — keeps
@@ -421,18 +440,24 @@ def resolve_report(base: Path, report_path: str, *, num_text: str = "") -> Path 
         return None
     if direct.is_file():
         return direct
-    num = _report_num_prefix(direct.name) or num_text
-    return find_report_file(base / "reports", num) if num else None
+    num = num_text or _report_num_prefix(direct.name)
+    files = _reports_numbered(base / "reports", num) if num else []
+    if len(files) > 1:
+        slug = _company_slug(company)
+        files = [f for f in files if slug and slug in f.name]
+    return files[0] if len(files) == 1 else None
 
 
-def read_report(base: Path, report_path: str, *, label: str = "report") -> str:
+def read_report(base: Path, report_path: str, *, label: str = "report",
+                company: str = "") -> str:
     """The text of the report a tracker row links to, or "" — resolving a dead
-    link by its number (`resolve_report`) and SAYING so either way, since the
-    consumers (cover letters, both tailors) otherwise build from the JD alone
-    in silence, which is the failure this exists to end."""
+    link by its number (`resolve_report`, with the row's `company` to tell two
+    same-numbered reports apart) and SAYING so either way, since the consumers
+    (cover letters, both tailors) otherwise build from the JD alone in silence,
+    which is the failure this exists to end."""
     if not (report_path or "").strip():
         return ""
-    found = resolve_report(base, report_path)
+    found = resolve_report(base, report_path, company=company)
     if found is None:
         print(f"[{label}] report {report_path} not found — building from the JD alone")
         return ""
@@ -511,6 +536,7 @@ _TRACKER_TSV_COLUMNS = len(ADDITION_COLUMNS)
 _ROLE_IDX = ADDITION_COLUMNS.index("role")
 _STATUS_IDX = ADDITION_COLUMNS.index("status")
 _SCORE_IDX = ADDITION_COLUMNS.index("score")
+_COMPANY_IDX = ADDITION_COLUMNS.index("company")
 _REPORT_IDX = ADDITION_COLUMNS.index("report")
 _NOTES_IDX = ADDITION_COLUMNS.index("notes")
 
@@ -884,7 +910,7 @@ def write_job_result(
     job_id = job_meta["id"]
     report_num = job_meta.get("report_num") or summary.get("report_num", "000")
     company = summary.get("company") or job_meta.get("company") or "unknown"
-    company_slug = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
+    company_slug = _company_slug(company)
     report_name = f"{report_num}-{company_slug}-{today}.md"
     report_file = report_name if report_content else None
 
@@ -1100,14 +1126,17 @@ def _trailing_url(tracker_tsv: str) -> str:
 
 def _dead_link_repair(career_ops: Path, tracker_tsv: str) -> str:
     """The filename to point a row's Report link at, or "" to leave it alone:
-    only a link whose target does NOT exist is repaired, and only when a report
-    with its number does — resolved exactly as the readers resolve it
-    (`resolve_report`), with the `[N]` text as the fallback number."""
-    parts = _row_parts(tracker_tsv)
+    only a link whose target does NOT exist is repaired, and only when exactly
+    one report answers to its number and company — resolved exactly as the
+    readers resolve it (`resolve_report`). Reads the row through the same
+    trailing-cell restore the chain applies, or the one row that lost its
+    empty Notes tab (the row `_restore_trailing_cells` exists to save) would
+    get every repair but this one, and merge with the dead link for good."""
+    parts = _row_parts(_restore_trailing_cells(tracker_tsv))
     if parts is None:
         return ""
     num_text, path = _report_link(parts[_REPORT_IDX])
-    found = resolve_report(career_ops, path, num_text=num_text)
+    found = resolve_report(career_ops, path, num_text=num_text, company=parts[_COMPANY_IDX])
     if found is None or found == _linked_report(career_ops, path):
         return ""
     return found.name
@@ -1171,7 +1200,7 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
         changed += 1
     if changed:
         print(f"[batch] sanitized {changed} addition(s) written outside the "
-              "Python path (score/URL/req-id)")
+              "Python path (score/URL/req-id/report link)")
 
 
 def run_merge_tracker(career_ops: Path) -> bool:

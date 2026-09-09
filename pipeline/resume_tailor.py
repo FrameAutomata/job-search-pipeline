@@ -714,7 +714,8 @@ def generate_for_job(career_ops: Path, job, *, caller=None,
     work_pdf = docx_out.parent / (docx_out.stem + ".work.pdf")
 
     report_text = read_report(Path(report_base or career_ops),
-                              getattr(job, "report_path", ""), label="tailor")
+                              getattr(job, "report_path", ""), label="tailor",
+                              company=getattr(job, "company", ""))
     jd_text = jd_text_for_job(career_ops, report_base, job)
     instructions = _tailoring_instructions(career_ops)   # candidate's own setup guidance
 
