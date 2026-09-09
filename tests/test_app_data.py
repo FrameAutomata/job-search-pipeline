@@ -410,6 +410,27 @@ class TestRecordStatusOverride:
         assert data.override_status("Applied") == "Applied"
         assert data.override_identity("Applied") is None
 
+    def test_a_note_rides_in_the_override(self):
+        """The re-check's Closed mark and the merge's Reopened mark must reach
+        the cloud with the status (#163): a status-only Push made the cloud read
+        a re-check Discard as a person's, and Refresh then erased the mark here."""
+        mark = "Closed 2026-09-06 (liveness re-check: HTTP 404)"
+        v = data._override_value("Discarded", "Acme", "Eng", mark)
+        assert v == {"status": "Discarded", "company": "Acme", "role": "Eng", "note": mark}
+        assert data.override_note(v) == mark and data.override_note("Applied") == ""
+        assert "note" not in data._override_value("Applied", "Acme", "Eng")
+        # No identity anchor: still a record, keyed by num like a plain one.
+        v = data._override_value("Evaluated", None, None, "Reopened 2026-09-08 (re-posted and re-evaluated)")
+        assert data.override_identity(v) is None and data.override_status(v) == "Evaluated"
+
+    def test_record_status_changes_carries_the_note_into_the_override(self, tmp_path):
+        apps = tmp_path / "applications.md"
+        apps.write_text(TestResolveOverridesForPush.APPS, encoding="utf-8")
+        mark = "Closed 2026-09-06 (liveness re-check: HTTP 404)"
+        data.record_status_changes(apps, [("3", "Discarded", "Acme", "Engineer")], notes={"3": mark})
+        assert data.load_status_overrides()["3"] == {
+            "status": "Discarded", "company": "Acme", "role": "Engineer", "note": mark}
+
     def test_clear_only_named_keys(self, tmp_path):
         # Selective clear keeps an entry written between a push's snapshot and now.
         import json
@@ -498,6 +519,29 @@ class TestResolveOverridesForPush:
         new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(self.APPS, overrides)
         assert cloud_payload == {"5": "SKIP"}
         assert unresolved == []
+
+    def test_a_noted_override_is_applied_and_dispatched_with_its_note(self):
+        mark = "Closed 2026-09-06 (liveness re-check: HTTP 404)"
+        overrides = {"99": {"status": "Discarded", "company": "Acme", "role": "Engineer", "note": mark}}
+        new_text, cloud_payload, unresolved = data.resolve_overrides_for_push(self.APPS, overrides)
+        assert cloud_payload == {"3": {"status": "Discarded", "note": mark}}
+        assert unresolved == []
+        row = {r["num"]: r for r in data.parse_applications_text(new_text)}["3"]
+        assert row["status_canonical"] == "Discarded" and row["notes"] == f"a — {mark}"
+
+    def test_apply_cloud_overrides_reads_both_payload_shapes(self):
+        """What edit-tracker.yml runs: the plain {num: status} a kanban drag
+        sends, and the {num: {status, note}} a re-check Discard sends."""
+        mark = "Reopened 2026-09-08 (re-posted and re-evaluated)"
+        text, applied = data.apply_cloud_overrides(
+            self.APPS, {"3": "Applied", "5": {"status": "Evaluated", "note": mark}, "9": "SKIP"})
+        assert applied == 2                                     # there is no row 9
+        rows = {r["num"]: r for r in data.parse_applications_text(text)}
+        assert rows["3"]["status_canonical"] == "Applied" and rows["3"]["notes"] == "a"
+        assert rows["5"]["status_canonical"] == "Evaluated" and rows["5"]["notes"] == f"b — {mark}"
+        # A dispatch applied twice (a cancelled, re-run workflow) does not stack the mark.
+        again, applied = data.apply_cloud_overrides(text, {"5": {"status": "Evaluated", "note": mark}})
+        assert again == text and applied == 0
 
     def test_build_text_false_keeps_payload_but_skips_rebuild(self):
         # The refreshed-artifact push only needs cloud_payload (it doesn't persist

@@ -293,6 +293,26 @@ def test_push_status_refreshes_applies_and_dispatches(client, tmp_path, mocker):
     assert client.get("/api/jobs").json()["pending"] == 0
 
 
+def test_push_carries_a_recheck_mark_to_the_cloud(client, mocker):
+    """A Discard the local re-check minted reached the cloud as a bare status
+    — a person's Discard, which the cloud never reopens — and the next Refresh
+    erased the mark here too (#163). The mark rides in the payload; the board's
+    post-push overlay stays status-only."""
+    import json
+    from pipeline.app import data, server
+    mark = "Closed 2026-09-06 (liveness re-check: HTTP 404)"
+    local_apps = server._career_ops_local() / "data" / "applications.md"
+    data.record_status_changes(local_apps, [("1", "Discarded", "Acme", "Eng")], notes={"1": mark})
+    mocker.patch.object(server.gh, "latest_successful_run", return_value=None)   # offline: local base
+    trigger = mocker.patch.object(server.gh, "trigger_workflow")
+
+    assert client.post("/api/push-status").status_code == 200
+    payload = json.loads(trigger.call_args.args[1]["status_overrides_json"])
+    assert payload == {"1": {"status": "Discarded", "note": mark}}
+    assert json.loads(server.PUSHED_OVERRIDES_FILE.read_text(encoding="utf-8")) == {"1": "Discarded"}
+    assert client.get("/api/jobs").json()["rows"][0]["status_canonical"] == "Discarded"
+
+
 def test_pushed_change_survives_post_push_reload_and_refresh(client, tmp_path, mocker):
     """A pushed status must stay visible across the post-push board reload AND a
     later Refresh, until a genuinely fresh pipeline run incorporates it. The bug:
