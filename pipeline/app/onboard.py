@@ -202,7 +202,16 @@ def derive_from_profile(profile: dict) -> dict:
     out: dict = {}
     for section, fields in _PROFILE_TEXT_FIELDS.items():
         src = _dsect(profile, section)
+        # `narrative.derived` names the fields the generator filled from the
+        # résumé rather than the wizard. Those are not answers (the rule the
+        # header above states), so they read back blank: the step's "left
+        # blank, derived" copy holds in edit mode, and a new résumé re-derives
+        # them on the next Save instead of the old sentence surviving it.
+        derived = src.get("derived")
+        derived = set(derived) if isinstance(derived, list) else set()
         for form_key, yaml_key in fields.items():
+            if yaml_key in derived:
+                continue
             _put(out, form_key, src.get(yaml_key))
 
     # target_roles.archetypes holds every role the user named, in order and
