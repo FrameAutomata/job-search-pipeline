@@ -36,10 +36,15 @@ in both stages.
 
 The rows judged are filter's — those with a description — and the screen stage
 re-runs the same judgement after it backfills LinkedIn JDs, which arrive empty.
-A row screen judges off-site is recorded in scan-history as
-`screened-offsite` (bridge.SCAN_HISTORY_STATUSES) so the same far-away posting
-is not re-fetched every morning; bridge.load_seen expires that status after
-sixty days so broadening the passes later can resurrect it.
+Same judgement, whole: a row screen turns on-site (ONSITE) is one filter
+passed through the remote bypass, so screen also re-applies the location half
+of filter.is_eligible — `location_eligible`, kept here so screen can call it
+without importing filter — and drops the row those checks refuse, exactly as
+filter would have had the JD been there. A row screen drops either way is
+recorded in scan-history as `screened-offsite` (bridge.SCAN_HISTORY_STATUSES)
+so the same far-away posting is not re-fetched every morning; bridge.load_seen
+expires that status after sixty days so broadening the passes later can
+resurrect it.
 
 The `"True"`/`"False"`/`""` string readers live here, beside the regex, so
 filter, screen and bridge share ONE reading of the two flags — the shape
@@ -135,6 +140,10 @@ def guard_enabled(cfg) -> bool:
     the guard on precisely the hand-edited config that meant to turn it off."""
     fcfg = (cfg.get("filter") if isinstance(cfg, dict) else None) or {}
     raw = fcfg.get("remote_requires_mention", True)
+    if raw is None:
+        # A key left blank (`remote_requires_mention:`) loads as None — a stub,
+        # not an answer — so it keeps the default rather than reading as off.
+        return True
     if isinstance(raw, str):
         return raw.strip().lower() not in _FALSE_CELLS
     return bool(raw)
@@ -202,6 +211,36 @@ def is_local_location(row_location, pass_locations) -> bool:
         if re.search(rf"\b{re.escape(name)}\b", where, re.IGNORECASE):
             return True
     return False
+
+
+def compile_alternation(terms) -> re.Pattern | None:
+    """Compile one \\b(?:t1|t2|...)\\b pattern, case-insensitive, from a config
+    list. Returns None for an empty list so callers can short-circuit cheaply;
+    drops falsy entries (a bare `-` in YAML parses to None). Filter's
+    `_compile_alternation`, moved here so screen can compile the two location
+    lists without importing filter."""
+    pieces = sorted({str(t).lower() for t in (terms or []) if t}, key=len, reverse=True)
+    if not pieces:
+        return None
+    return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
+
+
+def location_eligible(row, negative_loc_pattern, eligible_loc_pattern) -> bool:
+    """The location half of filter.is_eligible, for an ON-SITE row: False in a
+    `negative_locations` place, or outside the `eligible_locations` allowlist.
+    Word-bounded, so "US" matches the "US" in "Dallas, US" and not the "us" in
+    "Russia". Deliberately NOT the whole gate — the remote bypass belongs to
+    the caller (filter asks it first; screen asks it only of a row the guard
+    has just turned on-site), and `negative_description_terms` ran in filter
+    over every row and need not run twice."""
+    if negative_loc_pattern is None and eligible_loc_pattern is None:
+        return True
+    location = (row.get("location") or "").strip()
+    if negative_loc_pattern is not None and location and negative_loc_pattern.search(location):
+        return False
+    if eligible_loc_pattern is not None and location and not eligible_loc_pattern.search(location):
+        return False
+    return True
 
 
 def judge_remote_row(row: dict, pass_locations=()) -> str | None:

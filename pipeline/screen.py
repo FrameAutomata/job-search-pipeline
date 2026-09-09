@@ -576,7 +576,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     """Screen filtered_jobs.csv in-place.
 
     Returns the number of rows dropped: liveness failures plus the rows the
-    remote-consistency guard dropped (below).
+    remote-consistency guard dropped (below), off-site and ineligible alike.
 
     If `career_ops_path` is provided, the run also:
       1. Loads URLs already known (scan-history.tsv + pipeline.md + applications.md)
@@ -596,9 +596,15 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     are backfilled here, so this is the first time most of them can be judged.
     A row the JD says is on-site has `is_remote` rewritten to False; one that a
     remote pass alone returned, and that is not local to one of the user's
-    non-remote passes, is dropped. `filter.remote_requires_mention: false`
-    disables it. A remote JD that restricts residency to one state is not this
-    guard's problem (it mentions remote, so it passes).
+    non-remote passes, is dropped. The one it turns on-site and keeps then
+    meets filter's location checks (`negative_locations`, `eligible_locations`
+    — remote_signal.location_eligible), because it passed filter through the
+    remote bypass with no JD to judge and never met them; a row they refuse is
+    dropped and recorded like an off-site one, since it is the same far-away
+    posting seen through the user's own lists rather than their passes.
+    `filter.remote_requires_mention: false` disables it. A remote JD that
+    restricts residency to one state is not this guard's problem (it mentions
+    remote, so it passes).
     """
     import yaml
     from dotenv import load_dotenv
@@ -613,6 +619,11 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     liveness_timeout = int(scfg.get("liveness_timeout", 8))
     remote_guard = remote_signal.guard_enabled(cfg)
     local_locations = remote_signal.local_pass_locations(cfg) if remote_guard else []
+    # The location half of filter.is_eligible, for the rows the guard turns
+    # on-site below; compiled the way filter compiles them, from the same keys.
+    fcfg = cfg.get("filter") or {}
+    negative_loc_pattern = remote_signal.compile_alternation(fcfg.get("negative_locations"))
+    eligible_loc_pattern = remote_signal.compile_alternation(fcfg.get("eligible_locations"))
 
     if not liveness_on:
         print("[screen] liveness disabled -- skipping (set screen.liveness: true to enable)")
@@ -686,6 +697,7 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
     dropped = 0
     held = 0
     offsite = 0
+    ineligible = 0
     backfilled = 0
 
     # classify_liveness_each routes by site and yields as results land: Indeed
@@ -737,9 +749,23 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
                 job["description"] = extracted
                 backfilled += 1
         # Now that the row has whatever JD it is going to get, ask filter's
-        # question again: does a posting the board flagged remote say so?
-        if remote_guard and remote_signal.judge_remote_row(job, local_locations) == remote_signal.OFFSITE:
-            offsite += 1
+        # question again: does a posting the board flagged remote say so? And
+        # the question that follows it there: a row turned on-site is one
+        # filter waved through the remote bypass, so it meets the location
+        # checks here for the first time. Not on a None verdict — a row the
+        # guard left alone either confirmed its remote claim or already
+        # passed those checks in filter as the on-site row it always was.
+        verdict = remote_signal.judge_remote_row(job, local_locations) if remote_guard else None
+        if verdict == remote_signal.OFFSITE or (
+            verdict == remote_signal.ONSITE
+            and not remote_signal.location_eligible(job, negative_loc_pattern, eligible_loc_pattern)
+        ):
+            if verdict == remote_signal.OFFSITE:
+                offsite += 1
+            else:
+                ineligible += 1
+                print(f"  SKIP {title} -- on-site in an ineligible location: "
+                      f"{remote_signal.describe_dropped(job)}")
             offsite_rows.append(job)
             url = (job.get("job_url") or "").strip()
             if url:
@@ -751,6 +777,9 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
             continue
         kept.append(job)
 
+    # Both kinds of guard drop reach the log, the dropped-rows file and (below)
+    # scan-history together: the ineligible row is the same far-away on-site
+    # posting, found through the user's location lists instead of their passes.
     remote_signal.report_dropped(offsite_rows, "screen")
     if offsite_rows:
         # Extend, not overwrite: filter wrote this run's first half of the list.
@@ -769,12 +798,13 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
             career_ops_path, dead_entries, date.today().isoformat(), status="screened-dead",
         )
     # Off-site drops are recorded the same way, under their own status. The
-    # pre-screen dedup above treats ANY scan-history status as seen (load_seen
-    # reads only the URL column), which is what stops the same far-away posting
-    # being re-fetched and re-judged every morning. The trade-off: broadening
-    # the search passes later does not resurrect these rows on its own — bridge.
-    # load_seen expires this status after sixty days (SCAN_HISTORY_EXPIRY), and
-    # a user can delete the lines sooner. `screened-dead` stays permanent.
+    # pre-screen dedup above treats every scan-history status as seen —
+    # load_seen keys on the URL and consults the status/date only to expire
+    # `screened-offsite` lines after SCAN_HISTORY_EXPIRY days — which is what
+    # stops the same far-away posting being re-fetched and re-judged every
+    # morning. The trade-off: broadening the search passes later does not
+    # resurrect these rows on its own until that expiry (sixty days), and a
+    # user can delete the lines sooner. `screened-dead` stays permanent.
     if career_ops_path is not None and offsite_entries:
         from pipeline.bridge import append_to_scan_history
         append_to_scan_history(
@@ -784,10 +814,10 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
 
     print(
         f"[screen] kept {len(kept)}, dropped {dropped} of {len(jobs)} new "
-        f"(held: {held}, offsite: {offsite}, backfilled: {backfilled}, "
-        f"skipped-seen: {skipped_seen})"
+        f"(held: {held}, offsite: {offsite}, ineligible: {ineligible}, "
+        f"backfilled: {backfilled}, skipped-seen: {skipped_seen})"
     )
-    return dropped + offsite
+    return dropped + offsite + ineligible
 
 
 if __name__ == "__main__":

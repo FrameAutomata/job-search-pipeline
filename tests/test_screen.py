@@ -1393,14 +1393,14 @@ class TestRemoteConsistencyGuard:
         + "</div></body></html>"
     )
 
-    def _cfg(self, tmp_path, guard=None):
+    def _cfg(self, tmp_path, guard=None, filter_extra=""):
         cfg = tmp_path / "search.yml"
         flag = "" if guard is None else f"  remote_requires_mention: {guard}\n"
         cfg.write_text(
             "searches:\n"
             "  - {name: dfw, location: 'Dallas, TX', hours_old: 24}\n"
             "  - {name: remote, location: United States, is_remote: true}\n"
-            f"filter:\n{flag}"
+            f"filter:\n{flag}{filter_extra}"
             "screen:\n  liveness: true\n  liveness_timeout: 8\n",
             encoding="utf-8",
         )
@@ -1516,6 +1516,73 @@ class TestRemoteConsistencyGuard:
         assert run(cfg) == 0
 
         assert self._rows(filtered)["https://far.com"]["is_remote"] == "True"
+
+    def test_an_onsite_row_in_a_negative_location_is_dropped(self, tmp_path, monkeypatch, mocker, capsys):
+        # Board-flagged remote but NOT remote-only (a local pass returned it
+        # too — LinkedIn's city-scoped search hands back flagged-remote rows
+        # from anywhere), no JD at filter time, so filter passed it through
+        # the remote bypass. The backfilled JD turns it on-site, and an
+        # on-site row in a `negative_locations` place is one filter would have
+        # refused had the JD been there; screen owes it the same checks.
+        from pipeline import remote_signal
+        cfg = self._cfg(tmp_path, filter_extra="  negative_locations: [SC]\n")
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            self._row("https://far.com", "Spartanburg, SC", remote_only="False"),
+            self._row("https://dal.com", "Dallas, TX", remote_only="False"),
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg, career_ops_path=career_ops) == 1
+
+        rows = self._rows(filtered)
+        assert set(rows) == {"https://dal.com"}
+        assert rows["https://dal.com"]["is_remote"] == "False"
+        hist = (career_ops / "data" / "scan-history.tsv").read_text(encoding="utf-8")
+        lines = [ln for ln in hist.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        assert lines[1].startswith("https://far.com\t") and lines[1].endswith("\tscreened-offsite")
+        out = capsys.readouterr().out
+        assert "on-site in an ineligible location: Acme · Rep · Spartanburg, SC" in out
+        assert "offsite: 0, ineligible: 1" in out
+        with open(remote_signal.DROPPED_PATH, newline="", encoding="utf-8") as f:
+            dropped = list(csv.DictReader(f))
+        assert [(r["job_url"], r["dropped_by"]) for r in dropped] == [("https://far.com", "screen")]
+
+    def test_an_onsite_row_outside_the_eligible_allowlist_is_dropped(self, tmp_path, monkeypatch, mocker):
+        cfg = self._cfg(tmp_path, filter_extra="  eligible_locations: [TX]\n")
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            self._row("https://far.com", "Spartanburg, SC", remote_only="False"),
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg) == 1
+        assert filtered.read_text(encoding="utf-8") == ""
+
+    def test_the_location_checks_are_not_re_run_on_a_row_the_guard_left_alone(self, tmp_path, monkeypatch, mocker):
+        # A row filter already passed as on-site (no remote claim) meets the
+        # location checks in filter; a genuinely remote one bypasses them
+        # there and keeps bypassing them here. Neither is judged again — the
+        # negative list below would refuse both by location if it were.
+        cfg = self._cfg(tmp_path, filter_extra="  negative_locations: [SC]\n")
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            self._row("https://plain.com", "Spartanburg, SC", remote_only="False", is_remote="False"),
+            self._row("https://remote.com", "Spartanburg, SC", remote_only="False"),
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.REMOTE_PAGE))
+
+        assert run(cfg) == 0
+        assert set(self._rows(filtered)) == {"https://plain.com", "https://remote.com"}
 
     def test_a_row_with_no_remote_claim_is_never_judged(self, tmp_path, monkeypatch, mocker):
         cfg = self._cfg(tmp_path)

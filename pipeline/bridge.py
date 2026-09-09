@@ -34,9 +34,10 @@ APPLICATIONS_MD = "data/applications.md"
 #   added             bridge queued the URL for evaluation (permanent)
 #   screened-dead     screen's liveness check found the posting gone (permanent —
 #                     only positive evidence of removal produces it)
-#   screened-offsite  screen's remote-consistency guard dropped a remote-pass
-#                     row whose JD is on-site somewhere far away
-#                     (pipeline.remote_signal); expires, see SCAN_HISTORY_EXPIRY
+#   screened-offsite  screen's remote-consistency guard dropped a board-flagged
+#                     remote row whose JD is on-site somewhere the user's passes
+#                     and location lists do not reach (pipeline.remote_signal);
+#                     expires, see SCAN_HISTORY_EXPIRY
 SCAN_HISTORY_STATUSES = ("added", "screened-dead", "screened-offsite")
 
 # How long load_seen treats a status as seen, in days; a status absent here is
@@ -233,8 +234,9 @@ def append_to_scan_history(
     `status` is the value written in the final column and must be one of
     SCAN_HISTORY_STATUSES (glossed there): the default "added" for bridge's
     normal flow, "screened-dead" for a posting screen's liveness check found
-    gone, "screened-offsite" for a remote-pass row screen's remote-consistency
-    guard judged on-site elsewhere. Anything else raises ValueError before a
+    gone, "screened-offsite" for a board-flagged remote row screen's remote-
+    consistency guard judged on-site elsewhere — far from every non-remote
+    pass, or in a location filter's lists refuse. Anything else raises ValueError before a
     line is written, so a misspelling cannot mint a fourth status that
     load_seen would then treat as permanent.
 

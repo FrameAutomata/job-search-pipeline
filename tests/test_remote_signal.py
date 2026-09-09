@@ -98,6 +98,55 @@ class TestGuardEnabled:
     def test_on(self, value):
         assert rs.guard_enabled({"filter": {"remote_requires_mention": value}}) is True
 
+    def test_a_blank_key_keeps_the_default(self):
+        # `remote_requires_mention:` with no value loads as None — a stub a
+        # hand edit or a template leaves behind, not an answer — and
+        # bool(None) would have silently switched the guard off.
+        assert rs.guard_enabled({"filter": {"remote_requires_mention": None}}) is True
+
+
+class TestLocationEligible:
+    """The location half of filter.is_eligible, hoisted here so screen can
+    re-apply it to a row the guard turns on-site after the JD backfill.
+    filter.is_eligible delegates to it (tests/test_filter.py holds the whole
+    gate); these pin the helper's own contract."""
+
+    def test_compile_alternation_is_none_for_nothing(self):
+        assert rs.compile_alternation([]) is None
+        assert rs.compile_alternation(None) is None
+        assert rs.compile_alternation([None, ""]) is None
+
+    def test_compile_alternation_is_word_bounded_and_case_insensitive(self):
+        pat = rs.compile_alternation(["US", "sc"])
+        assert pat.search("Dallas, US")
+        assert pat.search("Spartanburg, SC")
+        assert not pat.search("Moscow, Russia")
+
+    def test_no_patterns_means_eligible(self):
+        assert rs.location_eligible({"location": "Spartanburg, SC"}, None, None) is True
+
+    def test_negative_location_refuses(self):
+        neg = rs.compile_alternation(["SC"])
+        assert rs.location_eligible({"location": "Spartanburg, SC"}, neg, None) is False
+        assert rs.location_eligible({"location": "Dallas, TX"}, neg, None) is True
+
+    def test_eligible_allowlist_refuses_outsiders(self):
+        allow = rs.compile_alternation(["TX"])
+        assert rs.location_eligible({"location": "Spartanburg, SC"}, None, allow) is False
+        assert rs.location_eligible({"location": "Dallas, TX"}, None, allow) is True
+
+    def test_blank_location_is_not_judged(self):
+        # No location to match means neither list can refuse it — the same
+        # tolerance filter.is_eligible always had for a row the board left blank.
+        neg = rs.compile_alternation(["SC"])
+        allow = rs.compile_alternation(["TX"])
+        assert rs.location_eligible({"location": ""}, neg, allow) is True
+        assert rs.location_eligible({}, neg, allow) is True
+
+    def test_filter_shares_the_helper(self):
+        from pipeline import filter as filter_mod
+        assert filter_mod._compile_alternation is rs.compile_alternation
+
 
 class TestSearchPasses:
     """The shape rule (`searches:` list vs legacy `search:`) mirrored from

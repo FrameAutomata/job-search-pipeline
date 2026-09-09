@@ -187,13 +187,10 @@ def parse_date_posted(val: str) -> datetime | None:
     return None
 
 
-def _compile_alternation(terms: list[str]) -> re.Pattern | None:
-    """Compile a single \\b(?:t1|t2|...)\\b pattern, case-insensitive.
-    Returns None for an empty list so callers can short-circuit cheaply."""
-    pieces = sorted({t.lower() for t in terms if t}, key=len, reverse=True)
-    if not pieces:
-        return None
-    return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in pieces) + r")\b", re.IGNORECASE)
+# Lives in pipeline.remote_signal now, so the screen stage can compile the two
+# location lists without importing this module (yake, pandas); the old name
+# stays for the callers and tests that reach it here.
+_compile_alternation = remote_signal.compile_alternation
 
 
 # A `target_titles` entry is matched LITERALLY against a posting's title, so one
@@ -253,14 +250,11 @@ def is_eligible(
     if _is_remote(row):
         return True
 
-    if negative_loc_pattern is None and eligible_loc_pattern is None:
-        return True
-    location = (row.get("location") or "").strip()
-    if negative_loc_pattern is not None and location and negative_loc_pattern.search(location):
-        return False
-    if eligible_loc_pattern is not None and location and not eligible_loc_pattern.search(location):
-        return False
-    return True
+    # The location half is shared with screen (pipeline.remote_signal), which
+    # re-asks it of a row the remote-consistency guard turns on-site after the
+    # JD backfill — that row passed through the bypass above with no JD to
+    # judge, so this is the check it never met.
+    return remote_signal.location_eligible(row, negative_loc_pattern, eligible_loc_pattern)
 
 
 def score_job(
