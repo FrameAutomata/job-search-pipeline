@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.app import data, gh, local_run, onboard, reset, self_update, skills
+from pipeline import agent_cli
 from pipeline import article_digest
 from pipeline import gemini_limits
 from pipeline._batch_common import (
@@ -787,7 +788,9 @@ def run_skill(req: SkillRequest) -> JSONResponse:
             "ok": True, "path": "cli",
             "command": skills.skill_command(req.skill, report_file, company, title),
             "cwd": "career-ops",
-            "prereqs": spec.get("prereqs", []),
+            # Through skill_prereqs, not spec["prereqs"]: the Playwright-MCP
+            # note is expanded for the CLI resolved on THIS request.
+            "prereqs": skills.skill_prereqs(req.skill),
         })
 
     if req.path == "api":
@@ -995,7 +998,9 @@ async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(onboard.parse_resume_info(text))
 
 
-_KNOWN_CLIS = ["claude", "gemini", "opencode", "qwen"]
+# The registry owns the vocabulary (and its default); this is a view of it, so
+# the save endpoint can't accept a CLI a run wouldn't resolve.
+_KNOWN_CLIS = list(agent_cli.AGENT_CLIS)
 _KNOWN_PROVIDERS = set(onboard.PROVIDER_SECRETS) | {"ollama"}
 
 
@@ -1028,7 +1033,7 @@ def get_providers() -> JSONResponse:
         "current": {
             "batch_provider": os.environ.get("BATCH_PROVIDER", ""),
             "batch_model": os.environ.get("BATCH_MODEL", ""),
-            "batch_cli": os.environ.get("BATCH_CLI", "claude"),
+            "batch_cli": agent_cli.resolve_cli().id,
             "gemini_free_tier": gemini_limits.conforming_enabled(),
             # The effective limits (baked table + this user's overrides), so the
             # wizard's hint quotes real numbers instead of a fourth hand-copy of

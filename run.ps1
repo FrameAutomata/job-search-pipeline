@@ -1,5 +1,6 @@
 # Thin wrapper: activate venv + run orchestrator. Pass-through args.
-# --batch            : evaluate pending jobs via career-ops batch runner (CLI set by BATCH_CLI, default: claude)
+# --batch            : evaluate pending jobs via career-ops batch runner (the agent CLI is
+#                      BATCH_CLI in .env, resolved by pipeline/agent_cli.py — which owns the default)
 # --skip-pdf         : skip PDF generation (report + tracker only)
 # --min-score <N>    : skip tracker for jobs scoring below N (0 = off)
 $ErrorActionPreference = "Stop"
@@ -29,7 +30,14 @@ while ($i -lt $args.Count) {
 & "$root\.venv\Scripts\python.exe" "$root\orchestrate.py" @orchestrateArgs
 
 if ($runBatch) {
-    $batchCli = if ($env:BATCH_CLI) { $env:BATCH_CLI } else { "claude" }
+    # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
+    # writes) and owns the default — no second copy of it here.
+    $batchCli = (& "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --resolved | Select-Object -Last 1)
+    if (-not $batchCli) {
+        Write-Host "run.ps1: could not resolve the agent CLI (python -m pipeline.agent_cli --resolved printed nothing)."
+        exit 1
+    }
+    $batchCli = "$batchCli".Trim()
     $batchRunner = "$root\career-ops\batch\batch-runner.sh"
     $batchArgs = @("--cli", $batchCli)
     $displayStr = $batchCli

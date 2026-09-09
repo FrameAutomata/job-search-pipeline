@@ -30,6 +30,7 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+from pipeline import agent_cli
 from pipeline import batch_evaluate as be
 
 
@@ -40,12 +41,13 @@ class SkillError(RuntimeError):
 # ── Capability detection ─────────────────────────────────────────────────────
 
 def cli_name() -> str:
-    """The agent CLI the CLI path would hand off to (BATCH_CLI, default claude)."""
-    return (os.environ.get("BATCH_CLI") or "").strip() or "claude"
+    """The agent CLI the CLI path would hand off to — `BATCH_CLI`, resolved by
+    the registry in pipeline/agent_cli.py (which owns the default)."""
+    return agent_cli.resolve_cli().id
 
 
 def cli_available() -> bool:
-    return shutil.which(cli_name()) is not None
+    return agent_cli.cli_available(agent_cli.resolve_cli())
 
 
 def detect_provider() -> str | None:
@@ -140,6 +142,20 @@ def _write_unix_script(command: str, cwd: str) -> str:
     return tf.name
 
 
+def _launch_env() -> dict:
+    """The environment the console window inherits: ours, minus the variables
+    the resolved CLI must not see. The shell command already carries an
+    `env -u`/`set NAME=` prefix for the same names; this covers the launcher
+    itself, so a terminal emulator that runs the script through a login shell
+    sourcing `.env` still starts the CLI without them (Gemini CLI switches
+    from the free personal-login tier to an API key's tier when one is in its
+    environment — see pipeline/agent_cli.py)."""
+    env = dict(os.environ)
+    for name in agent_cli.resolve_cli().env_unset:
+        env.pop(name, None)
+    return env
+
+
 def _launch_windows(command: str, cwd: str) -> dict:
     """Windows: a .cmd wrapper run via CREATE_NEW_CONSOLE so it pops a new
     visible window. UTF-8 codepage so accented role/company names render."""
@@ -159,7 +175,7 @@ def _launch_windows(command: str, cwd: str) -> dict:
     # CREATE_NEW_CONSOLE = 0x10. We deliberately don't unlink the script —
     # the child needs it alive to run, and Windows cleans %TEMP% over time.
     subprocess.Popen(
-        [tf.name], cwd=cwd, creationflags=0x10, close_fds=True,
+        [tf.name], cwd=cwd, creationflags=0x10, close_fds=True, env=_launch_env(),
     )
     return {"launcher": "cmd", "script": tf.name}
 
@@ -169,7 +185,8 @@ def _launch_macos(command: str, cwd: str) -> dict:
     Terminal.app, which runs it in a new window. The script's `read` keeps
     the window open until the user presses a key."""
     script_path = _write_unix_script(command, cwd)
-    subprocess.Popen(["open", "-a", "Terminal", script_path], close_fds=True)
+    subprocess.Popen(["open", "-a", "Terminal", script_path], close_fds=True,
+                     env=_launch_env())
     return {"launcher": "Terminal.app", "script": script_path}
 
 
@@ -186,7 +203,7 @@ def _launch_linux(command: str, cwd: str) -> dict:
         )
     term, flags = chosen
     script_path = _write_unix_script(command, cwd)
-    subprocess.Popen([term, *flags, script_path], close_fds=True)
+    subprocess.Popen([term, *flags, script_path], close_fds=True, env=_launch_env())
     return {"launcher": term, "script": script_path}
 
 
@@ -215,10 +232,15 @@ def launch_in_terminal(command: str, cwd: str) -> dict:
 # prompt. `prereqs` is a list of short one-line setup notes — surfaced inline
 # in the UI whenever a CLI hand-off is generated, so users see the requirement
 # right at the point of use instead of buried in docs.
-_PLAYWRIGHT_MCP_NOTE = (
-    "Needs the Playwright MCP server registered with your agent (one-time):  "
-    "`claude mcp add playwright -- npx -y @playwright/mcp@latest`"
-)
+#
+# The Playwright-MCP entry is a SENTINEL, not text: how the server is registered
+# differs per agent CLI (`claude mcp add …`, `gemini mcp add -s user …`, a JSON
+# merge for OpenCode), and the CLI is chosen per request via BATCH_CLI. So the
+# entry is expanded at call time by `skill_prereqs`, against the resolved CLI,
+# and both readers (`capabilities()` and `/api/skills/run`) go through it — a
+# baked `claude mcp add` string told a Gemini user to run a command for a CLI
+# they don't have.
+PLAYWRIGHT_MCP_PREREQ = "playwright-mcp"
 _CHROMIUM_NOTE = (
     "Needs Chromium installed for Playwright (one-time, in career-ops/):  "
     "`npx playwright install chromium`"
@@ -251,15 +273,42 @@ SKILLS: dict[str, dict] = {
         "mode": "apply",
         "verb": "help me fill out the application",
         "api": False,  # needs a live browser via the Playwright MCP server
-        "prereqs": [_PLAYWRIGHT_MCP_NOTE, _CHROMIUM_NOTE],
+        "prereqs": [PLAYWRIGHT_MCP_PREREQ, _CHROMIUM_NOTE],
     },
 }
 
 
+def skill_prereqs(skill_id: str) -> list:
+    """The skill's setup notes with the Playwright-MCP sentinel expanded for
+    the CLI resolved NOW — `BATCH_CLI` can change between two requests, and the
+    note must name the registration for the CLI the command will run."""
+    notes = []
+    for note in SKILLS[skill_id].get("prereqs", []):
+        if note == PLAYWRIGHT_MCP_PREREQ:
+            note = agent_cli.playwright_mcp_note(agent_cli.resolve_cli())
+        notes.append(note)
+    return notes
+
+
 def capabilities() -> dict:
     provider = detect_provider()
+    cli = agent_cli.resolve_cli()
     return {
-        "cli": {"available": cli_available(), "name": cli_name()},
+        "cli": {
+            "available": cli_available(),
+            "name": cli.id,
+            "label": cli.label,
+            "tier": cli.tier,
+            "tier_note": cli.tier_note,
+            "install_hint": cli.install_hint,
+            # Every registry entry, so the UI can offer a switch and mark what
+            # is on PATH; the surface that renders it is the UI agent's.
+            "known": [
+                {"id": c.id, "label": c.label, "tier": c.tier,
+                 "installed": agent_cli.cli_available(c)}
+                for c in agent_cli.AGENT_CLIS.values()
+            ],
+        },
         "api": {"available": provider is not None, "provider": provider},
         "terminal": {"available": terminal_available()},
         "default_path": default_path(),
@@ -268,7 +317,7 @@ def capabilities() -> dict:
                 "id": sid,
                 "label": s["label"],
                 "api": s["api"],
-                "prereqs": s.get("prereqs", []),
+                "prereqs": skill_prereqs(sid),
             }
             for sid, s in SKILLS.items()
         ],
@@ -284,12 +333,18 @@ def skill_command(skill_id: str, report_path: Path | None,
     the relative path is fine) and points at the role's report by **absolute**
     path — the report may live in a downloaded-artifact cache (after a Refresh),
     not under career-ops/reports/, so a career-ops-relative path would miss it.
-    Forward slashes work across PowerShell, cmd, and bash."""
+    Forward slashes work across PowerShell, cmd, and bash.
+
+    The rendering itself is `agent_cli.shell_command`: the resolved CLI's own
+    interactive argv (`-i` / `--prompt` / positional — never a bare
+    `<binary> "<prompt>"`, which is one-shot on qwen and a project dir on
+    opencode), quoted for this server's shell, behind the env prefix that keeps
+    a Google API key out of Gemini CLI's sight."""
     s = SKILLS[skill_id]
     prompt = f"use {s['mode']} mode to {s['verb']} for {company} / {role}"
     if report_path is not None:
         prompt += f" (evaluation report: {report_path.resolve().as_posix()})"
-    return f'cd career-ops && {cli_name()} "{prompt}"'
+    return agent_cli.shell_command(agent_cli.resolve_cli(), prompt)
 
 
 # ── Résumé tailoring (the one API-path skill) ────────────────────────────────

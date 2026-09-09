@@ -13,6 +13,17 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from pipeline import agent_cli  # noqa: E402
+
+
+def _which_for(*names):
+    """shutil.which stand-in: a path for `names` (and the RESOLVED agent CLI's
+    binary when asked for by `"cli"`), None for everything else."""
+    def which(name):
+        wanted = {agent_cli.resolve_cli().binary if n == "cli" else n for n in names}
+        return f"/usr/bin/{name}" if name in wanted else None
+    return which
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -69,12 +80,27 @@ def test_capabilities_none(client, mocker):
 
 
 def test_capabilities_detects_cli_and_api(client, mocker, monkeypatch):
-    mocker.patch("pipeline.app.skills.shutil.which",
-                 side_effect=lambda name: "/usr/bin/claude" if name == "claude" else None)
+    mocker.patch("pipeline.app.skills.shutil.which", side_effect=_which_for("cli"))
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     caps = client.get("/api/capabilities").json()
-    assert caps["cli"] == {"available": True, "name": "claude"}
+    # Subset, not equality: the registry adds label/tier/tier_note/install_hint
+    # and the `known` list the UI surface renders.
+    assert {"available": True, "name": agent_cli.DEFAULT_CLI}.items() <= caps["cli"].items()
+    assert caps["cli"]["tier"] == agent_cli.AGENT_CLIS[agent_cli.DEFAULT_CLI].tier
+    assert caps["cli"]["label"] and caps["cli"]["tier_note"] and caps["cli"]["install_hint"]
+    assert [k["id"] for k in caps["cli"]["known"]] == list(agent_cli.AGENT_CLIS)
+    installed = {k["id"]: k["installed"] for k in caps["cli"]["known"]}
+    assert installed[agent_cli.DEFAULT_CLI] is True
+    assert all(v is False for cid, v in installed.items() if cid != agent_cli.DEFAULT_CLI)
     assert caps["api"] == {"available": True, "provider": "gemini"}
+
+
+def test_capabilities_follow_batch_cli(client, mocker, monkeypatch):
+    monkeypatch.setenv("BATCH_CLI", "claude")
+    mocker.patch("pipeline.app.skills.shutil.which", side_effect=_which_for("cli"))
+    caps = client.get("/api/capabilities").json()
+    assert caps["cli"]["name"] == "claude" and caps["cli"]["available"] is True
+    assert caps["cli"]["tier"] == "paid"
 
 
 def test_capabilities_provider_with_missing_key_not_available(client, monkeypatch):
@@ -98,34 +124,75 @@ def test_capabilities_lists_skills(client):
 # ── CLI hand-off ─────────────────────────────────────────────────────────────
 
 def test_cli_returns_command(client, mocker):
-    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
     r = client.post("/api/skills/run", json={"skill": "tailor-resume", "num": "1", "path": "cli"})
     assert r.status_code == 200
     body = r.json()
     assert body["path"] == "cli"
-    assert "claude" in body["command"]
+    assert agent_cli.DEFAULT_CLI in body["command"]
     assert "Acme" in body["command"] and "Eng" in body["command"]
     # cd stays relative (UI runs from the repo root)...
     assert body["command"].startswith("cd career-ops && ")
     assert body["cwd"] == "career-ops"
     # ...but the report is referenced by ABSOLUTE path, not a career-ops-relative
     # one (it may live in a Refresh artifact cache, not career-ops/reports/).
-    report_ref = body["command"].split("evaluation report: ", 1)[1].rstrip(') "')
+    # The closing quote is the shell's — single on POSIX, double on Windows.
+    report_ref = body["command"].split("evaluation report: ", 1)[1].rstrip(") \"'")
     assert os.path.isabs(report_ref.replace("/", os.sep)) or report_ref[1:3] == ":/"
     assert report_ref.endswith("/reports/001-acme.md")
 
 
-def test_cli_returns_prereqs_for_browser_skill(client, mocker):
-    # `apply` needs the Playwright MCP server registered with claude; the API
-    # response must surface that one-time setup so the UI can display it inline.
-    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+@pytest.mark.parametrize("cid", list(agent_cli.AGENT_CLIS))
+def test_cli_command_is_the_registry_rendering(client, mocker, monkeypatch, cid):
+    # The command is the CLI's own INTERACTIVE argv rendered for this shell —
+    # `-i` on gemini/qwen, `--prompt` on opencode, positional on claude — never
+    # a bare `<binary> "<prompt>"`, and Gemini/Qwen get the key-unset prefix.
+    monkeypatch.setenv("BATCH_CLI", cid)
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
+    r = client.post("/api/skills/run", json={"skill": "apply", "num": "1", "path": "cli"})
+    assert r.status_code == 200, r.text
+    cmd = r.json()["command"]
+    cli = agent_cli.AGENT_CLIS[cid]
+    assert cmd.startswith("cd career-ops && ")
+    if cli.prompt_flag:
+        assert f" {cli.prompt_flag} " in cmd
+    if cli.env_unset:
+        assert all(v in cmd for v in cli.env_unset)
+    else:
+        assert "GEMINI_API_KEY" not in cmd
+
+
+@pytest.mark.parametrize("cid", list(agent_cli.AGENT_CLIS))
+def test_cli_returns_prereqs_for_browser_skill(client, mocker, monkeypatch, cid):
+    # `apply` needs the Playwright MCP server registered with THE CLI IN USE;
+    # the response must surface that one-time setup, spelled for that CLI, so
+    # a Gemini user is not told to run `claude mcp add`.
+    monkeypatch.setenv("BATCH_CLI", cid)
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
     r = client.post("/api/skills/run", json={"skill": "apply", "num": "1", "path": "cli"})
     assert r.status_code == 200
     prereqs = r.json().get("prereqs", [])
     assert prereqs, "apply must list its setup prerequisites"
     joined = " ".join(prereqs)
     assert "Playwright MCP" in joined
-    assert "claude mcp add playwright" in joined
+    cli = agent_cli.AGENT_CLIS[cid]
+    reg = cli.mcp_registration()
+    if reg.is_argv:
+        assert f"{cli.binary} mcp add" in joined
+    else:
+        assert "opencode/opencode.json" in joined
+    if cid != "claude":
+        assert "claude mcp add" not in joined
+    # The sentinel never leaks; the capabilities reader expands it the same way.
+    assert skills_module().PLAYWRIGHT_MCP_PREREQ not in prereqs
+    caps = client.get("/api/capabilities").json()
+    by_id = {s["id"]: s for s in caps["skills"]}
+    assert by_id["apply"]["prereqs"] == prereqs
+
+
+def skills_module():
+    from pipeline.app import skills
+    return skills
 
 
 def test_cli_no_prereqs_for_plain_resume_skill(client, mocker):
@@ -228,14 +295,14 @@ def test_launch_writes_cmd_script_and_spawns(client, mocker, monkeypatch):
     # Force the Windows code path regardless of test runner OS so the launcher
     # is exercised end-to-end on Linux CI too.
     monkeypatch.setattr("pipeline.app.skills.os.name", "nt")
-    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/claude")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/bin/x")
     popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
     r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["launched"] is True
     # Server rebuilt the same hand-off command (clients can't smuggle commands).
-    assert "claude" in body["command"]
+    assert agent_cli.DEFAULT_CLI in body["command"]
     assert "Acme" in body["command"] and "Eng" in body["command"]
     # Spawn used a new console (CREATE_NEW_CONSOLE = 0x10) with the .cmd script.
     args, kwargs = popen.call_args
@@ -261,7 +328,7 @@ def test_launch_refused_when_no_cli(client, mocker, monkeypatch):
 def test_launch_macos_opens_terminal_app(client, mocker, monkeypatch):
     monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
     monkeypatch.setattr("pipeline.app.skills.sys.platform", "darwin")
-    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/local/bin/claude")
+    mocker.patch("pipeline.app.skills.shutil.which", return_value="/usr/local/bin/x")
     popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
     r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
     assert r.status_code == 200, r.text
@@ -276,7 +343,7 @@ def test_launch_macos_opens_terminal_app(client, mocker, monkeypatch):
     script = open(cmd[3], encoding="utf-8").read()
     assert "#!/usr/bin/env bash" in script
     assert "cd " in script and "|| exit 1" in script   # cd guard present
-    assert "claude" in script
+    assert agent_cli.DEFAULT_CLI in script
     assert "read -n 1" in script
 
 
@@ -303,8 +370,9 @@ def test_launch_linux_uses_first_resolved_terminal(client, mocker, monkeypatch):
     monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
     monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
     monkeypatch.delenv("TERMINAL", raising=False)
-    # Only xterm and claude on PATH; the resolver should fall through to xterm.
-    available = {"claude", "xterm"}
+    # Only xterm and the default agent CLI on PATH; the resolver should fall
+    # through to xterm.
+    available = {agent_cli.DEFAULT_CLI, "xterm"}
     mocker.patch("pipeline.app.skills.shutil.which",
                  side_effect=lambda name: f"/usr/bin/{name}" if name in available else None)
     popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
@@ -314,6 +382,42 @@ def test_launch_linux_uses_first_resolved_terminal(client, mocker, monkeypatch):
     args, _ = popen.call_args
     cmd = args[0]
     assert cmd[0] == "xterm" and cmd[1] == "-e" and cmd[2].endswith(".sh")
+
+
+def test_launch_strips_the_google_keys_for_gemini(client, mocker, monkeypatch):
+    # Gemini CLI's free tier is the personal login; a GEMINI_API_KEY the UI
+    # loaded from .env would switch it to the key's tier silently. The launcher
+    # hands the console an env copy without the key names — and the script
+    # itself carries the `env -u` prefix for the same names.
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
+    monkeypatch.delenv("TERMINAL", raising=False)
+    monkeypatch.setenv("BATCH_CLI", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "leaked-from-dotenv")
+    monkeypatch.setenv("GOOGLE_API_KEY", "leaked-too")
+    monkeypatch.setenv("OTHER_VAR", "kept")
+    mocker.patch("pipeline.app.skills.shutil.which", side_effect=_which_for("gemini", "xterm"))
+    popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
+    r = client.post("/api/skills/launch", json={"skill": "apply", "num": "1"})
+    assert r.status_code == 200, r.text
+    env = popen.call_args.kwargs["env"]
+    assert "GEMINI_API_KEY" not in env and "GOOGLE_API_KEY" not in env
+    assert env["OTHER_VAR"] == "kept"
+    script = open(popen.call_args.args[0][2], encoding="utf-8").read()
+    assert "env -u GEMINI_API_KEY -u GOOGLE_API_KEY gemini -i " in script
+
+
+def test_launch_keeps_the_env_for_claude(client, mocker, monkeypatch):
+    monkeypatch.setattr("pipeline.app.skills.os.name", "posix")
+    monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
+    monkeypatch.delenv("TERMINAL", raising=False)
+    monkeypatch.setenv("BATCH_CLI", "claude")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    mocker.patch("pipeline.app.skills.shutil.which", side_effect=_which_for("claude", "xterm"))
+    popen = mocker.patch("pipeline.app.skills.subprocess.Popen")
+    r = client.post("/api/skills/launch", json={"skill": "apply", "num": "1"})
+    assert r.status_code == 200, r.text
+    assert popen.call_args.kwargs["env"]["GEMINI_API_KEY"] == "k"
 
 
 def test_launch_linux_honors_TERMINAL_env(client, mocker, monkeypatch):
@@ -334,8 +438,7 @@ def test_launch_linux_no_terminal_emulator(client, mocker, monkeypatch):
     monkeypatch.setattr("pipeline.app.skills.sys.platform", "linux")
     monkeypatch.delenv("TERMINAL", raising=False)
     # Only the agent CLI is on PATH — no terminal emulators.
-    mocker.patch("pipeline.app.skills.shutil.which",
-                 side_effect=lambda name: "/usr/bin/claude" if name == "claude" else None)
+    mocker.patch("pipeline.app.skills.shutil.which", side_effect=_which_for("cli"))
     r = client.post("/api/skills/launch", json={"skill": "tailor-resume", "num": "1"})
     # capabilities reports terminal.available == False → endpoint 501s.
     assert r.status_code == 501

@@ -79,17 +79,15 @@ else
   fi
 fi
 
-echo "==> Registering the Playwright MCP server with Claude Code (for the apply skill)"
-if command -v claude >/dev/null 2>&1; then
-  # `claude mcp add` errors if the server is already registered. That's a
-  # benign re-run — log and continue rather than aborting the whole setup.
-  if ! claude mcp add playwright -- npx -y @playwright/mcp@latest; then
-    echo "    Playwright MCP already registered (or claude mcp add failed). Continuing." >&2
-  fi
-else
-  echo "    'claude' CLI not found on PATH — skipping. Install Claude Code, then run:" >&2
-  echo "      claude mcp add playwright -- npx -y @playwright/mcp@latest" >&2
-fi
+echo "==> Registering the Playwright MCP server with every installed agent CLI (for the apply skill)"
+# The registry in pipeline/agent_cli.py knows each CLI's registration (an
+# `mcp add` for Gemini CLI / Qwen Code / Claude Code, a JSON config merge for
+# OpenCode), treats a "server already registered" error as the benign re-run
+# it is, and prints the free-first install hints itself when nothing is
+# installed. It always exits 0 — this script runs under `set -e`, and a missing
+# CLI must not abort setup.
+( cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --register-mcp-all-installed ) \
+  || echo "    Playwright MCP registration skipped" >&2
 
 echo "==> Copying example configs"
 [ -f "$root/.env" ] || cp "$root/.env.example" "$root/.env"

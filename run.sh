@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# --batch            : evaluate pending jobs via career-ops batch runner (CLI set by BATCH_CLI, default: claude)
+# --batch            : evaluate pending jobs via career-ops batch runner (the agent CLI is
+#                      BATCH_CLI in .env, resolved by pipeline/agent_cli.py — which owns the default)
 # --skip-pdf         : skip PDF generation (report + tracker only)
 # --min-score <N>    : skip tracker for jobs scoring below N (0 = off)
 set -euo pipefail
@@ -50,7 +51,13 @@ fi
 "$root/.venv/bin/python" "$root/orchestrate.py" "${orchestrate_args[@]}"
 
 if [[ "$run_batch" == "true" ]]; then
-  batch_cli="${BATCH_CLI:-claude}"
+  # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
+  # writes) and owns the default — no second copy of it here.
+  batch_cli="$("$root/.venv/bin/python" -m pipeline.agent_cli --resolved)"
+  if [[ -z "$batch_cli" ]]; then
+    echo "run.sh: could not resolve the agent CLI (python -m pipeline.agent_cli --resolved printed nothing)." >&2
+    exit 1
+  fi
   batch_args=(--cli "$batch_cli")
   display_str="$batch_cli"
   if [[ -n "${OLLAMA_MODEL:-}" ]]; then

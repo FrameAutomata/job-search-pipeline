@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from pipeline.agent_cli import AGENT_CLIS
 from pipeline.app import onboard
 from pipeline.sites import SUPPORTED_SITES
 
@@ -1087,6 +1088,20 @@ class TestOnboardHtmlSites:
     def test_offers_exactly_the_supported_boards(self, html):
         offered = set(re.findall(r'<input\b[^>]*\bname="sites"[^>]*\bvalue="([^"]+)"', html))
         assert offered == set(SUPPORTED_SITES)
+
+
+class TestOnboardHtmlAgentClis:
+    """The wizard's agent-CLI select restates the registry in
+    pipeline/agent_cli.py (static markup can't import it). Scoped to that one
+    `<select>`: every option is a registry id and every registry id is offered,
+    order-agnostic — the surface may later render it from `/api/onboard/providers`
+    and keep a static fallback, and either shape must still satisfy this."""
+
+    def test_cli_select_options_equal_the_registry(self, html):
+        m = re.search(r'<select id="local-cli-select">(.*?)</select>', html, re.S)
+        assert m, "no #local-cli-select in onboard.html"
+        offered = set(re.findall(r'<option\b[^>]*\bvalue="([^"]+)"', m.group(1)))
+        assert offered == set(AGENT_CLIS)
 
 
 class TestSupportedSitesMirror:

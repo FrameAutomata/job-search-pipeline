@@ -11,6 +11,7 @@ recording batch-runner.sh, and a profile.yml so the first-run wizard gate stays
 shut — and asserts which program each flag landed in.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -25,11 +26,18 @@ pytestmark = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Appends, because run.sh --batch now invokes python TWICE — orchestrate.py, then
+# Appends, because run.sh --batch now invokes python THREE times — orchestrate.py,
+# `-m pipeline.agent_cli --resolved` to learn the agent CLI, then
 # `-m pipeline.merge_additions` after the runner — and every assertion below is
 # a membership test over the whole recording.
 _RECORDER = """#!/usr/bin/env bash
 printf '%s\\n' "$@" >> "{out}"
+"""
+
+# The python stub also answers `--resolved` the way the registry would, since
+# run.sh captures that stdout as the `--cli` it forwards to batch-runner.sh.
+STUB_CLI = "stubcli"
+_PY_RECORDER = _RECORDER + """case " $* " in *" --resolved "*) echo "{cli}" ;; esac
 """
 
 
@@ -43,7 +51,7 @@ def stub_root(tmp_path):
     (tmp_path / "career-ops" / "config" / "profile.yml").write_text("x: 1\n")
 
     py = tmp_path / ".venv" / "bin" / "python"
-    py.write_text(_RECORDER.format(out=tmp_path / "orch_args.txt"))
+    py.write_text(_PY_RECORDER.format(out=tmp_path / "orch_args.txt", cli=STUB_CLI))
     py.chmod(0o755)
 
     runner = tmp_path / "career-ops" / "batch" / "batch-runner.sh"
@@ -110,3 +118,39 @@ class TestBatchFlagForwarding:
         batch = _recorded(stub_root, "batch_args.txt")
         assert "--skip-pdf" in batch
         assert "--min-score" in batch and "3" in batch
+
+
+class TestAgentCliResolution:
+    """The `--cli` run.sh forwards comes from `python -m pipeline.agent_cli
+    --resolved`, which reads .env — so a CLI chosen in the Setup wizard is
+    honoured — and owns the default. run.sh carries no default of its own
+    (tests/test_agent_cli.py::TestWrapperMirror pins the text)."""
+
+    def test_cli_comes_from_the_registry_resolver(self, stub_root):
+        proc = _run(stub_root, "--batch")
+        assert proc.returncode == 0, proc.stderr
+        orch = _recorded(stub_root, "orch_args.txt")
+        assert "pipeline.agent_cli" in orch and "--resolved" in orch
+        batch = _recorded(stub_root, "batch_args.txt")
+        assert batch[batch.index("--cli") + 1] == STUB_CLI
+        assert f"({STUB_CLI})" in proc.stdout
+
+    def test_batch_cli_env_is_not_read_by_the_wrapper(self, stub_root):
+        # The wrapper must not short-circuit the resolver with the raw env
+        # value: the registry validates and lower-cases it, and warns on a typo.
+        proc = subprocess.run(
+            ["bash", str(stub_root / "run.sh"), "--batch"],
+            capture_output=True, text=True, cwd=stub_root,
+            env={**os.environ, "BATCH_CLI": "Something-Else"},
+        )
+        assert proc.returncode == 0, proc.stderr
+        batch = _recorded(stub_root, "batch_args.txt")
+        assert batch[batch.index("--cli") + 1] == STUB_CLI
+
+    def test_an_empty_resolution_is_an_error_not_a_blank_cli(self, stub_root):
+        py = stub_root / ".venv" / "bin" / "python"
+        py.write_text(_RECORDER.format(out=stub_root / "orch_args.txt"))
+        proc = _run(stub_root, "--batch")
+        assert proc.returncode == 1
+        assert "could not resolve the agent CLI" in proc.stderr
+        assert not (stub_root / "batch_args.txt").exists()

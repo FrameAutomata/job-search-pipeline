@@ -115,7 +115,9 @@ function parseArgs() {
     resumePath: null,
     auto: false,
     force: false,
-    cli: 'claude',
+    // Mirrors DEFAULT_CLI in pipeline/agent_cli.py (Node can't import it);
+    // tests/test_agent_cli.py holds the two equal.
+    cli: 'gemini',
     fromJson: null,
   };
 
