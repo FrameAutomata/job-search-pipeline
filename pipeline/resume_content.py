@@ -170,7 +170,7 @@ def generate_for_job(career_ops, job, *, profile_dir, caller=None,
     # By number when the link is dead (#162) — the report's proof-points are
     # half of what makes the build role-specific, and losing them was silent.
     report = read_report(Path(report_base or career_ops), getattr(job, "report_path", ""),
-                         label="build")
+                         label="build", company=getattr(job, "company", ""))
 
     result = build_for_job(profile_md, jd, pdf_out.parent, report=report,
                            caller=caller, provider=provider, model=model)

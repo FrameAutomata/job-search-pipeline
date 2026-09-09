@@ -1207,6 +1207,17 @@ class TestSanitizePendingAdditions:
         assert (additions / "7.tsv").read_text(encoding="utf-8") == row + "\n"
         assert "sanitized" not in capsys.readouterr().out
 
+    def test_a_row_that_lost_its_trailing_notes_tab_gets_the_link_repair_too(self, tmp_path):
+        """The 8-cell foreign row is what _restore_trailing_cells exists to
+        save; the link repair saw the un-restored row and was the one step
+        that skipped it, so the row merged with its dead link for good."""
+        eight = "\t".join(_tracker_row(score="4.2", notes="").split("\t")[:-1])
+        co, additions = self._tree(tmp_path, rows={"7.tsv": eight},
+                                   reports={"003-initech-2026-08-25.md": "# report"})
+        _sanitize_pending_additions(co, additions)
+        cells = self._cells(additions)
+        assert len(cells) == 9 and cells[7] == "[003](reports/003-initech-2026-08-25.md)"
+
     def test_a_reserved_lock_is_not_a_repair_target(self, tmp_path):
         # `003-RESERVED.md` is career-ops' number lock, not a report.
         co, additions = self._tree(tmp_path, reports={"003-RESERVED.md": '{"pid": 1}'})
@@ -1303,6 +1314,33 @@ class TestDeadLinkRepair:
         shifted = _SHIFTED_ROW.replace("12-a.md", "12-b.md")      # a dead link, so only the shape declines it
         assert _dead_link_repair(co, shifted) == ""
 
+    def test_two_reports_with_the_number_resolve_by_the_rows_company(self, tmp_path):
+        """A synced cloud report and a local-only one can share a number; the
+        first by filename order was another company's evaluation, and this
+        pass would have written that binding into the tracker for good."""
+        co = _reports(tmp_path, "042-globex-2026-05-27.md", "042-zeta-corp-2026-08-25.md")
+        row = (_tracker_row().replace("Initech", "Zeta Corp")
+               .replace("[003](reports/003-x.md)", "[042](reports/042-zeta-&-corp-2026-08-25.md)"))
+        assert _dead_link_repair(co, row) == "042-zeta-corp-2026-08-25.md"
+
+    def test_two_reports_with_the_number_and_no_company_match_are_declined(self, tmp_path):
+        co = _reports(tmp_path, "042-globex-2026-05-27.md", "042-acme-2026-08-25.md")
+        row = (_tracker_row().replace("Initech", "Zeta Corp")
+               .replace("[003](reports/003-x.md)", "[042](reports/042-zeta-corp.md)"))
+        assert _dead_link_repair(co, row) == ""                   # a guess is worse than a dead link
+
+    def test_link_text_wins_over_a_disagreeing_filename_prefix(self, tmp_path):
+        # `[N]` is the row's identity to the UI, row_report_num and the loss
+        # guard; a dead path whose prefix says otherwise does not repoint the row.
+        co = _reports(tmp_path, "271-acme-2026.md", "270-globex-2026.md")
+        row = _tracker_row().replace("[003](reports/003-x.md)", "[271](reports/270-acme-&-co.md)")
+        assert _dead_link_repair(co, row) == "271-acme-2026.md"
+
+    def test_a_row_that_lost_its_trailing_notes_tab_is_still_repaired(self, tmp_path):
+        co = _reports(tmp_path, "003-initech-2026.md")
+        eight_cells = "\t".join(_tracker_row(notes="").split("\t")[:-1])
+        assert _dead_link_repair(co, eight_cells) == "003-initech-2026.md"
+
 
 class TestReadReport:
     """The readers — cover letters and both tailors — resolved `base / link`
@@ -1330,6 +1368,14 @@ class TestReadReport:
         co = _reports(tmp_path)
         assert read_report(co, "reports/999-gone.md", label="cover") == ""
         assert "[cover] report reports/999-gone.md not found" in capsys.readouterr().out
+
+    def test_two_reports_with_the_number_read_the_companys_or_nothing(self, tmp_path, capsys):
+        co = _reports(tmp_path, **{"042-globex-2026-05-27.md": "GLOBEX",
+                                   "042-zeta-corp-2026-08-25.md": "ZETA"})
+        dead = "reports/042-zeta-&-corp-2026-08-25.md"
+        assert read_report(co, dead, company="Zeta Corp") == "ZETA"
+        assert read_report(co, dead) == ""                        # no company to ask: not Globex's
+        assert "not found" in capsys.readouterr().out
 
     def test_lock_is_not_a_report(self, tmp_path):
         co = _reports(tmp_path, **{"271-RESERVED.md": '{"pid": 1}'})
