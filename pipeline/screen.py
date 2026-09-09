@@ -29,6 +29,9 @@ from urllib.parse import parse_qs, urlparse
 
 from pipeline.stdio import line_buffer_stdout
 
+# remote_signal rather than pipeline.filter, which owns the same guard's first
+# pass: filter pulls yake and pandas, which this stage never needs.
+from pipeline import remote_signal
 from pipeline.rowio import read_rows, write_rows
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -570,7 +573,10 @@ def classify_liveness_each(items, url_of, *, timeout: int = 8, max_workers: int 
 # ── Main entry point ────────────────────────────────────────────────────────
 
 def run(config_path: Path, career_ops_path: Path | None = None) -> int:
-    """Screen filtered_jobs.csv in-place. Returns number of jobs dropped.
+    """Screen filtered_jobs.csv in-place.
+
+    Returns the number of rows dropped: liveness failures plus the rows the
+    remote-consistency guard dropped (below).
 
     If `career_ops_path` is provided, the run also:
       1. Loads URLs already known (scan-history.tsv + pipeline.md + applications.md)
@@ -580,6 +586,19 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
       2. Records URLs that fail the liveness check back to scan-history.tsv
          with status `screened-dead`, so future runs skip them too instead of
          re-fetching a guaranteed-dead URL each day.
+      3. Records the rows the remote-consistency guard dropped as
+         `screened-offsite` — see below — so the same far-away posting is not
+         re-fetched every morning either.
+
+    After the description backfill this stage re-runs filter's remote-
+    consistency guard (pipeline.remote_signal) over the rows it keeps. Filter
+    could only judge rows that arrived with a JD; LinkedIn's arrive empty and
+    are backfilled here, so this is the first time most of them can be judged.
+    A row the JD says is on-site has `is_remote` rewritten to False; one that a
+    remote pass alone returned, and that is not local to one of the user's
+    non-remote passes, is dropped. `filter.remote_requires_mention: false`
+    disables it. A remote JD that restricts residency to one state is not this
+    guard's problem (it mentions remote, so it passes).
     """
     import yaml
     from dotenv import load_dotenv
@@ -592,6 +611,8 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
 
     liveness_on = bool(scfg.get("liveness", False))
     liveness_timeout = int(scfg.get("liveness_timeout", 8))
+    remote_guard = remote_signal.guard_enabled(cfg)
+    local_locations = remote_signal.local_pass_locations(cfg) if remote_guard else []
 
     if not liveness_on:
         print("[screen] liveness disabled -- skipping (set screen.liveness: true to enable)")
@@ -660,8 +681,11 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
 
     kept: list[dict] = []
     dead_entries: list[dict] = []
+    offsite_entries: list[dict] = []
+    offsite_rows: list[dict] = []
     dropped = 0
     held = 0
+    offsite = 0
     backfilled = 0
 
     # classify_liveness_each routes by site and yields as results land: Indeed
@@ -712,7 +736,25 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
             if extracted:
                 job["description"] = extracted
                 backfilled += 1
+        # Now that the row has whatever JD it is going to get, ask filter's
+        # question again: does a posting the board flagged remote say so?
+        if remote_guard and remote_signal.judge_remote_row(job, local_locations) == remote_signal.OFFSITE:
+            offsite += 1
+            offsite_rows.append(job)
+            url = (job.get("job_url") or "").strip()
+            if url:
+                offsite_entries.append({
+                    "url": url,
+                    "title": (job.get("title") or "").strip(),
+                    "company": (job.get("company") or "").strip(),
+                })
+            continue
         kept.append(job)
+
+    remote_signal.report_dropped(offsite_rows, "screen")
+    if offsite_rows:
+        # Extend, not overwrite: filter wrote this run's first half of the list.
+        remote_signal.write_dropped(offsite_rows, "screen", extend=True)
 
     # `kept` is empty when every job was dropped or held, which wrote the same
     # header-only file as the all-seen exit above until write_rows made every
@@ -726,12 +768,26 @@ def run(config_path: Path, career_ops_path: Path | None = None) -> int:
         append_to_scan_history(
             career_ops_path, dead_entries, date.today().isoformat(), status="screened-dead",
         )
+    # Off-site drops are recorded the same way, under their own status. The
+    # pre-screen dedup above treats ANY scan-history status as seen (load_seen
+    # reads only the URL column), which is what stops the same far-away posting
+    # being re-fetched and re-judged every morning. The trade-off: broadening
+    # the search passes later does not resurrect these rows on its own — bridge.
+    # load_seen expires this status after sixty days (SCAN_HISTORY_EXPIRY), and
+    # a user can delete the lines sooner. `screened-dead` stays permanent.
+    if career_ops_path is not None and offsite_entries:
+        from pipeline.bridge import append_to_scan_history
+        append_to_scan_history(
+            career_ops_path, offsite_entries, date.today().isoformat(),
+            status="screened-offsite",
+        )
 
     print(
         f"[screen] kept {len(kept)}, dropped {dropped} of {len(jobs)} new "
-        f"(held: {held}, backfilled: {backfilled}, skipped-seen: {skipped_seen})"
+        f"(held: {held}, offsite: {offsite}, backfilled: {backfilled}, "
+        f"skipped-seen: {skipped_seen})"
     )
-    return dropped
+    return dropped + offsite
 
 
 if __name__ == "__main__":

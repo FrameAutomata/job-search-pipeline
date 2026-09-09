@@ -866,6 +866,17 @@ searches:
     def test_missing_config_is_not_a_warning(self, tmp_path):
         assert onboard.search_detail_at_risk(tmp_path / "nope.yml") == []
 
+    def test_a_filter_key_is_not_at_risk(self, tmp_path):
+        # Save rewrites `searches:` wholesale; setup-profile.mjs preserves every
+        # `filter:` key but the two title lists, so the remote-consistency
+        # guard's switch survives a Save and must not be warned about.
+        assert onboard.search_detail_at_risk(self._cfg(tmp_path, """
+searches:
+  - {name: Dallas, location: "Dallas, TX", hours_old: 24}
+filter:
+  remote_requires_mention: false
+""")) == []
+
 
 class TestPrefillMerge:
     """Real files win where they have a home; the sidecar keeps the rest."""

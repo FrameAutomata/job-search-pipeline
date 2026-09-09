@@ -210,7 +210,8 @@ class TestClassifyLiveness:
 
 
 SCREEN_COLS = ["title", "company", "job_url", "relevance_score"]
-DESC_COLS = ["title", "company", "job_url", "description", "relevance_score"]
+DESC_COLS = ["title", "company", "job_url", "description", "relevance_score",
+             "location", "is_remote", "remote_only"]
 
 
 def write_filtered_csv(path: Path, cols_or_rows, rows=None) -> None:
@@ -1373,3 +1374,158 @@ class TestExpiredRequiresPositiveEvidence:
     def test_everything_else_is_non_fatal(self, name):
         verdict = classify_liveness(*self.SPARES[name])[0]
         assert verdict != "expired", f"{name} would be recorded permanently dead"
+
+
+class TestRemoteConsistencyGuard:
+    """After the description backfill, screen re-runs filter's remote-
+    consistency guard (pipeline.remote_signal): most LinkedIn rows arrive with
+    no JD, so this is the first time they can be judged. A remote-only row
+    judged on-site elsewhere is dropped and recorded `screened-offsite`."""
+
+    ONSITE_PAGE = (
+        '<html><body>Apply now! <div class="show-more-less-html__markup">'
+        + "Patient Access Representative, on-site at Spartanburg Regional. " * 10
+        + "</div></body></html>"
+    )
+    REMOTE_PAGE = (
+        '<html><body>Apply now! <div class="show-more-less-html__markup">'
+        + "Patient Access Representative. This role is fully remote. " * 10
+        + "</div></body></html>"
+    )
+
+    def _cfg(self, tmp_path, guard=None):
+        cfg = tmp_path / "search.yml"
+        flag = "" if guard is None else f"  remote_requires_mention: {guard}\n"
+        cfg.write_text(
+            "searches:\n"
+            "  - {name: dfw, location: 'Dallas, TX', hours_old: 24}\n"
+            "  - {name: remote, location: United States, is_remote: true}\n"
+            f"filter:\n{flag}"
+            "screen:\n  liveness: true\n  liveness_timeout: 8\n",
+            encoding="utf-8",
+        )
+        return cfg
+
+    def _row(self, url, location, remote_only="True", is_remote="True", description=""):
+        return {"title": "Rep", "company": "Acme", "job_url": url, "description": description,
+                "relevance_score": 8, "location": location, "is_remote": is_remote,
+                "remote_only": remote_only}
+
+    def _rows(self, filtered):
+        if not filtered.read_text(encoding="utf-8"):
+            return {}
+        with open(filtered, newline="", encoding="utf-8") as f:
+            return {r["job_url"]: r for r in csv.DictReader(f)}
+
+    def test_post_backfill_drop_is_recorded_offsite(self, tmp_path, monkeypatch, mocker, capsys):
+        cfg = self._cfg(tmp_path)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            self._row("https://far.com", "Spartanburg, SC"),
+            self._row("https://live.com", "Dallas, TX", remote_only="False", is_remote="False"),
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg, career_ops_path=career_ops) == 1
+
+        rows = self._rows(filtered)
+        assert set(rows) == {"https://live.com"}
+        hist = (career_ops / "data" / "scan-history.tsv").read_text(encoding="utf-8")
+        lines = [ln for ln in hist.splitlines() if ln.strip()]
+        assert len(lines) == 2
+        assert lines[1].startswith("https://far.com\t") and lines[1].endswith("\tscreened-offsite")
+        assert "https://live.com" not in hist
+        out = capsys.readouterr().out
+        assert "dropped remote-pass on-site posting: Acme · Rep · Spartanburg, SC" in out
+        assert "offsite: 1" in out
+
+    def test_a_later_run_skips_the_offsite_url_before_fetching(self, tmp_path, monkeypatch, mocker):
+        cfg = self._cfg(tmp_path)
+        filtered = tmp_path / "filtered_jobs.csv"
+        career_ops = tmp_path / "career-ops"
+        (career_ops / "data").mkdir(parents=True)
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        fetch_spy = mocker.patch.object(
+            screen_mod, "fetch_and_classify",
+            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        write_filtered_csv(filtered, DESC_COLS, [self._row("https://far.com", "Spartanburg, SC")])
+        run(cfg, career_ops_path=career_ops)
+        assert fetch_spy.call_count == 1
+
+        write_filtered_csv(filtered, DESC_COLS, [self._row("https://far.com", "Spartanburg, SC")])
+        fetch_spy.reset_mock()
+        run(cfg, career_ops_path=career_ops)
+        assert fetch_spy.call_count == 0
+
+    def test_a_backfilled_jd_that_mentions_remote_keeps_the_row_remote(self, tmp_path, monkeypatch, mocker):
+        cfg = self._cfg(tmp_path)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [self._row("https://far.com", "Spartanburg, SC")])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.REMOTE_PAGE))
+
+        assert run(cfg) == 0
+
+        rows = self._rows(filtered)
+        assert rows["https://far.com"]["is_remote"] == "True"
+        assert "fully remote" in rows["https://far.com"]["description"]
+
+    def test_a_local_onsite_row_is_kept_with_is_remote_corrected(self, tmp_path, monkeypatch, mocker):
+        cfg = self._cfg(tmp_path)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [self._row("https://dal.com", "Dallas, TX")])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg) == 0
+
+        assert self._rows(filtered)["https://dal.com"]["is_remote"] == "False"
+
+    def test_no_career_ops_path_still_drops_but_records_nothing(self, tmp_path, monkeypatch, mocker):
+        from pipeline import remote_signal
+        cfg = self._cfg(tmp_path)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [self._row("https://far.com", "Spartanburg, SC")])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg) == 1
+
+        assert filtered.read_text(encoding="utf-8") == ""
+        assert not (tmp_path / "career-ops").exists()
+        with open(remote_signal.DROPPED_PATH, newline="", encoding="utf-8") as f:
+            dropped = list(csv.DictReader(f))
+        assert [(r["job_url"], r["dropped_by"]) for r in dropped] == [("https://far.com", "screen")]
+
+    def test_config_flag_false_disables_the_guard_here_too(self, tmp_path, monkeypatch, mocker):
+        cfg = self._cfg(tmp_path, guard="false")
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [self._row("https://far.com", "Spartanburg, SC")])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg) == 0
+
+        assert self._rows(filtered)["https://far.com"]["is_remote"] == "True"
+
+    def test_a_row_with_no_remote_claim_is_never_judged(self, tmp_path, monkeypatch, mocker):
+        cfg = self._cfg(tmp_path)
+        filtered = tmp_path / "filtered_jobs.csv"
+        write_filtered_csv(filtered, DESC_COLS, [
+            self._row("https://far.com", "Spartanburg, SC", remote_only="False", is_remote="False"),
+        ])
+        monkeypatch.setattr(screen_mod, "FILTERED_PATH", filtered)
+        mocker.patch.object(screen_mod, "fetch_and_classify",
+                            return_value=("active", "apply control visible", self.ONSITE_PAGE))
+
+        assert run(cfg) == 0
+        assert set(self._rows(filtered)) == {"https://far.com"}

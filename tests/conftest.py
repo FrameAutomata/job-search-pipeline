@@ -233,6 +233,16 @@ def _clear_keyword_cache(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_remote_dropped(monkeypatch, tmp_path):
+    """Redirect the remote-consistency guard's dropped-rows file to tmp. filter
+    writes it on EVERY run — truncating when nothing was dropped, by design —
+    and screen extends it, so without this each run() test would rewrite the
+    real output/remote-dropped.csv and share it with the next test."""
+    from pipeline import remote_signal
+    monkeypatch.setattr(remote_signal, "DROPPED_PATH", tmp_path / "remote-dropped.csv")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_status_overrides(monkeypatch, tmp_path):
     """Redirect the UI's pending-status override file to tmp so tests (e.g.
     kanban drag / recheck-discard paths) never write the real .ui-cache state."""

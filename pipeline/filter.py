@@ -16,6 +16,7 @@ import yake
 import yaml
 from dotenv import load_dotenv
 
+from pipeline import remote_signal
 from pipeline import resume_text as _resume_text
 from pipeline.rowio import read_rows, write_rows
 from pipeline.stdio import line_buffer_stdout
@@ -222,8 +223,11 @@ def _target_lookup(target_titles: list[str | None]) -> dict[str, str]:
 
 
 def _is_remote(row: dict) -> bool:
-    """JobSpy writes is_remote as a stringified bool ("True"/"False"/"") or empty."""
-    return str(row.get("is_remote") or "").strip().lower() in ("true", "1", "yes", "t")
+    """JobSpy writes is_remote as a stringified bool ("True"/"False"/"") or empty.
+    One reader, shared with screen and bridge through pipeline.remote_signal, so
+    the remote-consistency guard's rewrite of the cell is read back here the
+    same way it was written."""
+    return remote_signal.is_remote_str(row)
 
 
 def is_eligible(
@@ -347,6 +351,15 @@ def run(config_path: Path) -> Path:
     eligible_loc_pattern = _compile_alternation(eligible_locations)
     negative_desc_pattern = _compile_alternation(negative_description_terms)
 
+    # The remote-consistency guard (pipeline.remote_signal): a row the board
+    # flagged remote whose JD never mentions remote work is treated as on-site,
+    # and dropped when a remote pass alone returned it — unless it sits in one
+    # of the user's own non-remote passes' locations. Read from the whole
+    # config, not `filter:` alone, because the local-pass locations live under
+    # `searches:`. `remote_requires_mention: false` disables it.
+    remote_guard = remote_signal.guard_enabled(cfg)
+    local_locations = remote_signal.local_pass_locations(cfg) if remote_guard else []
+
     # Deliberately louder than the no-op screen and bridge give the same
     # condition, and decided here rather than left implicit in the choice of
     # read: a *missing* jobs.csv means the scrape stage never ran, because a
@@ -379,16 +392,36 @@ def run(config_path: Path) -> Path:
     candidates = []
     too_old = 0
     ineligible = 0
+    offsite = 0
+    offsite_rows: list[dict] = []
     for row in rows:
         if cutoff:
             posted = parse_date_posted(row.get("date_posted") or "")
             if posted is not None and posted < cutoff:
                 too_old += 1
                 continue
+        # Before is_eligible, which lets a remote row bypass the location
+        # checks: this is what decides whether the row IS remote. A judged row
+        # has its is_remote rewritten to "False" and, when kept, meets the
+        # location checks below as the on-site row it turned out to be. A row
+        # with no description yet (LinkedIn) is left alone — the screen stage
+        # backfills the JD and runs the same judgement.
+        if remote_guard and remote_signal.judge_remote_row(row, local_locations) == remote_signal.OFFSITE:
+            offsite += 1
+            offsite_rows.append(row)
+            continue
         if not is_eligible(row, negative_loc_pattern, eligible_loc_pattern, negative_desc_pattern):
             ineligible += 1
             continue
         candidates.append(row)
+
+    # Always written, so a run that dropped nothing truncates the previous
+    # run's list rather than leaving it to read as today's.
+    remote_signal.report_dropped(offsite_rows, "filter")
+    remote_signal.write_dropped(offsite_rows, "filter")
+    if offsite:
+        print(f"[filter] dropped {offsite} remote-pass row(s) whose description is "
+              f"on-site elsewhere -> {remote_signal.DROPPED_PATH}")
 
     # The raw scrape is the largest file in the chain and most of it is already
     # discarded by here. Dropping the reference frees the non-survivors before
@@ -400,7 +433,7 @@ def run(config_path: Path) -> Path:
     if not candidates:
         return _no_results(
             f"[filter] nothing left to score of {scraped} scraped "
-            f"({ineligible} ineligible, {too_old} too old)"
+            f"({ineligible} ineligible, {offsite} off-site, {too_old} too old)"
         )
 
     # Resolved in pipeline.resume_text so an unset RESUME_PATH still discovers a
@@ -465,11 +498,11 @@ def run(config_path: Path) -> Path:
         return _no_results(
             f"[filter] no jobs scored >= {min_score} "
             f"(of {len(jobs)} scored, {excluded} negative-excluded, "
-            f"{ineligible} ineligible, {too_old} too old)"
+            f"{ineligible} ineligible, {offsite} off-site, {too_old} too old)"
         )
 
     summary_cols = [
-        "title", "company", "location", "is_remote",
+        "title", "company", "location", "is_remote", "remote_only",
         "min_amount", "max_amount", "interval", "job_url", "date_posted",
         "relevance_score", "matched_keywords",
     ]
@@ -479,8 +512,8 @@ def run(config_path: Path) -> Path:
 
     print(
         f"[filter] kept {len(relevant)} of {len(jobs)} "
-        f"({excluded} negative-excluded, {ineligible} ineligible, {too_old} too old) "
-        f"-> {OUTPUT_PATH}"
+        f"({excluded} negative-excluded, {ineligible} ineligible, {offsite} off-site, "
+        f"{too_old} too old) -> {OUTPUT_PATH}"
     )
     return OUTPUT_PATH
 

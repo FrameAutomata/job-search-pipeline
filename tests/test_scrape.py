@@ -1554,3 +1554,83 @@ class TestRunSurvivesAnUnreadableOption:
 
         out = capsys.readouterr().out
         assert "broken" in out and "easy_apply" in out and "skipping pass" in out
+
+
+class TestMarkRemoteOnly:
+    """scrape.mark_remote_only collapses the per-pass remote_pass tag to a
+    per-URL AND — a job returned by a remote pass (True) AND a local pass
+    (False) was found by a search aimed at the user's own city, so it is not
+    remote-only and the remote-consistency guard must not drop it."""
+
+    def test_url_in_both_passes_is_not_remote_only(self):
+        df = pd.DataFrame({
+            "job_url": ["https://a", "https://a", "https://b"],
+            "remote_pass": [True, False, True],
+        })
+        out = scrape_mod.mark_remote_only(df)
+        a_rows = out[out["job_url"] == "https://a"]["remote_only"]
+        assert [bool(v) for v in a_rows] == [False, False]
+        assert bool(out[out["job_url"] == "https://b"]["remote_only"].iloc[0]) is True
+
+    def test_url_only_in_remote_pass_is_remote_only(self):
+        out = scrape_mod.mark_remote_only(pd.DataFrame({"job_url": ["https://x"], "remote_pass": [True]}))
+        assert bool(out["remote_only"].iloc[0]) is True
+
+    def test_url_only_in_local_pass_is_not(self):
+        out = scrape_mod.mark_remote_only(pd.DataFrame({"job_url": ["https://y"], "remote_pass": [False]}))
+        assert bool(out["remote_only"].iloc[0]) is False
+
+    def test_the_per_pass_tag_is_replaced_by_the_combined_column(self):
+        out = scrape_mod.mark_remote_only(pd.DataFrame({"job_url": ["https://x"], "remote_pass": [True]}))
+        assert "remote_pass" not in out.columns
+        assert out["remote_only"].dtype == bool
+
+    def test_absent_tag_column_is_all_false(self):
+        out = scrape_mod.mark_remote_only(pd.DataFrame({"job_url": ["https://x", "https://y"]}))
+        assert out["remote_only"].tolist() == [False, False]
+        assert out["remote_only"].dtype == bool
+
+    def test_nan_url_stays_bool(self):
+        df = pd.DataFrame({"job_url": ["https://x", None], "remote_pass": [True, True]})
+        out = scrape_mod.mark_remote_only(df)
+        assert out["remote_only"].dtype == bool
+        assert bool(out["remote_only"].iloc[1]) is False
+
+
+class TestRunTagsRemoteOnly:
+    """run() tags each pass's rows post-normalize_pass and ANDs per URL, so a
+    row the remote pass and the local pass both returned reaches jobs.csv as
+    remote_only == False while a remote-pass-only row is True."""
+
+    CONFIG = """
+searches:
+  - name: local
+    search_terms: ["rep"]
+    sites: [indeed]
+    location: "Dallas, TX"
+    hours_old: 24
+  - name: remote
+    search_terms: ["rep"]
+    sites: [indeed]
+    location: "United States"
+    is_remote: "true"
+filter:
+  min_score: 5
+"""
+
+    def test_and_across_passes(self, tmp_path, patch_scrape_paths, mocker):
+        config = tmp_path / "config.yml"
+        config.write_text(self.CONFIG)
+        local = pd.DataFrame({"job_url": ["https://shared", "https://local-only"],
+                              "title": ["a", "b"]})
+        remote = pd.DataFrame({"job_url": ["https://shared", "https://remote-only"],
+                               "title": ["a", "c"]})
+        mocker.patch("pipeline.scrape.scrape_jobs", side_effect=[local, remote])
+
+        scrape_mod.run(config)
+
+        out = pd.read_csv(patch_scrape_paths).set_index("job_url")
+        assert bool(out.loc["https://shared", "remote_only"]) is False
+        assert bool(out.loc["https://local-only", "remote_only"]) is False
+        assert bool(out.loc["https://remote-only", "remote_only"]) is True
+        assert "remote_pass" not in out.columns

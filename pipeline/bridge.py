@@ -11,7 +11,7 @@ import html
 import os
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from pipeline._batch_common import parse_date_posted, read_url_set, recheck_discarded
@@ -26,6 +26,26 @@ FILTERED_PATH = ROOT / "output" / "filtered_jobs.csv"
 PIPELINE_MD = "data/pipeline.md"
 SCAN_HISTORY = "data/scan-history.tsv"
 APPLICATIONS_MD = "data/applications.md"
+
+# Every value the `status` column of scan-history.tsv may carry. The single
+# source of truth: append_to_scan_history refuses anything else, so a new
+# status is added here, with its gloss, before any stage can write it.
+#
+#   added             bridge queued the URL for evaluation (permanent)
+#   screened-dead     screen's liveness check found the posting gone (permanent —
+#                     only positive evidence of removal produces it)
+#   screened-offsite  screen's remote-consistency guard dropped a remote-pass
+#                     row whose JD is on-site somewhere far away
+#                     (pipeline.remote_signal); expires, see SCAN_HISTORY_EXPIRY
+SCAN_HISTORY_STATUSES = ("added", "screened-dead", "screened-offsite")
+
+# How long load_seen treats a status as seen, in days; a status absent here is
+# seen forever. An off-site drop is a judgement about the user's search passes
+# as much as about the posting, so it is re-fetched once after sixty days
+# rather than hidden forever when they broaden their locations later.
+# `added` and `screened-dead` stay permanent: one is a role already in the
+# queue or tracker, the other a posting that is gone.
+SCAN_HISTORY_EXPIRY = {"screened-offsite": 60}
 # Deduped, append-only list of URLs that came from an easy_apply search pass.
 # JobSpy returns no per-job "easy apply" flag, so this URL-keyed side channel is
 # how the pass-level flag reaches the UI (which gates the Indeed SmartApply
@@ -82,18 +102,50 @@ def _parse_applications_md(text: str) -> tuple[set[str], set[str]]:
     return urls, roles
 
 
-def load_seen(career_ops: Path) -> tuple[set[str], set[str]]:
-    """Return (seen_urls, seen_company_roles) merged across all dedup sources."""
+def _expired(fields: list[str], expire_days: dict[str, int], today: date) -> bool:
+    """Whether a scan-history line's status has aged out of the seen set.
+
+    Columns are url, first_seen, portal, title, company, status. A line too
+    short to carry a status, or whose date does not parse, is treated as
+    permanent — the older, stricter reading — rather than as expired."""
+    if len(fields) < 6:
+        return False
+    days = expire_days.get(fields[5].strip())
+    if days is None:
+        return False
+    try:
+        first_seen = date.fromisoformat(fields[1].strip())
+    except ValueError:
+        return False
+    return today - first_seen >= timedelta(days=days)
+
+
+def load_seen(
+    career_ops: Path,
+    expire_days: dict[str, int] | None = None,
+    *,
+    today: date | None = None,
+) -> tuple[set[str], set[str]]:
+    """Return (seen_urls, seen_company_roles) merged across all dedup sources.
+
+    `expire_days` maps a scan-history status to the number of days after which
+    its lines stop counting as seen — default SCAN_HISTORY_EXPIRY, so an
+    off-site drop is re-fetched once after sixty days while `added` and
+    `screened-dead` stay permanent. Pass {} for the older read-everything
+    behaviour. `today` is for tests."""
     urls: set[str] = set()
     roles: set[str] = set()
+    expire = SCAN_HISTORY_EXPIRY if expire_days is None else expire_days
+    today = today or date.today()
 
     hist = career_ops / SCAN_HISTORY
     if hist.exists():
         with open(hist, "r", encoding="utf-8") as f:
             next(f, None)  # header
             for line in f:
-                url = line.split("\t", 1)[0].strip()
-                if url:
+                fields = line.rstrip("\n").split("\t")
+                url = fields[0].strip()
+                if url and not _expired(fields, expire, today):
                     urls.add(url)
 
     pipe = career_ops / PIPELINE_MD
@@ -112,8 +164,8 @@ def load_seen(career_ops: Path) -> tuple[set[str], set[str]]:
 
 
 # Back-compat aliases — tests call these directly.
-def load_seen_urls(career_ops: Path) -> set[str]:
-    return load_seen(career_ops)[0]
+def load_seen_urls(career_ops: Path, expire_days=None, *, today=None) -> set[str]:
+    return load_seen(career_ops, expire_days, today=today)[0]
 
 
 def load_seen_company_roles(career_ops: Path) -> set[str]:
@@ -178,11 +230,20 @@ def append_to_scan_history(
 ) -> None:
     """Append rows to scan-history.tsv.
 
-    `status` is the value written in the final column. Use the default
-    "added" for bridge's normal flow; pre-screen records use "screened-dead"
-    so future runs can skip URLs that already failed liveness.
+    `status` is the value written in the final column and must be one of
+    SCAN_HISTORY_STATUSES (glossed there): the default "added" for bridge's
+    normal flow, "screened-dead" for a posting screen's liveness check found
+    gone, "screened-offsite" for a remote-pass row screen's remote-consistency
+    guard judged on-site elsewhere. Anything else raises ValueError before a
+    line is written, so a misspelling cannot mint a fourth status that
+    load_seen would then treat as permanent.
 
     Each entry must have `url`, `title`, `company`."""
+    if status not in SCAN_HISTORY_STATUSES:
+        raise ValueError(
+            f"unknown scan-history status {status!r}; "
+            f"expected one of {', '.join(SCAN_HISTORY_STATUSES)}"
+        )
     hist = career_ops / SCAN_HISTORY
     hist.parent.mkdir(parents=True, exist_ok=True)
     if not hist.exists():
