@@ -31,6 +31,7 @@ from datetime import date
 from pathlib import Path
 
 from pipeline import agent_cli
+from pipeline._batch_common import redact_profile_yml
 from pipeline import batch_evaluate as be
 
 
@@ -377,7 +378,9 @@ def build_tailor_messages(local: Path, role_context: str) -> tuple[str, str]:
             "cv.md not found in your local career-ops — run setup/onboarding "
             "first, or launch the UI from your career-ops clone."
         )
-    profile = _read(local / "config" / "profile.yml")
+    # Redacted read: this string lands in a system prompt below, and
+    # profile.yml carries the wizard's EEO self-ID answers (#165).
+    profile = redact_profile_yml(_read(local / "config" / "profile.yml"))
     rules = _read(local / "modes" / "text.md").strip() or _FALLBACK_RULES
     system = (
         "You tailor resumes. Follow these mode rules exactly:\n\n"

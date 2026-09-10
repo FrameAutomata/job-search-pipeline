@@ -148,13 +148,15 @@ def generate_for_job(career_ops, job, *, profile_dir, caller=None,
     tailor)."""
     # pipeline.* imports stay lazy: handoff↔resume_content would cycle at module
     # load, and a fully-cached run must not need a provider key.
-    from pipeline._batch_common import read_report, read_text
+    from pipeline._batch_common import profile_master_for_prompt, read_report, read_text
     from pipeline.handoff import HANDOFF_PROFILE
     from pipeline.resume_tailor import jd_text_for_job, resume_paths
 
     career_ops = Path(career_ops)
     profile_path = Path(profile_dir) / HANDOFF_PROFILE
-    profile_md = read_text(profile_path)
+    # Redacted read: this is pasted into the build prompt as the ONLY source
+    # of truth, and a pre-#165 PROFILE.md still carries the EEO bullets.
+    profile_md = profile_master_for_prompt(profile_path)
     if not profile_md.strip():
         return None                         # no living profile yet → agent tailors this row
 

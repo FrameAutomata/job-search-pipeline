@@ -1474,9 +1474,8 @@ def _profile_standing_answers(profile: dict) -> list[str]:
     wa = _dsect(profile, "work_authorization")
     comp = _dsect(profile, "compensation")
     loc = _dsect(profile, "location")
-    vd = _dsect(profile, "voluntary_disclosures")
 
-    def _ask(v, prompt="(add this)"):
+    def _ask(v, prompt):   # every call site states its own fallback
         v = "" if v is None else str(v).strip()
         return v or prompt
 
@@ -1502,10 +1501,18 @@ def _profile_standing_answers(profile: dict) -> list[str]:
         f"- **Work authorization:** {work_auth}",
         f"- **Compensation target:** {comp_line}",
         f"- **Location:** {place or '(add this)'}",
-        f"- **Gender:** {_ask(vd.get('gender'))}",
-        f"- **Race / ethnicity:** {_ask(vd.get('race_ethnicity'))}",
-        f"- **Veteran status:** {_ask(vd.get('veteran_status'))}",
-        f"- **Disability status:** {_ask(vd.get('disability_status'))}",
+        # Gender / race / veteran / disability are deliberately NOT written here.
+        # This file is the browser agent's master AND, when it exists, the
+        # authoritative candidate profile for evaluation (resolve_profile_md ->
+        # eval_system_prompt) — so a value seeded here reaches the model that
+        # SCORES the candidate, which is the one place a protected
+        # characteristic must never appear. profile.yml still holds whatever the
+        # wizard was told (the person's own record); _batch_common redacts it out
+        # of every prompt, and the agent is told what to do at the form instead.
+        "- **Self-identification (gender, race/ethnicity, veteran, disability):** "
+        "decline or choose \u201cprefer not to answer\u201d wherever the form offers it. "
+        "These are not recorded in this file on purpose. If a form REQUIRES a value, "
+        "stop and record `handoff` \u2014 the person answers it themselves.",
     ]
 
 
