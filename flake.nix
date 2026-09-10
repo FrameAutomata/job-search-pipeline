@@ -46,12 +46,43 @@
             # written to fail closed was failing closed on completed work.
             bashInteractive
 
+            # The agent CLIs pipeline/agent_cli.py launches — the browser agent
+            # that applies for you, and `--batch`. Two of the three free entries
+            # are packaged; the third is not, and that is worth writing down
+            # because the obvious guess is wrong.
+            #
+            # Both of these LAG the versions the registry's flags were read off
+            # (opencode 1.15.10 here vs 1.18.30 there; gemini-cli 0.42.0 vs
+            # 0.59.0). Same major on both, so the interactive argv and the model
+            # flag hold — but a pinned nixpkgs is the point, and if you need a
+            # newer one, `npm install -g @google/gemini-cli` works inside this
+            # shell because the shellHook sets NPM_CONFIG_PREFIX (npm's default
+            # global prefix is inside the read-only store).
+            #
+            # gemini-cli's mainProgram is `gemini`, which is the `binary` the
+            # registry names — not `gemini-cli`, so it resolves as written.
+            opencode
+            gemini-cli
+
+            # `agy` is deliberately absent. `pkgs.antigravity` is NOT it: that
+            # is buildVscode with executableName = "antigravity", the
+            # Antigravity IDE (a VS Code fork). The `agy` CLI ships as a
+            # prebuilt dynamically-linked binary from antigravity.google, which
+            # will not start here without programs.nix-ld or an
+            # autoPatchelfHook derivation — and note that the LD_LIBRARY_PATH
+            # block below does not help with that: nix-ld is for foreign
+            # EXECUTABLES, that block is for Python wheels dlopening bare
+            # sonames. Its registry entry also carries no verified_against, and
+            # its free tier is a small WEEKLY quota, so it is the last of the
+            # three worth the effort rather than the first.
+
             # soffice, for --handoff-tailor's one-page resume fit and the
-            # LibreOffice-gated tests in tests/test_resume_build.py. Left out
-            # by default: it is a ~2 GB closure and the stage degrades
-            # gracefully without it. Uncomment unless your system profile
-            # already provides it.
-            # libreoffice
+            # LibreOffice-gated tests in tests/test_resume_build.py. A ~2 GB
+            # closure, and the stage degrades gracefully without it — but
+            # --handoff-tailor is the résumé half of the apply path, so it is
+            # in by default now. Drop this line if your system profile already
+            # provides soffice, or if you never use that flag.
+            libreoffice
           ];
 
           # Libraries the pip-installed manylinux wheels load at import time.
@@ -97,6 +128,13 @@
           PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
 
           shellHook = ''
+            # npm's default global prefix is inside the read-only store, so
+            # `npm install -g` fails here. Pointing it at the user's home is
+            # what makes a NEWER agent CLI than the one nixpkgs pins
+            # installable from inside this shell.
+            export NPM_CONFIG_PREFIX="''${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
+            export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+
             # Put an existing venv first, so `python` and `pytest` mean the
             # project's — whichever subdirectory the shell was entered from.
             root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
