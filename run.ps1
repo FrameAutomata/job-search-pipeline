@@ -1,5 +1,6 @@
 # Thin wrapper: activate venv + run orchestrator. Pass-through args.
-# --batch            : evaluate pending jobs via career-ops batch runner (CLI set by BATCH_CLI, default: claude)
+# --batch            : evaluate pending jobs via career-ops batch runner (the agent CLI is
+#                      BATCH_CLI in .env, resolved by pipeline/agent_cli.py — which owns the default)
 # --skip-pdf         : skip PDF generation (report + tracker only)
 # --min-score <N>    : skip tracker for jobs scoring below N (0 = off)
 $ErrorActionPreference = "Stop"
@@ -29,11 +30,29 @@ while ($i -lt $args.Count) {
 & "$root\.venv\Scripts\python.exe" "$root\orchestrate.py" @orchestrateArgs
 
 if ($runBatch) {
-    $batchCli = if ($env:BATCH_CLI) { $env:BATCH_CLI } else { "claude" }
+    # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
+    # writes) and owns the default — no second copy of it here.
+    # From $root: `pipeline` is not pip-installed, so `-m` finds it by cwd.
+    # The model too: OLLAMA_MODEL (the older, --batch-only name) when set, else
+    # AGENT_MODEL / the registry's default for this CLI (`--resolved-model`,
+    # which may print nothing — then the CLI starts on its own default and no
+    # --model is passed).
+    Push-Location $root
+    try {
+        $batchCli = (& "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --resolved | Select-Object -Last 1)
+        $batchModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } `
+                      else { (& "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --resolved-model | Select-Object -Last 1) }
+    } finally { Pop-Location }
+    if (-not $batchCli) {
+        Write-Host "run.ps1: could not resolve the agent CLI (python -m pipeline.agent_cli --resolved printed nothing)."
+        exit 1
+    }
+    $batchCli = "$batchCli".Trim()
+    $batchModel = "$batchModel".Trim()
     $batchRunner = "$root\career-ops\batch\batch-runner.sh"
     $batchArgs = @("--cli", $batchCli)
     $displayStr = $batchCli
-    if ($env:OLLAMA_MODEL) { $batchArgs += @("--model", $env:OLLAMA_MODEL); $displayStr += " / $($env:OLLAMA_MODEL)" }
+    if ($batchModel) { $batchArgs += @("--model", $batchModel); $displayStr += " / $batchModel" }
     if ($skipPdf) { $batchArgs += "--skip-pdf" }
     if ($minScore) { $batchArgs += @("--min-score", $minScore) }
     Write-Host ""

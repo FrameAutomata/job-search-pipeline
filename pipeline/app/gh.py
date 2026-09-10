@@ -285,6 +285,19 @@ def set_variable(name: str, value: str) -> None:
     _run(["variable", "set", name, *_repo_args(), "--body", value])
 
 
+def list_variables() -> dict:
+    """Repository variables as {name: value}. Variables are readable (secrets
+    are not), which is what lets the wizard's edit mode prefill the digest
+    thresholds and the free-tier flag with what the cloud actually runs on."""
+    out = _run(["variable", "list", *_repo_args(), "--json", "name,value"])
+    try:
+        rows = json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        raise GhError(f"gh variable list returned unreadable JSON: {e}")
+    return {str(r.get("name")): str(r.get("value", "")) for r in rows
+            if isinstance(r, dict) and r.get("name")}
+
+
 # When any field is at least this large, fall back to feeding the whole input
 # dict as JSON on stdin via `gh workflow run --json`. Windows' direct
 # CreateProcess command line caps at ~32,767 chars and cmd /c at ~8,191; one big

@@ -1,5 +1,6 @@
 """Shared fixtures for job-search-pipeline tests."""
 
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -233,6 +234,16 @@ def _clear_keyword_cache(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_remote_dropped(monkeypatch, tmp_path):
+    """Redirect the remote-consistency guard's dropped-rows file to tmp. filter
+    writes it on EVERY run — truncating when nothing was dropped, by design —
+    and screen extends it, so without this each run() test would rewrite the
+    real output/remote-dropped.csv and share it with the next test."""
+    from pipeline import remote_signal
+    monkeypatch.setattr(remote_signal, "DROPPED_PATH", tmp_path / "remote-dropped.csv")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_status_overrides(monkeypatch, tmp_path):
     """Redirect the UI's pending-status override file to tmp so tests (e.g.
     kanban drag / recheck-discard paths) never write the real .ui-cache state."""
@@ -254,16 +265,34 @@ def _isolate_provider_env(monkeypatch):
     import pipeline.filter  # noqa: F401 — its import-time load_dotenv runs once here
     try:
         import pipeline.app.server  # noqa: F401 — same; optional UI dep
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: server.py raises SystemExit at import
+        # when UI_LAN is set with no UI_PASSWORD, and _isolate_ui_env below
+        # (which clears UI_LAN) has not run yet — a developer who once ran
+        # run-ui.sh --lan would otherwise error out of every test in the suite.
         pass
     # Key vars derive from the provider table so a newly added provider can't
     # leak the developer's real key into tests (the DeepSeek addition slipped
     # past one hand-copied list — review finding).
+    from pipeline.agent_cli import AGENT_MODEL_ENV, BATCH_CLI_ENV, XDG_CONFIG_HOME_ENV
     from pipeline.batch_evaluate import _PROVIDER_KEYS
+    # BATCH_CLI too: the agent-CLI registry resolves it on every request, and a
+    # developer's `.env` naming claude would flip every default-CLI assertion.
+    # AGENT_MODEL: the model the CLI is launched with; a developer's `.env`
+    # value would render into every command-shape assertion.
+    # XDG_CONFIG_HOME: the registry reads it (through the process env) to
+    # place OpenCode's config, and the prereq note renders that path.
+    # The digest's delivery secrets, settings and run facts derive from its
+    # own constants for the same reason: a webhook URL in a developer's .env
+    # would otherwise make a test post to a real Discord channel.
+    from pipeline import daily_digest
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "COVER_MODEL",
-                "TAILOR_PROVIDER", "TAILOR_MODEL",
+                "TAILOR_PROVIDER", "TAILOR_MODEL", BATCH_CLI_ENV, AGENT_MODEL_ENV,
+                XDG_CONFIG_HOME_ENV,
                 *_PROVIDER_KEYS.values(),
-                "OLLAMA_BASE_URL"):
+                "OLLAMA_BASE_URL",
+                *daily_digest.SECRET_VARS, *daily_digest.SETTING_VARS,
+                *daily_digest.RUN_VARS):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -275,9 +304,53 @@ def _isolate_handoff_env(monkeypatch):
     the developer's actual applied/skipped roles (run() reads HANDOFF_JOB_LOG
     when no job_log is passed), and a real out-dir would make run() read/write
     outside tmp_path. Clear both before every test; tests that need them set them
-    explicitly via monkeypatch.setenv."""
-    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR"):
+    explicitly via monkeypatch.setenv. The submit policy is cleared the same way
+    (its name comes from the module constant, so a rename can't leave a stale
+    string here): a developer's .env set to submit-all would flip every README /
+    prompt / fallback-row assertion that pins the stop-before-submit default."""
+    from pipeline.handoff import SUBMIT_POLICY_ENV
+    for var in ("HANDOFF_JOB_LOG", "HANDOFF_OUT_DIR", SUBMIT_POLICY_ENV):
         monkeypatch.delenv(var, raising=False)
+
+
+# What _isolate_ui_env clears when pipeline.app.server has not been imported —
+# the UI deps may not be installed, and importing it here would run its
+# load_dotenv() over the isolation the other fixtures just did. Pinned against
+# the module's own constants by tests/test_app_server.py.
+LAN_ENV_FALLBACK = ("UI_LAN", "UI_PASSWORD", "UI_ALLOWED_HOSTS")
+LAN_ENV_NAME_FALLBACK = "UI_LAN"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ui_env(monkeypatch):
+    """Keep the UI's LAN mode off in tests. server.py reads UI_LAN, UI_PASSWORD
+    and UI_ALLOWED_HOSTS at request time (a developer's .env leaks them via
+    load_dotenv the same way — see _isolate_provider_env), and under UI_LAN
+    every request needs Basic auth, so a leaked UI_LAN=1 would 401 every route
+    test. UI_LAN is set to "" rather than deleted: the client fixtures reload
+    server.py, whose load_dotenv(override=False) re-adds a deleted name but
+    leaves a present-and-empty one alone — and an empty UI_LAN is "off" to
+    _lan_enabled — which also keeps that reload from hitting the import-time
+    "UI_LAN without UI_PASSWORD" SystemExit on a developer's machine.
+
+    The names come from the module constant when the module is ALREADY loaded,
+    and from the literals otherwise — this fixture must never be the thing that
+    IMPORTS server.py. Only one fixture may do that, and it is
+    _isolate_provider_env, which imports it deliberately BEFORE clearing the
+    provider keys, precisely so the module's load_dotenv(override=False) cannot
+    put a developer's real keys back afterwards. Importing here too made that
+    guarantee rest on two autouse fixtures' relative order — and on the fact
+    that `except Exception` does not catch the import-time SystemExit a
+    developer with UI_LAN=1 and no password would raise, which would then error
+    every test in the suite from this fixture. The fallback cannot drift
+    silently: tests/test_app_server.py::TestLanEnvExampleMirror pins it against
+    the module's own constants (that file has server.py imported for real)."""
+    srv = sys.modules.get("pipeline.app.server")
+    LAN_ENV_VARS = getattr(srv, "LAN_ENV_VARS", LAN_ENV_FALLBACK)
+    UI_LAN_ENV = getattr(srv, "UI_LAN_ENV", LAN_ENV_NAME_FALLBACK)
+    for var in LAN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(UI_LAN_ENV, "")
 
 
 @pytest.fixture(autouse=True)

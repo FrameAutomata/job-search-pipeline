@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# --batch            : evaluate pending jobs via career-ops batch runner (CLI set by BATCH_CLI, default: claude)
+# --batch            : evaluate pending jobs via career-ops batch runner (the agent CLI is
+#                      BATCH_CLI in .env, resolved by pipeline/agent_cli.py — which owns the default)
 # --skip-pdf         : skip PDF generation (report + tracker only)
 # --min-score <N>    : skip tracker for jobs scoring below N (0 = off)
 set -euo pipefail
@@ -50,12 +51,29 @@ fi
 "$root/.venv/bin/python" "$root/orchestrate.py" "${orchestrate_args[@]}"
 
 if [[ "$run_batch" == "true" ]]; then
-  batch_cli="${BATCH_CLI:-claude}"
+  # The registry resolves BATCH_CLI (reading .env, which the Setup wizard
+  # writes) and owns the default — no second copy of it here.
+  # From $root: `pipeline` is not pip-installed, so `-m` finds it by cwd.
+  batch_cli="$(cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --resolved)"
+  if [[ -z "$batch_cli" ]]; then
+    echo "run.sh: could not resolve the agent CLI (python -m pipeline.agent_cli --resolved printed nothing)." >&2
+    exit 1
+  fi
   batch_args=(--cli "$batch_cli")
   display_str="$batch_cli"
-  if [[ -n "${OLLAMA_MODEL:-}" ]]; then
-    batch_args+=(--model "$OLLAMA_MODEL")
-    display_str="$batch_cli / $OLLAMA_MODEL"
+  # The model too: OLLAMA_MODEL (the older, --batch-only name) when set, else
+  # AGENT_MODEL / the registry's default for this CLI (`--resolved-model`, which
+  # may print nothing — then the CLI starts on its own default and no --model
+  # is passed). Without this, gemini's --batch ran on the CLI's own default
+  # model, which has ~20 requests/day on a free key where the registry's
+  # default has ~500.
+  batch_model="${OLLAMA_MODEL:-}"
+  if [[ -z "$batch_model" ]]; then
+    batch_model="$(cd "$root" && "$root/.venv/bin/python" -m pipeline.agent_cli --resolved-model)"
+  fi
+  if [[ -n "$batch_model" ]]; then
+    batch_args+=(--model "$batch_model")
+    display_str="$batch_cli / $batch_model"
   fi
   [[ "$skip_pdf" == "true" ]] && batch_args+=(--skip-pdf)
   [[ -n "$min_score" ]] && batch_args+=(--min-score "$min_score")

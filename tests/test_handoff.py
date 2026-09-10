@@ -10,6 +10,7 @@ This is the signed-off spec. It covers four concerns:
 """
 
 import json
+import re
 
 import pytest
 
@@ -173,6 +174,20 @@ class TestParenSubtitleMatching:
         tracker = [self._tracked("Acme", "Software Engineer (Backend)")]
         items = handoff.build_work_order([self._queue("Acme", "Software Engineer (Frontend)")], tracker)
         assert len(items) == 1
+
+    def test_ready_form_cousin_is_emitted_fresh_not_dropped(self):
+        # A ready-to-submit form is matched on its EXACT key only; a queue title
+        # re-worded since the form was filled used to hit the fuzzy matcher and
+        # vanish — neither re-emitted nor counted as excluded. It is fresh now.
+        ready = handoff.TrackedRole(key=handoff.role_key("Acme", "SWE"), company="Acme",
+                                    role="SWE", status=handoff.READY_STATUS)
+        items = handoff.build_work_order([self._queue("Acme", "SWE (Remote)")], [ready])
+        assert [(i.role, i.resume_from, i.status) for i in items] == [("SWE (Remote)", "", "")]
+        # The exact key still comes back ready, and an excluded cousin still dedups.
+        (item,) = handoff.build_work_order([self._queue("Acme", "SWE")], [ready])
+        assert item.resume_from == handoff.READY_STATUS
+        assert handoff.build_work_order(
+            [self._queue("Acme", "SWE (Remote)")], [self._tracked("Acme", "SWE")]) == []
 
 
 class TestBoardOf:
@@ -1043,8 +1058,11 @@ class TestResumeRunbook:
 
 
 class TestBootstrapHandoffDir:
-    """Create + seed the handoff directory. Non-clobbering (the folder accumulates
-    the user's own files) and idempotent (safe to call every run)."""
+    """Create + seed the handoff directory. The instruction files (README,
+    RUNBOOK) are OURS and are rewritten on every bootstrap — a submit-policy
+    change must reach a folder that already exists, which is every folder after
+    the first run — while PROFILE.md is the user's and is never clobbered.
+    Idempotent (safe to call every run)."""
 
     def test_creates_dir_and_seeds_readme(self, tmp_path):
         out = tmp_path / "agent-home"
@@ -1053,25 +1071,33 @@ class TestBootstrapHandoffDir:
         assert readme == out / handoff.HANDOFF_README
         assert readme.read_text(encoding="utf-8") == handoff.render_handoff_readme()
 
-    def test_does_not_clobber_existing_readme(self, tmp_path):
+    def test_rewrites_readme_and_runbook_but_preserves_profile(self, tmp_path):
         out = tmp_path / "agent-home"
         out.mkdir()
-        (out / handoff.HANDOFF_README).write_text("my own notes", encoding="utf-8")
+        (out / handoff.HANDOFF_README).write_text("stale instructions", encoding="utf-8")
+        (out / handoff.HANDOFF_RESUME_RUNBOOK).write_text("stale recipe", encoding="utf-8")
+        (out / handoff.HANDOFF_PROFILE).write_text("# my grown profile", encoding="utf-8")
         handoff.bootstrap_handoff_dir(out)
-        assert (out / handoff.HANDOFF_README).read_text(encoding="utf-8") == "my own notes"
+        assert (out / handoff.HANDOFF_README).read_text(encoding="utf-8") == \
+            handoff.render_handoff_readme()
+        assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == \
+            handoff.render_resume_runbook()
+        assert (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8") == "# my grown profile"
+
+    def test_policy_change_reaches_an_existing_folder(self, tmp_path):
+        # The README states the active policy; the whole point of rewriting it.
+        out = tmp_path / "agent-home"
+        handoff.bootstrap_handoff_dir(out, policy="stop-before-submit")
+        handoff.bootstrap_handoff_dir(out, policy="submit-all")
+        md = (out / handoff.HANDOFF_README).read_text(encoding="utf-8")
+        assert "`submit-all` — " in md and "**(active)**" in md
+        assert md == handoff.render_handoff_readme(policy="submit-all")
 
     def test_seeds_the_resume_runbook(self, tmp_path):
         out = tmp_path / "agent-home"
         handoff.bootstrap_handoff_dir(out)
         assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == \
             handoff.render_resume_runbook()
-
-    def test_does_not_clobber_existing_runbook(self, tmp_path):
-        out = tmp_path / "agent-home"
-        out.mkdir()
-        (out / handoff.HANDOFF_RESUME_RUNBOOK).write_text("mine", encoding="utf-8")
-        handoff.bootstrap_handoff_dir(out)
-        assert (out / handoff.HANDOFF_RESUME_RUNBOOK).read_text(encoding="utf-8") == "mine"
 
     def test_idempotent(self, tmp_path):
         out = tmp_path / "agent-home"
@@ -1771,3 +1797,514 @@ class TestResolveProfileMd:
         (arg_dir / "PROFILE.md").write_text("ARG", encoding="utf-8")
         monkeypatch.setenv("HANDOFF_OUT_DIR", str(env_dir))
         assert handoff.resolve_profile_md(tmp_path / "co", out_dir=arg_dir) == "ARG"
+
+
+# ── 9. Submit policy + ready-to-submit ─────────────────────────────────────────
+READY = handoff.READY_STATUS
+
+
+def _item(company, role, url, *, score=4.0, rank=1, resume_from="", easy_apply=False):
+    return handoff.WorkOrderItem(
+        rank=rank, num="1", score=score, company=company, role=role,
+        board=handoff.board_of(url), url=url, resume_base="content_adhoc",
+        status=resume_from, resume_from=resume_from, easy_apply=easy_apply,
+    )
+
+
+def _tracked(company, role, status, url=""):
+    return handoff.TrackedRole(key=handoff.role_key(company, role), company=company,
+                               role=role, status=status, url=url)
+
+
+class TestSubmitPolicy:
+    """HANDOFF_SUBMIT_POLICY: stop-before-submit by default (nothing is sent
+    without the person seeing it); aliases accepted on read, never rendered; an
+    unknown value degrades to the default with one warning, never to submit-all."""
+
+    def test_default_is_stop_before_submit(self):
+        assert handoff.submit_policy({}) == "stop-before-submit"
+        assert handoff.DEFAULT_SUBMIT_POLICY == "stop-before-submit"
+        assert list(handoff.SUBMIT_POLICIES) == ["stop-before-submit", "submit-easy-apply", "submit-all"]
+
+    @pytest.mark.parametrize("value", list(handoff.SUBMIT_POLICIES))
+    def test_each_id_reads_back(self, value):
+        assert handoff.submit_policy({handoff.SUBMIT_POLICY_ENV: value}) == value
+
+    @pytest.mark.parametrize("alias,canonical", [
+        ("review", "stop-before-submit"), ("easy-apply", "submit-easy-apply"), ("all", "submit-all"),
+        ("Review", "stop-before-submit"), (" SUBMIT-ALL ", "submit-all"),
+    ])
+    def test_aliases_accepted_on_read(self, alias, canonical):
+        assert handoff.submit_policy({handoff.SUBMIT_POLICY_ENV: alias}) == canonical
+        assert handoff.canonical_policy(alias) == canonical
+
+    def test_aliases_never_rendered(self):
+        for alias in ("review", "easy-apply", "all"):
+            assert f"`{alias}`" not in handoff.render_handoff_readme(policy=alias)
+            assert f"`{alias}`" not in handoff.policy_line(alias)
+
+    def test_unknown_falls_back_with_one_warning(self, capsys):
+        handoff._warned_policies.clear()
+        env = {handoff.SUBMIT_POLICY_ENV: "yolo-mode"}
+        assert handoff.submit_policy(env) == "stop-before-submit"
+        assert handoff.submit_policy(env) == "stop-before-submit"
+        out = capsys.readouterr().out
+        assert out.count("yolo-mode") == 1 and "stop-before-submit" in out
+        assert handoff.canonical_policy("yolo-mode") is None
+
+    def test_env_resolution_when_kwarg_is_none(self, monkeypatch):
+        monkeypatch.setenv(handoff.SUBMIT_POLICY_ENV, "submit-all")
+        assert "`submit-all`" in handoff.policy_line()
+        assert "`submit-all`" in handoff.policy_line(None)
+
+    def test_explicit_unknown_policy_raises(self):
+        with pytest.raises(ValueError):
+            handoff.policy_line("bogus")
+
+    def test_policy_line_carries_id_and_gloss(self):
+        for pid, gloss in handoff.SUBMIT_POLICIES.items():
+            assert handoff.policy_line(pid) == f"Submit policy: `{pid}` — {gloss}."
+
+
+class TestStatusPrecedence:
+    """Pinned numbers: applied 6 > handoff 5 > ready-to-submit 4 > drafted 3 >
+    claimed 2 > skipped 1. A ready form outranks a claim and a skip (the work is
+    done, waiting on a click) and loses to the two terminal outcomes."""
+
+    def test_pinned(self):
+        assert handoff.STATUS_PRECEDENCE == {
+            "applied": 6, "handoff": 5, READY: 4, "drafted": 3, "claimed": 2, "skipped": 1,
+        }
+
+    @pytest.mark.parametrize("other,winner", [
+        ("claimed", READY), ("skipped", READY), ("drafted", READY),
+        ("applied", "applied"), ("handoff", "handoff"),
+    ])
+    def test_merge_resolves_by_precedence(self, other, winner):
+        a, b = _tracked("Acme", "SWE", READY), _tracked("Acme", "SWE", other)
+        assert handoff.merge_tracked([a], [b])[0].status == winner
+        assert handoff.merge_tracked([b], [a])[0].status == winner
+
+    @pytest.mark.parametrize("newer", ["skipped", "claimed", "drafted", "applied", "handoff"])
+    def test_status_typed_over_a_ready_prefill_wins(self, newer):
+        # The ledger's ready-to-submit is the previous run's pre-fill; a status
+        # the person writes over it is newer by construction, so it wins even
+        # when it ranks lower (skip/claimed/drafted) — reconcile applies it.
+        ledger, typed = _tracked("Acme", "SWE", READY), _tracked("Acme", "SWE", newer)
+        assert handoff._supersede_ready([ledger], [typed]) == []
+        (t,) = handoff.reconcile("", [ledger], writeback=[typed])
+        assert t.status == newer
+        # An unchanged pre-fill (ready over ready) and every non-ready ledger entry survive.
+        assert handoff._supersede_ready([ledger], [_tracked("Acme", "SWE", READY)]) == [ledger]
+        other = _tracked("Acme", "SWE", "applied")
+        assert handoff._supersede_ready([other], [_tracked("Acme", "SWE", "skipped")]) == [other]
+        assert handoff._supersede_ready([ledger], [_tracked("Other", "SWE", newer)]) == [ledger]
+
+    def test_ready_in_writeback_vocabulary(self):
+        tokens = [t for t, _ in handoff.WRITEBACK_STATUSES]
+        assert READY in tokens
+        assert set(tokens) - {"skip:<reason>"} <= set(handoff.STATUS_PRECEDENCE)
+        assert "login, CAPTCHA, verification code" in dict(handoff.WRITEBACK_STATUSES)["handoff"]
+
+    @pytest.mark.parametrize("spelling", [READY, "ready", "Ready", "READY-TO-SUBMIT"])
+    def test_load_writeback_accepts_ready_and_alias(self, tmp_path, spelling):
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        wo.write_text(json.dumps({"company": "Acme", "role": "SWE",
+                                  "url": "https://www.linkedin.com/jobs/view/1",
+                                  "status": spelling}) + "\n", encoding="utf-8")
+        (t,) = handoff.load_writeback(wo)
+        assert t.status == READY                    # canonical, never the alias
+        (u,) = handoff.load_all_writeback(tmp_path)
+        assert u.status == READY
+
+
+class TestReadyReemittedFirst:
+    """A tracked ready-to-submit role is NOT excluded: it comes back first, in
+    score order among the ready ones, resume_from set and status pre-filled."""
+
+    def _queue(self):
+        return [
+            handoff.QueueRole(num="1", score=4.9, company="Fresh", role="Top Dev",
+                              url="https://www.linkedin.com/jobs/view/1", status="Evaluated"),
+            handoff.QueueRole(num="2", score=4.1, company="Acme", role="SWE",
+                              url="https://www.linkedin.com/jobs/view/2", status="Evaluated",
+                              easy_apply=True),
+            handoff.QueueRole(num="3", score=4.5, company="Globex", role="Dev",
+                              url="https://www.linkedin.com/jobs/view/3", status="Evaluated"),
+            handoff.QueueRole(num="4", score=3.0, company="Old", role="Gone",
+                              url="https://www.linkedin.com/jobs/view/4", status="Evaluated"),
+        ]
+
+    def _tracker(self):
+        return [_tracked("Acme", "SWE", READY), _tracked("Globex", "Dev", READY),
+                _tracked("Old", "Gone", "applied")]
+
+    def test_ready_first_then_fresh(self):
+        items = handoff.build_work_order(self._queue(), self._tracker())
+        assert [i.company for i in items] == ["Globex", "Acme", "Fresh"]   # ready by score, then fresh
+        assert [i.rank for i in items] == [1, 2, 3]
+        assert [i.resume_from for i in items] == [READY, READY, ""]
+        assert [i.status for i in items] == [READY, READY, ""]            # pre-filled
+        assert [i.easy_apply for i in items] == [False, True, False]      # flag threaded through
+
+    def test_jsonl_carries_prefilled_status_and_flags(self):
+        items = handoff.build_work_order(self._queue(), self._tracker())
+        rows = [json.loads(l) for l in handoff.render_work_order_jsonl(items).splitlines()]
+        assert rows[0]["status"] == READY and rows[0]["resume_from"] == READY
+        assert rows[1]["easy_apply"] is True
+        assert rows[2]["status"] == "" and rows[2]["resume_from"] == ""
+
+    def test_ready_role_absent_from_queue_is_not_invented(self):
+        tracker = self._tracker() + [_tracked("Vanished", "Role", READY)]
+        items = handoff.build_work_order(self._queue(), tracker)
+        assert "Vanished" not in [i.company for i in items]
+
+    def test_limit_keeps_ready_rows(self):
+        items = handoff.build_work_order(self._queue(), self._tracker(), limit=2)
+        assert [i.company for i in items] == ["Globex", "Acme"]
+
+    def test_sessions_put_ready_first_per_site(self):
+        queue = self._queue() + [handoff.QueueRole(
+            num="5", score=4.8, company="Indy", role="Backend",
+            url="https://www.indeed.com/viewjob?jk=a", status="Evaluated")]
+        sessions = handoff.build_sessions(queue, self._tracker() + [_tracked("Indy", "Backend", READY)])
+        assert [i.company for i in sessions["linkedin"]] == ["Globex", "Acme", "Fresh"]
+        assert sessions["indeed"][0].company == "Indy" and sessions["indeed"][0].rank == 1
+
+    def test_queue_readers_thread_easy_apply(self, tmp_path):
+        q = tmp_path / "q.jsonl"
+        q.write_text(json.dumps({"num": "1", "score": 4.0, "company": "A", "role": "R",
+                                 "url": "https://www.indeed.com/viewjob?jk=1",
+                                 "easy_apply": "true"}) + "\n" +
+                     json.dumps({"num": "2", "score": 4.0, "company": "B", "role": "R",
+                                 "url": "https://www.indeed.com/viewjob?jk=2",
+                                 "easy_apply": "false"}) + "\n", encoding="utf-8")
+        assert [r.easy_apply for r in handoff.load_queue(q)] == [True, False]
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-07-01 | A | R | 4.6/5 | Evaluated | X | [1](reports/1.md) "
+            "| https://www.indeed.com/viewjob?jk=1 |\n", encoding="utf-8")
+        (co / "data" / "easy-apply-urls.txt").write_text(
+            "https://www.indeed.com/viewjob?jk=1\n", encoding="utf-8")
+        (r,) = handoff.load_queue_from_tracker(co)
+        assert r.easy_apply is True
+
+
+class TestLateWritebackReady:
+    """drop_late_writeback decides on the (resume_from, late status) pair — see
+    its docstring: membership alone deleted every re-emitted ready row at write
+    time and made the work-order oscillate run to run."""
+
+    URL = "https://www.linkedin.com/jobs/view/1"
+
+    def _late_file(self, tmp_path, status):
+        handoff.work_order_paths(tmp_path, "linkedin")[0].write_text(json.dumps({
+            "company": "Acme", "role": "SWE", "url": self.URL, "status": status}) + "\n",
+            encoding="utf-8")
+
+    def _items(self, resume_from):
+        return [_item("Acme", "SWE", self.URL, rank=1, resume_from=resume_from),
+                _item("Globex", "Dev", "https://www.indeed.com/viewjob?jk=b", rank=2)]
+
+    def test_unchanged_prefill_is_kept_with_rank(self, tmp_path):
+        self._late_file(tmp_path, READY)
+        kept, late = handoff.drop_late_writeback(self._items(READY), tmp_path)
+        assert [(i.company, i.rank) for i in kept] == [("Acme", 1), ("Globex", 2)]
+        assert [t.status for t in late] == [READY]              # still folded into the tracker
+
+    @pytest.mark.parametrize("status", ["applied", "handoff", "skip:gone", "claimed"])
+    def test_prefill_moved_on_is_dropped(self, tmp_path, status):
+        self._late_file(tmp_path, status)
+        kept, late = handoff.drop_late_writeback(self._items(READY), tmp_path)
+        assert [(i.company, i.rank) for i in kept] == [("Globex", 1)]
+        assert len(late) == 1
+
+    def test_fresh_item_with_late_ready_is_dropped_and_tracked(self, tmp_path):
+        self._late_file(tmp_path, READY)
+        kept, late = handoff.drop_late_writeback(self._items(""), tmp_path)
+        assert [i.company for i in kept] == ["Globex"]
+        assert [(t.key, t.status) for t in late] == [(handoff.role_key("Acme", "SWE"), READY)]
+
+
+class TestReadyRoundTrip:
+    """run() twice with an untouched ready row: still first, still ready, and
+    applications.md never learns about it (dedup-only)."""
+
+    def _co(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            "# Applications Tracker\n\n"
+            "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+            "|---|------|---------|------|-------|--------|-----|--------|-------|\n"
+            "| 1 | 2026-07-01 | Acme | AI Engineer | 4.6/5 | Evaluated | X | [1](reports/1.md) "
+            "| https://www.linkedin.com/jobs/view/1 |\n"
+            "| 2 | 2026-07-01 | Curri | Software Engineer | 4.9/5 | Evaluated | X | [2](reports/2.md) "
+            "| https://www.linkedin.com/jobs/view/2 |\n", encoding="utf-8")
+        return co
+
+    def _rows(self, out):
+        p = handoff.work_order_paths(out, "linkedin")[0]
+        return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def test_round_trip(self, tmp_path):
+        co, out = self._co(tmp_path), tmp_path / "handoff"
+        assert handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co) == 0
+        rows = self._rows(out)
+        assert [r["company"] for r in rows] == ["Curri", "Acme"]         # score order
+        # The agent fills Acme's form and stops (short spelling, by hand).
+        rows[1]["status"] = "ready"
+        handoff.work_order_paths(out, "linkedin")[0].write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        for _ in range(2):                                              # untouched re-runs
+            assert handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co) == 0
+            rows = self._rows(out)
+            assert [r["company"] for r in rows] == ["Acme", "Curri"]     # ready first
+            assert rows[0]["status"] == READY and rows[0]["resume_from"] == READY
+            assert rows[0]["rank"] == 1 and rows[1]["status"] == ""
+        tracker = {t.key: t for t in handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)}
+        assert tracker[handoff.role_key("Acme", "AI Engineer")].status == READY
+        # Dedup-only: the tracker row is still Evaluated and no cloud override was queued.
+        apps = {r["company"]: r for r in app_data.parse_applications(co / "data" / "applications.md")}
+        assert apps["Acme"]["status_canonical"] == "Evaluated"
+        assert app_data.load_status_overrides() == {}
+        # The md lists it under the waiting-for-you heading, ahead of the fresh table.
+        md = handoff.work_order_paths(out, "linkedin")[1].read_text(encoding="utf-8")
+        assert md.index(handoff.READY_HEADING) < md.index("## Fresh roles")
+        assert "1 fresh" in md and "1 to finish" in md
+
+    def test_applied_after_ready_retires_the_row(self, tmp_path):
+        co, out = self._co(tmp_path), tmp_path / "handoff"
+        handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co)
+        rows = self._rows(out)
+        rows[1]["status"] = READY
+        p = handoff.work_order_paths(out, "linkedin")[0]
+        p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co)
+        rows = self._rows(out)
+        rows[0]["status"] = "applied"                                   # the person clicked Submit
+        p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        handoff.run(queue_path=tmp_path / "missing.jsonl", out_dir=out, career_ops=co)
+        assert [r["company"] for r in self._rows(out)] == ["Curri"]
+        apps = {r["company"]: r for r in app_data.parse_applications(co / "data" / "applications.md")}
+        assert apps["Acme"]["status_canonical"] == "Applied"
+
+    def _export(self, tmp_path):
+        # The scored-export queue: its rows stay Evaluated whatever the agent
+        # records, so a ready entry the ledger keeps would come back every run.
+        q = tmp_path / "export.jsonl"
+        q.write_text("\n".join(json.dumps(r) for r in (
+            {"num": "1", "score": 4.6, "company": "Acme", "role": "AI Engineer",
+             "url": "https://www.linkedin.com/jobs/view/1", "status": "Evaluated"},
+            {"num": "2", "score": 4.9, "company": "Curri", "role": "Software Engineer",
+             "url": "https://www.linkedin.com/jobs/view/2", "status": "Evaluated"},
+        )) + "\n", encoding="utf-8")
+        return q
+
+    def _set(self, out, company, status):
+        p = handoff.work_order_paths(out, "linkedin")[0]
+        rows = self._rows(out)
+        next(r for r in rows if r["company"] == company)["status"] = status
+        p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    @pytest.mark.parametrize("queue_kind", ["export", "tracker"])
+    def test_skip_typed_over_ready_retires_the_row(self, tmp_path, queue_kind):
+        co, out = self._co(tmp_path), tmp_path / "handoff"
+        q = self._export(tmp_path) if queue_kind == "export" else tmp_path / "missing.jsonl"
+        run = lambda: handoff.run(queue_path=q, out_dir=out, career_ops=co)
+        assert run() == 0
+        self._set(out, "Acme", "ready")
+        assert run() == 0
+        assert self._rows(out)[0] == {**self._rows(out)[0], "company": "Acme", "status": READY}
+        # The person decides against the re-emitted form and says so on its row.
+        self._set(out, "Acme", "skip:not for me")
+        for _ in range(2):                    # absent on the next run AND the one after
+            assert run() == 0
+            assert [r["company"] for r in self._rows(out)] == ["Curri"]
+            tracker = {t.key: t for t in handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)}
+            acme = tracker[handoff.role_key("Acme", "AI Engineer")]
+            assert acme.status == "skipped" and acme.reason == "not for me"
+        apps = {r["company"]: r for r in app_data.parse_applications(co / "data" / "applications.md")}
+        assert apps["Acme"]["status_canonical"] == "SKIP"
+
+    @pytest.mark.parametrize("newer", ["claimed", "drafted"])
+    def test_claimed_or_drafted_over_ready_is_kept(self, tmp_path, newer):
+        co, out = self._co(tmp_path), tmp_path / "handoff"
+        q = self._export(tmp_path)
+        run = lambda: handoff.run(queue_path=q, out_dir=out, career_ops=co)
+        run(); self._set(out, "Acme", READY); run(); self._set(out, "Acme", newer); run()
+        tracker = {t.key: t for t in handoff.load_tracker(out / handoff.DEFAULT_TRACKER_NAME)}
+        assert tracker[handoff.role_key("Acme", "AI Engineer")].status == newer
+        assert [r["company"] for r in self._rows(out)] == ["Curri"]   # excluded, not re-emitted
+
+    def test_sync_ignores_ready(self, tmp_path):
+        co = self._co(tmp_path)
+        n = handoff.sync_tracker_statuses([_tracked("Acme", "AI Engineer", READY)],
+                                          co / "data" / "applications.md")
+        assert n == 0
+        apps = {r["company"]: r for r in app_data.parse_applications(co / "data" / "applications.md")}
+        assert apps["Acme"]["status_canonical"] == "Evaluated"
+
+
+class TestPolicyText:
+    """Every agent-facing surface states the policy: README section + legend,
+    work-order header, kickoff prompt, per-role prompt (whose first line and
+    fallback row follow the policy)."""
+
+    @pytest.mark.parametrize("policy", list(handoff.SUBMIT_POLICIES))
+    def test_readme_states_policy_and_legend(self, policy):
+        md = handoff.render_handoff_readme(policy=policy)
+        assert "## Submit policy" in md
+        assert handoff.policy_line(policy) in md
+        assert md.count("**(active)**") == 1 and f"`{policy}` — " in md
+        assert f"- `{READY}` — " in md                       # the legend bullet
+        assert "HANDOFF_SUBMIT_POLICY" in md                 # how to change it
+
+    def test_readme_easy_apply_wording(self):
+        md = handoff.render_handoff_readme(policy="submit-easy-apply")
+        assert "submit only rows marked easy_apply" in md
+        assert f"everything else stops before Submit as {READY}" in md
+
+    @pytest.mark.parametrize("policy", list(handoff.SUBMIT_POLICIES))
+    def test_readme_tells_the_agent_not_to_submit_ready_rows(self, policy):
+        # The README is addressed to the agent; the click on a ready row is the
+        # candidate's, under every policy (a ready row can predate a policy change).
+        md = handoff.render_handoff_readme(policy=policy)
+        assert handoff.READY_AGENT_NOTE in md
+        assert "do not submit them" in handoff.READY_AGENT_NOTE
+        assert "until the candidate clicks Submit and records `applied`" in md
+        assert "until you click Submit" not in md
+
+    @pytest.mark.parametrize("policy", list(handoff.SUBMIT_POLICIES))
+    def test_work_order_header_and_kickoff_state_policy(self, tmp_path, policy):
+        md = handoff.render_work_order_md([], board="linkedin", total_queue=0, touched=0,
+                                          policy=policy)
+        assert handoff.policy_line(policy) in md
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        assert handoff.policy_line(policy) in handoff.kickoff_prompt(wo, board="linkedin", policy=policy)
+
+    def test_role_prompt_first_line_and_fallback_by_policy(self):
+        url = "https://www.linkedin.com/jobs/view/1"
+        p = handoff.role_prompt("Acme", "SWE", url, policy="stop-before-submit")
+        assert p.splitlines()[0] == ("Prepare this application through the browser and stop "
+                                     f"before Submit; record `{READY}`.")
+        assert json.dumps({"company": "Acme", "role": "SWE", "url": url, "status": READY}) in p
+        p = handoff.role_prompt("Acme", "SWE", url, policy="submit-all")
+        assert p.splitlines()[0] == "Apply to this role through the browser, then record the outcome."
+        assert '"status": "applied"' in p
+        # Unknown easy_apply under submit-easy-apply: the two-case instruction,
+        # and the SAFE fallback — a row saying applied would contradict the
+        # "stop unless board-hosted" the same prompt just gave.
+        p = handoff.role_prompt("Acme", "SWE", url, policy="submit-easy-apply")
+        first = p.splitlines()[0]
+        assert "if it is a board-hosted" in first and "otherwise" in first
+        assert f'"status": "{READY}"' in p and '"status": "applied"' not in p
+
+    @pytest.mark.parametrize("easy_apply,status,phrase", [
+        (True, "applied", "This is a board-hosted one-click application"),
+        (False, READY, "This is not a board-hosted one-click application"),
+    ])
+    def test_role_prompt_easy_apply_flag_decides_under_submit_easy_apply(self, easy_apply, status, phrase):
+        url = "https://www.indeed.com/viewjob?jk=1"
+        p = handoff.role_prompt("Acme", "SWE", url, policy="submit-easy-apply", easy_apply=easy_apply)
+        assert p.splitlines()[0].startswith(phrase)
+        assert json.dumps({"company": "Acme", "role": "SWE", "url": url, "status": status}) in p
+        # The flag only matters under submit-easy-apply.
+        assert '"status": "applied"' in handoff.role_prompt(
+            "Acme", "SWE", url, policy="submit-all", easy_apply=False)
+        assert f'"status": "{READY}"' in handoff.role_prompt(
+            "Acme", "SWE", url, policy="stop-before-submit", easy_apply=True)
+
+    def test_default_surfaces_are_stop_before_submit(self, tmp_path):
+        # With no env (conftest clears it) every renderer defaults to the safe policy.
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        for text in (handoff.render_handoff_readme(),
+                     handoff.kickoff_prompt(wo, board="linkedin"),
+                     handoff.role_prompt("Acme", "SWE", "https://www.linkedin.com/jobs/view/1"),
+                     handoff.render_work_order_md([], total_queue=0, touched=0)):
+            assert "`stop-before-submit`" in text
+
+    def test_fold_promise_states_the_exception(self, tmp_path):
+        wo = handoff.work_order_paths(tmp_path, "linkedin")[0]
+        for text in (handoff.render_handoff_readme(), handoff.kickoff_prompt(wo),
+                     handoff.render_work_order_md([], total_queue=0, touched=0)):
+            assert "never reappear — except" in text and READY in text
+
+
+class TestReadyMd:
+    def test_ready_section_easy_apply_tag_and_counters(self):
+        items = [
+            _item("Acme", "SWE", "https://www.linkedin.com/jobs/view/1", rank=1, resume_from=READY,
+                  easy_apply=True),
+            _item("Fresh", "Dev", "https://www.linkedin.com/jobs/view/2", rank=2),
+        ]
+        md = handoff.render_work_order_md(items, board="linkedin", total_queue=9, touched=3)
+        assert "1 fresh LinkedIn roles (of 9 scored; 1 to finish, 3 excluded)." in md
+        assert handoff.READY_HEADING in md and "## Fresh roles" in md
+        # The block is read by the agent: it must say the click is not the agent's.
+        block = md[md.index(handoff.READY_HEADING):md.index("## Fresh roles")]
+        assert handoff.READY_AGENT_NOTE in block
+        body = block.replace(handoff.READY_HEADING, "").replace(handoff.READY_AGENT_NOTE, "")
+        assert "click Submit" not in body            # no instruction to click but the candidate's
+        acme = next(l for l in md.splitlines() if "| Acme |" in l)
+        assert f"| {handoff.EASY_APPLY_TAG} |" in acme
+        fresh = next(l for l in md.splitlines() if "| Fresh |" in l)
+        assert handoff.EASY_APPLY_TAG not in fresh
+        assert md.index("| Acme |") < md.index("| Fresh |")
+
+    def test_no_ready_rows_no_heading(self):
+        md = handoff.render_work_order_md(
+            [_item("Fresh", "Dev", "https://www.linkedin.com/jobs/view/2")],
+            total_queue=1, touched=0)
+        assert handoff.READY_HEADING not in md and "## Fresh roles" not in md
+        assert "0 to finish, 0 excluded" in md
+        assert handoff.READY_AGENT_NOTE not in md
+
+
+class TestSessionSummariesReady:
+    def test_fresh_and_ready_counted_apart(self, tmp_path):
+        handoff.work_order_paths(tmp_path, "linkedin")[0].write_text(
+            "\n".join(json.dumps(r) for r in (
+                {"company": "A", "role": "R", "url": "u", "status": ""},
+                {"company": "B", "role": "R", "url": "u", "status": READY},
+                {"company": "C", "role": "R", "url": "u", "status": "ready"},
+                {"company": "D", "role": "R", "url": "u", "status": "applied"},
+            )) + "\n", encoding="utf-8")
+        handoff.work_order_paths(tmp_path, "indeed")[0].write_text(
+            json.dumps({"company": "E", "role": "R", "url": "u", "status": "applied"}) + "\n",
+            encoding="utf-8")
+        summ = {s["board"]: s for s in handoff.session_summaries(tmp_path)}
+        assert set(summ) == {"linkedin"}                 # a fully recorded file is not a session
+        assert summ["linkedin"]["fresh"] == 1 and summ["linkedin"]["ready"] == 2
+
+
+class TestEnvExampleSubmitPolicy:
+    """.env.example mirrors SUBMIT_POLICIES in a fixed shape — `#   <id>   <gloss>`
+    per policy, then the assignment — so the docs can't drift from the constant."""
+    LINE = re.compile(r"^#\s{3}([a-z-]+)\s{3,}(.+?)\s*$")
+    INTRO = re.compile(r"One of \(id")
+
+    def _block(self):
+        text = (handoff.ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        assign = next(i for i, l in enumerate(text)
+                      if re.match(rf"^#?\s*{handoff.SUBMIT_POLICY_ENV}=", l))
+        # The gloss lines are the LAST lines before the assignment, bounded above
+        # by the "One of (id, then what it does)" intro — not the whole handoff
+        # comment block, which runs ~20 lines up to the section banner and
+        # would let any stray `#   word   text` line in it parse as a policy.
+        start = assign
+        while start > 0 and self.LINE.match(text[start - 1]):
+            start -= 1
+        assert start < assign, "no `#   <id>   <gloss>` lines directly above the assignment"
+        assert self.INTRO.search(text[start - 1]), "gloss lines must follow the intro line"
+        return text[start:assign], text[assign]
+
+    def test_ids_glosses_and_default_mirror_the_constant(self):
+        comment, assign = self._block()
+        found = dict(m.groups() for l in comment if (m := self.LINE.match(l)))
+        assert found == handoff.SUBMIT_POLICIES
+        assert list(found) == list(handoff.SUBMIT_POLICIES)            # same order
+        assert assign.split("=", 1)[1].strip() == handoff.DEFAULT_SUBMIT_POLICY

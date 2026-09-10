@@ -755,3 +755,92 @@ class TestRecheckDiscardsAreProvisional:
                             "Nurse,Acme,https://a/new,7,desc,2026-09-08\n", encoding="utf-8")
         monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
         assert [o["url"] for o in bridge_mod.run(career_ops_dir)] == ["https://a/new"]
+
+
+class TestScanHistoryStatuses:
+    """The status column's vocabulary is one constant, and the writer refuses
+    anything outside it — a misspelling would otherwise mint a fourth status
+    that load_seen then treats as permanent."""
+
+    def test_the_three_statuses(self):
+        assert bridge_mod.SCAN_HISTORY_STATUSES == ("added", "screened-dead", "screened-offsite")
+
+    @pytest.mark.parametrize("status", bridge_mod.SCAN_HISTORY_STATUSES)
+    def test_every_known_status_is_written(self, career_ops_dir, status):
+        bridge_mod.append_to_scan_history(
+            career_ops_dir, [{"url": "https://x", "title": "t", "company": "c"}],
+            "2026-05-12", status=status)
+        hist = (career_ops_dir / "data" / "scan-history.tsv").read_text(encoding="utf-8")
+        assert hist.splitlines()[1].endswith(f"\t{status}")
+
+    def test_unknown_status_raises_before_writing(self, career_ops_dir):
+        with pytest.raises(ValueError, match="screened-offside"):
+            bridge_mod.append_to_scan_history(
+                career_ops_dir, [{"url": "https://x", "title": "t", "company": "c"}],
+                "2026-05-12", status="screened-offside")
+        assert not (career_ops_dir / "data" / "scan-history.tsv").exists()
+
+
+class TestScanHistoryExpiry:
+    """An off-site drop is re-fetched once after sixty days rather than hidden
+    forever when the user broadens their locations; `added` and
+    `screened-dead` stay permanent."""
+
+    HEADER = "url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n"
+
+    def _hist(self, career_ops_dir, *lines):
+        hist = career_ops_dir / "data" / "scan-history.tsv"
+        hist.parent.mkdir(parents=True, exist_ok=True)
+        hist.write_text(self.HEADER + "".join(f"{l}\n" for l in lines), encoding="utf-8")
+
+    def test_default_expiry_is_sixty_days_for_offsite_only(self):
+        assert bridge_mod.SCAN_HISTORY_EXPIRY == {"screened-offsite": 60}
+
+    def test_an_old_offsite_line_is_no_longer_seen(self, career_ops_dir):
+        self._hist(career_ops_dir,
+                   "https://old\t2026-01-01\tjobspy\tRep\tAcme\tscreened-offsite",
+                   "https://fresh\t2026-08-01\tjobspy\tRep\tAcme\tscreened-offsite")
+        seen = bridge_mod.load_seen_urls(career_ops_dir, today=date(2026, 9, 9))
+        assert seen == {"https://fresh"}
+
+    def test_exactly_sixty_days_expires(self, career_ops_dir):
+        self._hist(career_ops_dir, "https://edge\t2026-07-11\tjobspy\tRep\tAcme\tscreened-offsite")
+        assert bridge_mod.load_seen_urls(career_ops_dir, today=date(2026, 9, 9)) == set()
+        assert bridge_mod.load_seen_urls(career_ops_dir, today=date(2026, 9, 8)) == {"https://edge"}
+
+    @pytest.mark.parametrize("status", ["added", "screened-dead"])
+    def test_the_permanent_statuses_never_expire(self, career_ops_dir, status):
+        self._hist(career_ops_dir, f"https://old\t2020-01-01\tjobspy\tRep\tAcme\t{status}")
+        assert bridge_mod.load_seen_urls(career_ops_dir, today=date(2026, 9, 9)) == {"https://old"}
+
+    def test_an_unparseable_date_is_permanent(self, career_ops_dir):
+        self._hist(career_ops_dir, "https://odd\tyesterday\tjobspy\tRep\tAcme\tscreened-offsite")
+        assert bridge_mod.load_seen_urls(career_ops_dir, today=date(2026, 9, 9)) == {"https://odd"}
+
+    def test_a_short_line_is_permanent(self, career_ops_dir):
+        self._hist(career_ops_dir, "https://short\t2020-01-01")
+        assert bridge_mod.load_seen_urls(career_ops_dir, today=date(2026, 9, 9)) == {"https://short"}
+
+    def test_empty_expiry_reads_everything(self, career_ops_dir):
+        self._hist(career_ops_dir, "https://old\t2020-01-01\tjobspy\tRep\tAcme\tscreened-offsite")
+        assert bridge_mod.load_seen_urls(career_ops_dir, {}, today=date(2026, 9, 9)) == {"https://old"}
+
+    def test_a_custom_expiry_applies_to_the_status_named(self, career_ops_dir):
+        self._hist(career_ops_dir, "https://old\t2026-09-01\tjobspy\tRep\tAcme\tscreened-dead")
+        assert bridge_mod.load_seen_urls(
+            career_ops_dir, {"screened-dead": 7}, today=date(2026, 9, 9)) == set()
+
+    def test_load_seen_applies_the_same_rule(self, career_ops_dir):
+        self._hist(career_ops_dir, "https://old\t2026-01-01\tjobspy\tRep\tAcme\tscreened-offsite")
+        urls, _ = bridge_mod.load_seen(career_ops_dir, today=date(2026, 9, 9))
+        assert urls == set()
+
+    def test_run_re_bridges_an_expired_offsite_url(self, career_ops_dir, monkeypatch, tmp_path):
+        # Once expired the URL is new to bridge again: it is queued, and its
+        # fresh `added` line makes it permanent from then on.
+        self._hist(career_ops_dir, "https://old\t2026-01-01\tjobspy\tRep\tAcme\tscreened-offsite")
+        filtered = tmp_path / "filtered_jobs.csv"
+        filtered.write_text("title,company,job_url,description\nRep,Acme,https://old,jd\n")
+        monkeypatch.setattr(bridge_mod, "FILTERED_PATH", filtered)
+        monkeypatch.setattr(bridge_mod, "SCAN_HISTORY_EXPIRY", {"screened-offsite": 1})
+        assert [o["url"] for o in bridge_mod.run(career_ops_dir)] == ["https://old"]

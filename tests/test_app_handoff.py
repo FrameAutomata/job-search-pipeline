@@ -49,15 +49,19 @@ def client(tmp_path, monkeypatch):
     return TestClient(server.app)
 
 
-def _fake_run(out_dir, rows=0, board="linkedin"):
+def _fake_run(out_dir, rows=0, board="linkedin", ready=0):
     """A handoff.run stand-in that writes ONE site's work-order with `rows`
-    entries (the real run writes next-roles-<site>.{jsonl,md} per site)."""
+    fresh entries plus `ready` re-emitted ready-to-submit ones (the real run
+    writes next-roles-<site>.{jsonl,md} per site)."""
     def run(**kw):
         run.captured = kw
         out_dir.mkdir(parents=True, exist_ok=True)
         jsonl, md = handoff.work_order_paths(out_dir, board)
         lines = [json.dumps({"rank": i + 1, "company": "Acme", "role": "AI Engineer",
                              "board": board, "url": "u", "status": ""}) for i in range(rows)]
+        lines += [json.dumps({"rank": rows + i + 1, "company": f"Ready{i}", "role": "Dev",
+                              "board": board, "url": "u", "status": handoff.READY_STATUS,
+                              "resume_from": handoff.READY_STATUS}) for i in range(ready)]
         jsonl.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         md.write_text("# Work order\n", encoding="utf-8")
         return 0
@@ -108,12 +112,25 @@ class TestBuildEndpoint:
         # Result reports one session per site — here a single LinkedIn session.
         result = body["result"]
         assert result["total_fresh"] == 1
+        assert result["total_ready"] == 0
         assert len(result["sessions"]) == 1
         s = result["sessions"][0]
         assert s["board"] == "linkedin"
         assert s["fresh"] == 1
+        assert s["ready"] == 0
         assert s["work_order"].endswith("next-roles-linkedin.jsonl")
         assert "agent-home" in s["work_order"]   # HANDOFF_OUT_DIR honored
+
+    def test_ready_rows_counted_apart_from_fresh(self, client, tmp_path, monkeypatch):
+        # A re-emitted ready-to-submit row (a form waiting on the person's click)
+        # is reported as `ready`, never inflating `fresh` — the UI shows the two
+        # as different asks.
+        monkeypatch.setattr("pipeline.handoff.run",
+                            _fake_run(tmp_path / "agent-home", rows=1, ready=2))
+        body = _wait_done(client, client.post("/api/handoff/build", json={}).json()["job_id"])
+        result = body["result"]
+        assert result["total_fresh"] == 1 and result["total_ready"] == 2
+        assert result["sessions"][0]["fresh"] == 1 and result["sessions"][0]["ready"] == 2
 
     def test_result_includes_agent_agnostic_kickoff_prompt(self, client, tmp_path, monkeypatch):
         fake_run = _fake_run(tmp_path / "agent-home", rows=1)
@@ -292,6 +309,18 @@ class TestRolePrompt:
         prompt = client.get("/api/handoff/role-prompt/1").json()["prompt"]
         assert "resume" in prompt.lower()
         assert "Acme - resume.pdf" not in prompt
+
+    def test_easy_apply_flag_reaches_the_prompt(self, client, tmp_path, monkeypatch):
+        # parse_applications flags a row whose URL is in easy-apply-urls.txt; under
+        # submit-easy-apply the route passes that flag so the first line and the
+        # fallback row fit THIS role rather than stating both cases.
+        monkeypatch.setenv(handoff.SUBMIT_POLICY_ENV, "submit-easy-apply")
+        before = client.get("/api/handoff/role-prompt/1").json()["prompt"]
+        assert before.startswith("This is not a board-hosted") and '"status": "applied"' not in before
+        (tmp_path / "career-ops" / "data" / "easy-apply-urls.txt").write_text(
+            "https://www.linkedin.com/jobs/view/101\n", encoding="utf-8")
+        after = client.get("/api/handoff/role-prompt/1").json()["prompt"]
+        assert after.startswith("This is a board-hosted") and '"status": "applied"' in after
 
     def test_unknown_num_404(self, client):
         assert client.get("/api/handoff/role-prompt/999").status_code == 404

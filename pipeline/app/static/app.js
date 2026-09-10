@@ -804,14 +804,22 @@ async function pollHandoffBuild(jobId) {
     return;
   }
   // One paste-ready kickoff per site session — the agent works one site at a time.
+  // Two counts, because they are two kinds of work: `fresh` roles the agent has
+  // never touched, and `to finish` — forms it already filled and stopped before
+  // Submit, which come back at the top of every work-order until the person
+  // clicks Submit and records `applied`. One combined number would hide the
+  // half that is waiting on the person rather than on the agent.
+  const ready = r.total_ready || 0;
+  const readyPart = ready
+    ? ` + <b>${ready}</b> to finish` : "";
   handoffUi.result.innerHTML =
-    `<p><b>${r.total_fresh}</b> fresh role${r.total_fresh === 1 ? "" : "s"} across
+    `<p><b>${r.total_fresh}</b> fresh role${r.total_fresh === 1 ? "" : "s"}${readyPart} across
       <b>${sessions.length}</b> site session${sessions.length === 1 ? "" : "s"} —
       copy each into your browser agent:</p>` +
     sessions.map((s, i) =>
       `<div class="skill-choice">
          <button id="handoff-copy-kickoff-${i}">Copy ${escapeHtml(s.label)} kickoff</button>
-         <span class="hint"> ${s.fresh} role${s.fresh === 1 ? "" : "s"} → <code>${escapeHtml(s.work_order)}</code></span>
+         <span class="hint"> ${s.fresh} role${s.fresh === 1 ? "" : "s"}${s.ready ? ` + ${s.ready} to finish` : ""} → <code>${escapeHtml(s.work_order)}</code></span>
        </div>`).join("");
   sessions.forEach((s, i) =>
     wireCopy(`handoff-copy-kickoff-${i}`, s.kickoff,
@@ -915,9 +923,19 @@ function startSkill(skill) {
   const path = choosePath(skill);
   if (path === "none") {
     // Skill is unrunnable: say specifically what's missing for it.
+    // The CLI to name is whatever BATCH_CLI resolves to, with its own install
+    // line — /api/capabilities carries both from pipeline/agent_cli.py's
+    // registry. Naming a hard-coded one told a free-tier user to install the
+    // paid one, and to run an install command for a CLI the repo no longer
+    // defaults to.
+    const cli = CAPS.cli || {};
+    const named = cli.label || cli.name || "an agent CLI";
+    const how = cli.install_hint ? ` — install it: ${cli.install_hint}` : "";
+    const tier = cli.tier_note ? ` (${cli.tier_note})` : "";
     const need = skill.api
-      ? "Install an agent CLI (e.g. claude) or set an LLM API key (e.g. GEMINI_API_KEY)"
-      : "This skill needs an agent CLI (live browser / web search). Install one (e.g. claude) or set BATCH_CLI";
+      ? `Install ${named}${how} or set an LLM API key (e.g. GEMINI_API_KEY)`
+      : `This skill needs an agent CLI (live browser / web search): ${named}${how}${tier}, `
+        + "or point BATCH_CLI at one you have";
     showSkill(`Can't run “${skill.label}” yet. ${need}, then reload.`, "error");
     return;
   }
@@ -928,7 +946,7 @@ function startSkill(skill) {
       `<p>Run “${escapeHtml(skill.label)}” via:</p>
        <div class="skill-choice">
          <button data-path="api">⚡ API — ${escapeHtml(CAPS.api.provider || "provider")} (bounded, no install)</button>
-         <button data-path="cli">⌨ CLI — ${escapeHtml(CAPS.cli.name)} (interactive, uses your agent)</button>
+         <button data-path="cli">⌨ CLI — ${escapeHtml(CAPS.cli.label || CAPS.cli.name)} (interactive, uses your agent)</button>
        </div>`;
     skillPanel.querySelectorAll("button[data-path]").forEach((b) =>
       b.addEventListener("click", () => runSkill(skill, b.dataset.path)));

@@ -10,11 +10,17 @@ Run:
 or use the run-ui.sh / run-ui.ps1 launchers.
 """
 
+import base64
+import binascii
 import contextlib
 import datetime
+import functools
+import ipaddress
 import json
 import os
+import secrets
 import shutil
+import socket
 import threading
 import time
 import urllib.parse
@@ -27,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.app import data, gh, local_run, onboard, reset, self_update, skills
+from pipeline import agent_cli
 from pipeline import article_digest
 from pipeline import gemini_limits
 from pipeline._batch_common import (
@@ -180,16 +187,195 @@ def _is_loopback_origin(origin: str) -> bool:
         return False
 
 
+# ── LAN mode ─────────────────────────────────────────────────────────────────
+# `run-ui.sh --lan` / `run-ui.ps1 -Lan` bind uvicorn to 0.0.0.0 and set UI_LAN,
+# so a phone on the home network can reach the board. That reopens two doors
+# the loopback bind kept shut, and each gets its own rule:
+#  - anyone on the network can reach the port, so UI_PASSWORD is REQUIRED and
+#    checked on EVERY request (HTTP Basic, any username, constant-time
+#    compare). The shell wrappers refuse to start without it, and this module
+#    refuses to import without it — the wrappers cannot see .env; this module
+#    can, so it is the check that cannot be bypassed by exporting UI_LAN alone.
+#  - a browser on the network sends a non-loopback Origin, which the guard
+#    above refuses, so under UI_LAN an Origin whose host is one of THIS
+#    machine's names/addresses (UI_ALLOWED_HOSTS when set, else the hostname
+#    and its non-loopback IPv4s, computed ONCE at startup and printed — never a
+#    lookup at request time) is accepted, and the Host header must be in that
+#    set and agree with it. Without the Host half, a page at evil.example whose
+#    address the user typed into the browser would satisfy the Origin check.
+# Beyond that, a non-loopback peer may only change status (_LAN_MUTABLE — the
+# two routes that make the board usable from a phone): reset, template update,
+# skill runs and launches, the folder picker, onboarding, local config and
+# search, cloud and local runs, refresh, re-check, Add-Job, the work-order
+# build and the MCP registration stay loopback-only BY DEFAULT rather than by
+# enumeration, so a new POST route is LAN-refused until someone adds it here on
+# purpose (tests/test_app_server.py pins _LAN_MUTABLE ⊆ the registered POSTs).
+# Basic auth over plain HTTP is for a trusted home network: stop the server
+# before joining another one. Outside UI_LAN the guard is byte-for-byte the
+# loopback-only one above. All three names are read from os.environ at request
+# time (so tests monkeypatch them) and isolated in tests/conftest.py.
+# The peer rule rests on a DIRECT connection: `request.client.host` is the TCP
+# peer, and uvicorn honours X-Forwarded-For only from 127.0.0.1. So a reverse
+# proxy on this same machine (the natural way to put HTTPS in front of a LAN
+# run) makes every request look loopback and opens the loopback-only routes to
+# anyone with the password — such a proxy MUST forward the real client address
+# (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`).
+UI_LAN_ENV = "UI_LAN"
+UI_PASSWORD_ENV = "UI_PASSWORD"
+UI_ALLOWED_HOSTS_ENV = "UI_ALLOWED_HOSTS"
+LAN_ENV_VARS = (UI_LAN_ENV, UI_PASSWORD_ENV, UI_ALLOWED_HOSTS_ENV)
+_LAN_MUTABLE = frozenset({"/api/status", "/api/push-status"})
+_AUTH_CHALLENGE = 'Basic realm="job-search-pipeline"'
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _lan_enabled(env=None) -> bool:
+    env = os.environ if env is None else env
+    return (env.get(UI_LAN_ENV) or "").strip().lower() in _TRUTHY
+
+
+def _is_loopback_host(host: str) -> bool:
+    """`localhost`, any 127.0.0.0/8 (Debian's 127.0.1.1 included) or ::1."""
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _local_host_names() -> frozenset:
+    """This machine's hostname and non-loopback IPv4 addresses, lowercased.
+
+    Two sources, because either alone can come back empty: `getaddrinfo` on the
+    hostname (Debian resolves it to 127.0.1.1 only, which is dropped as
+    loopback) and the UDP-connect trick — `connect` on a datagram socket sends
+    nothing but makes the kernel pick the outbound interface, whose address
+    `getsockname` then reports. Cached: computed once per process, at startup
+    under UI_LAN, never per request."""
+    names: set[str] = set()
+    try:
+        hostname = socket.gethostname()
+        if hostname:
+            names.add(hostname.lower())
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                names.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("10.255.255.255", 1))
+            names.add(sock.getsockname()[0])
+    except OSError:
+        pass
+    return frozenset(n for n in names if n and not _is_loopback_host(n))
+
+
+def _allowed_hosts() -> frozenset:
+    """The non-loopback hosts a LAN request may name in Origin/Host:
+    UI_ALLOWED_HOSTS (comma-separated) when set, else this machine's own."""
+    raw = os.environ.get(UI_ALLOWED_HOSTS_ENV) or ""
+    listed = frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+    return listed or _local_host_names()
+
+
+def _host_port(netloc_or_url: str) -> tuple:
+    """(hostname, port) of an Origin URL or a bare Host header; (None, None)
+    when unparseable. Hostnames come back lowercased and un-bracketed."""
+    try:
+        parts = urllib.parse.urlsplit(netloc_or_url)
+        return parts.hostname, parts.port
+    except ValueError:
+        return None, None
+
+
+def _lan_origin_refusal(origin: str | None, host_header: str) -> str | None:
+    """Why a mutating LAN request is refused on its Origin/Host, or None."""
+    allowed = _allowed_hosts()
+    host, port = _host_port("//" + (host_header or ""))
+    if not host or not (_is_loopback_host(host) or host in allowed):
+        return (f"Host {host_header!r} is not this machine "
+                f"(accepted: loopback, {', '.join(sorted(allowed)) or 'none'}).")
+    if origin:
+        o_host, o_port = _host_port(origin)
+        if not o_host or not (_is_loopback_host(o_host) or o_host in allowed):
+            return "Cross-origin request refused (not this machine's address)."
+        if (o_host, o_port) != (host, port):
+            return "Origin does not agree with the Host header."
+    return None
+
+
+def _peer_is_loopback(request) -> bool:
+    """Whether the TCP peer is this machine. An unparseable or missing peer
+    address counts as remote — the rule fails closed."""
+    client = request.client
+    if client is None:
+        return False
+    try:
+        ip = ipaddress.ip_address(client.host)
+    except ValueError:
+        return client.host in _LOOPBACK_HOSTS
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _basic_auth_ok(request) -> bool:
+    """HTTP Basic against UI_PASSWORD (any username). An empty UI_PASSWORD
+    refuses everything: LAN mode without a password is not a mode."""
+    expected = (os.environ.get(UI_PASSWORD_ENV) or "").encode("utf-8")
+    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "basic" or not credential.strip():
+        return False
+    try:
+        decoded = base64.b64decode(credential.strip(), validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    _, _, password = decoded.partition(b":")
+    return bool(expected) and secrets.compare_digest(password, expected)
+
+
 @app.middleware("http")
 async def _same_origin_guard(request, call_next):
+    if not _lan_enabled():
+        if request.method in _MUTATING_METHODS:
+            origin = request.headers.get("origin")
+            if origin and not _is_loopback_origin(origin):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Cross-origin request refused (this UI is localhost-only)."},
+                )
+        return await call_next(request)
+    # LAN mode: password first (a 401 must not leak which routes exist), then
+    # the Origin/Host rule, then the peer rule for everything but the board.
+    if not _basic_auth_ok(request):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "This UI is on the LAN — sign in with UI_PASSWORD."},
+            headers={"WWW-Authenticate": _AUTH_CHALLENGE},
+        )
     if request.method in _MUTATING_METHODS:
-        origin = request.headers.get("origin")
-        if origin and not _is_loopback_origin(origin):
+        why = _lan_origin_refusal(request.headers.get("origin"), request.headers.get("host", ""))
+        if why:
+            return JSONResponse(status_code=403, content={"detail": why})
+        if request.url.path not in _LAN_MUTABLE and not _peer_is_loopback(request):
             return JSONResponse(
                 status_code=403,
-                content={"detail": "Cross-origin request refused (this UI is localhost-only)."},
+                content={"detail": (f"{request.url.path} is loopback-only: from the LAN this "
+                                    "UI can change a role's status and push it, nothing else.")},
             )
     return await call_next(request)
+
+
+if _lan_enabled():
+    if not (os.environ.get(UI_PASSWORD_ENV) or ""):
+        raise SystemExit(
+            f"{UI_LAN_ENV} is set but {UI_PASSWORD_ENV} is empty. LAN mode puts the "
+            "UI on every interface, so it refuses to start without a password: set "
+            f"{UI_PASSWORD_ENV} in .env (or export it) and start again."
+        )
+    print(f"[ui] LAN mode: Basic auth on every request; accepted hosts: "
+          f"{', '.join(sorted(_allowed_hosts())) or '(none — set ' + UI_ALLOWED_HOSTS_ENV + ')'}"
+          f" plus loopback; from the LAN only {', '.join(sorted(_LAN_MUTABLE))} may change state.")
 
 
 @app.get("/api/jobs")
@@ -787,7 +973,9 @@ def run_skill(req: SkillRequest) -> JSONResponse:
             "ok": True, "path": "cli",
             "command": skills.skill_command(req.skill, report_file, company, title),
             "cwd": "career-ops",
-            "prereqs": spec.get("prereqs", []),
+            # Through skill_prereqs, not spec["prereqs"]: the Playwright-MCP
+            # note is expanded for the CLI resolved on THIS request.
+            "prereqs": skills.skill_prereqs(req.skill),
         })
 
     if req.path == "api":
@@ -903,10 +1091,25 @@ def onboard_status() -> JSONResponse:
     required_present = [s for s in onboard.REQUIRED_SECRETS if s in present]
     has_provider = any(v in present for v in onboard.PROVIDER_SECRETS.values())
     ready = len(required_present) == len(onboard.REQUIRED_SECRETS) and has_provider
+    # Repository VARIABLES are readable (unlike secrets), so edit mode can
+    # prefill the digest thresholds, the free-tier flag and the weekly-update
+    # box with what the cloud actually runs on. Optional: a copy whose gh can
+    # list secrets but not variables still gets a status, with none.
+    try:
+        variables = gh.list_variables()
+    except gh.GhError as e:
+        print(f"[onboard] could not list repository variables (ignored): {e}")
+        variables = {}
     return JSONResponse({
         "repo": repo,
         "visibility": visibility,
         "secrets_present": sorted(present),
+        # The digest's delivery channels, by the secrets the sender reads:
+        # Discord needs the webhook; email needs an address AND a host (the
+        # port, user and password have defaults or are optional).
+        "has_digest_discord": onboard.DIGEST_DISCORD_SECRET in present,
+        "has_digest_email": all(n in present for n in onboard.DIGEST_EMAIL_REQUIRED),
+        "variables": variables,
         # Whether an LLM key is already on the repo, which is what makes the
         # wizard's API-key field optional. Edit mode used to imply it — you only
         # got there by having submitted a key — but edit mode is now entered by
@@ -995,7 +1198,9 @@ async def onboard_parse_resume(resume: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(onboard.parse_resume_info(text))
 
 
-_KNOWN_CLIS = ["claude", "gemini", "opencode", "qwen"]
+# The registry owns the vocabulary (and its default); this is a view of it, so
+# the save endpoint can't accept a CLI a run wouldn't resolve.
+_KNOWN_CLIS = list(agent_cli.AGENT_CLIS)
 _KNOWN_PROVIDERS = set(onboard.PROVIDER_SECRETS) | {"ollama"}
 
 
@@ -1018,17 +1223,37 @@ def get_providers() -> JSONResponse:
         "key_var": "OLLAMA_BASE_URL",
         "default_model": PROVIDER_DEFAULTS.get("ollama", "qwen2.5:32b"),
     })
+    # The registry's view of every agent CLI. `name`/`available` are the
+    # fields onboard.js read first; the rest let the wizard render the tier
+    # (free/paid), the tier note verbatim, the install line and which one is
+    # the default without a second copy of any of it in the markup.
     cli_tools = [
-        {"name": name, "available": shutil.which(name) is not None}
-        for name in _KNOWN_CLIS
+        {
+            "name": c.id, "available": agent_cli.cli_available(c),
+            "id": c.id, "label": c.label, "tier": c.tier, "tier_note": c.tier_note,
+            "install_hint": c.install_hint, "installed": agent_cli.cli_available(c),
+            "default": c.id == agent_cli.DEFAULT_CLI,
+        }
+        for c in agent_cli.AGENT_CLIS.values()
     ]
     return JSONResponse({
         "api_providers": api_providers,
         "cli_tools": cli_tools,
+        # The submit policies in display order with their glosses, so the
+        # wizard's select restates handoff.SUBMIT_POLICIES rather than a copy.
+        "submit_policies": [
+            {"id": pid, "gloss": gloss, "default": pid == handoff.DEFAULT_SUBMIT_POLICY}
+            for pid, gloss in handoff.SUBMIT_POLICIES.items()
+        ],
+        # What a blank BATCH_MODEL resolves to on Gemini's free tier — computed
+        # from the limits table (never a baked string), the same call
+        # onboard_submit writes to the cloud when the model is left blank.
+        "free_tier_recommendation": gemini_limits.batch_recommendation() or "",
         "current": {
             "batch_provider": os.environ.get("BATCH_PROVIDER", ""),
             "batch_model": os.environ.get("BATCH_MODEL", ""),
-            "batch_cli": os.environ.get("BATCH_CLI", "claude"),
+            "batch_cli": agent_cli.resolve_cli().id,
+            "handoff_submit_policy": handoff.submit_policy(),
             "gemini_free_tier": gemini_limits.conforming_enabled(),
             # The effective limits (baked table + this user's overrides), so the
             # wizard's hint quotes real numbers instead of a fourth hand-copy of
@@ -1050,7 +1275,11 @@ class LocalConfigRequest(BaseModel):
     batch_model: str = ""
     batch_cli: str = ""
     api_key: str = ""   # optional — write the provider's API key to .env too
-    gemini_free_tier: bool = False   # conform eval/tailoring to Gemini free-tier limits
+    # Conform eval/tailoring to Gemini free-tier limits. None (absent) leaves
+    # GEMINI_FREE_TIER as it is: the checkbox lives on the wizard's Provider
+    # step now, and the Local step's Save — which never mentions it — must not
+    # unset what that step wrote.
+    gemini_free_tier: bool | None = None
     # The user's own AI Studio numbers: {model_id: {rpm, tpm, rpd}}, or a model
     # mapped to null to clear it. None (absent) leaves the file untouched — an
     # omitted field must not wipe limits saved by an earlier visit to the wizard.
@@ -1058,12 +1287,28 @@ class LocalConfigRequest(BaseModel):
     # Resume tailoring can use a different (usually stronger) model — and even a
     # different provider — than bulk evaluation. Blank tailor_* = inherit the eval
     # model/provider. tailor_api_key (optional) is the tailor provider's key.
-    tailor_provider: str = ""
-    tailor_model: str = ""
+    #
+    # None (absent) leaves the key alone, the same rule as gemini_free_tier above
+    # and for the same reason: TWO screens post here. The Provider step posts on
+    # the way past with only its own fields, and a blank string means "unset", so
+    # a `str = ""` default made walking forward through the wizard wipe a
+    # cross-provider tailoring model and a handoff folder the user had set on the
+    # Local step. Only the screen that SHOWS a field may clear it, and it clears
+    # it by sending "".
+    tailor_provider: str | None = None
+    tailor_model: str | None = None
     tailor_api_key: str = ""
     # Where the browser-agent work-orders land (blank = output/handoff default).
     # Point it at a folder your agent can reach; setting it creates + seeds the dir.
-    handoff_out_dir: str = ""
+    handoff_out_dir: str | None = None
+    # What the browser agent does at the Submit button: a handoff.SUBMIT_POLICIES
+    # id (aliases accepted, the canonical id is written); blank unsets the key,
+    # which is the default policy. None (absent) leaves it alone, the same rule
+    # as the fields above and for the same reason — the Local step is the only
+    # screen that shows this select, so no other post may clear it, and the
+    # Provider step used to carry it through from a select that is still empty
+    # until /api/onboard/providers lands.
+    handoff_submit_policy: str | None = None
 
 
 def _validate_provider(name: str, label: str) -> str:
@@ -1092,7 +1337,22 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
             status_code=400,
             detail=f"Unknown CLI {cli!r}. Valid: {', '.join(_KNOWN_CLIS)}",
         )
-    tailor_provider = _validate_provider(req.tailor_provider, "tailoring provider")
+    tailor_provider = (None if req.tailor_provider is None
+                       else _validate_provider(req.tailor_provider, "tailoring provider"))
+    submit_policy = (None if req.handoff_submit_policy is None
+                     else req.handoff_submit_policy.strip())
+    if submit_policy:
+        # canonical_policy accepts the aliases the env reader accepts and hands
+        # back the id the env reader would resolve, so what .env carries is
+        # always a rendered spelling.
+        canonical = handoff.canonical_policy(submit_policy)
+        if canonical is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Unknown submit policy {submit_policy!r}. "
+                        f"Valid: {', '.join(handoff.SUBMIT_POLICIES)}"),
+            )
+        submit_policy = canonical
 
     # A key can only be written under its provider's env var — with the select
     # on "auto-detect" (blank) there is nowhere to put it, and silently
@@ -1135,7 +1395,9 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     if api_key and provider and provider in onboard.PROVIDER_SECRETS:
         _set(onboard.PROVIDER_SECRETS[provider], api_key)
     # Opt into Gemini free-tier conforming (RPM + TPM pacing, RPD capping).
-    _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
+    # None = the request did not mention it; leave the key alone.
+    if req.gemini_free_tier is not None:
+        _set("GEMINI_FREE_TIER", "true" if req.gemini_free_tier else "")
 
     # The user's own rate limits. These go to a JSON file rather than .env: the
     # shape is a per-model table, and flattening it into env vars would need one
@@ -1154,17 +1416,28 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
 
     # Tailoring model/provider (blank = inherit the eval model/provider). Write the
     # tailor provider's API key too when given, so a cross-provider tailor (e.g.
-    # evaluate on Gemini, tailor on Anthropic) can authenticate.
-    _set("TAILOR_PROVIDER", tailor_provider)
-    _set("TAILOR_MODEL", req.tailor_model.strip())
+    # evaluate on Gemini, tailor on Anthropic) can authenticate. An ABSENT field
+    # (None) is left alone — see LocalConfigRequest for why the two posting
+    # screens need that distinction.
+    if tailor_provider is not None:
+        _set("TAILOR_PROVIDER", tailor_provider)
+    if req.tailor_model is not None:
+        _set("TAILOR_MODEL", req.tailor_model.strip())
     tailor_key = req.tailor_api_key.strip()
     if tailor_key and tailor_provider and tailor_provider in onboard.PROVIDER_SECRETS:
         _set(onboard.PROVIDER_SECRETS[tailor_provider], tailor_key)
 
     # Where the browser-agent work-orders land. Setting it creates + seeds the dir
-    # (the agent README); blank clears it so run() falls back to output/handoff.
-    handoff_dir = req.handoff_out_dir.strip()
-    _set("HANDOFF_OUT_DIR", handoff_dir)
+    # (the agent README); blank clears it so run() falls back to output/handoff;
+    # absent leaves whatever is configured.
+    handoff_dir = "" if req.handoff_out_dir is None else req.handoff_out_dir.strip()
+    if req.handoff_out_dir is not None:
+        _set("HANDOFF_OUT_DIR", handoff_dir)
+    # The submit policy is written BEFORE the folder is seeded: bootstrap
+    # rewrites HANDOFF-README.md from the active policy on every call, so the
+    # README a Save leaves behind states the policy that Save chose.
+    if submit_policy is not None:
+        _set(handoff.SUBMIT_POLICY_ENV, submit_policy)
     seed_warning = ""
     if handoff_dir:
         try:
@@ -1194,6 +1467,36 @@ def pick_folder() -> JSONResponse:
     return JSONResponse({"path": path})
 
 
+class AgentCliRegisterRequest(BaseModel):
+    cli: str = ""   # a registry id; blank = the CLI BATCH_CLI resolves to
+
+
+@app.post("/api/agent-cli/register")
+def agent_cli_register(req: AgentCliRegisterRequest) -> JSONResponse:
+    """Register the Playwright MCP server (the browser bridge) with one agent
+    CLI — the wizard's "Register browser bridge" button. The registry does the
+    work (an `mcp add` or a config merge, per CLI) and never raises for a
+    missing binary: the install hint comes back as the message instead, so the
+    button is safe to press before the CLI is installed. Mutating, so the
+    loopback/same-origin guard covers it like every other state-changing route
+    — it runs a subprocess or writes under the user's home."""
+    cli_id = req.cli.strip().lower()
+    if not cli_id:
+        cli = agent_cli.resolve_cli()
+    elif cli_id in agent_cli.AGENT_CLIS:
+        cli = agent_cli.AGENT_CLIS[cli_id]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown CLI {req.cli!r}. Valid: {', '.join(agent_cli.AGENT_CLIS)}",
+        )
+    message = agent_cli.register_playwright_mcp(cli)
+    return JSONResponse({
+        "ok": True, "cli": cli.id, "label": cli.label,
+        "installed": agent_cli.cli_available(cli), "message": message,
+    })
+
+
 def _maybe_generate_article_digest(payload: dict, resume_text: str,
                                    provider: str, api_key: str) -> None:
     """Best-effort: draft career-ops/article-digest.md (the proof-points corpus
@@ -1218,6 +1521,62 @@ def _maybe_generate_article_digest(payload: dict, resume_text: str,
     except Exception as e:
         # best-effort — onboarding succeeds regardless; log so it's not invisible.
         print(f"[onboard] article-digest generation errored (ignored): {e}")
+
+
+# Wizard fields → repository VARIABLES (readable config, not secrets). The
+# digest's thresholds carry their defaults in daily_digest.SETTING_VARS, which
+# the workflow falls back to, so a blank field writes nothing and the cloud
+# keeps that default. `auto_update_weekly` is the "Keep my copy updated weekly"
+# box: update-from-template.yml's schedule proceeds only when the variable is
+# exactly "true", so unchecking it in edit mode has to write something other
+# than "true" — "false" — rather than leave the earlier "true" standing.
+_DIGEST_VARIABLE_FIELDS = {
+    "digest_min_score": "DIGEST_MIN_SCORE",
+    "digest_limit": "DIGEST_LIMIT",
+}
+AUTO_UPDATE_VARIABLE = "AUTO_UPDATE_FROM_TEMPLATE"
+
+
+def _flag(payload: dict, field: str) -> bool | None:
+    """A wizard checkbox: "yes"/"no" (how onboard.js serialises them), a bool,
+    or None when the payload never mentioned it."""
+    if field not in payload:
+        return None
+    v = payload.get(field)
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in _TRUTHY
+
+
+def _write_digest_variables(payload: dict) -> None:
+    for field, name in _DIGEST_VARIABLE_FIELDS.items():
+        value = str(payload.get(field) or "").strip()
+        if value:
+            gh.set_variable(name, value)
+    weekly = _flag(payload, "auto_update_weekly")
+    if weekly is not None:
+        gh.set_variable(AUTO_UPDATE_VARIABLE, "true" if weekly else "false")
+
+
+def _write_gemini_free_tier_variables(payload: dict) -> None:
+    """GEMINI_FREE_TIER ("true" | "") and, when the wizard's RPM/TPM/RPD boxes
+    carry a number, GEMINI_LIMITS_JSON — the daily's "Write Gemini limits" step
+    hands that JSON to gemini_limits verbatim, and a malformed value degrades
+    to the built-in table by that module's own rule. The same values reach .env
+    and config/gemini-limits.json through save_local_config (the wizard posts
+    both), so local runs and the cloud agree on the tier they conform to."""
+    free_tier = _flag(payload, "gemini_free_tier")
+    if free_tier is not None:
+        gh.set_variable("GEMINI_FREE_TIER", "true" if free_tier else "")
+    limits = payload.get("gemini_limits")
+    if isinstance(limits, dict):
+        rows = {
+            str(model): {k: v for k, v in row.items() if v not in (None, "")}
+            for model, row in limits.items() if isinstance(row, dict)
+        }
+        rows = {m: r for m, r in rows.items() if r}
+        if rows:
+            gh.set_variable("GEMINI_LIMITS_JSON", json.dumps(rows))
 
 
 @app.post("/api/onboard")
@@ -1351,8 +1710,39 @@ async def onboard_submit(
             written.append(secret)
             gh.set_variable("BATCH_PROVIDER", provider)
             model = (payload.get("batch_model") or "").strip()
+            if not model and provider == "gemini":
+                # A blank model on Gemini means the free tier's best row, not
+                # the provider default: PROVIDER_DEFAULTS["gemini"] is a
+                # ~20-requests-a-day model on a free key, and a 180-role daily
+                # would exhaust it before breakfast. Computed from the limits
+                # table (the user's own numbers win), never a baked string.
+                model = gemini_limits.batch_recommendation() or ""
             if model:
                 gh.set_variable("BATCH_MODEL", model)
+        # The free-tier answer is NOT gated on the key, and that asymmetry is
+        # the point. BATCH_PROVIDER/BATCH_MODEL say which provider the cloud
+        # calls and with what, so a blank key — "keep the saved one" — must not
+        # re-point them (`has_provider` is true for ANY provider secret, so the
+        # select can read `gemini` on a copy whose cloud runs on something
+        # else). GEMINI_FREE_TIER only decides whether Gemini calls are paced
+        # and capped, and is inert on every other provider. Edit mode is the
+        # normal path once a secret is on the repo: leaving it inside the key
+        # block meant the default-CHECKED box wrote nothing on almost every
+        # real Save, and the cloud daily then ran a free key unpaced into the
+        # 429 the box exists to prevent, while the wizard reported success.
+        if provider == "gemini":
+            _write_gemini_free_tier_variables(payload)
+        # Delivery secrets for the daily digest: each non-blank value is written
+        # under the name the sender reads; blank keeps the existing secret, the
+        # same rule as the API key (edit mode must not need the webhook pasted
+        # again). Iterated from the table, so a secret the digest grows reaches
+        # the wizard by adding a form field, not a branch here.
+        for field, secret_name in onboard.DIGEST_FORM_SECRETS.items():
+            value = str(payload.get(field) or "").strip()
+            if value:
+                gh.set_secret(secret_name, value)
+                written.append(secret_name)
+        _write_digest_variables(payload)
     except gh.GhError as e:
         raise HTTPException(
             status_code=502,
@@ -1639,6 +2029,9 @@ def _run_handoff_build(job_id: str, board: str, limit: int | None, tailor: bool)
         _finish_handoff(job_id, status="done", result={
             "sessions": sessions,
             "total_fresh": sum(s["fresh"] for s in sessions),
+            # Rows re-emitted ready-to-submit — forms waiting on the person's
+            # click, not on the agent — counted apart from the fresh ones.
+            "total_ready": sum(s["ready"] for s in sessions),
         })
     except Exception as exc:  # surface, never wedge the slot in "running"
         _finish_handoff(job_id, status="failed", error=str(exc))
@@ -1716,6 +2109,7 @@ def handoff_role_prompt(num: str) -> JSONResponse:
         company, row.get("role", ""), url,
         report=report,
         resume=find_existing(career_ops, company),
+        easy_apply=row.get("easy_apply"),   # so submit-easy-apply's first line/fallback fit THIS row
     )
     return JSONResponse({"company": company, "role": row.get("role", ""), "prompt": prompt})
 

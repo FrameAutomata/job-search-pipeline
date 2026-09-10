@@ -191,7 +191,7 @@
           <label class="chk"><input type="checkbox" name="sites" value="linkedin" checked /> LinkedIn</label>
         </fieldset>
         <label class="chk">
-          <input type="checkbox" name="include_easy_apply" /> Add an "Easy Apply" pass (runs every 4h in the cloud)
+          <input type="checkbox" name="include_easy_apply" /> Add an "Easy Apply" pass (runs in the same once-a-day cloud run as every other pass)
         </label>
       </section>
 
@@ -237,8 +237,100 @@
             <input name="batch_model" placeholder="leave blank for provider default" />
           </label>
         </div>
+        <p class="hint" id="cloud-model-hint" hidden></p>
         <label>API key
           <input name="api_key" type="password" placeholder="paste your key" autocomplete="off" />
+        </label>
+
+        <!-- Gemini only (onboard.js shows it for that provider). Checked by
+             default: a free key that is not paced 429s on its first busy run.
+             Submitting writes GEMINI_FREE_TIER (and GEMINI_LIMITS_JSON when a
+             box is filled) as repository variables AND the same values to .env /
+             config/gemini-limits.json, so local runs and the cloud agree. -->
+        <div id="gemini-free-tier-row" hidden>
+          <label class="chk" style="margin-top:10px">
+            <input type="checkbox" name="gemini_free_tier" id="gemini-free-tier" checked />
+            I'm on Gemini's free tier — pace requests and cap each run to the daily limit
+          </label>
+          <p class="hint" id="gemini-free-tier-hint">When on, evaluation and résumé tailoring stay
+            within the model's RPM, TPM and RPD; work past the daily cap defers to the next run.
+            On a low-TPM model (the Gemma rows) the token budget, not the request rate, is what
+            sets the pace — so runs are slower than the RPM suggests.</p>
+
+          <div id="gemini-limits-box" style="margin-top:8px">
+            <p class="hint" id="gemini-limits-status"></p>
+            <p class="hint">Google changes these, and they differ per tier — so the built-in
+              numbers are only a fallback. Read your project's real values at
+              <a href="https://aistudio.google.com/rate-limit" target="_blank"
+                 rel="noopener">aistudio.google.com/rate-limit</a> and enter them here; they
+              override the built-in table for this model, locally and in the cloud. Worth
+              copying TPM too: on a low-TPM model it is the limit that actually paces a run,
+              and a blank box leaves the built-in number in charge.</p>
+            <span style="display:flex; gap:6px; align-items:flex-end; flex-wrap:wrap">
+              <label style="flex:1; min-width:90px">RPM
+                <input id="gemini-rpm" type="number" min="1" step="1" placeholder="e.g. 15" />
+              </label>
+              <label style="flex:1; min-width:90px">TPM <span class="muted">(blank = keep built-in)</span>
+                <input id="gemini-tpm" type="number" min="1" step="1" placeholder="e.g. 250000" />
+              </label>
+              <label style="flex:1; min-width:90px">RPD
+                <input id="gemini-rpd" type="number" min="1" step="1" placeholder="e.g. 1000" />
+              </label>
+            </span>
+            <p class="hint">Leave all three blank to keep using the built-in numbers.</p>
+          </div>
+        </div>
+
+        <!-- Daily digest: delivery goes to repository SECRETS, the thresholds to
+             repository VARIABLES. Field names mirror the digest's own secret names
+             (onboard.DIGEST_FORM_SECRETS — a test keeps them equal); a blank
+             field keeps whatever the repo already holds. -->
+        <fieldset class="workauth" id="digest-block">
+          <legend>Daily digest <span class="muted">(optional — after every cloud run, the roles worth your attention)</span></legend>
+          <p class="hint">One message per day naming the roles that scored at or above the minimum,
+            with the evaluator's verdict, the posting link and the reports attached; a one-line
+            notice when the run failed. Either channel is enough.</p>
+          <p class="hint" id="digest-status" hidden></p>
+          <label>Discord webhook URL
+            <input name="digest_discord_webhook" type="password" autocomplete="off"
+              placeholder="https://discord.com/api/webhooks/… (blank = keep the saved one)" />
+          </label>
+          <p class="hint">Discord: <strong>Server Settings → Integrations → Webhooks → New Webhook →
+            Copy Webhook URL</strong> — about two minutes, on any server you own (a private one is fine).</p>
+          <details id="digest-email">
+            <summary>Email instead / also</summary>
+            <p class="hint">Sent over STARTTLS. <strong>Gmail needs an App Password with 2-step
+              verification on</strong> (Google Account → Security → App passwords); paste that
+              password here, not your account password.</p>
+            <div class="grid2">
+              <label>Send to<input name="digest_email_to" type="email" placeholder="you@example.com" /></label>
+              <label>SMTP host<input name="digest_smtp_host" placeholder="smtp.gmail.com" /></label>
+              <label>SMTP port<input name="digest_smtp_port" type="number" min="1" placeholder="587" /></label>
+              <label>SMTP user<input name="digest_smtp_user" placeholder="you@gmail.com" /></label>
+            </div>
+            <label>SMTP password
+              <input name="digest_smtp_pass" type="password" autocomplete="new-password"
+                placeholder="an app password (blank = keep the saved one)" />
+            </label>
+          </details>
+          <div class="grid2" style="margin-top:8px">
+            <label>Minimum score to include <span class="muted">(blank = the default)</span>
+              <input name="digest_min_score" type="number" min="0" max="5" step="0.1" />
+            </label>
+            <label>Roles per digest <span class="muted">(blank = the default)</span>
+              <input name="digest_limit" type="number" min="1" step="1" />
+            </label>
+          </div>
+        </fieldset>
+
+        <!-- Sets the AUTO_UPDATE_FROM_TEMPLATE repository variable, which is what
+             update-from-template.yml's Monday schedule checks. -->
+        <label class="chk" style="margin-top:10px">
+          <input type="checkbox" name="auto_update_weekly" checked />
+          Keep my copy updated weekly (merge the template's improvements every Monday
+          — the merged code, workflows included, then runs in your next daily with
+          your API keys and digest secrets, so leave this off if you would rather
+          read each update first)
         </label>
       </section>
 
@@ -284,49 +376,35 @@
         </label>
         <p class="hint">Résumé tailoring is low-volume, so it can use a stronger (or different-provider) model than bulk evaluation — quality matters more than cost there. Blank = use the evaluation model/provider.</p>
 
-        <label style="margin-top:8px">Interactive CLI <span class="muted">(for --batch and career skills)</span>
+        <!-- The agent CLI that applies for you and runs --batch. The options
+             are relabelled from /api/onboard/providers (label, tier,
+             installed?); the static list below is the fallback and mirrors
+             pipeline/agent_cli.py's registry — a test keeps them equal. -->
+        <label style="margin-top:8px">Agent CLI <span class="muted">(applies for you, runs --batch and career skills — free options first)</span>
           <select id="local-cli-select">
-            <option value="claude">claude</option>
-            <option value="gemini">gemini</option>
-            <option value="opencode">opencode</option>
-            <option value="qwen">qwen</option>
+            <option value="opencode">OpenCode — free</option>
+            <option value="agy">Antigravity CLI — free</option>
+            <option value="gemini">Gemini CLI — free</option>
+            <option value="claude">Claude Code — paid</option>
+            <option value="qwen">Qwen Code — paid</option>
           </select>
         </label>
         <p id="local-cli-hint" class="hint"></p>
+        <span style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          <button type="button" id="register-bridge-btn">Register browser bridge</button>
+          <span class="hint" id="register-bridge-msg">Connects the Playwright browser to this CLI (once per CLI); needs the CLI installed.</span>
+        </span>
 
-        <div id="gemini-free-tier-row" hidden>
-          <label class="check" style="margin-top:10px">
-            <input type="checkbox" id="gemini-free-tier" />
-            I'm on Gemini's free tier — pace requests and cap each run to the daily limit
-          </label>
-          <p class="hint" id="gemini-free-tier-hint">When on, evaluation and résumé tailoring stay
-            within the model's RPM, TPM and RPD; work past the daily cap defers to the next run.
-            On a low-TPM model (the Gemma rows) the token budget, not the request rate, is what
-            sets the pace — so runs are slower than the RPM suggests.</p>
-
-          <div id="gemini-limits-box" style="margin-top:8px">
-            <p class="hint" id="gemini-limits-status"></p>
-            <p class="hint">Google changes these, and they differ per tier — so the built-in
-              numbers are only a fallback. Read your project's real values at
-              <a href="https://aistudio.google.com/rate-limit" target="_blank"
-                 rel="noopener">aistudio.google.com/rate-limit</a> and enter them here; they
-              override the built-in table for this model. Worth copying TPM too: on a
-              low-TPM model it is the limit that actually paces a run, and a blank box
-              leaves the built-in number in charge.</p>
-            <span style="display:flex; gap:6px; align-items:flex-end; flex-wrap:wrap">
-              <label style="flex:1; min-width:90px">RPM
-                <input id="gemini-rpm" type="number" min="1" step="1" placeholder="e.g. 15" />
-              </label>
-              <label style="flex:1; min-width:90px">TPM <span class="muted">(blank = keep built-in)</span>
-                <input id="gemini-tpm" type="number" min="1" step="1" placeholder="e.g. 250000" />
-              </label>
-              <label style="flex:1; min-width:90px">RPD
-                <input id="gemini-rpd" type="number" min="1" step="1" placeholder="e.g. 1000" />
-              </label>
-            </span>
-            <p class="hint">Leave all three blank to keep using the built-in numbers.</p>
-          </div>
-        </div>
+        <!-- Option values are handoff.SUBMIT_POLICIES' ids (a test keeps them
+             equal); the glosses shown under the select come from the server. -->
+        <label style="margin-top:10px">At the Submit button, your agent should…
+          <select id="local-submit-policy">
+            <option value="stop-before-submit">Stop before Submit — you click it (default)</option>
+            <option value="submit-easy-apply">Submit Easy Apply / Indeed Apply only; stop before the rest</option>
+            <option value="submit-all">Submit everything it prepares</option>
+          </select>
+        </label>
+        <p id="local-submit-policy-hint" class="hint"></p>
 
         <label style="margin-top:10px">Browser-agent handoff folder <span class="muted">(optional)</span>
           <span style="display:flex; gap:6px; align-items:stretch">

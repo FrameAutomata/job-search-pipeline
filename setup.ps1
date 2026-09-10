@@ -47,16 +47,16 @@ try { npx --yes playwright install chromium }
 catch { Write-Host "    Playwright Chromium install failed: $($_.Exception.Message). Re-run later from career-ops/." -ForegroundColor Yellow }
 Pop-Location
 
-Write-Host "==> Registering the Playwright MCP server with Claude Code (for the apply skill)"
-if (Get-Command claude -ErrorAction SilentlyContinue) {
-    # `claude mcp add` errors if the server is already registered. That's a
-    # benign re-run — log and continue rather than aborting the whole setup.
-    try { claude mcp add playwright -- npx -y "@playwright/mcp@latest" }
-    catch { Write-Host "    Playwright MCP already registered (or claude mcp add failed): $($_.Exception.Message). Continuing." -ForegroundColor Yellow }
-} else {
-    Write-Host "    'claude' CLI not found on PATH — skipping. Install Claude Code, then run:" -ForegroundColor Yellow
-    Write-Host '      claude mcp add playwright -- npx -y @playwright/mcp@latest' -ForegroundColor Yellow
-}
+Write-Host "==> Registering the Playwright MCP server with every installed agent CLI (for the apply skill)"
+# The registry in pipeline/agent_cli.py knows each CLI's registration (an
+# `mcp add` for Gemini CLI / Qwen Code / Claude Code, a JSON config merge for
+# OpenCode), treats a "server already registered" error as the benign re-run
+# it is, and prints the free-first install hints itself when nothing is
+# installed. It always exits 0, so a missing CLI never aborts setup.
+Push-Location $root
+try { & "$root\.venv\Scripts\python.exe" -m pipeline.agent_cli --register-mcp-all-installed }
+catch { Write-Host "    Playwright MCP registration skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
+Pop-Location
 
 # Tailored resumes (--apply): python-docx comes from requirements.txt; the
 # one-page verification additionally uses LibreOffice when present.

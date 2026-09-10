@@ -345,6 +345,30 @@ def mark_easy_apply(combined: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
+def mark_remote_only(combined: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the per-pass `remote_pass` tag to a per-URL AND, as `remote_only`.
+
+    The mirror image of mark_easy_apply, for the opposite reason: a job returned
+    by a remote pass (True) AND by a non-remote local pass (False) was found by
+    a search the user aimed at their own city, so it is NOT remote-only — the
+    remote-consistency guard (pipeline.remote_signal) must not drop it as a
+    far-away leak. Only a URL that EVERY returning pass flagged remote is, so
+    the flag is a min across the rows sharing a job_url, taken before dedup
+    decides which duplicate survives. The per-pass tag is replaced by the
+    combined column; a frame with no tag at all (no pass ran) is all False."""
+    if "remote_pass" not in combined.columns:
+        combined["remote_only"] = False
+        return combined
+    flag = combined["remote_pass"].fillna(False).astype(bool)
+    # Same NaN-keyed-group caveat as mark_easy_apply: transform drops those rows,
+    # so they come back NaN and must be filled to keep the column bool. `where`
+    # rather than fillna, which pandas now warns about when it has to downcast
+    # the object column the NaN made.
+    combined_flag = flag.groupby(combined["job_url"]).transform("min")
+    combined["remote_only"] = combined_flag.where(combined_flag.notna(), False).astype(bool)
+    return combined.drop(columns=["remote_pass"])
+
+
 def _no_results(reason: str) -> Path:
     """Report `reason`, truncate jobs.csv, and hand back its path.
 
@@ -400,6 +424,8 @@ def run(
         optional = {k: cfg[k] for k in OPTIONAL_PARAMS if cfg.get(k) is not None}
 
         pass_easy_apply = cfg.get("easy_apply") is True
+        # Post-normalize_pass, so `is_remote: "true"` tags the same as `true`.
+        pass_remote = cfg.get("is_remote") is True
         for term in cfg["search_terms"]:
             print(f"[scrape] [{name}] searching: {term!r}")
             df = scrape_jobs(
@@ -411,6 +437,9 @@ def run(
             # Tag every row with the pass's easy_apply flag so it survives the
             # cross-pass merge; mark_easy_apply ORs it per URL below.
             df["easy_apply"] = pass_easy_apply
+            # And with whether this was a remote pass; mark_remote_only ANDs it
+            # per URL so a row a local pass also found is not remote-only.
+            df["remote_pass"] = pass_remote
             all_rows.append(df)
 
     combined = pd.concat(all_rows, ignore_index=True) if all_rows else None
@@ -428,6 +457,7 @@ def run(
         return _no_results("no jobs returned")
 
     combined = mark_easy_apply(combined)
+    combined = mark_remote_only(combined)
     before = len(combined)
     combined = combined.drop_duplicates(subset=["job_url"])
     print(f"[scrape] {before} rows -> {len(combined)} after dedup")

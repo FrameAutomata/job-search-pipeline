@@ -851,13 +851,17 @@ class TestRunEligibility:
     def test_run_excludes_negative_location_keeps_remote(
         self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
     ):
-        """Non-remote overseas job dropped; remote job in the same place survives."""
+        """Non-remote overseas job dropped; remote job in the same place survives.
+
+        The remote row's JD says so ("fully remote"): since the remote-consistency
+        guard (TestRemoteConsistencyGuard) a flagged-remote row whose JD never
+        mentions remote work is treated as on-site and meets this very check."""
         jobs_path, output_path = patch_filter_paths
         jobs_path.parent.mkdir(parents=True, exist_ok=True)
         csv_content = (
             "id,job_url,title,company,location,date_posted,description,skills,is_remote\n"
             '1,https://intl.com,engineer,a,"Bratislava, Slovakia",2026-05-12,stuff,,""\n'
-            '2,https://remote.com,engineer,b,"Bratislava, Slovakia",2026-05-12,stuff,,"true"\n'
+            '2,https://remote.com,engineer,b,"Bratislava, Slovakia",2026-05-12,fully remote stuff,,"true"\n'
             '3,https://us.com,engineer,c,"Dallas, TX",2026-05-12,stuff,,""\n'
         )
         jobs_path.write_text(csv_content)
@@ -949,3 +953,158 @@ class TestUnmatchableTargetTitles:
     def test_compounds_and_coordinator_are_not_grouped(self, capsys):
         assert filter_mod._warn_unmatchable_titles(["ui/ux designer", "patient care coordinator"]) == []
         assert capsys.readouterr().out == ""
+
+
+class TestRemoteConsistencyGuard:
+    """Integration: the remote-consistency guard (pipeline.remote_signal) wired
+    through filter.run(). A row flagged remote whose JD never mentions remote
+    work is treated as on-site; one a remote pass alone returned is dropped
+    unless it is local to a non-remote pass."""
+
+    HEADER = ("id,job_url,title,company,location,date_posted,description,skills,"
+              "is_remote,remote_only\n")
+    ONSITE_JD = '"Patient Access Rep. On-site at the hospital, day shift."'
+    REMOTE_JD = '"Patient Access Rep. This position is fully remote."'
+
+    def _config(self, jobs_path, extra=""):
+        config = jobs_path.parent.parent / "config.yml"
+        config.write_text(f"""
+searches:
+  - name: dfw
+    search_terms: ["rep"]
+    location: "Dallas, TX"
+    hours_old: 24
+  - name: remote
+    search_terms: ["rep"]
+    location: "United States"
+    is_remote: true
+filter:
+  target_titles: ["rep"]
+  negative_titles: []
+  min_score: 1
+{extra}
+""")
+        return config
+
+    def _run(self, jobs_path, rows, monkeypatch, fake_pdf, extra=""):
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(self.HEADER + "".join(rows))
+        monkeypatch.setenv("RESUME_PATH", str(fake_pdf))
+        return filter_mod.run(self._config(jobs_path, extra))
+
+    def _rows(self, output_path):
+        content = output_path.read_text(encoding="utf-8")
+        if not content:
+            return {}
+        # dtype=str: pandas would otherwise coerce the "True"/"False" cells the
+        # assertions are about back into bools.
+        df = pd.read_csv(output_path, dtype=str, keep_default_na=False)
+        return {r["job_url"]: r for _, r in df.iterrows()}
+
+    def test_remote_only_without_a_mention_is_dropped(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract, capsys
+    ):
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://far.com,rep,acme,"Spartanburg, SC",2026-05-12,{self.ONSITE_JD},,True,True\n',
+            f'2,https://ok.com,rep,globex,"Dallas, TX",2026-05-12,{self.ONSITE_JD},,False,False\n',
+        ], monkeypatch, fake_pdf)
+        assert set(self._rows(output_path)) == {"https://ok.com"}
+        out = capsys.readouterr().out
+        assert "dropped remote-pass on-site posting: acme · rep · Spartanburg, SC" in out
+        assert "1 off-site" in out
+
+    def test_remote_with_a_mention_stays_remote(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://far.com,rep,acme,"Spartanburg, SC",2026-05-12,{self.REMOTE_JD},,True,True\n',
+        ], monkeypatch, fake_pdf, extra="  negative_locations: [SC]")
+        rows = self._rows(output_path)
+        assert set(rows) == {"https://far.com"}
+        assert rows["https://far.com"]["is_remote"] == "True"
+
+    def test_not_remote_only_is_rewritten_and_meets_the_location_checks(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        # A local pass also returned both: neither is dropped by the guard, both
+        # have is_remote rewritten, and the location checks then decide —
+        # Slovakia is a negative location, so that one goes; Dallas stays.
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://sk.com,rep,acme,"Bratislava, Slovakia",2026-05-12,{self.ONSITE_JD},,True,False\n',
+            f'2,https://tx.com,rep,globex,"Dallas, TX",2026-05-12,{self.ONSITE_JD},,True,False\n',
+        ], monkeypatch, fake_pdf, extra="  negative_locations: [Slovakia]")
+        rows = self._rows(output_path)
+        assert set(rows) == {"https://tx.com"}
+        assert rows["https://tx.com"]["is_remote"] == "False"
+
+    def test_remote_only_but_local_is_kept_as_onsite(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://dal.com,rep,acme,"Dallas, TX",2026-05-12,{self.ONSITE_JD},,True,True\n',
+            f'2,https://plano.com,rep,acme,"Plano, TX",2026-05-12,{self.ONSITE_JD},,True,True\n',
+        ], monkeypatch, fake_pdf)
+        rows = self._rows(output_path)
+        assert set(rows) == {"https://dal.com"}      # the suburb is still dropped
+        assert rows["https://dal.com"]["is_remote"] == "False"
+
+    def test_empty_description_is_left_for_screen(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            '1,https://li.com,rep,acme,"Spartanburg, SC",2026-05-12,,,True,True\n',
+        ], monkeypatch, fake_pdf)
+        rows = self._rows(output_path)
+        assert set(rows) == {"https://li.com"}
+        assert rows["https://li.com"]["is_remote"] == "True"
+        assert rows["https://li.com"]["remote_only"] == "True"     # survives to screen
+
+    def test_config_flag_false_leaves_rows_untouched(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://far.com,rep,acme,"Spartanburg, SC",2026-05-12,{self.ONSITE_JD},,True,True\n',
+        ], monkeypatch, fake_pdf, extra="  remote_requires_mention: false")
+        rows = self._rows(output_path)
+        assert set(rows) == {"https://far.com"}
+        assert rows["https://far.com"]["is_remote"] == "True"
+
+    def test_dropped_rows_are_written_to_the_csv_and_truncated_when_none(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract
+    ):
+        from pipeline import remote_signal
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://far.com,rep,acme,"Spartanburg, SC",2026-05-12,{self.ONSITE_JD},,True,True\n',
+        ], monkeypatch, fake_pdf)
+        dropped = pd.read_csv(remote_signal.DROPPED_PATH, dtype=str, keep_default_na=False)
+        assert dropped["job_url"].tolist() == ["https://far.com"]
+        assert dropped["dropped_by"].tolist() == ["filter"]
+        assert dropped["is_remote"].tolist() == ["False"]      # the rewrite rides along
+
+        self._run(jobs_path, [
+            f'2,https://ok.com,rep,globex,"Dallas, TX",2026-05-12,{self.ONSITE_JD},,False,False\n',
+        ], monkeypatch, fake_pdf)
+        assert remote_signal.DROPPED_PATH.read_text(encoding="utf-8") == ""
+
+    def test_an_all_offsite_scrape_says_so_in_the_no_results_line(
+        self, patch_filter_paths, fake_pdf, monkeypatch, mock_pdf_extract, capsys
+    ):
+        jobs_path, output_path = patch_filter_paths
+        self._run(jobs_path, [
+            f'1,https://far.com,rep,acme,"Spartanburg, SC",2026-05-12,{self.ONSITE_JD},,True,True\n',
+        ], monkeypatch, fake_pdf)
+        assert output_path.read_text(encoding="utf-8") == ""
+        assert "nothing left to score of 1 scraped (0 ineligible, 1 off-site, 0 too old)" \
+            in capsys.readouterr().out
+
+    def test_is_remote_reader_is_the_shared_one(self):
+        from pipeline import remote_signal
+        assert filter_mod._is_remote({"is_remote": "True"}) is remote_signal.is_remote_str({"is_remote": "True"})
+        assert not filter_mod._is_remote({"is_remote": "False"})
