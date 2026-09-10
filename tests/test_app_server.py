@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from pipeline import agent_cli
+
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -968,6 +970,23 @@ class TestAgentCliSurface:
         assert r.status_code == 200, r.text
         assert r.json()["cli"] == server.agent_cli.resolve_cli().id
 
+    def test_known_clis_is_the_registry(self):
+        """The save endpoint's vocabulary. It is the one registry mirror the
+        endpoint ENFORCES, so a reverted literal list would 400 a CLI the
+        wizard's own select offers, and nothing else here would notice."""
+        from pipeline import agent_cli
+        from pipeline.app import server
+        assert server._KNOWN_CLIS == list(agent_cli.AGENT_CLIS)
+
+    @pytest.mark.parametrize("cli_id", list(agent_cli.AGENT_CLIS))
+    def test_save_accepts_every_registry_cli(self, client, tmp_path, mocker, cli_id):
+        from pipeline.app import server
+        mocker.patch.object(server, "ROOT", tmp_path)
+        r = client.post("/api/onboard/local-config",
+                        json={"batch_provider": "", "batch_model": "", "batch_cli": cli_id})
+        assert r.status_code == 200, r.text
+        assert f"BATCH_CLI={cli_id}" in (tmp_path / ".env").read_text(encoding="utf-8")
+
     def test_register_bridge_rejects_an_unknown_cli(self, client, mocker):
         from pipeline.app import server
         reg = mocker.patch.object(server.agent_cli, "register_playwright_mcp")
@@ -1005,6 +1024,20 @@ class TestSubmitPolicySave:
         assert r.status_code == 200, r.text
         env = (tmp_path / ".env").read_text(encoding="utf-8")
         assert f"{handoff.SUBMIT_POLICY_ENV}=submit-easy-apply" in env
+
+    def test_an_absent_policy_leaves_the_key_alone(self, client, tmp_path, mocker):
+        """The Provider step posts here too, and it does not show this select.
+        An absent field must not overwrite what the Local step saved — a blank
+        one would, which is why the field is `None`-means-absent like its
+        neighbours rather than carried through from a select that may still be
+        showing its static first option."""
+        from pipeline import handoff
+        from pipeline.app import server
+        mocker.patch.object(server, "ROOT", tmp_path)
+        assert self._save(client, handoff_submit_policy="submit-all").status_code == 200
+        assert self._save(client).status_code == 200
+        env = (tmp_path / ".env").read_text(encoding="utf-8")
+        assert f"{handoff.SUBMIT_POLICY_ENV}=submit-all" in env
 
     def test_unknown_policy_is_refused(self, client, tmp_path, mocker):
         from pipeline.app import server

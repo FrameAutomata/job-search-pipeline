@@ -265,7 +265,11 @@ def _isolate_provider_env(monkeypatch):
     import pipeline.filter  # noqa: F401 — its import-time load_dotenv runs once here
     try:
         import pipeline.app.server  # noqa: F401 — same; optional UI dep
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: server.py raises SystemExit at import
+        # when UI_LAN is set with no UI_PASSWORD, and _isolate_ui_env below
+        # (which clears UI_LAN) has not run yet — a developer who once ran
+        # run-ui.sh --lan would otherwise error out of every test in the suite.
         pass
     # Key vars derive from the provider table so a newly added provider can't
     # leak the developer's real key into tests (the DeepSeek addition slipped

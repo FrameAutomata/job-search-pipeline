@@ -62,7 +62,7 @@ The wizard generates your profile **and** writes it to your private repo's GitHu
    - **Resume** — upload your resume as DOCX, ODT, or PDF (DOCX recommended — per-job tailoring slot-edits a DOCX). Text is extracted locally; the About step is auto-filled from it
    - **About you** — name, email, location, optional phone / LinkedIn / GitHub / website
    - **Roles & compensation** — target roles, roles to avoid, target / minimum comp, location flexibility
-   - **Search settings** — locations (`City, ST` pairs stay together; put "Remote" in a chunk for a remote pass), distance, recency (`hours_old`), max results, job boards, and an optional easy-apply pass (runs every 4 h in the cloud)
+   - **Search settings** — locations (`City, ST` pairs stay together; put "Remote" in a chunk for a remote pass), distance, recency (`hours_old`), max results, job boards, and an optional easy-apply pass (runs in the same once-a-day cloud run as every other pass)
    - **Career narrative** *(optional, improves evaluations)* — transition story, deal-breakers, portfolio
    - **AI evaluation provider** — pick a provider and paste its API key (piped straight to a GitHub secret; never logged or stored locally). Gemini users also get the free-tier boxes here: tick "I'm on the free tier" and paste your project's RPM / TPM / RPD from [aistudio.google.com/rate-limit](https://aistudio.google.com/rate-limit), and both local and cloud runs pace themselves to those numbers instead of 429-ing
    - **Daily digest** — where each run's results should be delivered: a Discord webhook URL, an email address, or both (see [The daily digest](#the-daily-digest))
@@ -86,7 +86,7 @@ You'll be prompted for:
 - **How recent** results should be (`hours_old`, default 24)
 - **Max results** per site per search term (default 100)
 - **Which job boards** to scrape — Indeed and/or LinkedIn, the only two supported boards (Glassdoor/ZipRecruiter are Cloudflare-blocked; Google Jobs drops connections that crash the scraper)
-- Whether to include an **easy-apply pass** (runs on a separate 4 h cloud schedule)
+- Whether to include an **easy-apply pass** (runs in the same once-a-day cloud run as every other pass)
 
 ### What setup produces
 
@@ -297,11 +297,19 @@ Free options come first, and the default needs no API key at all:
 | `claude` — Claude Code | paid | A Claude Pro subscription or API credits; no free tier. The strongest at driving a browser through a long application form. | `npm install -g @anthropic-ai/claude-code` |
 | `qwen` — Qwen Code | paid | The free login ended 2026-04-15, so it needs a paid API key now. | `npm install -g @qwen-code/qwen-code` |
 
+Run these from the repo root with the venv's python — `pipeline` is found by the
+working directory, not installed, and on Windows a bare `python` often reaches
+the Store stub:
+
 ```bash
-python -m pipeline.agent_cli --list            # ids, tiers, and what's installed
-python -m pipeline.agent_cli --check           # is the one I configured usable?
-python -m pipeline.agent_cli --register-mcp    # give it Playwright, so it can drive a browser
+.venv/bin/python -m pipeline.agent_cli --list          # ids, tiers, and what's installed
+.venv/bin/python -m pipeline.agent_cli --check         # is the one I configured usable?
+.venv/bin/python -m pipeline.agent_cli --register-mcp  # give it Playwright, so it can drive a browser
 ```
+
+On Windows, `.venv\Scripts\python.exe` instead. Or skip the terminal: the Setup
+wizard's **Local settings** step has a **Register browser bridge** button that
+does the last one for the CLI you picked.
 
 `--register-mcp` is the one command that covers every CLI (some take a `mcp add`
 command, some want an entry merged into a config file). It's safe before the CLI

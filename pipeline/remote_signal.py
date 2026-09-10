@@ -49,9 +49,9 @@ resurrect it.
 The `"True"`/`"False"`/`""` string readers live here, beside the regex, so
 filter, screen and bridge share ONE reading of the two flags — the shape
 bridge.is_easy_apply_row already set for the third pass-level flag. Stdlib
-only, plus pipeline.sites (itself dependency-free) for the one reading of a
-pass's `is_remote` that the scraper uses; the jobspy-free UI venv can import
-this.
+only, plus the two dependency-free leaves pipeline.sites (the one reading of a
+pass's `is_remote` that the scraper uses) and pipeline.rowio (the dropped-rows
+CSV); the jobspy-free UI venv can import this.
 """
 
 import re
@@ -231,8 +231,15 @@ def location_eligible(row, negative_loc_pattern, eligible_loc_pattern) -> bool:
     Word-bounded, so "US" matches the "US" in "Dallas, US" and not the "us" in
     "Russia". Deliberately NOT the whole gate — the remote bypass belongs to
     the caller (filter asks it first; screen asks it only of a row the guard
-    has just turned on-site), and `negative_description_terms` ran in filter
-    over every row and need not run twice."""
+    has just turned on-site). `negative_description_terms` is knowingly NOT
+    re-applied here, and that is a gap rather than a redundancy: filter runs
+    the pattern over every row, but a LinkedIn row reaches filter with an
+    empty description (`linkedin_fetch_description: false` is the documented
+    default) and gets its JD only from screen's backfill, so on those rows the
+    term list has never been tested against a JD at all. The location half IS
+    re-asked because a row the guard turns on-site skipped it entirely through
+    the remote bypass; re-asking the description half would need a third drop
+    class in screen, with its own counter and scan-history question."""
     if negative_loc_pattern is None and eligible_loc_pattern is None:
         return True
     location = (row.get("location") or "").strip()

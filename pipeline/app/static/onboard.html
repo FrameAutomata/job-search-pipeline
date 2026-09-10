@@ -191,7 +191,7 @@
           <label class="chk"><input type="checkbox" name="sites" value="linkedin" checked /> LinkedIn</label>
         </fieldset>
         <label class="chk">
-          <input type="checkbox" name="include_easy_apply" /> Add an "Easy Apply" pass (runs every 4h in the cloud)
+          <input type="checkbox" name="include_easy_apply" /> Add an "Easy Apply" pass (runs in the same once-a-day cloud run as every other pass)
         </label>
       </section>
 
@@ -327,7 +327,10 @@
              update-from-template.yml's Monday schedule checks. -->
         <label class="chk" style="margin-top:10px">
           <input type="checkbox" name="auto_update_weekly" checked />
-          Keep my copy updated weekly (merge the template's improvements every Monday)
+          Keep my copy updated weekly (merge the template's improvements every Monday
+          — the merged code, workflows included, then runs in your next daily with
+          your API keys and digest secrets, so leave this off if you would rather
+          read each update first)
         </label>
       </section>
 

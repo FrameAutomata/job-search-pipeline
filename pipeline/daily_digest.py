@@ -58,6 +58,7 @@ import json
 import os
 import re
 import smtplib
+import ssl
 import sys
 import traceback
 import urllib.error
@@ -572,10 +573,12 @@ def _post(webhook: str, payload: dict, attachment: tuple[str, str] | None,
         body, ctype = _multipart(payload, attachment[0], attachment[1].encode("utf-8"))
     else:
         body, ctype = json.dumps(payload).encode("utf-8"), "application/json"
-    req = urllib.request.Request(
-        webhook, data=body, method="POST",
-        headers={"Content-Type": ctype, "User-Agent": "job-search-pipeline digest"})
     try:
+        # Inside the try: Request() itself raises ValueError on a URL it cannot
+        # read a scheme from, and this function promises never to raise.
+        req = urllib.request.Request(
+            webhook, data=body, method="POST",
+            headers={"Content-Type": ctype, "User-Agent": "job-search-pipeline digest"})
         with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             status = getattr(resp, "status", 200)
             if 200 <= int(status) < 300:
@@ -596,10 +599,21 @@ def _post(webhook: str, payload: dict, attachment: tuple[str, str] | None,
 
 def send_discord(digest: Digest, webhook: str, *, urlopen=None) -> int:
     """POST the digest to a Discord webhook. Returns the number of requests
-    that succeeded (0 when the webhook is unset). The first request carries the
-    content line(s) and the report attachment; later ones only embeds."""
+    that succeeded (0 when the webhook is unset or unusable). The first
+    request carries the content line(s) and the report attachment; later ones
+    only embeds."""
     if not (webhook or "").strip():
         _log("DIGEST_DISCORD_WEBHOOK unset; Discord skipped")
+        return 0
+    hook = webhook.strip()
+    # Refused BY NAME, never by value: a pasted webhook is a bearer credential,
+    # and urllib's own ValueError for a missing scheme quotes the whole URL into
+    # a traceback that main() prints. Discord failing must also not take the
+    # email channel down with it, so this is a logged no-op like every other
+    # unusable-channel case.
+    if not hook.lower().startswith(("http://", "https://")):
+        _log("DIGEST_DISCORD_WEBHOOK is not an http(s) URL (missing https://?); "
+             "Discord skipped")
         return 0
     urlopen = urlopen or urllib.request.urlopen
     chunks = chunk_embeds([discord_embed(i) for i in digest.items]) or [[]]
@@ -613,7 +627,7 @@ def send_discord(digest: Digest, webhook: str, *, urlopen=None) -> int:
             # Never ping anyone: a webhook cannot be trusted with @everyone.
             "allowed_mentions": {"parse": []},
         }
-        if _post(webhook.strip(), payload, attachment if i == 0 else None, urlopen):
+        if _post(hook, payload, attachment if i == 0 else None, urlopen):
             sent += 1
     _log(f"Discord: {sent}/{len(chunks)} request(s) delivered, "
          f"{len(digest.items)} embed(s)")
@@ -654,9 +668,9 @@ def render_email_html(digest: Digest) -> str:
 
 
 def send_email(digest: Digest, settings: dict, *, smtp_cls=None) -> bool:
-    """Send the digest as multipart/alternative (text + HTML) over STARTTLS,
-    with the report attachment when there is one. `settings` is the env view
-    (`SECRET_VARS` names). `smtp_cls` is injected for tests. A missing
+    """Send the digest as multipart/alternative (text + HTML) over verified
+    STARTTLS, with the report attachment when there is one. `settings` is the
+    env view (`SECRET_VARS` names). `smtp_cls` is injected for tests. A missing
     recipient or host is a no-op with a log line; a transport failure is
     logged, never raised."""
     to = (settings.get("DIGEST_EMAIL_TO") or "").strip()
@@ -689,7 +703,10 @@ def send_email(digest: Digest, settings: dict, *, smtp_cls=None) -> bool:
     try:
         with smtp_cls(host, port, timeout=HTTP_TIMEOUT) as smtp:
             smtp.ehlo()
-            smtp.starttls()
+            # A context, because smtplib's fallback is ssl._create_stdlib_context()
+            # — encrypted but with check_hostname off and verify_mode CERT_NONE, so
+            # any on-path certificate reads the app password we log in with below.
+            smtp.starttls(context=ssl.create_default_context())
             smtp.ehlo()
             if user:
                 smtp.login(user, password)

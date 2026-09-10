@@ -285,10 +285,14 @@ Free options come first, and the default needs no API key at all:
 marked; `--check` tells you whether the one you configured is on your PATH and
 how to install it if not. Set `AGENT_MODEL` to start any of them on a specific
 model. Before the agent can drive a browser it needs the Playwright MCP server
-registered — one command, whichever CLI you use:
+registered. The easiest route is the Setup wizard: **Setup → Local settings →
+Register browser bridge**, which does it for the CLI you picked. From a terminal
+it is one command, whichever CLI you use — run it from the repo root, with the
+venv's python, since `pipeline` is found by the working directory rather than
+installed:
 
 ```bash
-python -m pipeline.agent_cli --register-mcp
+.venv/bin/python -m pipeline.agent_cli --register-mcp        # Windows: .venv\Scripts\python.exe -m ...
 ```
 
 ## Local triage UI
@@ -374,9 +378,10 @@ The UI shows whichever paths each skill can use (an agent CLI on your PATH, an A
 
 - **Apply assistant** drives a live browser; your agent needs the **Playwright MCP server** registered. Each CLI registers it differently — some take a command, some want an entry merged into a config file — so one command covers whichever you use:
   ```bash
-  python -m pipeline.agent_cli --register-mcp                    # the CLI you configured
-  python -m pipeline.agent_cli --register-mcp opencode           # a specific one
-  python -m pipeline.agent_cli --register-mcp-all-installed      # what setup runs
+  # From the repo root, with the venv's python (Windows: .venv\Scripts\python.exe).
+  .venv/bin/python -m pipeline.agent_cli --register-mcp                # the CLI you configured
+  .venv/bin/python -m pipeline.agent_cli --register-mcp opencode       # a specific one
+  .venv/bin/python -m pipeline.agent_cli --register-mcp-all-installed  # what setup runs
   ```
   It is safe to run before the CLI is installed — you get the install line instead of an error — and safe to run twice. Without it the agent says it "doesn't have Playwright in this session" and falls back to asking you for a screenshot.
 - **PDF résumé** (and the Apply assistant the first time it drives the browser) need **Chromium installed locally**, from inside the career-ops clone:

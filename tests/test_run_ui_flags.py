@@ -11,7 +11,8 @@ exist because neither can see what the other sees.
 The test runs the real run-ui.sh against a stub root whose `python` records its
 argv and the LAN env, the same shape as tests/test_run_sh_flags.py. run-ui.ps1
 cannot be executed here, so it is checked as a mirror: the same four decisions
-must be spelled in it.
+must be spelled in it — and that mirror check runs on every platform, since it
+reads a file rather than running one.
 """
 
 import os
@@ -22,7 +23,10 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
+# Per-test, not module-wide: TestPowerShellMirror below is pure text inspection
+# of run-ui.ps1, and skipping it with the bash tests would silence it on
+# windows-latest — the one leg of tests.yml whose platform it exists to protect.
+needs_bash = pytest.mark.skipif(
     sys.platform == "win32" or shutil.which("bash") is None,
     reason="run-ui.sh is a bash script; no usable bash here",
 )
@@ -66,6 +70,7 @@ def _recording(root):
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+@needs_bash
 def test_default_run_stays_on_loopback(stub_root):
     """No flag, no change: uvicorn is started without --host, so it keeps its
     127.0.0.1 default and the server never sees UI_LAN."""
@@ -77,6 +82,7 @@ def test_default_run_stays_on_loopback(stub_root):
     assert "UI_LAN=1" not in rec
 
 
+@needs_bash
 def test_lan_binds_every_interface_and_tells_the_server(stub_root):
     r = _run(stub_root, "--lan", password="a-long-passphrase")
     assert r.returncode == 0, r.stderr
@@ -87,6 +93,7 @@ def test_lan_binds_every_interface_and_tells_the_server(stub_root):
     assert "UI_LAN=1" in rec
 
 
+@needs_bash
 def test_lan_refuses_without_a_password(stub_root):
     """The refusal is the feature. Exit non-zero, say which variable, and never
     reach uvicorn — a bound port with no password cannot be un-bound by a
@@ -97,6 +104,7 @@ def test_lan_refuses_without_a_password(stub_root):
     assert "--host" not in _recording(stub_root)
 
 
+@needs_bash
 def test_lan_composes_with_port(stub_root):
     r = _run(stub_root, "--lan", "--port", "8123", password="x")
     assert r.returncode == 0, r.stderr
@@ -104,6 +112,7 @@ def test_lan_composes_with_port(stub_root):
     assert "--port 8123" in rec and "--host 0.0.0.0" in rec
 
 
+@needs_bash
 def test_unknown_flag_still_refused(stub_root):
     r = _run(stub_root, "--nope")
     assert r.returncode != 0

@@ -379,11 +379,9 @@ nextBtn.addEventListener("click", async () => {
         batch_cli:      "",
         api_key:        apiKey || "",
         gemini_limits:  limits.limits,
-        // Not this step's field, but a blank one UNSETS the key: carry the
-        // Local step's current selection through rather than clear it on the
-        // way past.
-        handoff_submit_policy:
-          document.getElementById("local-submit-policy")?.value || "",
+        // handoff_submit_policy is deliberately absent: only the screen that
+        // SHOWS a field may write it, and this step's select is still on its
+        // static first option until loadLocalProviders() resolves.
       };
       // The free-tier answers belong to THIS step, so this is where they reach
       // .env and config/gemini-limits.json — the same values the submit writes

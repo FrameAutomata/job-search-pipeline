@@ -9,8 +9,10 @@ name: Update from Template
 # It also runs on a weekly schedule, but ONLY when the repository variable
 # AUTO_UPDATE_FROM_TEMPLATE is 'true' (the Setup wizard's "Keep my copy updated
 # weekly" box sets it). Opt-in rather than default because a merge lands in the
-# copy's history unasked and a conflict fails loudly in the Actions tab; a
-# dispatch always proceeds. tests/test_template_update_flag.py pins the gate.
+# copy's history unasked — and what lands is code, .github/workflows included,
+# which the next daily then executes with this repository's secrets — while a
+# conflict fails loudly in the Actions tab; a dispatch always proceeds.
+# tests/test_template_update_flag.py pins the gate.
 
 on:
   schedule:

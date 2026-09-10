@@ -212,9 +212,14 @@ class TestEveryJobHasAClock:
         timeout = _doc(DAILY)["jobs"][JOB]["timeout-minutes"]
         assert 0 < timeout <= DAILY_TIMEOUT_CEILING, timeout
 
-    def test_manual_workflows_are_bounded_tighter(self):
-        """Nothing dispatched by hand runs a scrape; 30 minutes covers a
-        cache restore, a merge, an export."""
+    def test_every_other_job_is_bounded_tighter(self):
+        """Every job that neither scrapes nor evaluates: 30 minutes covers a
+        cache restore, a merge, an export — and the PR gate, which is not
+        dispatched by hand but runs in ~3 minutes on wheels. The one way it
+        could exceed this is a pin whose Windows wheel disappears, turning an
+        install into a source build; that would be reported here as a timeout
+        rather than as the build failure it is, so raise this deliberately
+        rather than reading the red X as flakiness."""
         for label, job in self._jobs():
             if label.startswith(DAILY):
                 continue

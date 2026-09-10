@@ -214,6 +214,12 @@ def _is_loopback_origin(origin: str) -> bool:
 # before joining another one. Outside UI_LAN the guard is byte-for-byte the
 # loopback-only one above. All three names are read from os.environ at request
 # time (so tests monkeypatch them) and isolated in tests/conftest.py.
+# The peer rule rests on a DIRECT connection: `request.client.host` is the TCP
+# peer, and uvicorn honours X-Forwarded-For only from 127.0.0.1. So a reverse
+# proxy on this same machine (the natural way to put HTTPS in front of a LAN
+# run) makes every request look loopback and opens the loopback-only routes to
+# anyone with the password — such a proxy MUST forward the real client address
+# (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`).
 UI_LAN_ENV = "UI_LAN"
 UI_PASSWORD_ENV = "UI_PASSWORD"
 UI_ALLOWED_HOSTS_ENV = "UI_ALLOWED_HOSTS"
@@ -1297,8 +1303,12 @@ class LocalConfigRequest(BaseModel):
     handoff_out_dir: str | None = None
     # What the browser agent does at the Submit button: a handoff.SUBMIT_POLICIES
     # id (aliases accepted, the canonical id is written); blank unsets the key,
-    # which is the default policy.
-    handoff_submit_policy: str = ""
+    # which is the default policy. None (absent) leaves it alone, the same rule
+    # as the fields above and for the same reason — the Local step is the only
+    # screen that shows this select, so no other post may clear it, and the
+    # Provider step used to carry it through from a select that is still empty
+    # until /api/onboard/providers lands.
+    handoff_submit_policy: str | None = None
 
 
 def _validate_provider(name: str, label: str) -> str:
@@ -1329,7 +1339,8 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
         )
     tailor_provider = (None if req.tailor_provider is None
                        else _validate_provider(req.tailor_provider, "tailoring provider"))
-    submit_policy = req.handoff_submit_policy.strip()
+    submit_policy = (None if req.handoff_submit_policy is None
+                     else req.handoff_submit_policy.strip())
     if submit_policy:
         # canonical_policy accepts the aliases the env reader accepts and hands
         # back the id the env reader would resolve, so what .env carries is
@@ -1425,7 +1436,8 @@ def save_local_config(req: LocalConfigRequest) -> JSONResponse:
     # The submit policy is written BEFORE the folder is seeded: bootstrap
     # rewrites HANDOFF-README.md from the active policy on every call, so the
     # README a Save leaves behind states the policy that Save chose.
-    _set(handoff.SUBMIT_POLICY_ENV, submit_policy)
+    if submit_policy is not None:
+        _set(handoff.SUBMIT_POLICY_ENV, submit_policy)
     seed_warning = ""
     if handoff_dir:
         try:

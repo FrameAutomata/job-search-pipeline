@@ -9,7 +9,10 @@ jobs:
     name: "py${{ matrix.python-version }} / ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
     # Bounded so a hang bills 30 minutes, not GitHub's 360-minute default, against
-    # the account's 2,000 free Actions minutes a month.
+    # the account's 2,000 free Actions minutes a month. This run installs
+    # requirements + requirements-ui + requirements-dev on both legs, which is
+    # minutes on wheels and could be far more if a pin ever loses its Windows
+    # wheel — that would surface here as a timeout, not as a build failure.
     timeout-minutes: 30
 
     strategy:

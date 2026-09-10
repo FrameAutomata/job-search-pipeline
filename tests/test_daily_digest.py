@@ -13,6 +13,7 @@ import email.policy
 import io
 import json
 import re
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -146,7 +147,7 @@ def test_no_third_party_imports_of_its_own():
     src = (ROOT / "pipeline" / "daily_digest.py").read_text(encoding="utf-8")
     top = [l for l in src.splitlines() if re.match(r"^(import|from) ", l)]
     third = [l for l in top if not re.match(
-        r"^(import|from) (argparse|json|os|re|smtplib|sys|traceback|urllib|uuid|"
+        r"^(import|from) (argparse|json|os|re|smtplib|ssl|sys|traceback|urllib|uuid|"
         r"dataclasses|datetime|email|pathlib|__future__|pipeline)\b", l)]
     assert not third, third
     assert "import yaml" in src and "yaml" not in " ".join(top)
@@ -507,6 +508,18 @@ class TestDiscord:
         assert dd.send_discord(_digest([_item(1)]), "", urlopen=never) == 0
         assert "DIGEST_DISCORD_WEBHOOK unset" in capsys.readouterr().out
 
+    def test_a_webhook_without_a_scheme_is_a_no_op(self, capsys):
+        """A pasted webhook missing `https://` used to reach urllib.request.Request,
+        whose ValueError quotes the whole URL — a bearer credential — into the
+        traceback main() prints, and which escaped _post's `never raised`."""
+        def never(req, timeout=None):
+            raise AssertionError("must not be called")
+        hook = "discord.com/api/webhooks/111/TOKEN"
+        assert dd.send_discord(_digest([_item(1)]), hook, urlopen=never) == 0
+        out = capsys.readouterr().out
+        assert "not an http(s) URL" in out
+        assert "TOKEN" not in out
+
     def test_heartbeat_alone_is_one_request_with_no_embeds(self):
         calls = []
         dd.send_discord(_digest([]), "https://discord.test/hook", urlopen=_fake_urlopen(calls))
@@ -533,8 +546,9 @@ class FakeSMTP:
     def ehlo(self):
         self.calls.append("ehlo")
 
-    def starttls(self):
+    def starttls(self, context=None):
         self.calls.append("starttls")
+        self.tls_context = context
 
     def login(self, user, password):
         self.calls.append(("login", user, password))
@@ -556,6 +570,10 @@ class TestEmail:
         (s,) = FakeSMTP.instances
         assert (s.host, s.port) == ("smtp.example.com", 587)
         assert s.calls == ["ehlo", "starttls", "ehlo", ("login", "me@gmail.com", "app-pass"), "send"]
+        # The app password rides in this session, so the certificate is verified:
+        # smtplib's own fallback context checks neither hostname nor chain.
+        assert s.tls_context is not None
+        assert s.tls_context.check_hostname and s.tls_context.verify_mode == ssl.CERT_REQUIRED
         msg = s.msg
         assert msg["To"] == "me@example.com" and msg["From"] == "me@gmail.com"
         assert msg["Subject"] == "Job digest 2026-09-09: 1 role at ≥ 4.0"
@@ -581,7 +599,7 @@ class TestEmail:
 
     def test_transport_failure_is_logged_not_raised(self, capsys):
         class Broken(FakeSMTP):
-            def starttls(self):
+            def starttls(self, context=None):
                 raise OSError("tls down")
         settings = {"DIGEST_EMAIL_TO": "me@example.com", "DIGEST_SMTP_HOST": "h"}
         assert not dd.send_email(_digest([]), settings, smtp_cls=Broken)
@@ -601,6 +619,22 @@ class TestMain:
         assert dd.main(["--root", str(root), "--manifest", str(manifest)]) == 0
         out = capsys.readouterr().out
         assert "DIGEST_DISCORD_WEBHOOK unset" in out and "email skipped" in out
+
+    def test_a_bad_discord_webhook_does_not_take_the_email_channel_down(
+            self, world, monkeypatch, capsys):
+        """Two channels exist so one can fail alone. A scheme-less webhook used
+        to raise out of send_discord before send_email was ever reached."""
+        root, manifest = world
+        FakeSMTP.instances.clear()
+        monkeypatch.setenv("DIGEST_DISCORD_WEBHOOK", "discord.com/api/webhooks/1/TOKEN")
+        monkeypatch.setenv("DIGEST_EMAIL_TO", "me@example.com")
+        monkeypatch.setenv("DIGEST_SMTP_HOST", "smtp.example.com")
+        monkeypatch.setattr(dd.smtplib, "SMTP", FakeSMTP)
+        assert dd.main(["--root", str(root), "--manifest", str(manifest)]) == 0
+        out = capsys.readouterr().out
+        assert "not an http(s) URL" in out and "TOKEN" not in out
+        assert "email sent to me@example.com" in out
+        assert len(FakeSMTP.instances) == 1
 
     def test_env_settings_reach_the_digest_and_dump(self, world, tmp_path, monkeypatch, capsys):
         root, manifest = world
