@@ -1655,6 +1655,71 @@ def _hint_missing_node_modules(stderr: str) -> None:
           "career-ops checkout — a `git pull`/rebase there does not install them.")
 
 
+# ── Protected characteristics never reach an evaluation prompt ───────────────
+#
+# The wizard collects EEO self-ID answers so the BROWSER AGENT can fill them on
+# an application form, and setup-profile.mjs writes them into profile.yml under
+# `voluntary_disclosures:` — which build_system_prompt embedded verbatim, so
+# every evaluation saw the candidate's race, gender, veteran and disability
+# status. Two separate harms, and only one of them is about privacy: a model
+# that scores job fit must not see the characteristics a fitness judgement is
+# forbidden to rest on, which is true on a paid tier and with consent; and on a
+# free provider tier those answers may additionally be retained.
+#
+# The WHOLE section goes, not just the four EEO keys: the rest of it is the
+# site-consent booleans (data_processing_consent / save_answers /
+# share_answers), which are apply-path form data an evaluator has no use for.
+#
+# Line-based rather than yaml.safe_load + dump because this module is
+# stdlib-only on purpose (sites.py's terms) and a round trip would reorder keys
+# and drop comments, rewriting a document we otherwise pass through verbatim.
+_REDACTED_PROFILE_SECTIONS = ("voluntary_disclosures",)
+
+# PROFILE.md is the other route in, and it needs its own pass rather than the
+# same one: it is markdown, it SUPERSEDES the seeds when present, and it is
+# non-clobber — so an install whose PROFILE.md was seeded by an older version
+# keeps those bullets forever and no regeneration will ever remove them.
+# Matching the generator's own `- **Label:** value` bullet shape is enough for
+# the files we wrote; a hand-written master that states a protected
+# characteristic in prose is not reachable this way and is the user's to edit.
+_REDACTED_PROFILE_LABELS = frozenset({
+    "gender", "race / ethnicity", "race/ethnicity", "race and ethnicity",
+    "ethnicity", "veteran status", "disability status",
+})
+_PROFILE_BULLET_RE = re.compile(r"^\s*[-*]\s*\*\*(?P<label>[^*]+?):?\*\*")
+
+
+def redact_profile_yml(text: str) -> str:
+    """`profile.yml` with the protected-characteristics section dropped."""
+    out: list[str] = []
+    skipping = False
+    for line in (text or "").splitlines(keepends=True):
+        stripped = line.lstrip()
+        # A top-level key ends the previous block. A column-0 COMMENT does not:
+        # while skipping it is dropped with the block (the conservative read —
+        # better to lose a comment than to leak the section it sits inside).
+        is_top = line[:1] not in ("", " ", "\t", "\n", "\r")
+        if is_top and not stripped.startswith("#"):
+            skipping = stripped.split(":", 1)[0].strip() in _REDACTED_PROFILE_SECTIONS
+            if skipping:
+                continue
+        elif skipping:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def redact_profile_master(text: str) -> str:
+    """`PROFILE.md` with the protected-characteristic standing answers dropped."""
+    keep = []
+    for line in (text or "").splitlines(keepends=True):
+        m = _PROFILE_BULLET_RE.match(line)
+        if m and m.group("label").strip().lower() in _REDACTED_PROFILE_LABELS:
+            continue
+        keep.append(line)
+    return "".join(keep)
+
+
 def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article_digest: str = "", *, profile_master: str = "") -> str:
     # PROFILE.md (Commit 4), when present, is the candidate's living master and
     # supersedes the 4 seed fragments: it already folds in the CV, profile,
@@ -1667,7 +1732,7 @@ def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article
             "_Folds in the CV/experience, structured profile, positioning, and "
             'proof points. Where the framework below says "CV" or "_profile.md", '
             "read this profile._\n\n"
-            f"{profile_master}\n"
+            f"{redact_profile_master(profile_master)}\n"
         )
     else:
         extra = ""
@@ -1677,7 +1742,7 @@ def build_system_prompt(cv: str, profile_yml: str, profile_md: str = "", article
             extra += f"\n### Proof Points (article-digest.md)\n{article_digest}\n"
         candidate_profile = (
             f"### CV (read-only)\n{cv}\n\n"
-            f"### Profile (profile.yml)\n{profile_yml}\n{extra}"
+            f"### Profile (profile.yml)\n{redact_profile_yml(profile_yml)}\n{extra}"
         )
 
     return f"""You are a job evaluation expert running in headless batch mode. \

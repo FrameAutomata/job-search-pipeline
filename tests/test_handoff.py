@@ -1229,8 +1229,13 @@ class TestRenderProfileMd:
         assert "$75K-$500K" in md                                    # comp target
         assert "CST" in md                                           # location/tz
         assert "Citizen" in md or "no sponsorship" in md.lower()     # work auth
-        assert "I am not a protected veteran" in md                  # EEO verbatim
-        assert "Yes, I have a disability (or previously had one)" in md
+        # Protected characteristics are deliberately NOT seeded here (#165): this
+        # file supersedes the seeds as the evaluation profile, so a value written
+        # here reaches the model that scores the candidate. The agent gets an
+        # instruction instead of an answer.
+        assert "I am not a protected veteran" not in md
+        assert "Yes, I have a disability (or previously had one)" not in md
+        assert "Self-identification" in md and "prefer not to answer" in md
 
     def test_scaffold_without_sources(self):
         # A fresh install with no cv.md / profile.yml still gets every heading +
@@ -1392,7 +1397,8 @@ class TestBootstrapSeedsProfile:
         text = (out / handoff.HANDOFF_PROFILE).read_text(encoding="utf-8")
         assert "Jane Doe" in text
         assert "99.999% uptime" in text                    # cv.md metric
-        assert "I am not a protected veteran" in text      # profile.yml standing answer
+        assert "$75K-$500K" in text                        # profile.yml standing answer
+        assert "I am not a protected veteran" not in text  # but never the EEO answers (#165)
         assert "Three production PRs merged" in text       # article-digest.md proof point
         assert "agentic / AI-first framing" in text        # _profile.md positioning
         # _load_profile_sources surfaces all four grounded sources end-to-end.

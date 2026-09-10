@@ -39,6 +39,7 @@ from pipeline._batch_common import (   # the #163 marks, a separate block on pur
     _liveness_closed_rows, _reopen_reposted, by_hand_mark, closed_by_recheck,
     liveness_closed_mark, reopened_mark,
 )
+from pipeline import _batch_common
 from tests.conftest import tracker_row
 
 
@@ -1635,3 +1636,66 @@ class TestReopenRepostedDiscards:
         co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", "x")])
         _reopen_reposted({}, co)
         assert self._row(co, "5")["status_canonical"] == "Discarded"
+
+
+class TestProtectedCharacteristicRedaction:
+    """Protected characteristics must never reach an evaluation prompt (#165).
+
+    Two routes in and they need separate passes: profile.yml's
+    `voluntary_disclosures:` section on the seed path, and PROFILE.md's standing
+    answers on the master path — which supersedes the seeds AND is non-clobber,
+    so an install seeded by an older version keeps those bullets forever.
+    """
+
+    YML = (
+        "candidate:\n"
+        "  full_name: Jane Roe\n"
+        "voluntary_disclosures:\n"
+        "  gender: Female\n"
+        "  race_ethnicity: Hispanic or Latino\n"
+        "  # a column-0 comment inside the block\n"
+        "  veteran_status: I am a protected veteran\n"
+        "  disability_status: Yes, I have a disability\n"
+        "  data_processing_consent: true\n"
+        "\n"
+        "compensation:\n"
+        "  target_range: 60-70k\n"
+    )
+    SECRETS = ("Female", "Hispanic", "protected veteran", "have a disability")
+
+    def test_seed_path_drops_the_section_and_keeps_the_rest(self):
+        out = _batch_common.build_system_prompt("CV text", self.YML)
+        for leak in self.SECRETS:
+            assert leak not in out, leak
+        assert "data_processing_consent" not in out   # apply-path form data too
+        assert "Jane Roe" in out and "60-70k" in out  # everything else survives
+
+    def test_master_path_drops_the_standing_answer_bullets(self):
+        master = (
+            "## Standing answers\n"
+            "- **Work authorization:** US citizen — no sponsorship required\n"
+            "- **Gender:** Female\n"
+            "- **Race / ethnicity:** Hispanic or Latino\n"
+            "- **Veteran status:** I am a protected veteran\n"
+            "- **Disability status:** Yes, I have a disability\n"
+        )
+        out = _batch_common.build_system_prompt("CV", self.YML, profile_master=master)
+        for leak in self.SECRETS:
+            assert leak not in out, leak
+        assert "US citizen" in out
+
+    def test_a_column_zero_comment_does_not_end_the_block_early(self):
+        """The conservative read: a comment at column 0 inside the section is
+        dropped with it rather than reopening the file and leaking the keys
+        that follow it."""
+        red = _batch_common.redact_profile_yml(self.YML)
+        assert "protected veteran" not in red and "disability" not in red
+        assert "compensation:" in red
+
+    def test_redaction_is_idempotent(self):
+        once = _batch_common.redact_profile_yml(self.YML)
+        assert _batch_common.redact_profile_yml(once) == once
+
+    def test_empty_and_missing_degrade_quietly(self):
+        assert _batch_common.redact_profile_yml("") == ""
+        assert _batch_common.redact_profile_master("") == ""
