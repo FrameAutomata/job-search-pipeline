@@ -1236,7 +1236,7 @@ def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
         "",
         f"{len(fresh)} fresh {site}roles (of {total_queue} scored; {len(ready)} to finish, "
         f"{touched} excluded).",
-        "Work top-down. The score set reading order only — judge each role from the live posting.",
+        "Work top-down: the score sets your reading order, nothing more — judge each role from the live posting.",
         policy_line(policy),
         "",
         "For each role: open the URL, qualify it against the profile, tailor the resume",
