@@ -1475,7 +1475,7 @@ def _profile_standing_answers(profile: dict) -> list[str]:
     comp = _dsect(profile, "compensation")
     loc = _dsect(profile, "location")
 
-    def _ask(v, prompt="(add this)"):
+    def _ask(v, prompt):   # every call site states its own fallback
         v = "" if v is None else str(v).strip()
         return v or prompt
 

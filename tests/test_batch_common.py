@@ -1,6 +1,7 @@
 """Tests for pipeline/_batch_common.py"""
 
 import csv
+import re
 import json
 from pathlib import Path
 
@@ -1653,7 +1654,7 @@ class TestProtectedCharacteristicRedaction:
         "voluntary_disclosures:\n"
         "  gender: Female\n"
         "  race_ethnicity: Hispanic or Latino\n"
-        "  # a column-0 comment inside the block\n"
+        "# a genuinely column-0 comment inside the block\n"
         "  veteran_status: I am a protected veteran\n"
         "  disability_status: Yes, I have a disability\n"
         "  data_processing_consent: true\n"
@@ -1686,16 +1687,102 @@ class TestProtectedCharacteristicRedaction:
 
     def test_a_column_zero_comment_does_not_end_the_block_early(self):
         """The conservative read: a comment at column 0 inside the section is
-        dropped with it rather than reopening the file and leaking the keys
-        that follow it."""
+        dropped with it rather than reopening the file and leaking the KEY NAMES
+        after it — which the prompt-level test above cannot see, since it only
+        checks the values."""
         red = _batch_common.redact_profile_yml(self.YML)
-        assert "protected veteran" not in red and "disability" not in red
+        assert "veteran_status" not in red and "disability_status" not in red
         assert "compensation:" in red
+
+    def test_stems_catch_labels_no_generator_ever_wrote(self):
+        """PROFILE.md is agent-grown and append-only, so an exact-label
+        allowlist is defeated by the next wording the agent invents."""
+        grown = ("- **Gender identity:** Non-binary\n"
+                 "- **Protected veteran status:** Yes\n"
+                 "- **Disability (self-ID):** Prefer not to say\n"
+                 "- **Compensation target:** 60-70k\n")
+        out = _batch_common.redact_profile_master(grown)
+        assert "Non-binary" not in out and "Prefer not to say" not in out
+        assert "**Protected veteran status:**" not in out
+        assert "60-70k" in out
+
+    def test_stems_are_word_anchored_and_keep_the_fact_bank(self):
+        """PROFILE.md is the résumé build's ONLY source of truth, so an
+        unanchored "race" would silently delete real experience."""
+        bank = ("- **Grace Health:** ran intake for 12 clinics\n"
+                "- **Terrace Senior Living:** 3 years front desk\n"
+                "- **Traceability:** built the audit trail\n")
+        assert _batch_common.redact_profile_master(bank) == bank
 
     def test_redaction_is_idempotent(self):
         once = _batch_common.redact_profile_yml(self.YML)
         assert _batch_common.redact_profile_yml(once) == once
 
-    def test_empty_and_missing_degrade_quietly(self):
-        assert _batch_common.redact_profile_yml("") == ""
-        assert _batch_common.redact_profile_master("") == ""
+    def test_empty_and_none_degrade_quietly(self):
+        for f in (_batch_common.redact_profile_yml, _batch_common.redact_profile_master):
+            assert f("") == "" and f(None) == ""
+
+
+class TestNoUnredactedProfileReads:
+    """No prompt may read profile.yml or PROFILE.md raw (#165).
+
+    Redacting inside ONE builder is opt-in, and this repo has five that eat the
+    candidate files — so the sixth would be safe only if its author remembered.
+    Every read is therefore either redacted at the call site or listed here with
+    a reason it never reaches a model. A new raw read fails this test, and the
+    fix is to route it through `profile_yml_for_prompt` /
+    `profile_master_for_prompt` — or to add it below and say why.
+    """
+
+    READS = re.compile(r'(_read|read_text|_read_or_empty|_load_yaml_or_empty|safe_load)\s*\(')
+    PATHS = ('profile.yml"', "HANDOFF_PROFILE")
+    SAFE = ("redact_", "_for_prompt")
+
+    # The exact source line -> why that read never reaches a model. Keyed on the
+    # LINE, not the module: a per-module exemption would wave through a NEW
+    # prompt builder added to skills.py or handoff.py, which are precisely the
+    # two files that hold both a safe read and a prompt read. Line text rather
+    # than line number so an edit above it doesn't spuriously fail.
+    ALLOWED = {
+        'path = Path(career_ops) / "config" / "profile.yml"':
+            "candidate_profile.ApplyProfile projects four contact fields",
+        'derived = derive_from_profile(_load_yaml_or_empty(career_ops / "config" / "profile.yml"))':
+            "wizard prefill, not a prompt",
+        'text = _read(local / "config" / "profile.yml")':
+            "_candidate_slug regexes out a name for a filename",
+        'if not read_text(co / "cv.md") and not read_text(co / "config" / "profile.yml"):':
+            "existence check for the onboarding gate",
+        '"profile": _load_yaml_or_empty(co / "config" / "profile.yml"),':
+            "render_profile_md's own sources; it no longer writes the EEO fields",
+        "master = _read_or_empty(Path(out_dir or default_out_dir()) / HANDOFF_PROFILE)":
+            "resolve_profile_md; both prompt consumers redact on the way out",
+        "return _read_or_empty(_career_ops_dir(career_ops) / HANDOFF_PROFILE)":
+            "resolve_profile_md's fallback arm, same reason",
+        'read_text(career_ops / "config" / "profile.yml"),':
+            "eval_system_prompt; build_system_prompt redacts both inputs",
+    }
+
+    def test_every_raw_read_is_redacted_or_declared(self):
+        root = Path(__file__).resolve().parent.parent / "pipeline"
+        offenders = []
+        for py in sorted(root.rglob("*.py")):
+            for n, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+                if not any(t in line for t in self.PATHS) or not self.READS.search(line):
+                    continue
+                if any(t in line for t in self.SAFE) or line.strip() in self.ALLOWED:
+                    continue
+                offenders.append(f"{py.relative_to(root.parent)}:{n}: {line.strip()}")
+        assert not offenders, (
+            "raw read of a candidate profile file — route it through "
+            "profile_yml_for_prompt / profile_master_for_prompt, or add the "
+            "module to ALLOWED with a reason:\n" + "\n".join(offenders))
+
+    def test_the_two_builders_this_commit_fixed_stay_fixed(self):
+        """Named explicitly because the allowlist is per-MODULE: skills.py and
+        resume_content.py each hold both a safe read and a prompt read, so the
+        scan above cannot tell them apart."""
+        root = Path(__file__).resolve().parent.parent / "pipeline"
+        skills = (root / "app" / "skills.py").read_text(encoding="utf-8")
+        assert 'redact_profile_yml(_read(local / "config" / "profile.yml"))' in skills
+        content = (root / "resume_content.py").read_text(encoding="utf-8")
+        assert "profile_master_for_prompt(profile_path)" in content
