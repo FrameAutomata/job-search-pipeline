@@ -1765,7 +1765,15 @@ def kickoff_prompt(work_order: Path, board: str = "", *, policy: str | None = No
     session — names that session's work-order file (+ its .md sibling), states
     the submit policy, and gives the writeback contract; deliberately names no
     specific agent (this template ships to users of any of them)."""
-    work_order = Path(work_order)
+    # RESOLVED, not just Path()-normalized: every path below derives from this
+    # one, and a relative work-order re-resolves against the AGENT's cwd. With
+    # several copies of this repo on one machine that is a silent, plausible
+    # failure rather than an error — the agent finds another copy's
+    # bootstrapped-but-empty output/handoff/, correctly reports "nothing to
+    # work", and suggests a sensible remedy. Nothing in that output looks
+    # wrong. run() already passes absolute paths; this makes a hand-rolled
+    # caller as safe as the UI's button.
+    work_order = Path(work_order).resolve()
     site = _site_prefix(board)
     profile = work_order.parent / HANDOFF_PROFILE
     return (
