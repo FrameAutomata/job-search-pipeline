@@ -11,6 +11,7 @@ This is the signed-off spec. It covers four concerns:
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -488,6 +489,24 @@ class TestRender:
         assert "next-roles-linkedin.jsonl" in prompt
         assert "next-roles-linkedin.md" in prompt   # human-readable sibling
         assert "cowork" not in prompt.lower()
+
+    def test_kickoff_prompt_names_absolute_paths(self, tmp_path, monkeypatch):
+        """A relative path in the prompt re-resolves against the AGENT's cwd.
+        With several copies of this repo on one machine that fails silently and
+        plausibly: the agent finds another copy's bootstrapped-but-empty
+        output/handoff/, reports "nothing to work", and offers a remedy — no
+        error anywhere. So the prompt names absolute paths whatever it was
+        given."""
+        monkeypatch.chdir(tmp_path)
+        rel = Path("output/handoff/next-roles-indeed.jsonl")
+        prompt = handoff.kickoff_prompt(rel, board="indeed")
+
+        for suffix in ("next-roles-indeed.jsonl", "next-roles-indeed.md",
+                       handoff.HANDOFF_PROFILE):
+            want = str((tmp_path / "output" / "handoff" / suffix).resolve())
+            assert want in prompt, suffix
+        # and nothing left bare: the writeback contract names the file too
+        assert f" {rel}" not in prompt
 
 
 # ── 5. Tailoring enrichment ────────────────────────────────────────────────────
