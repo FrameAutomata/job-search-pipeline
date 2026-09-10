@@ -375,6 +375,8 @@ to run end to end.
 
 Requires Python 3.12 (not 3.13 — jobspy pins numpy 1.26.3, no 3.13 wheel).
 
+**NixOS** has a dev shell — `nix develop`, then `./setup.sh` as usual. It carries python312, node, `gh`, LibreOffice (for `--handoff-tailor`'s one-page fit), and two of the three free agent CLIs: `opencode` (`DEFAULT_CLI`) and `gemini-cli`, whose `mainProgram` is `gemini`, the `binary` [pipeline/agent_cli.py](pipeline/agent_cli.py) names. Both lag the versions the registry's flags were read off, same major; `npm install -g` works inside the shell for a newer one, because the shellHook points `NPM_CONFIG_PREFIX` at the user's home (npm's default global prefix is inside the read-only store). **`agy` is not there, and `pkgs.antigravity` is not it** — that attribute is `buildVscode`, the Antigravity *IDE*, while `agy` is a prebuilt dynamically-linked binary from antigravity.google that needs `programs.nix-ld` or an `autoPatchelfHook` derivation to start. The flake's `LD_LIBRARY_PATH` block does **not** cover that case: nix-ld is for foreign executables, and that block exists for Python wheels dlopening bare sonames — a distinction its own comment makes, and one that reads the other way at a glance. Playwright is the other thing the flake settles: `PLAYWRIGHT_BROWSERS_PATH` hands career-ops the nixpkgs browsers, because the chromium `npx playwright install` downloads is a generic-linux build that will not start here — so run the agent CLIs *from inside* `nix develop`, or Playwright MCP fetches its own and fails.
+
 ---
 
 ## Tests
