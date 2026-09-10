@@ -117,6 +117,105 @@ ANTIGRAVITY_PLAYWRIGHT_ENTRY = {
     "args": list(PLAYWRIGHT_MCP_COMMAND[1:]),
 }
 
+# ── Which browser the Playwright MCP server launches ─────────────────────────
+#
+# It defaults to the branded CHROME channel, and its `--browser` flag does not
+# even accept "chromium" (chrome, firefox, webkit, msedge). Meanwhile setup.sh
+# installs Playwright's Chromium and the Nix dev shell supplies nixpkgs'. So
+# the registration this module shipped named a browser our own setup never
+# installs: on any machine without Chrome — most Linux installs, not only
+# NixOS — the agent could not open a browser at all, and nothing in setup said
+# so. The whole apply path was dead on arrival there.
+#
+# So the registration pins `--executable-path` to a Chromium we can actually
+# find. Resolution happens at REGISTRATION time, not import: which browsers
+# exist is a property of the machine, and this module is imported by the UI
+# long before anyone registers anything.
+CHROMIUM_PATH_ENV = "PLAYWRIGHT_CHROMIUM_PATH"      # explicit override, wins
+BROWSERS_PATH_ENV = "PLAYWRIGHT_BROWSERS_PATH"      # what flake.nix sets
+
+# Per-platform layout under a `chromium-<revision>` directory in the browsers
+# dir. `chromium_headless_shell-*` is deliberately NOT matched: it cannot open
+# a headed window, and every application form worth driving is behind a login.
+_CHROMIUM_RELS = (
+    "chrome-linux/chrome",
+    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-win/chrome.exe",
+)
+# A system chromium, for a machine with no Playwright browsers dir at all.
+_CHROMIUM_BINARIES = ("chromium", "chromium-browser")
+
+
+def _browsers_dir(env: dict) -> Path | None:
+    """The Playwright browsers directory, or None."""
+    explicit = (env.get(BROWSERS_PATH_ENV) or "").strip()
+    if explicit:
+        # "0" means "next to the package"; we cannot resolve that, so decline
+        # rather than probe a path that does not mean what it looks like.
+        return None if explicit == "0" else Path(explicit)
+    # Everything below comes out of `env`, never the process: a caller that
+    # passes an explicit env — every test does — must get an answer that does
+    # not depend on the machine running it. os.environ carries HOME on POSIX
+    # and USERPROFILE on Windows, so the real call is unaffected.
+    if os.name == "nt":
+        local = (env.get("LOCALAPPDATA") or "").strip()
+        return Path(local) / "ms-playwright" if local else None
+    home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+    if not home:
+        return None
+    if sys.platform == "darwin":
+        return Path(home) / "Library" / "Caches" / "ms-playwright"
+    return Path(home) / ".cache" / "ms-playwright"
+
+
+def _revision(path: Path) -> int:
+    """Sort key for `chromium-1234`: numeric, so 1234 beats 987."""
+    tail = path.name.rpartition("-")[2]
+    return int(tail) if tail.isdigit() else -1
+
+
+def resolve_chromium(env: dict | None = None) -> str:
+    """Absolute path to a Chromium the MCP server can launch, or "".
+
+    Order: the explicit override, then the newest `chromium-*` in the browsers
+    directory, then a system chromium on PATH. An empty string means "found
+    nothing" and the caller then registers WITHOUT the flag — which is the old
+    behaviour, and the right one on a machine that does have Chrome.
+    """
+    env = os.environ if env is None else env
+    override = (env.get(CHROMIUM_PATH_ENV) or "").strip()
+    if override:
+        return override                      # verbatim: the user's own answer
+
+    root = _browsers_dir(env)
+    if root is not None:
+        try:
+            candidates = sorted((d for d in root.glob("chromium-*") if d.is_dir()),
+                                key=_revision, reverse=True)
+        except OSError:
+            candidates = []
+        for d in candidates:
+            for rel in _CHROMIUM_RELS:
+                exe = d / rel
+                if exe.exists():
+                    return str(exe)
+
+    # `path=` from the same env, for the same reason: an explicit env with no
+    # PATH searches nothing rather than falling through to the process's.
+    search = env.get("PATH")
+    for name in _CHROMIUM_BINARIES:
+        found = shutil.which(name, path=search) if search is not None else shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def _pin_chromium(command: list, env: dict) -> list:
+    """`command` with `--executable-path <chromium>` appended, when we found one."""
+    path = resolve_chromium(env)
+    return [*command, "--executable-path", path] if path else list(command)
+
+
 _GEMINI_API_TERMS_URL = "https://ai.google.dev/gemini-api/terms"
 
 
@@ -194,11 +293,16 @@ class AgentCli:
         """How to register the Playwright MCP server with this CLI.
 
         `home`/`env` exist for the config-merge form (they decide where the
-        config file lives) and for tests; they default to the real ones."""
-        if self.mcp_add_args:
-            return McpRegistration(argv=(self.binary, *self.mcp_add_args))
+        config file lives) and for tests; they default to the real ones. Both
+        forms pin `--executable-path` when a Chromium can be found — see the
+        browser note above for why the default is not usable here."""
         home = Path.home() if home is None else Path(home)
         env = os.environ if env is None else env
+        if self.mcp_add_args:
+            # For every CLI taking this form the SERVER command is the tail of
+            # these args, so the flag appends cleanly to the whole sequence.
+            return McpRegistration(
+                argv=(self.binary, *_pin_chromium(list(self.mcp_add_args), env)))
         if self.mcp_config_base == "home":
             base = home
         else:
@@ -208,8 +312,23 @@ class AgentCli:
             config_path=base / self.mcp_config_rel,
             servers_key=self.mcp_servers_key,
             merge={self.mcp_servers_key: {
-                PLAYWRIGHT_MCP_SERVER: dict(self.mcp_server_entry)}},
+                PLAYWRIGHT_MCP_SERVER: _pin_entry(self.mcp_server_entry, env)}},
         )
+
+
+def _pin_entry(entry: dict, env: dict) -> dict:
+    """A server entry with the chromium flag on whichever key holds the argv.
+
+    Two shapes ship here and they disagree about where the arguments live:
+    OpenCode keeps the whole command in `command` (a list), Antigravity splits
+    it into `command` (a string) + `args`. Appending to the wrong one produces
+    a config that merges cleanly and launches nothing."""
+    out = dict(entry)
+    if isinstance(out.get("command"), list):
+        out["command"] = _pin_chromium(out["command"], env)
+    elif isinstance(out.get("args"), list):
+        out["args"] = _pin_chromium(out["args"], env)
+    return out
 
 
 # Display order: free first, the default at the top. Every tier note for a free

@@ -376,7 +376,7 @@ class TestMcpRegistration:
     def test_claude_argv_forces_user_scope(self):
         # Its scope DEFAULT is `local` (per cwd): a server added from the repo
         # root is invisible to `cd career-ops && claude …`, a separate checkout.
-        reg = AGENT_CLIS["claude"].mcp_registration()
+        reg = AGENT_CLIS["claude"].mcp_registration(env={})
         assert reg.is_argv
         assert list(reg.argv) == ["claude", "mcp", "add", "-s", "user", "playwright", "--", *PLAYWRIGHT_MCP_COMMAND]
 
@@ -389,11 +389,11 @@ class TestMcpRegistration:
     def test_gemini_argv_forces_user_scope(self):
         # Its scope DEFAULT is `project` — without -s user the registration
         # lands in the cwd's .gemini/settings.json.
-        reg = AGENT_CLIS["gemini"].mcp_registration()
+        reg = AGENT_CLIS["gemini"].mcp_registration(env={})
         assert list(reg.argv) == ["gemini", "mcp", "add", "-s", "user", "playwright", *PLAYWRIGHT_MCP_COMMAND]
 
     def test_qwen_argv(self):
-        reg = AGENT_CLIS["qwen"].mcp_registration()
+        reg = AGENT_CLIS["qwen"].mcp_registration(env={})
         assert list(reg.argv) == ["qwen", "mcp", "add", "-s", "user", "playwright", *PLAYWRIGHT_MCP_COMMAND]
 
     def test_opencode_is_a_config_merge(self, tmp_path):
@@ -920,3 +920,87 @@ class TestAgentCliDataclass:
         # No model flag: a model is ignored rather than rendered as a positional.
         assert c.interactive_argv("p", model="m") == ["x", "--go", "p"]
         assert not c.mcp_registration(home=Path("/h"), env={}).is_argv
+
+
+class TestChromiumIsPinned:
+    """The Playwright MCP server must be told which browser to launch (#166).
+
+    It defaults to the branded CHROME channel — and its `--browser` flag does
+    not even accept "chromium" (chrome, firefox, webkit, msedge) — while
+    setup.sh installs Playwright's Chromium and the Nix dev shell supplies
+    nixpkgs'. Shipping a bare registration therefore named a browser our own
+    setup never installs: on any machine without Chrome the agent could not
+    open a browser at all, and nothing in setup said so.
+    """
+
+    def _browsers(self, tmp_path, *revisions, headless_shell=True):
+        for rev in revisions:
+            d = tmp_path / f"chromium-{rev}" / "chrome-linux"
+            d.mkdir(parents=True)
+            (d / "chrome").write_text("#!/bin/sh\n", encoding="utf-8")
+        if headless_shell:                      # the decoy: headless-only
+            d = tmp_path / "chromium_headless_shell-99999" / "chrome-linux"
+            d.mkdir(parents=True)
+            (d / "chrome").write_text("", encoding="utf-8")
+        return {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path), "HOME": str(tmp_path)}
+
+    def test_newest_revision_wins_and_headless_shell_is_skipped(self, tmp_path):
+        env = self._browsers(tmp_path, 987, 1234)
+        got = agent_cli.resolve_chromium(env)
+        assert got == str(tmp_path / "chromium-1234" / "chrome-linux" / "chrome")
+        # numeric, not lexical: "987" must not beat "1234"
+        assert "chromium-987" not in got
+        # a headless shell cannot open a headed window, and every application
+        # form worth driving is behind a login
+        assert "headless_shell" not in got
+
+    def test_every_cli_pins_it_on_the_right_key(self, tmp_path):
+        """Two config shapes disagree about where the argv lives: OpenCode
+        keeps it all in `command`, Antigravity splits `command` + `args`.
+        Appending to the wrong one merges cleanly and launches nothing."""
+        env = self._browsers(tmp_path, 1234)
+        chrome = str(tmp_path / "chromium-1234" / "chrome-linux" / "chrome")
+
+        for cid in ("gemini", "claude"):         # argv form
+            argv = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env=env).argv
+            assert list(argv[-2:]) == ["--executable-path", chrome], cid
+
+        entry = self._entry("opencode", tmp_path, env)
+        assert entry["command"][-2:] == ["--executable-path", chrome]
+
+        entry = self._entry("agy", tmp_path, env)
+        assert entry["args"][-2:] == ["--executable-path", chrome]
+        assert entry["command"] == "npx"         # the string is left alone
+
+    def _entry(self, cid, tmp_path, env):
+        merge = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env=env).merge
+        return list(merge.values())[0][agent_cli.PLAYWRIGHT_MCP_SERVER]
+
+    def test_override_is_taken_verbatim(self, tmp_path):
+        env = self._browsers(tmp_path, 1234)
+        env[agent_cli.CHROMIUM_PATH_ENV] = "/opt/my/chrome"
+        assert agent_cli.resolve_chromium(env) == "/opt/my/chrome"
+
+    def test_nothing_found_registers_bare(self, tmp_path, monkeypatch):
+        """The old behaviour, and the right one on a machine that has Chrome:
+        no flag, and the server picks its own default."""
+        monkeypatch.setattr(agent_cli.shutil, "which", lambda _n: None)
+        env = {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "absent"),
+               "HOME": str(tmp_path / "absent")}
+        assert agent_cli.resolve_chromium(env) == ""
+        argv = AGENT_CLIS["gemini"].mcp_registration(home=tmp_path, env=env).argv
+        assert "--executable-path" not in argv
+        assert list(argv[-3:]) == list(PLAYWRIGHT_MCP_COMMAND)
+
+    def test_browsers_path_zero_is_not_a_directory(self, tmp_path, monkeypatch):
+        """Playwright reads "0" as "keep the browsers next to the package". It
+        is not a path, so probing it would search a directory named `0`."""
+        monkeypatch.setattr(agent_cli.shutil, "which", lambda _n: None)
+        assert agent_cli.resolve_chromium({"PLAYWRIGHT_BROWSERS_PATH": "0"}) == ""
+
+    def test_a_system_chromium_is_the_last_resort(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_cli.shutil, "which",
+                            lambda n: "/usr/bin/chromium" if n == "chromium" else None)
+        env = {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "absent"),
+               "HOME": str(tmp_path / "absent")}
+        assert agent_cli.resolve_chromium(env) == "/usr/bin/chromium"
