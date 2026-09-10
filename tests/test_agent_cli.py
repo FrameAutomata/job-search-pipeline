@@ -933,21 +933,35 @@ class TestChromiumIsPinned:
     open a browser at all, and nothing in setup said so.
     """
 
-    def _browsers(self, tmp_path, *revisions, headless_shell=True):
+    def _browsers(self, tmp_path, *revisions, folder="chrome-linux64",
+                  headless_shell=True, symlink=False):
+        """A browsers dir. `folder` defaults to the layout Playwright ACTUALLY
+        ships now (`chrome-linux64`, the Chrome-for-Testing name) — the first
+        version of this code hardcoded `chrome-linux` and its fixture used the
+        same wrong name, so the test agreed with the bug instead of catching
+        it. `symlink` reproduces nixpkgs, where every entry is a link into the
+        store."""
+        root = tmp_path / "browsers"
+        root.mkdir(exist_ok=True)
         for rev in revisions:
-            d = tmp_path / f"chromium-{rev}" / "chrome-linux"
-            d.mkdir(parents=True)
-            (d / "chrome").write_text("#!/bin/sh\n", encoding="utf-8")
-        if headless_shell:                      # the decoy: headless-only
-            d = tmp_path / "chromium_headless_shell-99999" / "chrome-linux"
+            real = tmp_path / "store" / f"chromium-{rev}" / folder
+            real.mkdir(parents=True)
+            (real / "chrome").write_text("#!/bin/sh\n", encoding="utf-8")
+            (real / "chrome-wrapper").write_text("", encoding="utf-8")   # decoy
+            if symlink:
+                (root / f"chromium-{rev}").symlink_to(real.parent)
+            else:
+                (real.parent).rename(root / f"chromium-{rev}")
+        if headless_shell:                      # headless-only: never a match
+            d = root / "chromium_headless_shell-99999" / folder
             d.mkdir(parents=True)
             (d / "chrome").write_text("", encoding="utf-8")
-        return {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path), "HOME": str(tmp_path)}
+        return {"PLAYWRIGHT_BROWSERS_PATH": str(root), "HOME": str(tmp_path)}
 
     def test_newest_revision_wins_and_headless_shell_is_skipped(self, tmp_path):
         env = self._browsers(tmp_path, 987, 1234)
         got = agent_cli.resolve_chromium(env)
-        assert got == str(tmp_path / "chromium-1234" / "chrome-linux" / "chrome")
+        assert got == str(tmp_path / "browsers" / "chromium-1234" / "chrome-linux64" / "chrome")
         # numeric, not lexical: "987" must not beat "1234"
         assert "chromium-987" not in got
         # a headless shell cannot open a headed window, and every application
@@ -959,7 +973,7 @@ class TestChromiumIsPinned:
         keeps it all in `command`, Antigravity splits `command` + `args`.
         Appending to the wrong one merges cleanly and launches nothing."""
         env = self._browsers(tmp_path, 1234)
-        chrome = str(tmp_path / "chromium-1234" / "chrome-linux" / "chrome")
+        chrome = str(tmp_path / "browsers" / "chromium-1234" / "chrome-linux64" / "chrome")
 
         for cid in ("gemini", "claude"):         # argv form
             argv = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env=env).argv
@@ -997,6 +1011,23 @@ class TestChromiumIsPinned:
         is not a path, so probing it would search a directory named `0`."""
         monkeypatch.setattr(agent_cli.shutil, "which", lambda _n: None)
         assert agent_cli.resolve_chromium({"PLAYWRIGHT_BROWSERS_PATH": "0"}) == ""
+
+    @pytest.mark.parametrize("folder", ["chrome-linux64", "chrome-linux"])
+    def test_both_linux_layouts_resolve(self, tmp_path, folder):
+        """Playwright renamed chrome-linux -> chrome-linux64. Enumerating the
+        names it had when this was written is how the first version missed the
+        one nixpkgs actually pins."""
+        env = self._browsers(tmp_path, 1234, folder=folder)
+        assert agent_cli.resolve_chromium(env).endswith(f"{folder}/chrome")
+
+    def test_the_nixpkgs_shape_resolves(self, tmp_path):
+        """Every entry in nixpkgs' playwright-browsers is a SYMLINK into the
+        store, which is the real shape this has to work against."""
+        env = self._browsers(tmp_path, 1217, symlink=True)
+        got = agent_cli.resolve_chromium(env)
+        assert got.endswith("chromium-1217/chrome-linux64/chrome")
+        assert "headless_shell" not in got
+        assert not got.endswith("chrome-wrapper")
 
     def test_a_system_chromium_is_the_last_resort(self, tmp_path, monkeypatch):
         monkeypatch.setattr(agent_cli.shutil, "which",

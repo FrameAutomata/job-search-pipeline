@@ -134,13 +134,22 @@ ANTIGRAVITY_PLAYWRIGHT_ENTRY = {
 CHROMIUM_PATH_ENV = "PLAYWRIGHT_CHROMIUM_PATH"      # explicit override, wins
 BROWSERS_PATH_ENV = "PLAYWRIGHT_BROWSERS_PATH"      # what flake.nix sets
 
-# Per-platform layout under a `chromium-<revision>` directory in the browsers
-# dir. `chromium_headless_shell-*` is deliberately NOT matched: it cannot open
-# a headed window, and every application form worth driving is behind a login.
-_CHROMIUM_RELS = (
-    "chrome-linux/chrome",
-    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
-    "chrome-win/chrome.exe",
+# Where the binary sits under a `chromium-<revision>` directory. GLOBS, not
+# exact paths: Playwright renamed the Linux folder `chrome-linux` ->
+# `chrome-linux64` (the Chrome-for-Testing layout) and splits macOS by arch
+# (`chrome-mac`, `chrome-mac-arm64`), so any enumeration is a list of the
+# layouts that existed when it was written. Matching `chrome-*/` covers the
+# ones that came after — including whatever nixpkgs pins, which is how this
+# was found: the first version hardcoded `chrome-linux/chrome`, and its test
+# built a fixture with the same wrong name, so the test could not catch it.
+#
+# `chromium_headless_shell-*` is deliberately not matched at the directory
+# level: it cannot open a headed window, and every application form worth
+# driving is behind a login.
+_CHROMIUM_GLOBS = (
+    "chrome-*/chrome",                                  # chrome-linux, chrome-linux64
+    "chrome-*/chrome.exe",                              # chrome-win, chrome-win64
+    "chrome-*/Chromium.app/Contents/MacOS/Chromium",    # chrome-mac, chrome-mac-arm64
 )
 # A system chromium, for a machine with no Playwright browsers dir at all.
 _CHROMIUM_BINARIES = ("chromium", "chromium-browser")
@@ -195,10 +204,12 @@ def resolve_chromium(env: dict | None = None) -> str:
         except OSError:
             candidates = []
         for d in candidates:
-            for rel in _CHROMIUM_RELS:
-                exe = d / rel
-                if exe.exists():
-                    return str(exe)
+            for pattern in _CHROMIUM_GLOBS:
+                # sorted() so a directory with two arch folders resolves the
+                # same way twice rather than on filesystem order.
+                for exe in sorted(d.glob(pattern)):
+                    if exe.is_file():
+                        return str(exe)
 
     # `path=` from the same env, for the same reason: an explicit env with no
     # PATH searches nothing rather than falling through to the process's.
