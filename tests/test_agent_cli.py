@@ -13,6 +13,7 @@ read, so a change here is a deliberate one.
 """
 
 import ast
+import os
 import json
 import re
 import shutil
@@ -1036,16 +1037,19 @@ class TestChromiumIsPinned:
         names it had when this was written is how the first version missed the
         one nixpkgs actually pins."""
         env = self._browsers(tmp_path, 1234, folder=folder)
-        assert agent_cli.resolve_chromium(env).endswith(f"{folder}/chrome")
+        # Path, not endswith("…/chrome"): resolve_chromium returns a NATIVE
+        # path, so a hardcoded "/" fails on Windows against the identical
+        # result. These layouts are Playwright's names, not the host's.
+        assert Path(agent_cli.resolve_chromium(env)).parts[-2:] == (folder, "chrome")
 
     def test_the_nixpkgs_shape_resolves(self, tmp_path):
         """Every entry in nixpkgs' playwright-browsers is a SYMLINK into the
         store, which is the real shape this has to work against."""
         env = self._browsers(tmp_path, 1217, symlink=True)
         got = agent_cli.resolve_chromium(env)
-        assert got.endswith("chromium-1217/chrome-linux64/chrome")
+        assert Path(got).parts[-3:] == ("chromium-1217", "chrome-linux64", "chrome")
         assert "headless_shell" not in got
-        assert not got.endswith("chrome-wrapper")
+        assert Path(got).name != "chrome-wrapper"
 
     def test_an_env_without_path_does_not_search_the_real_machine(
             self, tmp_path, monkeypatch):
@@ -1060,7 +1064,9 @@ class TestChromiumIsPinned:
         """
         real = tmp_path / "realbin"
         real.mkdir()
-        planted = real / "chromium"
+        # Windows resolves a bare name through PATHEXT, so an extension-less
+        # file is not findable there however its mode bits are set.
+        planted = real / ("chromium.exe" if os.name == "nt" else "chromium")
         planted.write_text("#!/bin/sh\nexit 0\n")
         planted.chmod(0o755)
         monkeypatch.setenv("PATH", str(real))
