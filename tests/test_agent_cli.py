@@ -1071,15 +1071,20 @@ class TestChromiumIsPinned:
         planted.chmod(0o755)
         monkeypatch.setenv("PATH", str(real))
 
+        # normcase, because Windows returns the PATHEXT case (`chromium.EXE`)
+        # rather than the name on disk; it is the identity on POSIX.
+        def same(a, b):
+            return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
         # Sanity: the process PATH really would find it.
-        assert shutil.which("chromium") == str(planted)
+        assert same(shutil.which("chromium"), planted)
 
         # An env with no PATH key searches nothing...
         assert agent_cli.resolve_chromium({}) == ""
         # ...and an env with an empty PATH likewise.
         assert agent_cli.resolve_chromium({"PATH": ""}) == ""
         # ...while an env that ASKS for that directory still finds it.
-        assert agent_cli.resolve_chromium({"PATH": str(real)}) == str(planted)
+        assert same(agent_cli.resolve_chromium({"PATH": str(real)}), planted)
 
     def test_a_system_chromium_is_the_last_resort(self, tmp_path, monkeypatch):
         monkeypatch.setattr(agent_cli.shutil, "which", _which({"chromium"}))
