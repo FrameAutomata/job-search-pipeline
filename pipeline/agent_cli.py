@@ -119,18 +119,33 @@ ANTIGRAVITY_PLAYWRIGHT_ENTRY = {
 
 # ── Which browser the Playwright MCP server launches ─────────────────────────
 #
-# It defaults to the branded CHROME channel, and its `--browser` flag does not
-# even accept "chromium" (chrome, firefox, webkit, msedge). Meanwhile setup.sh
-# installs Playwright's Chromium and the Nix dev shell supplies nixpkgs'. So
-# the registration this module shipped named a browser our own setup never
+# It defaults to the branded CHROME channel, while setup.sh installs
+# Playwright's Chromium and the Nix dev shell supplies nixpkgs'. So the
+# registration this module shipped named a browser our own setup never
 # installs: on any machine without Chrome — most Linux installs, not only
 # NixOS — the agent could not open a browser at all, and nothing in setup said
 # so. The whole apply path was dead on arrival there.
 #
-# So the registration pins `--executable-path` to a Chromium we can actually
-# find. Resolution happens at REGISTRATION time, not import: which browsers
-# exist is a property of the machine, and this module is imported by the UI
-# long before anyone registers anything.
+# So the registration pins the browser, and it takes BOTH flags together.
+# `--executable-path` alone is not enough, and the reason is not obvious:
+# the channel stays `chrome`, so Playwright believes it launched the branded
+# build and enables the namespace sandbox for it. On a machine where
+# unprivileged user namespaces are restricted — Ubuntu 24.04's AppArmor rule,
+# hardened kernels, most containers — a Chrome-for-Testing build launched that
+# way dies at startup. `--browser chromium` resolves to the chrome-for-testing
+# channel, for which Playwright passes `--no-sandbox` ITSELF; that is upstream's
+# own default for a non-branded build, not an override of ours.
+#
+# Worth knowing, because the docs say otherwise: `--browser` DOES accept
+# "chromium". `--help` and the README's option table both list only
+# "chrome, firefox, webkit, msedge" — the README's own Docker example uses
+# `--browser chromium`. Verified against the installed package by A/B: the pin
+# alone yields a `mcp-chrome-*` profile with the sandbox on, and the pin plus
+# `--browser chromium` yields `mcp-chrome-for-testing-*` with `--no-sandbox`.
+#
+# Resolution happens at REGISTRATION time, not import: which browsers exist is
+# a property of the machine, and this module is imported by the UI long before
+# anyone registers anything.
 CHROMIUM_PATH_ENV = "PLAYWRIGHT_CHROMIUM_PATH"      # explicit override, wins
 BROWSERS_PATH_ENV = "PLAYWRIGHT_BROWSERS_PATH"      # what flake.nix sets
 
@@ -164,12 +179,12 @@ def _browsers_dir(env: dict) -> Path | None:
         return None if explicit == "0" else Path(explicit)
     # Everything below comes out of `env`, never the process: a caller that
     # passes an explicit env — every test does — must get an answer that does
-    # not depend on the machine running it. os.environ carries HOME on POSIX
-    # and USERPROFILE on Windows, so the real call is unaffected.
+    # not depend on the machine running it. os.environ carries LOCALAPPDATA on
+    # Windows and HOME on POSIX, so the real call is unaffected either way.
     if os.name == "nt":
         local = (env.get("LOCALAPPDATA") or "").strip()
         return Path(local) / "ms-playwright" if local else None
-    home = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+    home = (env.get("HOME") or "").strip()
     if not home:
         return None
     if sys.platform == "darwin":
@@ -213,18 +228,30 @@ def resolve_chromium(env: dict | None = None) -> str:
 
     # `path=` from the same env, for the same reason: an explicit env with no
     # PATH searches nothing rather than falling through to the process's.
-    search = env.get("PATH")
+    # The default must be "" and not None: `shutil.which(name, path=None)` is
+    # DEFINED as "use os.environ['PATH']", so the obvious spelling would search
+    # the real machine and hand a test an answer that depends on where it ran.
+    # `path=""` is falsy inside shutil.which, which returns None for it.
     for name in _CHROMIUM_BINARIES:
-        found = shutil.which(name, path=search) if search is not None else shutil.which(name)
-        if found:
+        if found := shutil.which(name, path=env.get("PATH", "")):
             return found
     return ""
 
 
-def _pin_chromium(command: list, env: dict) -> list:
-    """`command` with `--executable-path <chromium>` appended, when we found one."""
+# Both flags or neither: `--browser` names the CHANNEL (and so the sandbox
+# rule), `--executable-path` names the binary. Pinning the path alone leaves
+# the channel at `chrome` and the sandbox on — see the browser note above.
+CHROMIUM_PIN_ARGS = ("--browser", "chromium", "--executable-path")
+
+
+def _pin_chromium(command, env: dict) -> list:
+    """`command` with the chromium pin appended, when we found a browser.
+
+    Always a FRESH list, on both branches: `_pin_entry`'s shallow `dict(entry)`
+    would otherwise alias a module-level registry constant into the merge dict,
+    where a later caller could mutate the registry itself."""
     path = resolve_chromium(env)
-    return [*command, "--executable-path", path] if path else list(command)
+    return [*command, *CHROMIUM_PIN_ARGS, path] if path else [*command]
 
 
 _GEMINI_API_TERMS_URL = "https://ai.google.dev/gemini-api/terms"
@@ -313,7 +340,7 @@ class AgentCli:
             # For every CLI taking this form the SERVER command is the tail of
             # these args, so the flag appends cleanly to the whole sequence.
             return McpRegistration(
-                argv=(self.binary, *_pin_chromium(list(self.mcp_add_args), env)))
+                argv=(self.binary, *_pin_chromium(self.mcp_add_args, env)))
         if self.mcp_config_base == "home":
             base = home
         else:
@@ -595,6 +622,13 @@ def _merge_config(reg: McpRegistration) -> str:
     return f"Playwright MCP server {verb} {_display_path(path)}."
 
 
+def _pinned_path(argv) -> str:
+    """The browser `argv` pins, or "" when it registers bare."""
+    argv = list(argv)
+    flag = CHROMIUM_PIN_ARGS[-1]
+    return argv[argv.index(flag) + 1] if flag in argv[:-1] else ""
+
+
 def register_playwright_mcp(cli: AgentCli, *, run=None,
                             home: Path | None = None, env: dict | None = None) -> str:
     """Register the Playwright MCP server with `cli`; return a one-line message.
@@ -629,7 +663,18 @@ def register_playwright_mcp(cli: AgentCli, *, run=None,
     if proc.returncode == 0:
         return f"Registered the Playwright MCP server with {cli.label}."
     if "already" in output.lower():
-        return f"Playwright MCP server already registered with {cli.label}."
+        # Non-zero plus "already" is Claude Code's re-run error and setup runs
+        # under `set -e`, so it counts as success — but `mcp add` did NOT
+        # rewrite the existing entry, and the pin lives INSIDE that entry. So
+        # an earlier registration survives with whatever browser it named:
+        # stale after a `nix flake update` GCs the old store path, or bare if
+        # no browser was installed the first time. The config-merge CLIs
+        # rewrite their entry on every run; these cannot, so say so rather
+        # than report a success that changed nothing.
+        want = _pinned_path(reg.argv)
+        extra = (f" It keeps the browser it was first registered with — re-run"
+                 f" after removing it to pin {want}." if want else "")
+        return f"Playwright MCP server already registered with {cli.label}.{extra}"
     tail = output.splitlines()[-1] if output else f"exit {proc.returncode}"
     return f"`{shlex.join(reg.argv)}` failed: {tail}"
 
@@ -646,6 +691,18 @@ def _print_list() -> None:
         mark = "yes" if cli_available(c) else "no"
         tag = "  (default)" if c.id == DEFAULT_CLI else ""
         print(f"{c.id:<9} {c.label:<16} {c.tier:<5} {mark}{tag}")
+
+
+def _load_env() -> None:
+    """Load the repo's `.env`, if python-dotenv is installed.
+
+    Absent on a bare UI venv, and this must not become a hard dependency of a
+    stdlib-only leaf — a missing dotenv just means the process env stands."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def main(argv=None) -> int:
@@ -668,11 +725,20 @@ def main(argv=None) -> int:
                          "else its registry default, else nothing (reads .env)")
     args = ap.parse_args(argv)
 
+    # Not at import: the module stays import-clean for the UI venv and tests.
+    # Scoped to the commands that act on `.env` rather than merely report:
+    # the wrappers need the CLI the wizard chose, and the register commands
+    # need PLAYWRIGHT_CHROMIUM_PATH, which `.env.example` documents. The UI's
+    # Register button already saw it (server.py calls load_dotenv at import),
+    # so loading it only for `--resolved` left the two register routes
+    # disagreeing with nothing to say so. `--check`/`--list` stay out: they
+    # print what is installed, and pulling `.env` in would also make every
+    # test that drives them depend on the developer's file.
+    if (args.resolved or args.resolved_model
+            or args.register_mcp is not None or args.register_mcp_all_installed):
+        _load_env()
+
     if args.resolved or args.resolved_model:
-        # Only here: the module stays import-clean for the UI venv and tests,
-        # but the wrappers need the same `.env` view the wizard writes to.
-        from dotenv import load_dotenv
-        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
         cli = resolve_cli()
         # `--resolved-model` may print an empty line: the wrappers pass
         # batch-runner's `--model` only when there is one, so "no model" has
