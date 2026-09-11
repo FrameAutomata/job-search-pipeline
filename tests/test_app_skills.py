@@ -19,7 +19,9 @@ from pipeline import agent_cli  # noqa: E402
 def _which_for(*names):
     """shutil.which stand-in: a path for `names` (and the RESOLVED agent CLI's
     binary when asked for by `"cli"`), None for everything else."""
-    def which(name):
+    def which(name, path=None):
+        # `path=` because resolve_chromium passes it; ignored on purpose, since
+        # the stub's whole job is to answer independently of the real PATH.
         wanted = {agent_cli.resolve_cli().binary if n == "cli" else n for n in names}
         return f"/usr/bin/{name}" if name in wanted else None
     return which

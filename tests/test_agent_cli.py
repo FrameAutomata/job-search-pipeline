@@ -13,8 +13,10 @@ read, so a change here is a deliberate one.
 """
 
 import ast
+import os
 import json
 import re
+import shutil
 import shlex
 import subprocess
 import sys
@@ -39,8 +41,11 @@ GEMINI_MODEL = AGENT_CLIS["gemini"].default_model
 
 
 def _which(available):
-    """A shutil.which stand-in: a path for the names in `available`, else None."""
-    return lambda name: f"/usr/bin/{name}" if name in available else None
+    """A shutil.which stand-in: a path for the names in `available`, else None.
+
+    Takes `path=` because `resolve_chromium` passes it; ignoring it is right
+    here, since the point of the stub is to answer independently of PATH."""
+    return lambda name, path=None: f"/usr/bin/{name}" if name in available else None
 
 
 # ── Registry integrity ───────────────────────────────────────────────────────
@@ -376,7 +381,7 @@ class TestMcpRegistration:
     def test_claude_argv_forces_user_scope(self):
         # Its scope DEFAULT is `local` (per cwd): a server added from the repo
         # root is invisible to `cd career-ops && claude …`, a separate checkout.
-        reg = AGENT_CLIS["claude"].mcp_registration()
+        reg = AGENT_CLIS["claude"].mcp_registration(env={})
         assert reg.is_argv
         assert list(reg.argv) == ["claude", "mcp", "add", "-s", "user", "playwright", "--", *PLAYWRIGHT_MCP_COMMAND]
 
@@ -389,11 +394,11 @@ class TestMcpRegistration:
     def test_gemini_argv_forces_user_scope(self):
         # Its scope DEFAULT is `project` — without -s user the registration
         # lands in the cwd's .gemini/settings.json.
-        reg = AGENT_CLIS["gemini"].mcp_registration()
+        reg = AGENT_CLIS["gemini"].mcp_registration(env={})
         assert list(reg.argv) == ["gemini", "mcp", "add", "-s", "user", "playwright", *PLAYWRIGHT_MCP_COMMAND]
 
     def test_qwen_argv(self):
-        reg = AGENT_CLIS["qwen"].mcp_registration()
+        reg = AGENT_CLIS["qwen"].mcp_registration(env={})
         assert list(reg.argv) == ["qwen", "mcp", "add", "-s", "user", "playwright", *PLAYWRIGHT_MCP_COMMAND]
 
     def test_opencode_is_a_config_merge(self, tmp_path):
@@ -920,3 +925,169 @@ class TestAgentCliDataclass:
         # No model flag: a model is ignored rather than rendered as a positional.
         assert c.interactive_argv("p", model="m") == ["x", "--go", "p"]
         assert not c.mcp_registration(home=Path("/h"), env={}).is_argv
+
+
+class TestChromiumIsPinned:
+    """The Playwright MCP server must be told which browser to launch (#166).
+
+    It defaults to the branded CHROME channel, while setup.sh installs
+    Playwright's Chromium and the Nix dev shell supplies nixpkgs'. Shipping a
+    bare registration therefore named a browser our own setup never installs:
+    on any machine without Chrome the agent could not open a browser at all,
+    and nothing in setup said so.
+
+    The pin is BOTH flags. `--executable-path` alone leaves the channel at
+    `chrome`, so Playwright enables the namespace sandbox for a build that is
+    not the branded one, and the browser dies at startup wherever unprivileged
+    user namespaces are restricted (Ubuntu 24.04's AppArmor rule, hardened
+    kernels, most containers). `--browser chromium` resolves to the
+    chrome-for-testing channel, for which Playwright passes `--no-sandbox`
+    itself. Despite `--help` and the README's option table listing only
+    "chrome, firefox, webkit, msedge", the flag does accept "chromium".
+    """
+
+    def _browsers(self, tmp_path, *revisions, folder="chrome-linux64",
+                  headless_shell=True, symlink=False):
+        """A browsers dir. `folder` defaults to the layout Playwright ACTUALLY
+        ships now (`chrome-linux64`, the Chrome-for-Testing name) — the first
+        version of this code hardcoded `chrome-linux` and its fixture used the
+        same wrong name, so the test agreed with the bug instead of catching
+        it. `symlink` reproduces nixpkgs, where every entry is a link into the
+        store."""
+        root = tmp_path / "browsers"
+        root.mkdir(exist_ok=True)
+        for rev in revisions:
+            real = tmp_path / "store" / f"chromium-{rev}" / folder
+            real.mkdir(parents=True)
+            (real / "chrome").write_text("#!/bin/sh\n", encoding="utf-8")
+            (real / "chrome-wrapper").write_text("", encoding="utf-8")   # decoy
+            if symlink:
+                (root / f"chromium-{rev}").symlink_to(real.parent)
+            else:
+                (real.parent).rename(root / f"chromium-{rev}")
+        if headless_shell:                      # headless-only: never a match
+            d = root / "chromium_headless_shell-99999" / folder
+            d.mkdir(parents=True)
+            (d / "chrome").write_text("", encoding="utf-8")
+        return {"PLAYWRIGHT_BROWSERS_PATH": str(root), "HOME": str(tmp_path)}
+
+    def test_newest_revision_wins_and_headless_shell_is_skipped(self, tmp_path):
+        env = self._browsers(tmp_path, 987, 1234)
+        got = agent_cli.resolve_chromium(env)
+        assert got == str(tmp_path / "browsers" / "chromium-1234" / "chrome-linux64" / "chrome")
+        # numeric, not lexical: "987" must not beat "1234"
+        assert "chromium-987" not in got
+        # a headless shell cannot open a headed window, and every application
+        # form worth driving is behind a login
+        assert "headless_shell" not in got
+
+    def test_every_cli_pins_it_on_the_right_key(self, tmp_path):
+        """Two config shapes disagree about where the argv lives: OpenCode
+        keeps it all in `command`, Antigravity splits `command` + `args`.
+        Appending to the wrong one merges cleanly and launches nothing."""
+        env = self._browsers(tmp_path, 1234)
+        chrome = str(tmp_path / "browsers" / "chromium-1234" / "chrome-linux64" / "chrome")
+
+        pin = [*agent_cli.CHROMIUM_PIN_ARGS, chrome]
+        assert pin[:2] == ["--browser", "chromium"]   # the channel, not just the binary
+
+        for cid in ("gemini", "claude"):         # argv form
+            argv = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env=env).argv
+            assert list(argv[-4:]) == pin, cid
+
+        entry = self._entry("opencode", tmp_path, env)
+        assert entry["command"][-4:] == pin
+
+        entry = self._entry("agy", tmp_path, env)
+        assert entry["args"][-4:] == pin
+        assert entry["command"] == "npx"         # the string is left alone
+
+    def _entry(self, cid, tmp_path, env):
+        reg = AGENT_CLIS[cid].mcp_registration(home=tmp_path, env=env)
+        return reg.merge[reg.servers_key][agent_cli.PLAYWRIGHT_MCP_SERVER]
+
+    def test_override_is_taken_verbatim(self, tmp_path):
+        env = self._browsers(tmp_path, 1234)
+        env[agent_cli.CHROMIUM_PATH_ENV] = "/opt/my/chrome"
+        assert agent_cli.resolve_chromium(env) == "/opt/my/chrome"
+
+    def test_nothing_found_registers_bare(self, tmp_path, monkeypatch):
+        """The old behaviour, and the right one on a machine that has Chrome:
+        no flag, and the server picks its own default."""
+        monkeypatch.setattr(agent_cli.shutil, "which", _which(set()))
+        env = {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "absent"),
+               "HOME": str(tmp_path / "absent")}
+        assert agent_cli.resolve_chromium(env) == ""
+        argv = AGENT_CLIS["gemini"].mcp_registration(home=tmp_path, env=env).argv
+        assert "--executable-path" not in argv
+        assert "--browser" not in argv           # no channel override either:
+        # finding nothing must fall back to the server's own default, which is
+        # the branded Chrome a machine WITH Chrome installed can actually use.
+        assert list(argv[-3:]) == list(PLAYWRIGHT_MCP_COMMAND)
+
+    def test_browsers_path_zero_is_not_a_directory(self, tmp_path, monkeypatch):
+        """Playwright reads "0" as "keep the browsers next to the package". It
+        is not a path, so probing it would search a directory named `0`."""
+        monkeypatch.setattr(agent_cli.shutil, "which", _which(set()))
+        assert agent_cli.resolve_chromium({"PLAYWRIGHT_BROWSERS_PATH": "0"}) == ""
+
+    @pytest.mark.parametrize("folder", ["chrome-linux64", "chrome-linux"])
+    def test_both_linux_layouts_resolve(self, tmp_path, folder):
+        """Playwright renamed chrome-linux -> chrome-linux64. Enumerating the
+        names it had when this was written is how the first version missed the
+        one nixpkgs actually pins."""
+        env = self._browsers(tmp_path, 1234, folder=folder)
+        # Path, not endswith("…/chrome"): resolve_chromium returns a NATIVE
+        # path, so a hardcoded "/" fails on Windows against the identical
+        # result. These layouts are Playwright's names, not the host's.
+        assert Path(agent_cli.resolve_chromium(env)).parts[-2:] == (folder, "chrome")
+
+    def test_the_nixpkgs_shape_resolves(self, tmp_path):
+        """Every entry in nixpkgs' playwright-browsers is a SYMLINK into the
+        store, which is the real shape this has to work against."""
+        env = self._browsers(tmp_path, 1217, symlink=True)
+        got = agent_cli.resolve_chromium(env)
+        assert Path(got).parts[-3:] == ("chromium-1217", "chrome-linux64", "chrome")
+        assert "headless_shell" not in got
+        assert Path(got).name != "chrome-wrapper"
+
+    def test_an_env_without_path_does_not_search_the_real_machine(
+            self, tmp_path, monkeypatch):
+        """`resolve_chromium` answers from the `env` it is GIVEN, always.
+
+        No stub here on purpose: the real `shutil.which` is the thing under
+        test. `shutil.which(name, path=None)` is DEFINED as "use
+        os.environ['PATH']", so the obvious spelling makes an explicit env
+        silently fall through to the machine — and every test that passes
+        `env={}` would then depend on whether the developer has chromium
+        installed. Planting one on the process PATH is how that is caught.
+        """
+        real = tmp_path / "realbin"
+        real.mkdir()
+        # Windows resolves a bare name through PATHEXT, so an extension-less
+        # file is not findable there however its mode bits are set.
+        planted = real / ("chromium.exe" if os.name == "nt" else "chromium")
+        planted.write_text("#!/bin/sh\nexit 0\n")
+        planted.chmod(0o755)
+        monkeypatch.setenv("PATH", str(real))
+
+        # normcase, because Windows returns the PATHEXT case (`chromium.EXE`)
+        # rather than the name on disk; it is the identity on POSIX.
+        def same(a, b):
+            return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+        # Sanity: the process PATH really would find it.
+        assert same(shutil.which("chromium"), planted)
+
+        # An env with no PATH key searches nothing...
+        assert agent_cli.resolve_chromium({}) == ""
+        # ...and an env with an empty PATH likewise.
+        assert agent_cli.resolve_chromium({"PATH": ""}) == ""
+        # ...while an env that ASKS for that directory still finds it.
+        assert same(agent_cli.resolve_chromium({"PATH": str(real)}), planted)
+
+    def test_a_system_chromium_is_the_last_resort(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_cli.shutil, "which", _which({"chromium"}))
+        env = {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "absent"),
+               "HOME": str(tmp_path / "absent")}
+        assert agent_cli.resolve_chromium(env) == "/usr/bin/chromium"
