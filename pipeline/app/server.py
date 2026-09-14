@@ -53,6 +53,7 @@ from pipeline.batch_evaluate import (
     PROVIDER_DEFAULTS,
 )
 from pipeline.screen import extract_description, fetch_and_classify, linkedin_guest_jd_url
+from pipeline.search_config import LOCAL_SEARCH_CONFIG, SHARED_SEARCH_CONFIG
 from pipeline.sites import (
     SUPPORTED_SITES,
     limitation_conflict,
@@ -719,11 +720,11 @@ def run_local_cancel() -> JSONResponse:
 # runs use it; the cloud is untouched (the daily decodes SEARCH_CONFIG_B64 into
 # search.yml and never sees this gitignored file). The UI seeds the editor from
 # search.yml so "full replacement" starts from the current cloud config.
-# These filenames mirror orchestrate.{LOCAL,SHARED}_SEARCH_CONFIG — not imported
-# from there because orchestrate pulls jobspy transitively and this UI process
-# shouldn't. Keep the two in sync if either is ever renamed.
+# The filenames come from pipeline.search_config, the stdlib leaf that owns
+# "which search config is in effect" (#180 moved them out of orchestrate, which
+# pulls jobspy transitively and this UI process must not import).
 def _local_search_path() -> Path:
-    return ROOT / "config" / "search.local.yml"
+    return ROOT / LOCAL_SEARCH_CONFIG
 
 
 class LocalSearchConfig(BaseModel):
@@ -755,7 +756,7 @@ def local_search_get() -> JSONResponse:
     if local.exists():
         return JSONResponse({"active": True, "content": local.read_text(encoding="utf-8"),
                              "path": "config/search.local.yml"})
-    shared = ROOT / "config" / "search.yml"
+    shared = ROOT / SHARED_SEARCH_CONFIG
     content = shared.read_text(encoding="utf-8") if shared.exists() else ""
     return JSONResponse({"active": False, "content": content, "path": "config/search.local.yml"})
 
@@ -2107,6 +2108,7 @@ def handoff_role_prompt(num: str) -> JSONResponse:
     # standing answers the agent tailors from) — not the raw onboarding YAML.
     prompt = handoff.role_prompt(
         company, row.get("role", ""), url,
+        area=str(row.get("area") or "").strip(),
         report=report,
         resume=find_existing(career_ops, company),
         easy_apply=row.get("easy_apply"),   # so submit-easy-apply's first line/fallback fit THIS row

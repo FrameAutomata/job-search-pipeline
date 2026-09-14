@@ -76,8 +76,10 @@ from pipeline._batch_common import (
     _report_int,
     env_float,
     env_int,
+    parse_machine_summary,
 )
 from pipeline.app import data
+from pipeline.work_location import OUT_OF_AREA_TAG, WORK_LOCATION_RE
 from pipeline.stdio import line_buffer_stdout
 
 # ── Env contract ─────────────────────────────────────────────────────────────
@@ -147,18 +149,24 @@ _CLOSED_FULL_RE = re.compile(
     LIVENESS_CLOSED_RE.pattern + r"(?:[^()]|\([^()]*\))*\)?", re.I)
 _MENTION_RE = re.compile(r"@(everyone|here)\b")
 
-# The fence may sit a few prose lines below the heading (a model that adds a
-# sentence there is drift, not a different shape): any non-fence lines are
-# skipped, or `final_decision: Skip` would parse as no summary and a Skip
-# above min_score would be digested.
-_MACHINE_SUMMARY_RE = re.compile(
-    r"##\s*Machine Summary[^\n]*\n(?:(?!\s*```)[^\n]*\n)*?\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```",
-    re.S)
-_DECISION_RE = re.compile(r"^\s*final_decision:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", re.M)
-
 
 def _log(msg: str) -> None:
-    print(f"[digest] {msg}")
+    """One stage-log line, never fatal.
+
+    `DigestItem.title` carries `OUT_OF_AREA_TAG`'s ⚠ (U+26A0), which cp1252 — a
+    Windows console's default — cannot encode, and `print` raises rather than
+    substituting. That exception would surface inside `build_digest`, be caught
+    by `main`'s blanket handler, and the digest would send NOTHING: a run
+    reported as fine with no message, which is the single failure this module
+    exists to prevent. The existing `·` and `—` happen to be cp1252-encodable;
+    the new glyph is the first that is not, so the guarantee is made here rather
+    than by policing which characters a title may contain."""
+    line = f"[digest] {msg}"
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        enc = (getattr(sys.stdout, "encoding", None) or "ascii")
+        print(line.encode(enc, "replace").decode(enc, "replace"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -182,17 +190,30 @@ class DigestItem:
     verdict: str
     report_num: str
     report_file: str        # path relative to --root, "" when unknown
+    # The #180 gate's verdict AND its reason in one field: the mode and the
+    # place ("On-site Chicago, IL") when the role needs a body in a metro none
+    # of the candidate's non-remote search passes covers, "" when it does not.
+    # One field because `area_verdict` only ever labels a role the predicate
+    # demoted, so a separate bool could only ever express an impossible state.
+    area: str = ""
 
     @property
     def title(self) -> str:
         head = f"{self.score:.1f}/5"
         if self.decision:
             head += f" · {self.decision}"
-        return f"{head} · {self.company} — {self.role}"
+        title = f"{head} · {self.company} — {self.role}"
+        # In the TITLE, not only the description: at these volumes (1–6 roles a
+        # day on the two real copies) sorting an out-of-area role last changes
+        # nothing a reader can see — there is often nothing above it — so the
+        # label is what does the work the sort cannot.
+        return f"{title} · {OUT_OF_AREA_TAG}" if self.area else title
 
     @property
     def description(self) -> str:
         parts = []
+        if self.area:
+            parts.append(f"{OUT_OF_AREA_TAG}: {self.area}")
         if self.strength:
             parts.append(f"+ {self.strength}")
         if self.hard_stop:
@@ -258,26 +279,6 @@ def report_number_map(files: list[str]) -> dict[int, str]:
     return out
 
 
-def parse_machine_summary(report_text: str) -> dict:
-    """The `## Machine Summary` YAML block of a report as a dict, `{}` when
-    there is none. PyYAML when it is importable and the block parses; else a
-    regex that recovers `final_decision` alone, which is the field that
-    changes what the digest does (a `Skip` is excluded)."""
-    m = _MACHINE_SUMMARY_RE.search(report_text or "")
-    if not m:
-        return {}
-    block = m.group(1)
-    try:
-        import yaml  # a pipeline dependency; optional here on purpose
-        doc = yaml.safe_load(block)
-        if isinstance(doc, dict):
-            return doc
-    except Exception:
-        pass
-    d = _DECISION_RE.search(block)
-    return {"final_decision": d.group(1).strip()} if d else {}
-
-
 def _first(value) -> str:
     """The first entry of a YAML list, or a scalar, as one line."""
     if isinstance(value, (list, tuple)):
@@ -296,7 +297,8 @@ def clean_verdict(notes: str) -> str:
     # after a link belongs to the sentence — `extract_url` trims the same set.
     text = data._NOTES_URL_RE.sub(
         lambda m: m.group(0)[len(m.group(0).rstrip(".,);]")):], text)
-    for pattern in (data._REEVAL_MARK_RE, _CLOSED_FULL_RE, _REOPENED_RE, _BY_HAND_RE):
+    for pattern in (data._REEVAL_MARK_RE, _CLOSED_FULL_RE, _REOPENED_RE, _BY_HAND_RE,
+                    WORK_LOCATION_RE):
         text = pattern.sub(" ", text)
     text = " ".join(text.split())
     text = re.sub(r"\s+([,;:.)\]])", r"\1", text)      # no space before punctuation
@@ -311,8 +313,17 @@ def select_items(rows: list[dict], new_files: dict[int, str], root: Path, *,
                  min_score: float, limit: int) -> tuple[list[DigestItem], list[DigestItem]]:
     """(shown, dropped): the tracker rows whose report is new this run, at
     `min_score` or above, still Evaluated, and not a Machine-Summary `Skip` —
-    sorted by score desc then company, cut at `limit`. `dropped` is the tail
-    the limit removed, for the log."""
+    reachable roles first, then by score desc then company, cut at `limit`.
+    `dropped` is the tail the limit removed, for the log.
+
+The rows arrive with `area` already derived (`build_digest` parses the
+    tracker with the run's commutable metros). A role whose recorded work
+    location is on-site or hybrid outside them sorts BELOW every reachable role
+    and is labelled — demoted, never dropped (#180): someone may genuinely relocate,
+    and the score, the report and the link are all still there. The verdict is
+    already on the row (`data.parse_applications` derives it); a row with no
+    `Work location:` mark, which is every row written before #180, demotes
+    nothing."""
     items: list[DigestItem] = []
     for row in rows:
         n = _report_int(row.get("report_num"))
@@ -331,6 +342,7 @@ def select_items(rows: list[dict], new_files: dict[int, str], root: Path, *,
         decision = _first(summary.get("final_decision"))
         if decision.lower().startswith(DECISION_SKIP):
             continue
+
         items.append(DigestItem(
             company=(row.get("company") or "").strip(),
             role=(row.get("role") or "").strip(),
@@ -342,8 +354,9 @@ def select_items(rows: list[dict], new_files: dict[int, str], root: Path, *,
             verdict=clean_verdict(row.get("notes", "")),
             report_num=str(row.get("report_num") or ""),
             report_file=rel,
+            area=str(row.get("area") or "").strip(),
         ))
-    items.sort(key=lambda i: (-i.score, i.company.lower(), i.role.lower()))
+    items.sort(key=lambda i: (bool(i.area), -i.score, i.company.lower(), i.role.lower()))
     limit = max(0, int(limit))
     return items[:limit], items[limit:]
 
@@ -456,10 +469,13 @@ def build_attachment(items: list[DigestItem], root: Path, date: str) -> tuple[st
 def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
                  run_url: str = "", run_outcome: str = "", run_started_at: str = "",
                  always: bool = True, attach: bool = True, next_step: str = "",
-                 now: datetime | None = None) -> Digest:
+                 commutable=None, now: datetime | None = None) -> Digest:
     """Compute the digest — no I/O beyond reading the manifest, the reports
     directory and the tracker. Every env-resolved setting is a kwarg so tests
-    pass values instead of setting the environment."""
+    pass values instead of setting the environment — `commutable` (the #180
+    commutable metros) included, which is why it is a kwarg here and resolved
+    by `data.parse_applications` rather than by this module: the digest
+    resolving its own config is how the two surfaces could disagree."""
     root = Path(root)
     now = now or datetime.now(timezone.utc)
     date = now.strftime("%Y-%m-%d")
@@ -468,7 +484,7 @@ def build_digest(root: Path, manifest: Path, *, min_score: float, limit: int,
     new_files = report_number_map(new_report_files(root, manifest_files))
     tracker = root / "data" / "applications.md"
     try:
-        rows = data.parse_applications(tracker)
+        rows = data.parse_applications(tracker, commutable=commutable)
     except Exception as exc:
         # A tracker the run left half-written is exactly the case where the
         # run failed and the notice matters; read it as empty and carry on.

@@ -35,6 +35,9 @@ from pipeline._batch_common import (
     run_merge_tracker,
     tail_text,
     write_job_result,
+    _report_location_mark,
+    _pending_location_mark,
+    _row_report,
 )
 from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
     _liveness_closed_rows, _reopen_reposted, by_hand_mark, closed_by_recheck,
@@ -1298,28 +1301,34 @@ class TestSetReportLink:
 
 
 class TestDeadLinkRepair:
+    """`_dead_link_repair` takes the row's already-resolved report, because
+    `_sanitize_pending_additions` resolves it once and shares it with
+    `_pending_location_mark` — a dead link sends `resolve_report` through a full
+    `reports/` glob, and two independent callers meant two scans per addition.
+    These drive the real composition rather than a two-argument shorthand."""
+
     def test_dead_link_resolves_by_the_filename_number(self, tmp_path):
         co = _reports(tmp_path, "003-initech-2026.md")
-        assert _dead_link_repair(co, _tracker_row()) == "003-initech-2026.md"
+        assert _dead_link_repair(co, _tracker_row(), _row_report(co, _tracker_row())) == "003-initech-2026.md"
 
     def test_padding_of_the_number_is_tolerated(self, tmp_path):
         co = _reports(tmp_path, "3-initech-2026.md")
-        assert _dead_link_repair(co, _tracker_row()) == "3-initech-2026.md"
+        assert _dead_link_repair(co, _tracker_row(), _row_report(co, _tracker_row())) == "3-initech-2026.md"
 
     def test_live_link_is_not_repaired(self, tmp_path):
         co = _reports(tmp_path, "003-x.md", "003-y.md")
-        assert _dead_link_repair(co, _tracker_row()) == ""
+        assert _dead_link_repair(co, _tracker_row(), _row_report(co, _tracker_row())) == ""
 
     def test_link_text_is_the_fallback_number(self, tmp_path):
         # A slug so mangled it lost its numeric prefix: the `[N]` text still says.
         co = _reports(tmp_path, "003-initech-2026.md")
         row = _tracker_row().replace("[003](reports/003-x.md)", "[003](reports/initech.md)")
-        assert _dead_link_repair(co, row) == "003-initech-2026.md"
+        assert _dead_link_repair(co, row, _row_report(co, row)) == "003-initech-2026.md"
 
     def test_shifted_row_declined(self, tmp_path):
         co = _reports(tmp_path, "12-a.md")
         shifted = _SHIFTED_ROW.replace("12-a.md", "12-b.md")      # a dead link, so only the shape declines it
-        assert _dead_link_repair(co, shifted) == ""
+        assert _dead_link_repair(co, shifted, _row_report(co, shifted)) == ""
 
     def test_two_reports_with_the_number_resolve_by_the_rows_company(self, tmp_path):
         """A synced cloud report and a local-only one can share a number; the
@@ -1328,25 +1337,25 @@ class TestDeadLinkRepair:
         co = _reports(tmp_path, "042-globex-2026-05-27.md", "042-zeta-corp-2026-08-25.md")
         row = (_tracker_row().replace("Initech", "Zeta Corp")
                .replace("[003](reports/003-x.md)", "[042](reports/042-zeta-&-corp-2026-08-25.md)"))
-        assert _dead_link_repair(co, row) == "042-zeta-corp-2026-08-25.md"
+        assert _dead_link_repair(co, row, _row_report(co, row)) == "042-zeta-corp-2026-08-25.md"
 
     def test_two_reports_with_the_number_and_no_company_match_are_declined(self, tmp_path):
         co = _reports(tmp_path, "042-globex-2026-05-27.md", "042-acme-2026-08-25.md")
         row = (_tracker_row().replace("Initech", "Zeta Corp")
                .replace("[003](reports/003-x.md)", "[042](reports/042-zeta-corp.md)"))
-        assert _dead_link_repair(co, row) == ""                   # a guess is worse than a dead link
+        assert _dead_link_repair(co, row, _row_report(co, row)) == ""                   # a guess is worse than a dead link
 
     def test_link_text_wins_over_a_disagreeing_filename_prefix(self, tmp_path):
         # `[N]` is the row's identity to the UI, row_report_num and the loss
         # guard; a dead path whose prefix says otherwise does not repoint the row.
         co = _reports(tmp_path, "271-acme-2026.md", "270-globex-2026.md")
         row = _tracker_row().replace("[003](reports/003-x.md)", "[271](reports/270-acme-&-co.md)")
-        assert _dead_link_repair(co, row) == "271-acme-2026.md"
+        assert _dead_link_repair(co, row, _row_report(co, row)) == "271-acme-2026.md"
 
     def test_a_row_that_lost_its_trailing_notes_tab_is_still_repaired(self, tmp_path):
         co = _reports(tmp_path, "003-initech-2026.md")
         eight_cells = "\t".join(_tracker_row(notes="").split("\t")[:-1])
-        assert _dead_link_repair(co, eight_cells) == "003-initech-2026.md"
+        assert _dead_link_repair(co, eight_cells, _row_report(co, eight_cells)) == "003-initech-2026.md"
 
 
 class TestReadReport:
@@ -1786,3 +1795,135 @@ class TestNoUnredactedProfileReads:
         assert 'redact_profile_yml(_read(local / "config" / "profile.yml"))' in skills
         content = (root / "resume_content.py").read_text(encoding="utf-8")
         assert "profile_master_for_prompt(profile_path)" in content
+
+
+class TestGeographyRuleInThePrompt:
+    """The belt half of #180's belt-and-braces. `work_location` is what the code
+    gates on, and the code degrades to "leave it alone" when the field is absent
+    — so a prompt that stops asking for the field disables the whole feature
+    silently, on every copy, with every test below this one still green.
+
+    The rule's own wording is guarded too, not just the schema key. Every clause
+    here is one the evaluator got wrong on a real report: it filed "requires
+    local presence in Chicago" as a soft gap because nothing defined a hard
+    stop, and it padded that gap with flexibility the posting never offered
+    ("may offer remote", "or candidate is open to relocation").
+    """
+
+    def _prompt(self):
+        return build_system_prompt("cv", "profile", profile_master="MASTER")
+
+    def test_the_machine_summary_asks_for_the_structured_field(self):
+        p = self._prompt()
+        i = p.index("**Machine Summary**")
+        block = p[i:i + 900]
+        assert "work_location:" in block
+        for key in ("mode:", "metro:", "state:"):
+            assert key in block, key
+        assert "onsite | hybrid | remote" in block
+
+    def test_hard_stops_are_defined_at_all(self):
+        """`hard_stops: []` shipped in the schema for months with no definition
+        anywhere of what earns one, which is how "cannot physically be there"
+        ended up beside "unfamiliar with the neighbourhood"."""
+        p = self._prompt()
+        assert "**Hard stops**" in p
+        assert "hard_stops" in p
+
+    def test_the_geography_rule_is_stated(self):
+        p = self._prompt().lower()
+        assert "physical presence" in p
+        # Hybrid must be named: the failure mode is reading one office day a
+        # week as near enough to remote.
+        assert "hybrid" in p
+        assert "commutable" in p or "has not said they can work in" in p
+
+    def test_invented_flexibility_is_forbidden(self):
+        p = self._prompt().lower()
+        assert "do not invent flexibility" in p
+
+    def test_inherently_local_work_is_called_out(self):
+        """The report that prompted this said "remote coordination", so the
+        keyword guard in remote_signal could never have caught it."""
+        p = self._prompt().lower()
+        assert "community-based" in p and "field" in p
+
+    def test_the_mode_is_what_the_posting_requires_not_prefers(self):
+        p = self._prompt()
+        assert "REQUIRES" in p
+        assert "headquarters" in p.lower()
+
+
+class TestWorkLocationMark:
+    """#180's storage half: the evaluation records WHERE the role is on the row,
+    once, so the three surfaces that rank roles (the digest, the work-order, the
+    UI) read one fact instead of each opening the report. Notes rather than a new
+    column or a state file, for `liveness_closed_mark`'s own reasons — it rides
+    the cached cloud tracker and every Refresh."""
+
+    ROW = ("12\t2026-09-14\tUCAN\tOutreach Specialist\tEvaluada\t4.8/5\tnull\t"
+           "[047](reports/047-ucan-2026-09-14.md)\tAPPLY strong outreach match")
+
+    def _report(self, mode="onsite", metro="Chicago, IL", state="IL"):
+        return ("# Evaluacion\n\n## Machine Summary\n\n```yaml\n"
+                f'final_decision: "Apply"\nwork_location:\n  mode: "{mode}"\n'
+                f'  metro: "{metro}"\n  state: "{state}"\nhard_stops: []\n```\n')
+
+    def test_write_job_result_records_the_location_it_evaluated(self, tmp_path):
+        reports, additions = tmp_path / "reports", tmp_path / "additions"
+        reports.mkdir(); additions.mkdir()
+        response = (f"<report>{self._report()}</report>"
+                    f"<tracker_tsv>{self.ROW}</tracker_tsv>"
+                    '<summary>{"status": "completed", "company": "UCAN"}</summary>')
+        write_job_result(response, {"id": "j1", "report_num": "047",
+                                    "url": "https://x.example/47"},
+                         reports, additions, "2026-09-14")
+        notes = (additions / "j1.tsv").read_text(encoding="utf-8").strip().split("\t")[-1]
+        assert "Work location: On-site Chicago, IL" in notes
+
+    def test_a_report_without_the_field_gets_no_mark(self):
+        """Every row written before #180. An unmarked row has never been judged,
+        which must stay distinguishable from a row judged remote."""
+        plain = '# Evaluacion\n\n## Machine Summary\n\n```yaml\nfinal_decision: "Apply"\n```\n'
+        assert _report_location_mark(plain) == ""
+        assert "Work location" not in sanitize_addition(self.ROW, work_location="")
+
+    def test_the_mark_lands_after_the_url_and_req_id(self):
+        """Those two are read by machines that take the FIRST match in the cell
+        (merge-tracker's extractReqNumber, the UI's Open posting); the mark is
+        read by a regex that does not care where it sits."""
+        out = sanitize_addition(self.ROW, "https://x.example/47", "Job ID: 88214",
+                                work_location="Work location: On-site Chicago, IL")
+        notes = out.split("\t")[-1]
+        assert notes.index("req ") < notes.index("https://") < notes.index("Work location:")
+
+    def test_it_is_idempotent(self):
+        """sanitize_addition runs at two points; a second pass must not grow a
+        second mark."""
+        once = sanitize_addition(self.ROW, "https://x.example/47",
+                                 work_location="Work location: On-site Chicago, IL")
+        twice = sanitize_addition(once, "https://x.example/47",
+                                  work_location="Work location: On-site Chicago, IL")
+        assert once == twice and twice.count("Work location:") == 1
+
+    def test_a_batch_row_gets_the_mark_from_the_report_it_links(self, tmp_path):
+        """The `--batch` path: career-ops' batch-runner lets the agent CLI write
+        the TSV directly, so the row reaches the merge with none of the chain
+        applied — but the report it names is on disk from the same run."""
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "047-ucan-2026-09-14.md").write_text(
+            self._report(), encoding="utf-8")
+        assert _pending_location_mark(self.ROW, _row_report(tmp_path, self.ROW)) == "Work location: On-site Chicago, IL"
+
+    def test_a_dead_report_link_still_finds_its_report(self, tmp_path):
+        """The Report cell is model-authored (#162), so the slug may name no file;
+        resolution is by number, exactly as every other reader does it."""
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "reports" / "047-ucan-2026-09-14.md").write_text(
+            self._report(), encoding="utf-8")
+        dead = self.ROW.replace("047-ucan-2026-09-14.md", "047-ucan-&-co-2026-09-14.md")
+        assert _pending_location_mark(dead, _row_report(tmp_path, dead)) == "Work location: On-site Chicago, IL"
+
+    def test_no_report_means_no_mark(self, tmp_path):
+        (tmp_path / "reports").mkdir()
+        assert _pending_location_mark(self.ROW, _row_report(tmp_path, self.ROW)) == ""

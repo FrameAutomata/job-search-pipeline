@@ -47,6 +47,7 @@ from pipeline._batch_common import (
     atomic_write_text, env_float, env_int, normalize_company as _squeeze, read_text,
 )
 from pipeline.app import data as _data
+from pipeline.work_location import OUT_OF_AREA_TAG, commutable_area
 from pipeline.tracker_layout import SEPARATOR_RE, split_row
 from pipeline.stdio import line_buffer_stdout
 
@@ -231,6 +232,10 @@ class QueueRole:
     report: str = ""         # career-ops-relative eval report path; feeds tailoring
     report_num: str = ""     # the row's `[N]`, for a dead link the path alone can't resolve
     easy_apply: bool = False  # a board-hosted one-click application (parse_applications' flag)
+    # "On-site Chicago, IL" when the role needs a body outside every commutable
+    # pass metro (#180), "" when it does not — one field, since the label is only
+    # ever set for a role the predicate demoted.
+    area: str = ""
 
     @property
     def board(self) -> str:
@@ -254,6 +259,7 @@ class WorkOrderItem:
     report_num: str = ""     # the row's `[N]`, so the readers resolve a dead link the UI can
     easy_apply: bool = False  # board-hosted one-click application — what submit-easy-apply submits
     resume_from: str = ""    # READY_STATUS when this row is a re-emitted form the person must Submit
+    area: str = ""           # "On-site Chicago, IL" — sorted below every reachable role (#180)
 
 
 # ── Normalization / keys ───────────────────────────────────────────────────────
@@ -635,7 +641,13 @@ def _iter_jsonl(path: Path):
 
 
 def load_queue(path: Path) -> list[QueueRole]:
-    """Read evaluated-roles-by-score.jsonl (tolerant of blank/garbled lines)."""
+    """Read evaluated-roles-by-score.jsonl (tolerant of blank/garbled lines).
+
+    `area` (#180) is taken from the row when the export carries it. Nothing in
+    this repo produces this file, and an export written without that key gets no
+    out-of-area demotion — the tracker path derives it from each row's Notes,
+    this one cannot, and inventing a lookup back into the tracker would make the
+    optional artifact depend on the thing it exists to replace."""
     out: list[QueueRole] = []
     for o in _iter_jsonl(path):
         try:
@@ -649,6 +661,12 @@ def load_queue(path: Path) -> list[QueueRole]:
             role=str(o.get("role") or "").strip(),
             url=str(o.get("url") or "").strip(),
             status=str(o.get("status") or "").strip(),
+            # An out-of-band export has no Notes cell to derive this from, so it
+            # is read straight off the object when the exporter supplied it. A
+            # jsonl without the key gets no demotion — said in the docstring
+            # rather than guessed at, since the alternative is re-deriving a
+            # tracker fact from a file that is not the tracker.
+            area=str(o.get("area") or "").strip(),
             report=str(o.get("report") or "").strip(),
             report_num=str(o.get("report_num") or "").strip(),
             easy_apply=_truthy(o.get("easy_apply")),
@@ -696,6 +714,11 @@ def load_queue_from_tracker(career_ops: Path) -> list[QueueRole]:
             report=str(row.get("report_path") or "").strip(),
             report_num=str(row.get("report_num") or "").strip(),
             easy_apply=_truthy(row.get("easy_apply")),
+            # Derived by the tracker parser from the row's own `Work location:`
+            # mark against the commutable area in effect (#180) — the same route
+            # easy_apply takes, so the UI, the digest and this ranker cannot
+            # come to three different answers about one role.
+            area=str(row.get("area") or "").strip(),
         ))
     return out
 
@@ -1012,7 +1035,10 @@ def build_work_order(
         fresh.append(q)
 
     ready.sort(key=lambda q: q.score, reverse=True)
-    fresh.sort(key=lambda q: q.score, reverse=True)
+    # Reachable roles first, then by score (#180). Ready rows are NOT reordered:
+    # the form is already filled and waiting on the person, so where the job is
+    # stopped being a reading-order question the moment that happened.
+    fresh.sort(key=lambda q: (bool(q.area), -q.score))
     # Non-positive limit means "no limit": --limit 0 must not empty the
     # work-order, and --limit -3 must not slice off the 3 lowest (review L1).
     # The cap applies to the whole list, ready rows first — a form waiting on
@@ -1026,7 +1052,7 @@ def build_work_order(
             rank=i + 1, num=q.num, score=q.score, company=q.company, role=q.role,
             board=q.board, url=q.url, resume_base=suggest_resume_base(q.role),
             status=resume_from, report=q.report, report_num=q.report_num,
-            easy_apply=q.easy_apply, resume_from=resume_from,
+            easy_apply=q.easy_apply, resume_from=resume_from, area=q.area,
         )
         for i, (q, resume_from) in enumerate(ordered)
     ]
@@ -1208,15 +1234,33 @@ READY_AGENT_NOTE = (
 READY_HEADING = "## Waiting for you: form filled — open it, check it, click Submit"
 EASY_APPLY_TAG = "Easy Apply"
 _MD_TABLE_HEAD = (
-    "| # | Score | Company | Role | Board | Apply | Resume base | URL |",
-    "|---|-------|---------|------|-------|-------|-------------|-----|",
+    "| # | Score | Company | Role | Board | Apply | Where | Resume base | URL |",
+    "|---|-------|---------|------|-------|-------|-------|-------------|-----|",
 )
 
 
 def _md_row(i: WorkOrderItem) -> str:
     tag = EASY_APPLY_TAG if i.easy_apply else ""
+    # Blank for every reachable row, like the Apply column: a mark that fires on
+    # most rows is wallpaper, and these sort last anyway.
+    where = f"{OUT_OF_AREA_TAG} — {i.area}" if i.area else ""
     return (f"| {i.rank} | {i.score:g} | {i.company} | {i.role} | {i.board} | {tag} | "
-            f"{i.resume_base} | {i.url} |")
+            f"{where} | {i.resume_base} | {i.url} |")
+
+
+def _out_of_area_note(fresh: list[WorkOrderItem]) -> list[str]:
+    """The one line explaining why the tail of the table is the tail — emitted
+    only when there IS a tail, so a work-order with nothing out of area reads
+    exactly as it did before."""
+    n = sum(1 for i in fresh if i.area)
+    if not n:
+        return []
+    return [f"The last {n} need someone on site somewhere the candidate has not said "
+            f"they can work ({OUT_OF_AREA_TAG} in `Where`) — they sort last for that "
+            f"reason alone. Do NOT prepare or submit these, whatever the submit policy "
+            f"above says: they are blocked on the candidate, not on you, so record "
+            f"`handoff` and move on. Not `ready-to-submit` — that one comes back at the "
+            f"TOP of the next work-order, which would undo the demotion."]
 
 
 def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
@@ -1237,6 +1281,7 @@ def render_work_order_md(items: list[WorkOrderItem], *, board: str = "both",
         f"{len(fresh)} fresh {site}roles (of {total_queue} scored; {len(ready)} to finish, "
         f"{touched} excluded).",
         "Work top-down: the score sets your reading order, nothing more — judge each role from the live posting.",
+        *_out_of_area_note(fresh),
         policy_line(policy),
         "",
         "For each role: open the URL, qualify it against the profile, tailor the resume",
@@ -1827,6 +1872,15 @@ def session_summaries(out_dir) -> list[dict]:
 # no caller knows it the prompt states the rule for both cases.
 _LEAD_STOP = ("Prepare this application through the browser and stop before "
               f"Submit; record `{READY_STATUS}`.")
+# An out-of-area role is not a form to fill and hold — it is blocked on a
+# question only the candidate can answer ("can you work in Chicago?"), which is
+# what `handoff` means. `ready-to-submit` would have been worse than doing
+# nothing: that status is RE-EMITTED at the top of every later work-order under
+# "form filled — click Submit", so telling the agent to record it would invert
+# the demotion on the next run.
+_LEAD_OUT_OF_AREA = ("Do NOT prepare or submit this application. It needs someone on "
+                     "site somewhere the candidate has not said they can work, so it is "
+                     "blocked on them, not on you: record `handoff` and move on.")
 _LEAD_SUBMIT = "Apply to this role through the browser, then record the outcome."
 _LEAD_EASY_APPLY_UNKNOWN = ("Apply to this role through the browser if it is a board-hosted "
                             "one-click application (Indeed Apply, LinkedIn Easy Apply); "
@@ -1865,16 +1919,29 @@ def role_prompt(company: str, role: str, url: str, *,
                 profile: Path | None = None,
                 resume: Path | None = None,
                 policy: str | None = None,
-                easy_apply: bool | None = None) -> str:
+                easy_apply: bool | None = None,
+                area: str = "") -> str:
     """The paste-ready prompt for handing ONE role to a browser agent. The
     caller (the UI route) gathers the facts/paths; this module renders them so
     the writeback contract and the appended-row schema — which must mirror the
     keys load_writeback() reads — live beside their parser. The first line and
     the fallback row's status follow the submit policy AND, under
     submit-easy-apply, the row's `easy_apply` flag (None = unknown): the
-    fallback says `applied` only for a role the agent is told to submit."""
+    fallback says `applied` only for a role the agent is told to submit.
+
+    `area` is the #180 out-of-area label when the role needs a body somewhere the
+    candidate has not said they can work. It is stated here because this is the
+    one path that dispatches an agent at a SINGLE role — the work-order's ranking
+    never runs, so the demotion that protects every other surface cannot."""
     policy = _resolve_policy(policy)
-    lead, fallback_status = _role_prompt_lead(policy, easy_apply)
+    # An out-of-area role is never auto-submitted, whatever the policy says:
+    # otherwise line 1 reads "apply and record applied" while the paragraph below
+    # reads "confirm with them before applying", and the agent has to pick — with
+    # the fallback row pre-set to `applied`, which is the wrong one.
+    # Demote-not-drop means the person still decides; it cannot mean the agent
+    # submits an application to a city they cannot work in first.
+    lead, fallback_status = ((_LEAD_OUT_OF_AREA, "handoff") if area
+                             else _role_prompt_lead(policy, easy_apply))
     # The role's writeback target — and its living profile — live in the same
     # handoff dir as its own site's session file.
     out_dir = default_out_dir()
@@ -1888,6 +1955,13 @@ def role_prompt(company: str, role: str, url: str, *,
         f"Role: {role}",
         f"Posting: {url}",
     ]
+    if area:
+        lines.append(
+            f"{OUT_OF_AREA_TAG}: {area} — this role needs someone on site somewhere "
+            "the candidate has not said they can work, so it is blocked on them "
+            "whatever the submit policy above says. Do not assume the posting "
+            "will go remote."
+        )
     if report:
         lines.append(f"Evaluation report: {report}")
     lines.append(f"Candidate profile (qualify + tailor against it): {profile}")
@@ -1942,7 +2016,8 @@ def run(
     # Queue source: the scored-export jsonl when present (an optional
     # out-of-band artifact), else the tracker itself — applications.md is what
     # every --evaluate-batch run writes, so a fresh install works end to end.
-    if queue_path.exists():
+    from_export = queue_path.exists()
+    if from_export:
         queue = load_queue(queue_path)
     else:
         queue = load_queue_from_tracker(co)
@@ -1952,6 +2027,31 @@ def run(
             return 1
         print(f"[handoff] queue source: {co / 'data' / 'applications.md'} "
               f"(no scored-export jsonl at {queue_path})")
+
+    # #180: a role whose recorded work location is outside every commutable
+    # search-pass metro sorts below every reachable one and is labelled. The
+    # verdict rides in on the queue rows (the tracker parser derives it), so
+    # there is nothing to compute here — only to report, because a config the
+    # parser could not read makes the whole gate a silent no-op.
+    # `load_search_config` is deliberately total, so a missing file, a syntax
+    # error or a PyYAML-less venv all end as "no commutable metros" and every
+    # row comes back reachable — indistinguishable, in the output, from a
+    # candidate who really can reach everything. This is a feature whose only
+    # failure mode is invisibility, so the two cases say different things.
+    commutable = commutable_area()
+    away = sum(1 for q in queue if q.area)
+    if not commutable:
+        print("[handoff] out of area: gate OFF -- no commutable metros in the search "
+              "config (no non-remote pass with a location, or the config is unreadable)")
+    elif from_export and not away:
+        # The tracker path derives the verdict from each row's Notes; the export
+        # has no Notes cell, so a jsonl written without an `area` key demotes
+        # nothing — which must not print as "nothing is out of area".
+        print(f"[handoff] out of area: gate OFF -- the scored export at {queue_path} "
+              "carries no `area` field (the tracker queue derives it from Notes)")
+    else:
+        print(f"[handoff] out of area: {away} of {len(queue)} queued roles need presence "
+              f"outside {', '.join(commutable)} (sorted last)")
 
     tracker_path = Path(tracker) if tracker else out_dir / DEFAULT_TRACKER_NAME
     job_log_text = job_log.read_text(encoding="utf-8") if job_log and job_log.exists() else ""
@@ -1982,8 +2082,11 @@ def run(
             # flatten every session's rows in global score order and let
             # enrich_with_resumes pick the single best row per company. Rows are
             # mutated in place, so the session lists see the attached resume.
+            # Same order the sessions use: tailoring caches per COMPANY and the
+            # first row wins that cache, so a reachable role should be the one it
+            # is tailored for when a company posts both.
             all_items = sorted((i for items in sessions.values() for i in items),
-                               key=lambda i: i.score, reverse=True)
+                               key=lambda i: (bool(i.area), -i.score))
             enrich_with_resumes(all_items, tailor_fn, min_score=min_score,
                                 workers=max(1, workers or env_int("BATCH_CONCURRENCY", 3)))
 

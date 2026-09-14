@@ -512,3 +512,18 @@ tbody tr.selected { background: #233047; }
 }
 .danger-btn:hover { filter: brightness(1.1); }
 .danger-btn:disabled { opacity: 0.6; cursor: default; }
+
+/* #180: a role whose recorded work location is outside the candidate's search
+   area. Muted rather than alarming — the role is demoted and labelled, never
+   removed, because someone may genuinely relocate. Matches .status-badge's
+   shape so it reads as one of the row's tags, not as an error. */
+.area-tag {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  white-space: nowrap;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
