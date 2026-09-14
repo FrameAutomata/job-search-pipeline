@@ -58,3 +58,7 @@ Thumbs.db
 
 # Claude Code local session/config (per-user, not for the repo)
 .claude/
+
+# Session handoff notes: working context, not template content. Names the
+# real people whose searches run on the private copies; this repo is public.
+HANDOFF.md
