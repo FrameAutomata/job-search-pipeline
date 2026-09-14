@@ -37,7 +37,7 @@ HEADER = (
 
 def _report(num, company, role, *, decision="Apply", strengths=("Eight years of Java",),
             hard_stops=(), url="https://www.indeed.com/viewjob?jk=abc123",
-            score="4.6") -> str:
+            score="4.6", work_location=None) -> str:
     """A report in the shape the evaluation prompt in _batch_common asks for:
     the header block, then `## Machine Summary` with its fenced YAML."""
     def yaml_list(items):
@@ -51,7 +51,11 @@ def _report(num, company, role, *, decision="Apply", strengths=("Eight years of 
         "```yaml\n"
         f'company: "{company}"\nrole: "{role}"\nscore: {score}\n'
         'legitimacy_tier: "High Confidence"\narchetype: "Backend"\n'
-        f'final_decision: "{decision}"\nhard_stops: {yaml_list(hard_stops)}\n'
+        f'final_decision: "{decision}"\n'
+        + (f'work_location:\n  mode: "{work_location[0]}"\n'
+           f'  metro: "{work_location[1]}"\n  state: "{work_location[2]}"\n'
+           if work_location else "")
+        + f'hard_stops: {yaml_list(hard_stops)}\n'
         'soft_gaps: ["No Kubernetes"]\n'
         f"top_strengths: {yaml_list(strengths)}\n"
         'risk_level: "Low"\nconfidence: "High"\nnext_action: "Apply today"\n'
@@ -121,8 +125,15 @@ def test_importable_without_ui_deps():
     server and onboard into THIS one: blocking the two names here and
     re-importing only the digest would let a fastapi import added to data.py,
     or a `from pipeline.app import onboard` (→ batch_evaluate → provider
-    SDKs), pass while the cloud step (requirements.txt only) broke."""
+    SDKs), pass while the cloud step (requirements.txt only) broke.
+
+    `yaml` is blocked here rather than grepped for below, and that is the
+    stronger half: the digest's two lazy-yaml readers now live in modules it
+    imports (`_batch_common.parse_machine_summary`,
+    `search_config.load_search_config`), where a source grep of THIS file
+    cannot see either of them promoted to a top-level import."""
     probe = ("import sys; sys.modules['fastapi'] = None; sys.modules['markdown'] = None; "
+             "sys.modules['yaml'] = None; "
              "import pipeline.daily_digest as m; "
              "assert m.SECRET_VARS and m.SETTING_VARS and m.DELTA == 'reports'")
     res = subprocess.run([sys.executable, "-c", probe], cwd=ROOT,
@@ -150,7 +161,9 @@ def test_no_third_party_imports_of_its_own():
         r"^(import|from) (argparse|json|os|re|smtplib|ssl|sys|traceback|urllib|uuid|"
         r"dataclasses|datetime|email|pathlib|__future__|pipeline)\b", l)]
     assert not third, third
-    assert "import yaml" in src and "yaml" not in " ".join(top)
+    # The lazy `import yaml` itself moved out with parse_machine_summary; that
+    # it stays lazy is now held by test_importable_without_ui_deps' probe.
+    assert "yaml" not in " ".join(top)
 
 
 # ── Selection ────────────────────────────────────────────────────────────────
@@ -785,3 +798,82 @@ def test_conftest_isolates_every_name_the_module_reads():
     conftest = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
     for const in ("SECRET_VARS", "SETTING_VARS", "RUN_VARS"):
         assert f"daily_digest.{const}" in conftest
+
+
+# ── Out of area (#180) ───────────────────────────────────────────────────────
+
+class TestOutOfArea:
+    """A role needing a body in another metro is DEMOTED, never dropped: it keeps
+    its score, its link and its place in the digest, and it sorts below every
+    reachable role with a label saying why. The failure this replaces ranked four
+    such roles 4.8/4.8/4.7/4.5 at the top of a real queue, and the candidate
+    stopped after the first wall."""
+
+    DFW = ["Dallas, TX"]
+
+    @pytest.fixture
+    def world(self, tmp_path):
+        root = tmp_path / "career-ops"
+        manifest = _snapshot(root, tmp_path / "manifest.json")
+        _write(root / "reports" / "002-ucan-2026-09-09.md",
+               _report("002", "UCAN", "Outreach Specialist", score="4.8"))
+        _write(root / "reports" / "003-metrocare-2026-09-09.md",
+               _report("003", "Metrocare", "Case Manager", score="4.1"))
+        _write(root / "reports" / "004-globex-2026-09-09.md",
+               _report("004", "Globex", "Coordinator", score="4.3"))
+        _write(root / "data" / "applications.md", HEADER
+               + _row(2, "UCAN", "Outreach Specialist", "4.8/5", "Evaluated", "002", "https://www.linkedin.com/jobs/view/2 — Work location: On-site Chicago, IL — APPLY")
+               + _row(3, "Metrocare", "Case Manager", "4.1/5", "Evaluated", "003", "https://www.linkedin.com/jobs/view/3 — Work location: On-site Dallas, TX — APPLY")
+               + _row(4, "Globex", "Coordinator", "4.3/5", "Evaluated", "004", "https://www.linkedin.com/jobs/view/4 — Work location: Remote — APPLY"))
+        return root, manifest
+
+    def test_the_reachable_roles_come_first_even_scoring_lower(self, world):
+        root, manifest = world
+        d = _build(root, manifest, commutable=self.DFW)
+        assert [i.company for i in d.items] == ["Globex", "Metrocare", "UCAN"]
+
+    def test_it_is_demoted_not_dropped(self, world):
+        root, manifest = world
+        d = _build(root, manifest, commutable=self.DFW)
+        ucan = [i for i in d.items if i.company == "UCAN"][0]
+        assert ucan.score == 4.8 and ucan.url and ucan.report_num == "002"
+
+    def test_the_row_says_why(self, world):
+        root, manifest = world
+        d = _build(root, manifest, commutable=self.DFW)
+        ucan = [i for i in d.items if i.company == "UCAN"][0]
+        assert ucan.area == "On-site Chicago, IL"
+        # In the TITLE: at 1-6 roles a day the sort alone is invisible, because
+        # there is often nothing above the demoted row to see it fall below.
+        assert dd.OUT_OF_AREA_TAG in ucan.title
+        assert f"{dd.OUT_OF_AREA_TAG}: On-site Chicago, IL" in ucan.description
+
+    def test_a_reachable_role_is_not_labelled(self, world):
+        root, manifest = world
+        d = _build(root, manifest, commutable=self.DFW)
+        for company in ("Metrocare", "Globex"):
+            item = [i for i in d.items if i.company == company][0]
+            assert not item.area and dd.OUT_OF_AREA_TAG not in item.title
+
+    def test_no_commutable_config_changes_nothing(self, world):
+        """The cloud reads config/search.yml; a copy without one, or a PyYAML-less
+        environment, must digest exactly as it did before rather than demote
+        everything."""
+        root, manifest = world
+        d = _build(root, manifest, commutable=[])
+        assert [i.company for i in d.items] == ["UCAN", "Globex", "Metrocare"]
+        assert not any(i.area for i in d.items)
+
+    def test_reports_without_the_field_are_left_alone(self, world):
+        """Every report evaluated before #180 shipped. Reading a missing
+        work_location as anything but "unknown" would re-sort the whole backlog
+        on no evidence."""
+        root, manifest = world
+        _write(root / "reports" / "005-oldco-2026-09-09.md",
+               _report("005", "Oldco", "Legacy Role", score="4.9"))
+        tracker = root / "data" / "applications.md"
+        tracker.write_text(tracker.read_text(encoding="utf-8")
+                           + _row(5, "Oldco", "Legacy Role", "4.9/5", "Evaluated", "005", "APPLY https://www.linkedin.com/jobs/view/5"),
+                           encoding="utf-8")
+        d = _build(root, manifest, commutable=self.DFW)
+        assert d.items[0].company == "Oldco" and not d.items[0].area

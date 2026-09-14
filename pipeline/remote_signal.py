@@ -55,6 +55,7 @@ CSV); the jobspy-free UI venv can import this.
 """
 
 import re
+from functools import lru_cache
 from pathlib import Path
 
 from pipeline.rowio import read_rows, write_rows
@@ -191,6 +192,20 @@ def _place_name(pass_location: str) -> str:
     return pass_location.split(",", 1)[0].strip()
 
 
+@lru_cache(maxsize=16)
+def local_pattern(pass_locations: tuple):
+    """One compiled `\\b(city1|city2|...)\\b` for a pass list, or None.
+
+    The place names of the passes are a property of the CONFIG, not of the row
+    being judged, but every caller asks per row — filter and screen per scraped
+    row, and `work_location.out_of_area` per tracker row on a path the UI runs
+    per request. Building one pattern per pass per row was 1,600 regex lookups
+    on a 400-row, 4-pass tracker. Cached on the pass tuple; pure, so a stale
+    entry is impossible."""
+    return compile_alternation([n for loc in pass_locations
+                                if len(n := _place_name(str(loc or ""))) >= 2])
+
+
 def is_local_location(row_location, pass_locations) -> bool:
     """Whether a row's location is one of the user's non-remote passes'.
 
@@ -204,13 +219,8 @@ def is_local_location(row_location, pass_locations) -> bool:
     where = str(row_location or "")
     if not where.strip():
         return False
-    for loc in pass_locations:
-        name = _place_name(str(loc or ""))
-        if len(name) < 2:
-            continue
-        if re.search(rf"\b{re.escape(name)}\b", where, re.IGNORECASE):
-            return True
-    return False
+    pattern = local_pattern(tuple(pass_locations or ()))
+    return pattern is not None and pattern.search(where) is not None
 
 
 def compile_alternation(terms) -> re.Pattern | None:

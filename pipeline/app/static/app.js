@@ -96,6 +96,15 @@ function visibleRows() {
     );
   });
   rows.sort((a, b) => {
+    // Out-of-area roles sink below every reachable one FIRST, before the chosen
+    // column is consulted (#180). The server derives `area` per row: non-empty
+    // means the role needs a body in a metro none of the candidate's non-remote
+    // search passes covers. It leads the comparator rather than being a sort
+    // option because it is not a way of ordering the queue, it is whether the
+    // role is takeable — the digest and the work-order rank it the same way, and
+    // three surfaces disagreeing about the top of the list is the bug (#180).
+    const aa = gated(a) ? 1 : 0, ba = gated(b) ? 1 : 0;
+    if (aa !== ba) return aa - ba;
     let av = a[sortKey], bv = b[sortKey];
     // Nulls always sort to the bottom regardless of direction.
     if (av == null && bv == null) return 0;
@@ -128,7 +137,7 @@ function renderTable() {
     tr.innerHTML = `
       <td class="num"><span class="score-pill ${scoreClass(j.score_value)}">${scoreText}</span></td>
       <td title="${escapeAttr(j.company)}">${escapeHtml(j.company)}</td>
-      <td title="${escapeAttr(j.role)}">${escapeHtml(j.role)}</td>
+      <td title="${escapeAttr(j.role)}">${escapeHtml(j.role)}${areaTag(j)}</td>
       <td><span class="status-badge">${escapeHtml(j.status)}</span></td>
       <td>${escapeHtml(j.date)}</td>`;
     tr.addEventListener("click", () => openReport(j));
@@ -168,6 +177,26 @@ function renderBoard() {
   els.count.textContent = `${rows.length} of ${JOBS.length} role${JOBS.length === 1 ? "" : "s"}`;
 }
 
+// The one-line reason a role is at the bottom, so "why is this last" never
+// needs the report open. Blank for every reachable role, like the work-order's
+// Where column: a mark that fires on most rows is wallpaper.
+// The out-of-area verdict answers "should I open this next", not "what is true
+// about this row forever". A role someone APPLIED to — deliberately, or after
+// negotiating remote — is past that question, so it keeps its place and loses
+// the tag; the digest and the work-order scope themselves to Evaluated rows the
+// same way, and a badge you cannot clear on a card you already actioned is the
+// wallpaper this mark exists to avoid.
+function gated(j) {
+  return Boolean(j.area) && j.status_canonical === "Evaluated";
+}
+
+function areaTag(j) {
+  if (!gated(j)) return "";
+  return ` <span class="area-tag" title="${escapeAttr(
+    "Needs someone on site outside your search area: " + j.area
+  )}">\u26a0 ${escapeHtml(j.area)}</span>`;
+}
+
 function makeCard(j) {
   const card = document.createElement("div");
   card.className = "kanban-card" + (j.pending ? " pending" : "");
@@ -179,7 +208,7 @@ function makeCard(j) {
       <span class="card-company">${escapeHtml(j.company)}</span>
       <span class="score-pill ${scoreClass(j.score_value)}">${scoreText}</span>
     </div>
-    <div class="card-role">${escapeHtml(j.role)}</div>`;
+    <div class="card-role">${escapeHtml(j.role)}</div>${areaTag(j)}`;
   card.addEventListener("click", () => openReport(j));
   card.addEventListener("dragstart", (e) => {
     card.classList.add("dragging");

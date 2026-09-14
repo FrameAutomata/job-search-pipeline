@@ -26,6 +26,7 @@ from pipeline._batch_common import (
     score_value,
 )
 from pipeline import tracker_layout
+from pipeline.work_location import area_verdict, commutable_area, work_location_from_notes
 from pipeline.tracker_layout import (
     CANONICAL_COLUMNS,
     SEPARATOR_RE as _SEPARATOR_RE,
@@ -555,27 +556,57 @@ def load_easy_apply_urls(data_dir: Path) -> set[str]:
     return read_url_set(data_dir / _EASY_APPLY_URLS_FILE)
 
 
-def parse_applications(applications_md: Path) -> list[dict]:
+def parse_applications(applications_md: Path, *, commutable=None) -> list[dict]:
     """Parse applications.md into a list of row dicts.
 
     Each dict has the _COLUMNS keys plus a derived `report_num` and
     `report_path` extracted from the Report cell's markdown link, a
-    `score_value` float (parsed from the "X.X/5" Score cell, or None), and an
-    `easy_apply` bool (its Notes URL is in the sibling easy-apply-urls.txt).
+    `score_value` float (parsed from the "X.X/5" Score cell, or None), an
+    `easy_apply` bool (its Notes URL is in the sibling easy-apply-urls.txt), and
+    an `area` string — the out-of-area label (#180) when the row's recorded work
+    location is outside the candidate's commutable metros, "" otherwise.
     Returns [] if the file is missing or has no data rows."""
     if not applications_md.exists():
         return []
     return parse_applications_text(
         applications_md.read_text(encoding="utf-8"),
         easy_apply_urls=load_easy_apply_urls(applications_md.parent),
+        commutable=commutable_area() if commutable is None else commutable,
     )
 
 
-def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = None) -> list[dict]:
+def _area_for(notes: str, commutable) -> str:
+    """The #180 out-of-area label for one row, from the `Work location:` mark the
+    evaluation wrote into its Notes. One helper because both parsers below
+    produce the same row shape and the UI ranks whichever it gets.
+
+    No empty-`commutable` guard: `out_of_area` already answers False when there
+    are no commutable states, and restating that rule here would be a second
+    place for "the gate is off" to be decided."""
+    return area_verdict(work_location_from_notes(notes), commutable)
+
+
+def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = None,
+                            commutable=()) -> list[dict]:
     """Parse applications.md *text* into row dicts (see parse_applications for the
     shape). Split out so the offline-tracker merge can parse in-memory cloud and
     local trackers without a file. `easy_apply_urls` tags the easy_apply flag;
-    omitted for callers (like the merge) that don't need it."""
+    omitted for callers (like the merge) that don't need it.
+
+    `commutable` is the candidate's non-remote search-pass locations, and `area`
+    is derived here for the same reason `easy_apply` is: it is a per-row fact
+    every ranker needs — the digest, the handoff work-order and the UI's own
+    table and Kanban — and deriving it once in the parser is what stops each of
+    them growing its own copy of the rule (#180). The row carries the recorded
+    FACT (`Work location:` in Notes, written at evaluation time) and the
+    predicate runs HERE, against whatever commutable area is in effect now, so
+    widening a search re-judges old rows instead of leaving frozen verdicts.
+    It defaults to `()` — no derivation — because this half is the pure text
+    parser the offline tracker merge runs over in-memory cloud and local
+    trackers: that path compares cells, a derived field is not one, and
+    resolving a search config off env and disk would make a documented pure
+    merge depend on both. `parse_applications`, the file entry point every
+    ranking caller uses, is where the default flips to "resolve it"."""
     easy_apply_urls = easy_apply_urls or set()
     vocabulary = _load_states()
     rows: list[dict] = []
@@ -594,6 +625,7 @@ def parse_applications_text(text: str, *, easy_apply_urls: set[str] | None = Non
         row["score_value"] = score_value(row.get("score", ""))
         row["status_canonical"] = canonical_status(row.get("status", ""), vocabulary)
         row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
+        row["area"] = _area_for(row.get("notes", ""), commutable)
 
         rows.append(row)
 
@@ -827,6 +859,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
     # Same easy_apply tagging as parse_applications, so the apply button gating
     # works in this fallback path too (career-ops/data is a sibling of batch/).
     easy_apply_urls = load_easy_apply_urls(tracker_dir.parent.parent / "data")
+    commutable = commutable_area()
     rows: list[dict] = []
     for f in tracker_dir.glob("*.tsv"):
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -842,6 +875,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
             row["score_value"] = score_value(row.get("score", ""))
             row["status_canonical"] = canonical_status(row.get("status", ""))
             row["easy_apply"] = extract_url(row.get("notes", "")) in easy_apply_urls
+            row["area"] = _area_for(row.get("notes", ""), commutable)
             rows.append(row)
     rows.sort(key=lambda r: _safe_int(r.get("num")))
     return rows

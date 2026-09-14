@@ -2333,3 +2333,247 @@ class TestEnvExampleSubmitPolicy:
         assert found == handoff.SUBMIT_POLICIES
         assert list(found) == list(handoff.SUBMIT_POLICIES)            # same order
         assert assign.split("=", 1)[1].strip() == handoff.DEFAULT_SUBMIT_POLICY
+
+
+# ── Out of area (#180) ───────────────────────────────────────────────────────
+
+class TestOutOfArea:
+    """A role the evaluation puts on-site or hybrid outside every commutable
+    search-pass metro sorts BELOW every reachable role and is labelled in the
+    `Where` column — demoted, never dropped. On the copy this came from, 20 of
+    61 queued roles were in other metros and they held the top four ranks.
+    """
+
+    DFW = ["Dallas, TX"]
+
+    def _q(self, company, score, **kw):
+        return handoff.QueueRole(num="1", score=score, company=company, role="Coordinator",
+                                 url="https://www.linkedin.com/jobs/view/9", **kw)
+
+    def _report(self, mode, metro, state):
+        return ("# Evaluacion\n\n## Machine Summary\n\n```yaml\n"
+                f'final_decision: "Apply"\nwork_location:\n  mode: "{mode}"\n'
+                f'  metro: "{metro}"\n  state: "{state}"\nhard_stops: []\n```\n')
+
+    # ── ranking ──────────────────────────────────────────────────────────────
+
+    def test_a_reachable_role_outranks_a_higher_scoring_one_elsewhere(self):
+        away = self._q("UCAN", 4.8, area="On-site Chicago, IL")
+        near = self._q("Metrocare", 4.1)
+        items = handoff.build_work_order([away, near], [])
+        assert [i.company for i in items] == ["Metrocare", "UCAN"]
+        assert [i.rank for i in items] == [1, 2]
+
+    def test_score_still_orders_within_each_group(self):
+        q = [self._q("A", 4.0), self._q("B", 4.9),
+             self._q("C", 4.2, area="On-site Chicago, IL"), self._q("D", 4.7, area="Hybrid Tucson, AZ")]
+        assert [i.company for i in handoff.build_work_order(q, [])] == ["B", "A", "D", "C"]
+
+    def test_it_is_demoted_not_dropped(self):
+        (item,) = handoff.build_work_order(
+            [self._q("UCAN", 4.8, area="On-site Chicago, IL")], [])
+        assert item.score == 4.8 and item.url and item.area
+        assert item.area == "On-site Chicago, IL"
+
+    def test_ready_rows_are_not_reordered_by_area(self):
+        """A filled form waiting on the person is past the point where "where is
+        this job" is a reading-order question — and it must stay ahead of every
+        fresh role, which is what the re-emit contract promises."""
+        ready = handoff.TrackedRole(key=handoff.role_key("UCAN", "Coordinator"),
+                                    company="UCAN", role="Coordinator",
+                                    status=handoff.READY_STATUS)
+        items = handoff.build_work_order(
+            [self._q("UCAN", 4.0, area="On-site Chicago, IL"),
+             self._q("Metrocare", 4.9)], [ready])
+        assert [i.company for i in items] == ["UCAN", "Metrocare"]
+
+    # ── rendering ────────────────────────────────────────────────────────────
+
+    def test_the_md_says_where_and_why(self):
+        items = handoff.build_work_order(
+            [self._q("Metrocare", 4.9),
+             self._q("UCAN", 4.8, area="On-site Chicago, IL")], [])
+        md = handoff.render_work_order_md(items, board="linkedin", total_queue=2, touched=0)
+        assert "| Where |" in md
+        assert f"{handoff.OUT_OF_AREA_TAG} — On-site Chicago, IL" in md
+        assert "The last 1 need someone on site" in md
+        # The reachable row's cell is blank — a mark on every row is wallpaper.
+        metrocare = [l for l in md.splitlines() if "Metrocare" in l][0]
+        assert handoff.OUT_OF_AREA_TAG not in metrocare
+
+    def test_a_work_order_with_nothing_out_of_area_reads_as_before(self):
+        items = handoff.build_work_order([self._q("Metrocare", 4.9)], [])
+        md = handoff.render_work_order_md(items, board="linkedin", total_queue=1, touched=0)
+        assert handoff.OUT_OF_AREA_TAG not in md and "need someone on site" not in md
+
+    def test_the_jsonl_carries_the_verdict_for_the_agent(self):
+        items = handoff.build_work_order(
+            [self._q("UCAN", 4.8, area="On-site Chicago, IL")], [])
+        row = json.loads(handoff.render_work_order_jsonl(items).strip())
+        # `area` alone — non-empty IS the verdict, and it says why, so the agent
+        # needs no second key that could contradict it.
+        assert row["area"] == "On-site Chicago, IL"
+        reachable = json.loads(handoff.render_work_order_jsonl(
+            handoff.build_work_order([self._q("Metrocare", 4.1)], [])).strip())
+        assert reachable["area"] == ""
+
+    # ── where the verdict comes from ────────────────────────────────────────
+
+    def test_the_queue_row_carries_the_verdict_from_the_tracker(self, tmp_path):
+        """No report is opened here: the evaluation recorded WHERE the role is in
+        the row's Notes, and `data.parse_applications` turns that into `area`
+        against the commutable area in effect — the same route `easy_apply`
+        takes. That is what lets the UI, the digest and this ranker agree."""
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        header = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+                  "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+        (co / "data" / "applications.md").write_text(
+            header
+            + ("| 1 | 2026-09-14 | UCAN | Coordinator | 4.8/5 | Evaluated |  |  | "
+               "https://www.linkedin.com/jobs/view/1 — Work location: On-site Chicago, IL — APPLY |\n")
+            + ("| 2 | 2026-09-14 | Metrocare | Coordinator | 4.1/5 | Evaluated |  |  | "
+               "https://www.linkedin.com/jobs/view/2 — Work location: On-site Dallas, TX — APPLY |\n")
+            + ("| 3 | 2026-09-14 | Oldco | Coordinator | 4.9/5 | Evaluated |  |  | "
+               "https://www.linkedin.com/jobs/view/3 — APPLY |\n"),
+            encoding="utf-8")
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches:\n  - location: Dallas, TX\n", encoding="utf-8")
+        monkey = {"SEARCH_CONFIG": str(cfg)}
+        import os
+        old = {k: os.environ.get(k) for k in monkey}
+        os.environ.update(monkey)
+        try:
+            queue = {q.company: q for q in handoff.load_queue_from_tracker(co)}
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+        assert queue["UCAN"].area == "On-site Chicago, IL"
+        assert queue["Metrocare"].area == ""
+        # A row written before #180 carries no mark and is left where it was.
+        assert queue["Oldco"].area == ""
+
+
+class TestOutOfAreaIsNeverAutoSubmitted:
+    """Demote-not-drop means the PERSON still decides — it cannot mean the agent
+    submits an application to a city they cannot work in first. Under submit-all
+    the prompt's first line used to say "apply and record applied" while the
+    paragraph below said "confirm before applying", with the fallback row
+    pre-filled `applied`: an agent had to pick, and the wrong one costs a real
+    application.
+
+    The recorded status is `handoff`, and that is the load-bearing part.
+    `ready-to-submit` would have been worse than doing nothing: it is RE-EMITTED
+    at the top of every later work-order under "form filled — click Submit", so
+    it would invert the demotion one run later."""
+
+    AREA = "On-site Chicago, IL"
+
+    @pytest.mark.parametrize("policy", sorted(handoff.SUBMIT_POLICIES))
+    def test_every_policy_hands_an_out_of_area_role_back_to_the_person(self, policy):
+        p = handoff.role_prompt("UCAN", "Coordinator", "https://www.linkedin.com/jobs/view/1",
+                                policy=policy, easy_apply=True, area=self.AREA)
+        # The two surfaces that actually tell the agent what to do: the FIRST
+        # line, and the status the fallback row is pre-filled with. Asserting
+        # merely that a status word appears somewhere is vacuous — the legend
+        # lists all five on every prompt whatever the policy.
+        assert p.startswith(handoff._LEAD_OUT_OF_AREA), p.splitlines()[0]
+        assert '"status": "handoff"' in p
+        assert f'"status": "{handoff.READY_STATUS}"' not in p
+
+    @pytest.mark.parametrize("policy", sorted(handoff.SUBMIT_POLICIES))
+    def test_a_reachable_role_keeps_its_policy(self, policy):
+        """The override is scoped to the out-of-area row, not a policy change."""
+        plain = handoff.role_prompt("Metrocare", "Coordinator",
+                                    "https://www.linkedin.com/jobs/view/2",
+                                    policy=policy, easy_apply=True)
+        expected = handoff._role_prompt_lead(policy, True)[0]
+        assert plain.startswith(expected)
+
+    def test_the_work_order_says_the_same_thing(self):
+        items = handoff.build_work_order(
+            [handoff.QueueRole(num="1", score=4.8, company="UCAN", role="Coordinator",
+                               url="https://www.linkedin.com/jobs/view/1", area=self.AREA)], [])
+        md = handoff.render_work_order_md(items, board="linkedin", total_queue=1, touched=0,
+                                          policy="submit-all")
+        assert "Do NOT prepare or submit these" in md
+        # ...and it says WHY not ready-to-submit, since that is the trap.
+        assert "`handoff`" in md and "comes back at the" in md
+
+
+class TestScoredExportCarriesArea:
+    def test_the_jsonl_queue_reads_area_when_the_export_supplies_it(self, tmp_path):
+        """The tracker path derives the verdict from Notes; this path has no
+        Notes cell, so it is read straight off the row or not at all."""
+        p = tmp_path / "evaluated-roles-by-score.jsonl"
+        p.write_text(
+            json.dumps({"num": "1", "score": 4.8, "company": "UCAN", "role": "Coordinator",
+                        "url": "https://www.linkedin.com/jobs/view/1",
+                        "area": "On-site Chicago, IL"}) + "\n"
+            + json.dumps({"num": "2", "score": 4.1, "company": "Metrocare", "role": "Coordinator",
+                          "url": "https://www.linkedin.com/jobs/view/2"}) + "\n",
+            encoding="utf-8")
+        by_company = {q.company: q for q in handoff.load_queue(p)}
+        assert by_company["UCAN"].area == "On-site Chicago, IL"
+        assert by_company["Metrocare"].area == ""
+
+
+class TestGateOffIsVisible:
+    """`load_search_config` is deliberately total, so a missing file, a syntax
+    error or a PyYAML-less venv all end as "no commutable metros" and every row
+    comes back reachable — identical, in the output, to a candidate who can
+    reach everything. This is a feature whose only failure mode is invisibility,
+    so the two cases must not print the same line."""
+
+    def _run(self, tmp_path, monkeypatch, capsys, config_text):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        header = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+                  "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+        (co / "data" / "applications.md").write_text(
+            header + ("| 1 | 2026-09-14 | UCAN | Coordinator | 4.8/5 | Evaluated |  |  | "
+                      "https://www.linkedin.com/jobs/view/1 — "
+                      "Work location: On-site Chicago, IL — APPLY |\n"), encoding="utf-8")
+        cfg = tmp_path / "search.yml"
+        cfg.write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("SEARCH_CONFIG", str(cfg))
+        handoff.run(queue_path=tmp_path / "none.jsonl", career_ops=co,
+                    out_dir=tmp_path / "handoff", tracker=tmp_path / "role-status.jsonl")
+        return capsys.readouterr().out
+
+    def test_a_working_gate_names_the_metros_and_the_count(self, tmp_path, monkeypatch, capsys):
+        out = self._run(tmp_path, monkeypatch, capsys, "searches:\n  - location: Dallas, TX\n")
+        assert "out of area: 1 of 1" in out and "Dallas, TX" in out
+        assert "gate OFF" not in out
+
+    @pytest.mark.parametrize("config_text", [
+        "searches: [oh: no: wait\n",                            # malformed
+        "searches:\n  - location: United States\n    is_remote: true\n",  # remote-only
+        "",                                                      # empty
+    ])
+    def test_a_disabled_gate_says_so(self, tmp_path, monkeypatch, capsys, config_text):
+        out = self._run(tmp_path, monkeypatch, capsys, config_text)
+        assert "gate OFF" in out
+        assert "out of area: 0 of" not in out
+
+    def test_a_scored_export_without_the_field_is_also_a_disabled_gate(
+            self, tmp_path, monkeypatch, capsys):
+        """The other silent no-op: the tracker path derives the verdict from each
+        row's Notes, the jsonl export has no Notes cell, so an export written
+        without an `area` key demotes nothing — which must not print as "0 of N
+        are out of area", the reading that says the gate looked and found none."""
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text("", encoding="utf-8")
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches:\n  - location: Dallas, TX\n", encoding="utf-8")
+        monkeypatch.setenv("SEARCH_CONFIG", str(cfg))
+        export = tmp_path / "evaluated-roles-by-score.jsonl"
+        export.write_text(json.dumps({
+            "num": "1", "score": 4.8, "company": "UCAN", "role": "Coordinator",
+            "url": "https://www.linkedin.com/jobs/view/1"}) + "\n", encoding="utf-8")
+        handoff.run(queue_path=export, career_ops=co, out_dir=tmp_path / "handoff",
+                    tracker=tmp_path / "role-status.jsonl")
+        out = capsys.readouterr().out
+        assert "gate OFF" in out and "carries no `area` field" in out
+        assert "out of area: 0 of" not in out

@@ -27,6 +27,8 @@ class ApplyJob:
     score: float | None
     report_path: str = ""
     report_num: str = ""     # the row's `[N]`: resolves a dead link the path alone cannot (#162)
+    area: str = ""           # "On-site Chicago, IL" when the role needs a body outside
+                             # every commutable metro (#180); "" when it does not
 
 
 def select(
@@ -36,7 +38,16 @@ def select(
     limit: int = 0,
     applications_md: Path | None = None,
 ) -> list[ApplyJob]:
-    """Return pending candidates, highest score first.
+    """Return pending candidates: reachable roles first, then highest score.
+
+    Reachable FIRST, and here rather than in each consumer, because this is the
+    selector that decides what gets money spent on it — `cover_letters` makes an
+    LLM call and caches a file per role, and the bulk tailoring path renders a
+    PDF each. Ranking on score alone meant `--limit N` spent its whole cap on the
+    roles the work-order simultaneously tells the agent not to submit: on the
+    copy #180 came from the top four scorers were all out of area, and 20 of 61
+    queued roles were. The verdict rides in on the row (`data.parse_applications`
+    derives it), so this is an ordering change, not a second rule.
 
     min_score: skip rows scoring below this (rows with no score are skipped).
     limit: cap the number returned (0 = no cap).
@@ -63,7 +74,10 @@ def select(
             score=score,
             report_path=row.get("report_path", ""),
             report_num=row.get("report_num", ""),
+            area=str(row.get("area") or "").strip(),
         ))
 
-    jobs.sort(key=lambda j: j.score, reverse=True)   # None scores were filtered above
+    # None scores were filtered above; out-of-area roles keep their score and
+    # their place in the list, they just stop taking the top of a capped run.
+    jobs.sort(key=lambda j: (bool(j.area), -j.score))
     return jobs[:limit] if limit else jobs

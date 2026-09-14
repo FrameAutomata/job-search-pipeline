@@ -9,6 +9,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from pipeline.work_location import (
+    WORK_LOCATION_RE, location_mark, parse_work_location,
+)
 from pipeline.tracker_layout import (
     SCORE_SENTINELS, data_rows, header_columns, is_score_cell, split_row,
     # Aliased: `report_num` is also the name of the number itself in
@@ -468,6 +471,40 @@ def read_report(base: Path, report_path: str, *, label: str = "report",
     return read_text(found)
 
 
+# The `## Machine Summary` block a report carries, read here beside the other
+# report readers because two stages act on it: the digest excludes a
+# `final_decision: Skip`, and both it and the handoff build demote a role whose
+# `work_location` names a metro outside the candidate's commutable ones (#180).
+# The fence may sit a few prose lines below the heading (a model that adds a
+# sentence there is drift, not a different shape): any non-fence lines are
+# skipped, or `final_decision: Skip` would parse as no summary and a Skip
+# above min_score would be digested.
+_MACHINE_SUMMARY_RE = re.compile(
+    r"##\s*Machine Summary[^\n]*\n(?:(?!\s*```)[^\n]*\n)*?\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```",
+    re.S)
+_DECISION_RE = re.compile(r"^\s*final_decision:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", re.M)
+
+
+def parse_machine_summary(report_text: str) -> dict:
+    """The `## Machine Summary` YAML block of a report as a dict, `{}` when
+    there is none. PyYAML when it is importable and the block parses; else a
+    regex that recovers `final_decision` alone, which is the field that
+    changes what the digest does (a `Skip` is excluded)."""
+    m = _MACHINE_SUMMARY_RE.search(report_text or "")
+    if not m:
+        return {}
+    block = m.group(1)
+    try:
+        import yaml  # a pipeline dependency; optional here on purpose
+        doc = yaml.safe_load(block)
+        if isinstance(doc, dict):
+            return doc
+    except Exception:
+        pass
+    d = _DECISION_RE.search(block)
+    return {"final_decision": d.group(1).strip()} if d else {}
+
+
 def max_tracker_num(applications_md: Path, state: dict) -> int:
     max_num = 0
     if applications_md.exists():
@@ -580,7 +617,6 @@ def _row_parts(tracker_tsv: str) -> list[str] | None:
     if len(parts) > _TRACKER_TSV_COLUMNS and not _REPORT_CELL_RE.match(parts[_REPORT_IDX].strip()):
         return None
     return parts
-
 
 
 def _restore_trailing_cells(tracker_tsv: str) -> str:
@@ -742,6 +778,23 @@ def _prepend_to_notes(tracker_tsv: str, text: str, already_present) -> str:
     return "\t".join(parts)
 
 
+def _inject_work_location_into_notes(tracker_tsv: str, mark: str) -> str:
+    """Record WHERE the role is in the notes cell (#180).
+
+    The fact, not the verdict: every surface that ranks roles then applies its
+    own commutable area to it, so a candidate who widens their search gets the
+    new answer on old rows instead of a frozen one nothing refreshes. Written
+    once, where the evaluation is written, because the alternative is three
+    consumers each opening the report — including the UI, on a path that runs
+    per request and has deliberately never read reports.
+
+    Idempotent on the LABEL, not the value: a row already carrying a mark keeps
+    the one it has rather than growing a second, and a re-evaluation that moved
+    the role writes through `sanitize_addition`'s fresh row, not over this one."""
+    return _prepend_to_notes(tracker_tsv, mark,
+                             lambda notes: WORK_LOCATION_RE.search(notes) is not None)
+
+
 def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     """Splice the job URL into the notes cell so the UI's "Open posting" link
     works.
@@ -897,6 +950,13 @@ def _set_report_link(tracker_tsv: str, report_file: str) -> str:
     return "\t".join(parts)
 
 
+def _report_location_mark(report_text: str) -> str:
+    """The `Work location:` mark for a report's own `work_location` block, or ""
+    when it has none — the one place a report is turned into that mark, so the
+    writer and the merge-time repair cannot produce two shapes."""
+    return location_mark(parse_work_location(parse_machine_summary(report_text)))
+
+
 def write_job_result(
     response_text: str,
     job_meta: dict,
@@ -923,7 +983,8 @@ def write_job_result(
         # model guessed at (#162): the prompt gives it only the link's shape.
         tracker_tsv = sanitize_addition(tracker_tsv, job_meta.get("url", ""),
                                         job_meta.get("jd_text", ""),
-                                        report_file=report_file or "")
+                                        report_file=report_file or "",
+                                        work_location=_report_location_mark(report_content))
         (tracker_dir / f"{job_id}.tsv").write_text(tracker_tsv + "\n", encoding="utf-8")
 
     return {
@@ -1040,7 +1101,7 @@ def ensure_applications_md(career_ops: Path) -> Path:
 
 
 def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "",
-                      report_file: str = "") -> str:
+                      report_file: str = "", work_location: str = "") -> str:
     """Turn a model's tracker row into one merge-tracker can read, and read
     correctly. The whole chain, in the one order that works.
 
@@ -1053,16 +1114,21 @@ def sanitize_addition(tracker_tsv: str, url: str = "", jd_text: str = "",
     Report link is set from `report_file` — the report that exists on disk,
     which the writer knows and the merge-time pass looks up by number — because
     the model authors that cell from a shape alone and invents the slug (#162).
+    The `work_location` mark goes in BEFORE the URL and the req id so it lands
+    after them in the cell: those two are read by machines that take the first
+    match (merge-tracker's `extractReqNumber`, the UI's "Open posting"), and the
+    mark is read by a regex that does not care where it sits.
 
     **Idempotent**, which is what lets it run at two points without a second
     mechanism: padding a nine-column row does nothing, the pipe strip has nothing
     left to strip, a normalized score re-normalizes to itself, a link already
-    pointing at the file is rewritten to itself, and both injectors bail when
-    their content is already present."""
+    pointing at the file is rewritten to itself, and all three injectors bail
+    when their content is already present."""
     row = _restore_trailing_cells(tracker_tsv)
     row = _strip_role_pipe(row)
     row = _normalize_score_cell(row)
     row = _set_report_link(row, report_file)
+    row = _inject_work_location_into_notes(row, work_location)
     # The URL the pipeline QUEUED first, the row's own trailing field second.
     # Everything downstream routes by the notes URL — handoff picks the site
     # session from it — so it should be the board URL the run searched from, not
@@ -1126,7 +1192,27 @@ def _trailing_url(tracker_tsv: str) -> str:
     return ""
 
 
-def _dead_link_repair(career_ops: Path, tracker_tsv: str) -> str:
+def _row_report(career_ops: Path, tracker_tsv: str) -> Path | None:
+    """The report file a row's Report link names, resolved the way every reader
+    resolves it — the link when it exists, else the report carrying its number
+    and company (`resolve_report`, for #162's model-invented slugs).
+
+    Called ONCE per addition by `_sanitize_pending_additions` and handed to both
+    merge-time passes that need it (`_dead_link_repair`, `_pending_location_mark`).
+    That is the point of extracting it rather than of each pass resolving its own:
+    a dead link — the case both passes exist for — sends `resolve_report` through
+    a full `reports/` glob, so two independent callers meant two scans of a
+    several-hundred-file directory per addition. Reads through the same
+    trailing-cell restore the rest of the chain applies, or the one row that lost
+    its empty Notes tab resolves differently here than everywhere else."""
+    parts = _row_parts(_restore_trailing_cells(tracker_tsv))
+    if parts is None:
+        return None
+    num_text, path = _report_link(parts[_REPORT_IDX])
+    return resolve_report(career_ops, path, num_text=num_text, company=parts[_COMPANY_IDX])
+
+
+def _dead_link_repair(career_ops: Path, tracker_tsv: str, found: Path | None) -> str:
     """The filename to point a row's Report link at, or "" to leave it alone:
     only a link whose target does NOT exist is repaired, and only when exactly
     one report answers to its number and company — resolved exactly as the
@@ -1137,11 +1223,34 @@ def _dead_link_repair(career_ops: Path, tracker_tsv: str) -> str:
     parts = _row_parts(_restore_trailing_cells(tracker_tsv))
     if parts is None:
         return ""
-    num_text, path = _report_link(parts[_REPORT_IDX])
-    found = resolve_report(career_ops, path, num_text=num_text, company=parts[_COMPANY_IDX])
+    _, path = _report_link(parts[_REPORT_IDX])
     if found is None or found == _linked_report(career_ops, path):
         return ""
     return found.name
+
+
+def _pending_location_mark(tracker_tsv: str, found: Path | None) -> str:
+    """The `Work location:` mark for an addition written outside Python, read
+    off the report its own row links to.
+
+    This is what gets a `--batch` row marked at all: career-ops' `batch-runner.sh`
+    lets the agent CLI write the TSV directly, so the row reaches the merge with
+    none of the chain applied — and the report it names is on disk, written by
+    the same run. `found` is that report, resolved ONCE by the caller (`_row_report`)
+    and shared with `_dead_link_repair`, so a model-invented slug (#162) still
+    finds its report by number without a second directory scan."""
+    parts = _row_parts(_restore_trailing_cells(tracker_tsv))
+    if parts is None:
+        return ""
+    # Cheapest guard first: a row `write_job_result` wrote already carries its
+    # mark, and that is most pending additions on every run that is not
+    # `--batch`. `_inject_work_location_into_notes` would discard whatever we
+    # computed anyway, so reading and YAML-parsing an 8KB report to reach that
+    # conclusion is ~1ms per addition spent to learn nothing — 160-190 of them
+    # on a cloud daily.
+    if WORK_LOCATION_RE.search(parts[_NOTES_IDX]):
+        return ""
+    return _report_location_mark(read_text(found)) if found else ""
 
 
 def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
@@ -1190,9 +1299,12 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
             raw = f.read_text(encoding="utf-8").strip("\r\n")
         except (OSError, UnicodeDecodeError):
             continue        # one unreadable row must not hold up the other nine
+        # One resolution per addition, shared by the two passes that need it.
+        report = _row_report(career_ops, raw)
         fixed = sanitize_addition(raw, urls.get(f.stem, ""),
                                   read_text(jd_cache_path(career_ops, f.stem)),
-                                  report_file=_dead_link_repair(career_ops, raw))
+                                  report_file=_dead_link_repair(career_ops, raw, report),
+                                  work_location=_pending_location_mark(raw, report))
         if fixed == raw:
             continue
         try:
@@ -1202,7 +1314,7 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
         changed += 1
     if changed:
         print(f"[batch] sanitized {changed} addition(s) written outside the "
-              "Python path (score/URL/req-id/report link)")
+              "Python path (score/URL/req-id/report link/work location)")
 
 
 def run_merge_tracker(career_ops: Path) -> bool:
@@ -1797,6 +1909,9 @@ Assess: High Confidence | Proceed with Caution | Suspicious.
 
 **Global Score** table: CV Match, North Star Alignment, Comp, Cultural Signals, Red Flags penalty, Global (all X/5).
 
+**Hard stops** - `hard_stops` is what makes the candidate unable to HOLD the role, not what they merely lack. Anything they could learn, be trained on, or argue around is a soft gap. Name every hard stop you find and cap `final_decision` at "Consider" when there is one.
+Geography is the one most often missed. A role requiring recurring physical presence - on-site OR hybrid, however few the office days - in a metro the candidate has not said they can work in is a hard stop, whatever the fit. Read the candidate's own stated locations from the profile above. Do not invent flexibility the posting does not state: "may offer remote", "could relocate" and "remote coordination may be possible" are not in the JD. Work that is inherently local - community-based, field, in-home, canvassing, site-based - requires presence even where the posting also uses the word remote.
+
 **Machine Summary** YAML block:
 ```yaml
 company: "name"
@@ -1805,6 +1920,10 @@ score: X.X
 legitimacy_tier: "High Confidence | Proceed with Caution | Suspicious"
 archetype: "detected"
 final_decision: "Apply | Consider | Research first | Skip"
+work_location:
+  mode: "onsite | hybrid | remote"
+  metro: "City, ST"
+  state: "ST"
 hard_stops: []
 soft_gaps: []
 top_strengths: []
@@ -1870,6 +1989,8 @@ TRACKER_NUM	DATE	COMPANY	ROLE	STATUS	SCORE/5	PDF	[REPORT_NUM](reports/REPORT_NUM
 {{"status": "completed", "id": "JOB_ID", "report_num": "REPORT_NUM", "company": "COMPANY", "role": "ROLE", "score": SCORE_FLOAT, "legitimacy": "LEGITIMACY_TIER", "pdf": null, "report": "reports/REPORT_NUM-company-slug-DATE.md", "error": null}}
 </summary>
 </evaluation>
+
+work_location rules: `mode` is what the posting REQUIRES of the person, not what it prefers - any required office days at all are "hybrid", never "remote". `metro` is where that presence is required (the work site, not the employer's headquarters) and `state` is that metro's 2-letter state/province code; both are "" for a fully remote role and "" when the posting does not say. Never guess a metro from the company's address.
 
 Tracker TSV rules (9 tab-separated columns, no header):
 - Col 1 TRACKER_NUM: use the Tracker Number from the user message

@@ -936,3 +936,138 @@ class TestAppendNoteInText:
         cells = _row_cells(apps.read_text(encoding="utf-8"), "2")
         assert cells[6] == "Discarded"
         assert cells[9] == "maybe — Closed 2026-09-06 (liveness re-check: HTTP 404)"
+
+
+class TestAreaDerivation:
+    """#180: `area` is derived in the tracker parser for the same reason
+    `easy_apply` is — it is a per-row fact every ranker needs (the digest, the
+    work-order, the UI's own table and Kanban), and deriving it once here is what
+    stops each of them growing its own copy of the rule."""
+
+    HEADER = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+
+    def _text(self, *notes):
+        rows = "".join(
+            f"| {i} | 2026-09-14 | Co{i} | Role | 4.5/5 | Evaluated |  |  | {n} |\n"
+            for i, n in enumerate(notes, start=1))
+        return self.HEADER + rows
+
+    def test_a_marked_row_outside_the_area_is_labelled(self):
+        rows = data.parse_applications_text(
+            self._text("https://x.example/1 — Work location: On-site Chicago, IL — APPLY"),
+            commutable=["Dallas, TX"])
+        assert rows[0]["area"] == "On-site Chicago, IL"
+
+    @pytest.mark.parametrize("notes", [
+        "https://x.example/1 — Work location: On-site Dallas, TX — APPLY",   # in area
+        "https://x.example/1 — Work location: Hybrid Fort Worth, TX — APPLY",  # same state
+        "https://x.example/1 — Work location: Remote — APPLY",               # remote
+        "https://x.example/1 — APPLY",                                        # pre-#180 row
+    ])
+    def test_reachable_and_unmarked_rows_are_not_labelled(self, notes):
+        rows = data.parse_applications_text(self._text(notes), commutable=["Dallas, TX"])
+        assert rows[0]["area"] == ""
+
+    def test_no_commutable_area_labels_nothing(self):
+        """An unreadable or missing search config must leave the queue exactly as
+        it was, not demote everything."""
+        rows = data.parse_applications_text(
+            self._text("https://x.example/1 — Work location: On-site Chicago, IL — APPLY"),
+            commutable=())
+        assert rows[0]["area"] == ""
+
+    def test_the_verdict_follows_the_area_in_effect(self):
+        """The row stores the FACT, so widening the search re-judges it with
+        nothing re-evaluated — which a frozen verdict could not do."""
+        text = self._text("https://x.example/1 — Work location: On-site Chicago, IL — APPLY")
+        assert data.parse_applications_text(text, commutable=["Dallas, TX"])[0]["area"]
+        assert not data.parse_applications_text(
+            text, commutable=["Dallas, TX", "Chicago, IL"])[0]["area"]
+
+
+class TestUiRanksOutOfAreaLast:
+    """The UI is the surface a person has open while triaging, and it ranked the
+    same queue independently — so #180 survived there after both other surfaces
+    were fixed. The comparator must consult `area` BEFORE the chosen sort column:
+    the demotion is not one ordering among several, it is whether the role is
+    takeable at all."""
+
+    @staticmethod
+    def _js():
+        return (Path(__file__).resolve().parent.parent
+                / "pipeline" / "app" / "static" / "app.js").read_text(encoding="utf-8")
+
+    def test_the_comparator_sinks_out_of_area_rows_first(self):
+        js = self._js()
+        body = js[js.index("rows.sort("):js.index("return rows;")]
+        assert body.index("gated(a)") < body.index("a[sortKey]"), \
+            "the out-of-area test must run before the chosen sort column"
+
+    def test_the_verdict_is_scoped_to_rows_still_in_the_queue(self):
+        """It answers "should I open this next", not "what is true about this row
+        forever" — so a role someone applied to keeps its place and loses the
+        tag, the way the digest and the work-order scope themselves to Evaluated.
+        Both the comparator and the label go through the same predicate, or the
+        Kanban would re-order an Applied column by a rule it no longer shows."""
+        js = self._js()
+        gate = js[js.index("function gated(j)"):]
+        gate = gate[:gate.index("}")]
+        assert "j.area" in gate and 'status_canonical === "Evaluated"' in gate
+        # ...and nothing reads `.area` raw to decide placement or labelling.
+        body = js[js.index("rows.sort("):js.index("return rows;")]
+        assert "a.area" not in body and "b.area" not in body
+        tag = js[js.index("function areaTag(j)"):]
+        assert tag[:tag.index("return")].count("gated(j)") == 1
+
+    def test_both_views_render_the_label(self):
+        """The table and the Kanban card — the Kanban especially, since that is
+        the view in #180's own description."""
+        js = self._js()
+        assert "function areaTag(j)" in js
+        calls = [l for l in js.splitlines()
+                 if "areaTag(j)" in l and not l.strip().startswith("function")]
+        assert len(calls) == 2, calls
+        # One in the table row, one on the Kanban card.
+        assert any("<td" in l for l in calls) and any("card-role" in l for l in calls)
+
+
+class TestSelectorRanksOutOfAreaLast:
+    """`role_select.select` is the surface that decides what gets money spent on
+    it — an LLM call and a cached file per role in cover_letters, a rendered PDF
+    each on the bulk tailoring path. Ranking on score alone spent a capped run's
+    whole budget on roles the work-order simultaneously tells the agent not to
+    submit."""
+
+    HEADER = ("| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
+              "|---|------|---------|------|-------|--------|-----|--------|-------|\n")
+
+    def _tracker(self, tmp_path):
+        co = tmp_path / "career-ops"
+        (co / "data").mkdir(parents=True)
+        (co / "data" / "applications.md").write_text(
+            self.HEADER
+            + ("| 1 | 2026-09-14 | UCAN | Coordinator | 4.8/5 | Evaluated |  |  | "
+               "https://x.example/1 — Work location: On-site Chicago, IL — APPLY |\n")
+            + ("| 2 | 2026-09-14 | Metrocare | Coordinator | 4.1/5 | Evaluated |  |  | "
+               "https://x.example/2 — Work location: On-site Dallas, TX — APPLY |\n"),
+            encoding="utf-8")
+        cfg = tmp_path / "search.yml"
+        cfg.write_text("searches:\n  - location: Dallas, TX\n", encoding="utf-8")
+        return co, cfg
+
+    def test_a_capped_run_spends_on_the_reachable_role_first(self, tmp_path, monkeypatch):
+        from pipeline import role_select
+        co, cfg = self._tracker(tmp_path)
+        monkeypatch.setenv("SEARCH_CONFIG", str(cfg))
+        jobs = role_select.select(co, min_score=4.0, limit=1)
+        assert [j.company for j in jobs] == ["Metrocare"]
+
+    def test_the_out_of_area_role_is_kept_and_labelled(self, tmp_path, monkeypatch):
+        """Demoted, not dropped — someone may genuinely relocate."""
+        from pipeline import role_select
+        co, cfg = self._tracker(tmp_path)
+        monkeypatch.setenv("SEARCH_CONFIG", str(cfg))
+        jobs = role_select.select(co, min_score=4.0)
+        assert [j.company for j in jobs] == ["Metrocare", "UCAN"]
+        assert jobs[1].area == "On-site Chicago, IL" and jobs[1].score == 4.8

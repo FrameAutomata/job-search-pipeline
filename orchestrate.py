@@ -17,43 +17,14 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-# The cloud-shared search config (populated from the SEARCH_CONFIG_B64 secret in
-# the daily workflow) and the optional LOCAL override. A local run auto-prefers
-# the override so a user can search different terms locally than the cloud daily,
-# without touching the secret. The cloud checkout never has search.local.yml —
-# it's gitignored and the daily only ever decodes the secret into search.yml.
-SHARED_SEARCH_CONFIG = Path("config/search.yml")
-LOCAL_SEARCH_CONFIG = Path("config/search.local.yml")
-
-
-def resolve_search_config(explicit: str | Path | None, root: Path = ROOT) -> Path:
-    """Pick the search config, resolved against `root`.
-
-    Precedence: explicit --config > a *custom* SEARCH_CONFIG env >
-    config/search.local.yml (if present) > config/search.yml.
-
-    Note the "custom" qualifier: .env.example ships `SEARCH_CONFIG=./config/search.yml`,
-    so nearly every local .env has the var set to the shared default. Honoring that
-    literally would defeat the local override for everyone, so a SEARCH_CONFIG that
-    resolves to the shared config/search.yml is treated as boilerplate (equivalent to
-    unset) and the override still wins. A SEARCH_CONFIG pointing anywhere else is a
-    deliberate choice and takes precedence. The cloud daily sets no SEARCH_CONFIG env
-    (it relies on the default path), so it always uses the decoded search.yml.
-    """
-    def _resolve(p: str | Path) -> Path:
-        p = Path(p)
-        return p if p.is_absolute() else (root / p).resolve()
-
-    if explicit:
-        return _resolve(explicit)
-    shared = _resolve(SHARED_SEARCH_CONFIG)
-    env = os.environ.get("SEARCH_CONFIG")
-    if env and (env_path := _resolve(env)) != shared:
-        return env_path
-    local = _resolve(LOCAL_SEARCH_CONFIG)
-    if local.exists():
-        return local
-    return shared
+# Resolved in pipeline/search_config.py — a leaf, because the daily digest and
+# the handoff build ask the same question (#180) and cannot import this module
+# without pulling yake, pandas and jobspy in with it. Re-exported here because
+# this is still where a reader looks for it.
+from pipeline.search_config import (  # noqa: E402
+    LOCAL_SEARCH_CONFIG,
+    resolve_search_config,
+)
 
 
 from pipeline import scrape, filter as filter_step, screen, bridge, batch_prep, batch_evaluate, notify  # noqa: E402
