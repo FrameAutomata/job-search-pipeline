@@ -1378,10 +1378,15 @@ class TestLanBasicAuth:
 
 class TestLanPeerMatrix:
     """From the LAN the board is usable and nothing else is. The allowlist is
-    two routes; everything else is loopback-only BY DEFAULT, so a POST route
-    added next month is refused until someone adds it here on purpose."""
+    three routes; everything else is loopback-only BY DEFAULT, so a POST route
+    added next month is refused until someone adds it here on purpose.
 
-    def test_loopback_reaches_a_loopback_only_route(self, lan):
+    Loopback trust is itself opt-in (`UI_TRUST_LOOPBACK_PEER`), so the tests
+    that exercise the admin side set it — the interactive launchers do the same,
+    and a hosted instance behind a proxy deliberately does not."""
+
+    def test_loopback_reaches_a_loopback_only_route(self, lan, monkeypatch):
+        monkeypatch.setenv(lan.module.UI_TRUST_LOOPBACK_PEER_ENV, "1")
         c = lan.peer(LOOPBACK_PEER)
         r = c.post("/api/agent-cli/register", json={"cli": "notacli"})
         # 400 for the unknown id — the point is that the peer rule let it in.
@@ -1412,6 +1417,35 @@ class TestLanPeerMatrix:
             assert "loopback-only" in r.json()["detail"], route.path
             checked += 1
         assert checked > 5, "the matrix stopped covering anything"
+
+    @staticmethod
+    def _stub_gh(lan, monkeypatch):
+        """No live `gh`: unstubbed these spawn real subprocesses and download a
+        real artifact on any machine with credentials, and `!= 403` passes
+        whatever they do."""
+        monkeypatch.setattr(lan.module.gh, "latest_successful_run", lambda *a, **k: None)
+
+    def test_refresh_is_reachable_from_the_lan(self, lan, monkeypatch):
+        """Without it the board is FROZEN for the only people this mode exists
+        for — they would see whatever the server last synced and never the roles
+        today's run found. Any status but 403 is fine here; offline/no-gh is a
+        502 and that is still the route doing its job."""
+        self._stub_gh(lan, monkeypatch)
+        c = lan.peer(LAN_PEER)
+        # 404 "no successful runs" is the stub talking — the route ran.
+        assert c.post("/api/refresh", json={}).status_code == 404
+
+    def test_the_lan_cannot_start_work_or_wipe_state(self, lan):
+        """The three routes it CAN reach read or write the tracker. Spending,
+        launching and destroying stay loopback-only — this is the line
+        `_LAN_MUTABLE` draws, stated as a test so widening it again is a
+        deliberate act."""
+        c = lan.peer(LAN_PEER)
+        registered = {r.path for r in lan.module.app.routes if hasattr(r, "path")}
+        for path in ("/api/run", "/api/reset", "/api/jobs/add", "/api/handoff/build"):
+            assert path in registered, f"{path} is not a route — this test would pass vacuously"
+            r = c.post(path, json={})
+            assert r.status_code == 403, f"{path} -> {r.status_code}"
 
     def test_reads_are_unrestricted_from_the_lan(self, lan):
         c = lan.peer(LAN_PEER)
@@ -1508,3 +1542,56 @@ class TestLanEnvExampleMirror:
         from pipeline.app import server
         assert conftest.LAN_ENV_FALLBACK == tuple(server.LAN_ENV_VARS)
         assert conftest.LAN_ENV_NAME_FALLBACK == server.UI_LAN_ENV
+
+
+class TestProxiedLoopbackIsNotLocalAdmin:
+    """Behind a reverse proxy the TCP peer is the proxy, so every request looks
+    like 127.0.0.1 and the loopback-only routes — reset, a pipeline run, the
+    route that writes repository SECRETS — open to anyone who can reach it.
+    uvicorn rewrites the peer from X-Forwarded-For, so a correct proxy is safe;
+    the common hand-written nginx block sets only X-Real-IP, which uvicorn does
+    not read, and then NOTHING fails. A forwarded header on a loopback peer is
+    therefore treated as remote."""
+
+    @pytest.mark.parametrize("header", ["x-forwarded-for", "x-real-ip", "forwarded"])
+    def test_a_forwarded_header_on_a_loopback_peer_is_refused(self, lan, monkeypatch, header):
+        """Belt and braces: even WITH the opt-in, a forwarded header means the
+        peer is a proxy — had the header been honoured the peer would not still
+        be loopback."""
+        monkeypatch.setenv(lan.module.UI_TRUST_LOOPBACK_PEER_ENV, "1")
+        c = lan.peer(LOOPBACK_PEER)
+        r = c.post("/api/reset", json={}, headers={header: "100.64.1.5"})
+        assert r.status_code == 403, r.status_code
+        assert "loopback-only" in r.json()["detail"]
+
+    def test_a_genuine_local_request_still_works(self, lan, monkeypatch):
+        """No proxy, no header, and the launcher's opt-in — the admin at the
+        machine keeps full access."""
+        monkeypatch.setenv(lan.module.UI_TRUST_LOOPBACK_PEER_ENV, "1")
+        c = lan.peer(LOOPBACK_PEER)
+        assert c.post("/api/reset", json={}).status_code != 403
+
+    def test_without_the_opt_in_a_loopback_peer_is_not_the_admin(self, lan):
+        """The default, and the case that matters: a bare `proxy_pass` sends NO
+        forwarded header, so header-presence could never have caught it. Only
+        refusing by default does."""
+        c = lan.peer(LOOPBACK_PEER)
+        r = c.post("/api/reset", json={})
+        assert r.status_code == 403 and "loopback-only" in r.json()["detail"]
+
+    def test_the_lan_allowlist_is_unaffected_by_the_rule(self, lan, monkeypatch):
+        """A proxied peer must still be able to do the three things the board
+        is for; otherwise the hosted deployment cannot work at all."""
+        monkeypatch.setattr(lan.module.gh, "latest_successful_run", lambda *a, **k: None)
+        monkeypatch.setenv(lan.module.UI_TRUST_LOOPBACK_PEER_ENV, "1")
+        c = lan.peer(LOOPBACK_PEER)
+        for path in sorted(lan.module._LAN_MUTABLE):
+            r = c.post(path, json={}, headers={"x-forwarded-for": "100.64.1.5"})
+            assert r.status_code != 403, f"{path} -> {r.status_code}"
+
+    def test_the_refusal_names_what_is_allowed(self, lan):
+        """Built from _LAN_MUTABLE, so the message cannot contradict the set."""
+        c = lan.peer(LAN_PEER)
+        detail = c.post("/api/reset", json={}).json()["detail"]
+        for path in lan.module._LAN_MUTABLE:
+            assert path in detail

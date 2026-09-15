@@ -43,10 +43,14 @@ if [[ -n "$lan" ]]; then
     exit 1
   fi
   export UI_LAN=1
+  # This launcher is someone sitting at the machine, so a loopback peer here IS
+  # the admin. A hosted instance behind a proxy does not set this and therefore
+  # cannot have its loopback-only routes reached through the proxy.
+  export UI_TRUST_LOOPBACK_PEER=1
   host_args=(--host 0.0.0.0)
   echo "==> LAN mode: sign in with any username and UI_PASSWORD. Basic auth over"
   echo "    plain HTTP is for a network you trust — stop the server before joining"
-  echo "    another one. From the LAN this UI can move a card and push it, nothing else."
+  echo "    another one. From the LAN this UI can move a card, push it and refresh."
 fi
 
 echo "==> Triage UI on http://localhost:$port  (reading: ${CAREER_OPS_PATH:-./career-ops})"

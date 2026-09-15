@@ -343,10 +343,17 @@ UI_PASSWORD='a long passphrase' ./run-ui.sh --lan     # Windows: .\run-ui.ps1 -L
   username works; the password is what's checked, on every request.
 - Basic auth over plain HTTP is for a network you trust. **Stop the server before
   joining another one.**
-- From the LAN the UI can move a card between columns and push that to the cloud —
-  and nothing else. Reset, Update, running the pipeline, the Setup wizard,
-  launching an agent and building a hand-off stay loopback-only: they run programs
-  and rewrite config, which isn't what a phone is for.
+- From the LAN the UI can move a card between columns, push that to the cloud, and
+  refresh from the cloud — and nothing else. Reset, Update, running the pipeline,
+  the Setup wizard, launching an agent and building a hand-off stay loopback-only:
+  they run programs and rewrite config, which isn't what a phone is for.
+- **Behind a reverse proxy, pass the real client address through.** The proxy is
+  the TCP peer, so without it every request looks local and those loopback-only
+  routes open to anyone with the password. nginx: `recommendedProxySettings` (or
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) plus uvicorn's
+  `--forwarded-allow-ips 127.0.0.1`. A proxy that sends only `X-Real-IP` does not
+  count — uvicorn does not read it — so the server treats any forwarded header on
+  a loopback peer as remote and refuses rather than silently opening.
 - `UI_ALLOWED_HOSTS` is the comma-separated list of names/addresses a browser may
   use in the URL bar. Left unset the server works them out at startup and prints
   what it accepted; set it when that guess is wrong.
