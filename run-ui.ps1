@@ -40,10 +40,13 @@ if ($Lan) {
         exit 1
     }
     $env:UI_LAN = "1"
+    # This launcher is someone sitting at the machine, so a loopback peer here
+    # IS the admin. A hosted instance behind a proxy does not set this.
+    $env:UI_TRUST_LOOPBACK_PEER = "1"
     $hostArgs = @("--host", "0.0.0.0")
     Write-Host "==> LAN mode: sign in with any username and UI_PASSWORD. Basic auth over"
     Write-Host "    plain HTTP is for a network you trust — stop the server before joining"
-    Write-Host "    another one. From the LAN this UI can move a card and push it, nothing else."
+    Write-Host "    another one. From the LAN this UI can move a card, push it and refresh."
 }
 
 Write-Host "==> Triage UI on http://localhost:$Port  (reading: $reading)"

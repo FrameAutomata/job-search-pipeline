@@ -204,13 +204,22 @@ def _is_loopback_origin(origin: str) -> bool:
 #    lookup at request time) is accepted, and the Host header must be in that
 #    set and agree with it. Without the Host half, a page at evil.example whose
 #    address the user typed into the browser would satisfy the Origin check.
-# Beyond that, a non-loopback peer may only change status (_LAN_MUTABLE — the
-# two routes that make the board usable from a phone): reset, template update,
+# Beyond that, a non-loopback peer may only change status, push it, and pull
+# the latest cloud tracker (_LAN_MUTABLE — the three routes that make the board
+# usable from something that is not this machine): reset, template update,
 # skill runs and launches, the folder picker, onboarding, local config and
-# search, cloud and local runs, refresh, re-check, Add-Job, the work-order
-# build and the MCP registration stay loopback-only BY DEFAULT rather than by
-# enumeration, so a new POST route is LAN-refused until someone adds it here on
-# purpose (tests/test_app_server.py pins _LAN_MUTABLE ⊆ the registered POSTs).
+# search, cloud and local runs, re-check, Add-Job, the work-order build and the
+# MCP registration stay loopback-only BY DEFAULT rather than by enumeration, so
+# a new POST route is LAN-refused until someone adds it here on purpose
+# (tests/test_app_server.py pins _LAN_MUTABLE ⊆ the registered POSTs).
+# `/api/refresh` is in the set because without it the board is FROZEN for the
+# only people this mode exists for: it pulls the newest cloud artifact and
+# merges it into the local tracker, so a remote user who cannot call it sees
+# whatever the server last synced and never the roles today's run found. It
+# earns its place on what it can do rather than on convenience — it reads a
+# workflow artifact this repo produced and rewrites local state from it. It
+# spends nothing, starts nothing, and reaches nothing outside the tracker; the
+# routes that trigger a run, an evaluation or a wipe are all still refused.
 # Basic auth over plain HTTP is for a trusted home network: stop the server
 # before joining another one. Outside UI_LAN the guard is byte-for-byte the
 # loopback-only one above. All three names are read from os.environ at request
@@ -218,14 +227,18 @@ def _is_loopback_origin(origin: str) -> bool:
 # The peer rule rests on a DIRECT connection: `request.client.host` is the TCP
 # peer, and uvicorn honours X-Forwarded-For only from 127.0.0.1. So a reverse
 # proxy on this same machine (the natural way to put HTTPS in front of a LAN
-# run) makes every request look loopback and opens the loopback-only routes to
-# anyone with the password — such a proxy MUST forward the real client address
-# (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`).
+# run) makes every request look loopback, which would open the loopback-only
+# routes to anyone with the password. That is why loopback trust is now OPT-IN
+# (`_trust_loopback_peer`): a proxied deployment simply does not set it, and is
+# safe whether or not its proxy forwards anything. A proxy SHOULD forward the
+# real address anyway (nginx: `recommendedProxySettings`, or
+# `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) plus uvicorn's
+# `--forwarded-allow-ips 127.0.0.1`, so the LAN rules apply per real client.
 UI_LAN_ENV = "UI_LAN"
 UI_PASSWORD_ENV = "UI_PASSWORD"
 UI_ALLOWED_HOSTS_ENV = "UI_ALLOWED_HOSTS"
 LAN_ENV_VARS = (UI_LAN_ENV, UI_PASSWORD_ENV, UI_ALLOWED_HOSTS_ENV)
-_LAN_MUTABLE = frozenset({"/api/status", "/api/push-status"})
+_LAN_MUTABLE = frozenset({"/api/status", "/api/push-status", "/api/refresh"})
 _AUTH_CHALLENGE = 'Basic realm="job-search-pipeline"'
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -307,6 +320,64 @@ def _lan_origin_refusal(origin: str | None, host_header: str) -> str | None:
     return None
 
 
+# Headers a reverse proxy adds to say who the real client is. Their PRESENCE on
+# a request whose TCP peer is loopback is the tell that matters — see
+# `_peer_is_local_admin`.
+_FORWARDED_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded")
+
+
+UI_TRUST_LOOPBACK_PEER_ENV = "UI_TRUST_LOOPBACK_PEER"
+
+
+def _trust_loopback_peer(env=None) -> bool:
+    """Whether a loopback TCP peer may be believed to be the local admin.
+
+    OFF by default under UI_LAN, and that default is the whole point. The
+    previous rule inferred "a proxy is in front" from a forwarded header being
+    present — which catches the nginx block that sends only `X-Real-IP`, but
+    NOT the far more common `location / { proxy_pass ...; }` that sends no
+    forwarded header at all. That config still read as the local admin, so the
+    failure mode stayed a silent opening rather than a refusal.
+    Presence cannot be the signal, because absence is the dangerous case.
+
+    So it is opt-in: `run-ui.sh --lan` and `run-ui.ps1 -Lan` set it, because
+    those ARE someone at the machine; a systemd unit behind a proxy does not,
+    and the worst that costs is walking to the box to press Reset. The worst
+    the old default cost was a stranger pressing it."""
+    env = os.environ if env is None else env
+    return (env.get(UI_TRUST_LOOPBACK_PEER_ENV) or "").strip().lower() in _TRUTHY
+
+
+def _peer_is_local_admin(request) -> bool:
+    """Whether this request came from someone sitting at THIS machine.
+
+    `_peer_is_loopback` alone answers that only when nothing is proxying. Put
+    nginx in front — the natural way to give a LAN run HTTPS, and what the
+    hosted deployment in flake.nix does — and the proxy becomes the TCP peer, so
+    every request looks like 127.0.0.1 and the loopback-only routes open to
+    anyone who can reach the proxy: reset (snapshot-then-wipe), a pipeline run,
+    the onboarding route that writes repository SECRETS, the template update
+    that pushes to origin. uvicorn rewrites the peer from `X-Forwarded-For`, so
+    a correctly configured proxy is safe — but the common hand-written nginx
+    block sets only `X-Real-IP`, which uvicorn does not read, and then nothing
+    fails: the UI works perfectly and is wide open.
+
+    So a forwarded header PRESENT on a loopback peer is treated as remote. If
+    the header had been honoured, the peer would not be loopback; that it still
+    is means the hop was not trusted (or every hop was), and either way the TCP
+    peer is a proxy rather than this machine. The rule costs one real case —
+    someone browsing the vhost from a browser on the server itself — which gets
+    a 403 naming the direct port, and buys the failure mode being a refusal
+    instead of a silent opening."""
+    if not _trust_loopback_peer():
+        return False
+    # Belt and braces for a deployment that opts in AND proxies: if a forwarded
+    # header is present the peer would not still be loopback had it been
+    # honoured, so the hop was untrusted and the peer is a proxy.
+    return _peer_is_loopback(request) and not any(
+        h in request.headers for h in _FORWARDED_HEADERS)
+
+
 def _peer_is_loopback(request) -> bool:
     """Whether the TCP peer is this machine. An unparseable or missing peer
     address counts as remote — the rule fails closed."""
@@ -358,11 +429,13 @@ async def _same_origin_guard(request, call_next):
         why = _lan_origin_refusal(request.headers.get("origin"), request.headers.get("host", ""))
         if why:
             return JSONResponse(status_code=403, content={"detail": why})
-        if request.url.path not in _LAN_MUTABLE and not _peer_is_loopback(request):
+        if request.url.path not in _LAN_MUTABLE and not _peer_is_local_admin(request):
+            allowed = ", ".join(sorted(_LAN_MUTABLE))
             return JSONResponse(
                 status_code=403,
-                content={"detail": (f"{request.url.path} is loopback-only: from the LAN this "
-                                    "UI can change a role's status and push it, nothing else.")},
+                content={"detail": (f"{request.url.path} is loopback-only. From the LAN this "
+                                    f"UI allows: {allowed}. (If you are on the server itself, "
+                                    "use the port directly rather than the proxy.)")},
             )
     return await call_next(request)
 
@@ -583,6 +656,35 @@ def refresh() -> JSONResponse:
     rows (offline `Run local` results) are preserved. The merged tracker lives
     durably in local, so it survives restarts and offline periods. Only writes
     to local on a successful download — a gh/credits error leaves local intact."""
+    # Every other route that rewrites applications.md takes this first. Refresh
+    # did not, and it is the one a REMOTE user can now reach: mid-run,
+    # sync_pulled_tracker would replace the tracker wholesale and rename report
+    # files under the subprocess minting new ones — the numbering collision
+    # _refuse_during_local_run exists to prevent.
+    _refuse_during_local_run()
+    # ...and the in-process liveness sweep, which rewrites the same
+    # applications.md from a background thread. Without this a remote Refresh
+    # mid-sweep drops the Discarded marks written so far and renames reports
+    # under it.
+    #
+    # REFUSED rather than queued: `with _recheck_lock` would block the request
+    # for as long as the sweep runs (a drain is minutes), and the caller is a
+    # browser — a hung tab says nothing, a 409 says come back. It matches
+    # `_refuse_during_local_run`, which is the same hazard from the other
+    # process. Held for the whole merge, not just the download.
+    if not _recheck_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="A liveness re-check is in progress. Wait for it to finish — "
+                   "refreshing now would overwrite the marks it is writing.",
+        )
+    try:
+        return _refresh_locked()
+    finally:
+        _recheck_lock.release()
+
+
+def _refresh_locked() -> JSONResponse:
     try:
         run = gh.latest_successful_run(PIPELINE_WORKFLOWS)
         if run is None:

@@ -19,6 +19,93 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      # The triage UI as a runnable package, for hosting it as a service rather
+      # than launching run-ui.sh by hand.
+      #
+      # This can be a plain `withPackages` where the dev shell cannot, and the
+      # reason is the whole point: the UI imports NONE of the scraping stack.
+      # No jobspy, so no numpy==1.26.3, so no python312 pin and no wheel-loader
+      # LD_LIBRARY_PATH problem — every dependency it does have is in nixpkgs.
+      # (`tests/test_app_data.py` and the digest's import guard are what keep
+      # that true; a heavy import added to the UI path breaks them first.)
+      #
+      # It deliberately does NOT wrap run-ui.sh: that script pip-installs into
+      # a .venv and is for a developer on a laptop. A service wants an argv it
+      # can put in ExecStart, with the environment supplied by systemd.
+      #
+      #   nix run .#ui -- --host 127.0.0.1 --port 8801
+      #
+      # It takes uvicorn's argv and nothing else; the three environment
+      # variables a hosted instance needs are the service's to set, and
+      # run-ui.sh is where they are otherwise implied:
+      #   UI_LAN=1          REQUIRED for any instance a person reaches over a
+      #                     network. It accepts the browser's cross-origin POST
+      #                     from the vhost AND is what turns the password check
+      #                     on at all — omit it and every GET (`/api/jobs`,
+      #                     `/api/reports/{n}`: the whole tracker and every
+      #                     evaluation report) is served unauthenticated to
+      #                     anyone who reaches the proxy.
+      #   NOT UI_TRUST_LOOPBACK_PEER — a hosted instance behind a proxy must
+      #                     leave it unset. The proxy is the TCP peer, so
+      #                     setting it would hand the loopback-only routes
+      #                     (reset, runs, the route that writes repository
+      #                     secrets) to anyone with the password.
+      #   UI_PASSWORD=...   required — the module refuses to import without it
+      #   UI_ALLOWED_HOSTS  the vhost name the browser will send as Host/Origin;
+      #                     unset, the server works out this machine's own
+      #                     names, which will not include it
+      #   CAREER_OPS_PATH   optional; defaults to ./career-ops under the cwd
+      #
+      # Behind a reverse proxy on the SAME host, pass
+      # `--forwarded-allow-ips 127.0.0.1` (uvicorn's default, stated explicitly
+      # because it is load-bearing): the proxy is the TCP peer, so without
+      # X-Forwarded-For being honoured every request looks like loopback and
+      # `server.py`'s loopback-only routes open to anyone who can reach the
+      # proxy. The proxy must send that header — nginx's
+      # `recommendedProxySettings = true` does.
+      packages = forAllSystems (
+        pkgs:
+        let
+          # One name per line of requirements-ui.txt — including the extra,
+          # which nixpkgs already ships as data. Listing its six members by
+          # hand (httptools, uvloop, websockets, watchfiles, python-dotenv,
+          # pyyaml) was a second statement of `uvicorn[standard]` that froze
+          # today's answer and made each look like an independent decision.
+          # tests/test_ui_package_deps.py holds this list to that file.
+          py = pkgs.python3.withPackages (
+            ps:
+            (with ps; [
+              fastapi
+              uvicorn
+              markdown
+              python-multipart
+            ])
+            ++ ps.uvicorn.optional-dependencies.standard
+          );
+          ui =
+            pkgs.writeShellApplication {
+              name = "job-search-ui";
+              runtimeInputs = [
+                py
+                pkgs.gh
+                pkgs.git
+              ];
+              # gh: the Refresh and Push routes shell out to it. git: the
+              # self-update route. Neither is optional for a hosted instance.
+              # `python -m`, not a bare `uvicorn`: it puts the working directory
+              # on sys.path, which is what makes pipeline.app.server importable
+              # from the checkout a service sets as its WorkingDirectory.
+              text = ''
+                exec python -m uvicorn pipeline.app.server:app "$@"
+              '';
+            };
+        in
+        {
+          inherit ui;
+          default = ui;
+        }
+      );
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           # python312, not pkgs.python3 (3.13 on this branch): python-jobspy

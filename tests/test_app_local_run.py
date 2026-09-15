@@ -260,3 +260,35 @@ class TestAddJobGuard:
         assert r.status_code == 409
         r2 = client.post("/api/jobs/add-async", json={"url": "https://example.com/job"})
         assert r2.status_code == 409
+
+    def test_refresh_refused_during_local_run(self, client, fake_popen):
+        """Refresh replaces applications.md wholesale and renames report files;
+        mid-run it would do that under the subprocess minting new ones — the
+        same numbering collision, and the only one of these a REMOTE user can
+        trigger, since refresh is reachable from the LAN and add-job is not."""
+        assert client.post("/api/run-local", json={}).status_code == 200
+        assert client.post("/api/refresh", json={}).status_code == 409
+
+
+class TestRefreshVsLivenessSweep:
+    """Refresh and the liveness sweep both rewrite applications.md, and refresh
+    is the one a REMOTE user can trigger. It refuses rather than queueing: a
+    drain runs for minutes and the caller is a browser, where a hung tab says
+    nothing and a 409 says come back."""
+
+    def test_refresh_refused_while_the_sweep_holds_the_lock(self, client):
+        from pipeline.app import server
+        assert server._recheck_lock.acquire(blocking=False)
+        try:
+            r = client.post("/api/refresh", json={})
+            assert r.status_code == 409
+            assert "liveness re-check" in r.json()["detail"]
+        finally:
+            server._recheck_lock.release()
+
+    def test_the_lock_is_released_for_the_next_caller(self, client, monkeypatch):
+        from pipeline.app import server
+        monkeypatch.setattr(server.gh, "latest_successful_run", lambda *a, **k: None)
+        assert client.post("/api/refresh", json={}).status_code == 404
+        # ...and again, which a leaked lock would turn into a 409.
+        assert client.post("/api/refresh", json={}).status_code == 404

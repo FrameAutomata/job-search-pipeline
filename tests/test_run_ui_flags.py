@@ -140,3 +140,35 @@ class TestPowerShellMirror:
     def test_refuses_without_a_password(self, ps1):
         assert "$env:UI_PASSWORD" in ps1
         assert "exit 1" in ps1
+
+
+class TestLaunchersOptIntoLoopbackTrust:
+    """`UI_TRUST_LOOPBACK_PEER` is off by default so a HOSTED instance behind a
+    reverse proxy cannot have its loopback-only routes reached through the
+    proxy — the proxy is the TCP peer, and a bare `proxy_pass` sends no
+    forwarded header to give that away.
+
+    These two launchers are the opposite case: someone at the machine. Without
+    the opt-in, `--lan` on a laptop would refuse Reset, Update and the Setup
+    wizard to the person who started it, which is the wrong half of the trade.
+    Checked in both, because a rule only the bash half spells protects nobody
+    on Windows."""
+
+    def test_bash_sets_it_under_lan(self):
+        sh = (REPO_ROOT / "run-ui.sh").read_text(encoding="utf-8")
+        lan_block = sh[sh.index("if [[ -n \"$lan\" ]]"):]
+        assert "export UI_TRUST_LOOPBACK_PEER=1" in lan_block
+        # ...and only there: an unconditional export would defeat the default.
+        assert sh.count("UI_TRUST_LOOPBACK_PEER") == 1
+
+    def test_powershell_sets_it_under_lan(self):
+        ps1 = (REPO_ROOT / "run-ui.ps1").read_text(encoding="utf-8")
+        assert '$env:UI_TRUST_LOOPBACK_PEER = "1"' in ps1
+        assert ps1.count("UI_TRUST_LOOPBACK_PEER") == 1
+
+    def test_the_name_matches_the_server_constant(self):
+        """A typo here is silent: the launcher would export a variable nothing
+        reads, and the admin would simply lose their own routes."""
+        from pipeline.app import server
+        for f in ("run-ui.sh", "run-ui.ps1"):
+            assert server.UI_TRUST_LOOPBACK_PEER_ENV in (REPO_ROOT / f).read_text(encoding="utf-8")
