@@ -7,6 +7,7 @@ import pytest
 
 from pipeline import tracker_layout
 from pipeline.app import data
+from tests.conftest import ADDITION_LABEL_LINE
 
 
 def _reset_contract_cache():
@@ -245,6 +246,48 @@ class TestParseTrackerAdditions:
 
     def test_short_row_skipped(self, tmp_path):
         d = self._make(tmp_path, {"bad.tsv": "1\t2026-05-27\tAcme\n"})
+        assert data.parse_tracker_additions(d) == []
+
+    # The worker's label row since career-ops#3706 (tests/conftest.py). Legacy
+    # headerless files still arrive too, and the tests above keep their reading.
+    LABELS = ADDITION_LABEL_LINE + "\n"
+
+    def test_headed_file_yields_its_one_data_row(self, tmp_path):
+        """The board reads unmerged additions when the merge did not run. Split
+        line by line, a headed file's label row is a ten-cell line like any
+        other, and the board listed a role called "role" at "company" beside
+        the real one."""
+        d = self._make(tmp_path, {
+            "562.tsv": self.LABELS + SAMPLE_TSV.rstrip("\n") + "\thttps://x/j/562\n"})
+        rows = data.parse_tracker_additions(d)
+        assert len(rows) == 1
+        r = rows[0]
+        assert (r["num"], r["company"], r["role"]) == ("2920", "Tential Solutions", "Fullstack Developer")
+        assert r["status"] == "Evaluada" and r["score_value"] == 4.0
+        assert r["report_num"] == "2920"
+
+    def test_the_url_column_rides_into_notes_once(self, tmp_path, alias_table):
+        """A headed row carries its posting URL in a `url` column of its own,
+        while every reader of these dicts — `extract_url`, the board's "Open
+        posting" — looks for it in Notes. So it is composed in, in front as the
+        merge-time sanitizer puts it, and a row whose Notes already carry a URL
+        does not get a second. The baked table is pinned so the test reads the
+        same labels with or without a local ./career-ops."""
+        alias_table()
+        url = "https://www.indeed.com/viewjob?jk=abc"
+        bare = SAMPLE_TSV.rstrip("\n") + f"\t{url}\n"
+        noted = (bare.replace("CONSIDER: strong match", f"CONSIDER: strong match — {url}")
+                 .replace("2920", "2921"))
+        d = self._make(tmp_path, {"a.tsv": self.LABELS + bare, "b.tsv": self.LABELS + noted})
+        rows = {r["num"]: r for r in data.parse_tracker_additions(d)}
+        assert rows["2920"]["notes"] == f"{url} — CONSIDER: strong match"
+        assert data.extract_url(rows["2920"]["notes"]) == url
+        assert rows["2921"]["notes"].count(url) == 1
+
+    def test_headed_file_without_a_data_row_yields_nothing(self, tmp_path):
+        # A label line alone is "headed, nothing to read" — not a role called
+        # "role", which is what falling through to the positional read lists.
+        d = self._make(tmp_path, {"x.tsv": self.LABELS})
         assert data.parse_tracker_additions(d) == []
 
 

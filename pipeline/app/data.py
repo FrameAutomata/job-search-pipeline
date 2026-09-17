@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pipeline._batch_common import (
     _REPORT_LINK_RE,
+    _addition_lines,
     _report_int,
     _report_link,
     ADDITION_COLUMNS,
@@ -21,6 +22,10 @@ from pipeline._batch_common import (
     by_hand_mark,
     closed_by_recheck,
     find_report_file,
+    compose_notes,
+    has_notes_url,
+    headed_addition_row,
+    read_addition,
     normalize_company,
     read_url_set,
     score_value,
@@ -844,11 +849,42 @@ def _rename_report_file(reports_dir: Path, old: str, new: str) -> None:
         src.rename(reports_dir / new)
 
 
+def _addition_records(text: str) -> list[dict]:
+    """The rows one tracker-additions file holds, keyed by `_TRACKER_COLUMNS`.
+
+    A HEADED file (career-ops#3706: a label row, then one data row) is read by
+    name, where a positional read lists its label line as a role. Its posting
+    URL has a column of its own, while every reader of these dicts looks for it
+    in Notes (`extract_url`, the board's "Open posting") — so it is composed in
+    there on `_inject_url_into_notes`' terms (`compose_notes`). Only the row's
+    own URL is at hand here; the merge-time sanitizer prefers the one the
+    pipeline queued, so until the merge runs a worker's careers-page URL is what
+    the board links to."""
+    headed = headed_addition_row(text)
+    if headed is not None:
+        if "role" not in headed:
+            return []
+        row = {col: headed.get(col, "") for col in _TRACKER_COLUMNS}
+        url = headed.get("url", "")
+        if _NOTES_URL_RE.match(url):
+            row["notes"] = compose_notes(row["notes"], url, has_notes_url)
+        return [row]
+    records = []
+    for line in _addition_lines(text)[0]:        # non-blank, split as merge-tracker splits
+        # maxsplit keeps the notes column intact even if it contains tabs.
+        cells = line.split("\t", len(_TRACKER_COLUMNS) - 1)
+        if len(cells) < len(_TRACKER_COLUMNS):
+            continue
+        records.append(dict(zip(_TRACKER_COLUMNS, [c.strip() for c in cells])))
+    return records
+
+
 def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
     """Parse career-ops/batch/tracker-additions/*.tsv into row dicts.
 
-    These are the raw per-evaluation rows the batch evaluator writes, one TSV
-    line per file, before `merge-tracker.mjs` folds them into applications.md.
+    These are the raw per-evaluation rows the batch evaluator writes, one row
+    per file (under a label row, from career-ops' own worker), before
+    `merge-tracker.mjs` folds them into applications.md.
     We read them as a fallback so the UI shows results even when the merge
     step didn't run (e.g. node missing in the runner, or merge-tracker failed).
 
@@ -862,15 +898,7 @@ def parse_tracker_additions(tracker_dir: Path) -> list[dict]:
     commutable = commutable_area()
     rows: list[dict] = []
     for f in tracker_dir.glob("*.tsv"):
-        for line in f.read_text(encoding="utf-8").splitlines():
-            line = line.rstrip("\n")
-            if not line.strip():
-                continue
-            # maxsplit keeps the notes column intact even if it contains tabs.
-            cells = line.split("\t", len(_TRACKER_COLUMNS) - 1)
-            if len(cells) < len(_TRACKER_COLUMNS):
-                continue
-            row = dict(zip(_TRACKER_COLUMNS, [c.strip() for c in cells]))
+        for row in _addition_records(read_addition(f)):
             row["report_num"], row["report_path"] = _report_link(row.get("report", ""))
             row["score_value"] = score_value(row.get("score", ""))
             row["status_canonical"] = canonical_status(row.get("status", ""))

@@ -14,6 +14,8 @@ from pipeline._batch_common import (
     _sanitize_pending_additions,
     _set_report_link,
     find_report_file,
+    headed_addition_row,
+    read_addition,
     read_report,
     resolve_report,
     sanitize_addition,
@@ -39,6 +41,7 @@ from pipeline._batch_common import (
     _pending_location_mark,
     _row_report,
 )
+from tests.conftest import ADDITION_LABEL_LINE
 from pipeline._batch_common import (   # the #163 marks, a separate block on purpose
     _liveness_closed_rows, _reopen_reposted, by_hand_mark, closed_by_recheck,
     liveness_closed_mark, reopened_mark,
@@ -772,6 +775,100 @@ class TestMaxReportNumCountsLocks:
         assert max_report_num(reports, {}) == 11, "a lock must reserve its number"
 
 
+class TestHeadedAdditionDetection:
+    """career-ops' batch worker writes a label row above its one data row since
+    career-ops#3706, and merge-tracker still accepts the legacy headerless row,
+    so both arrive — and every reader here tells them apart by merge-tracker's
+    own rule (`looksLikeTsvHeaderRow`): the first cell is not a tracker number
+    AND at least three cells are recognised labels. Misjudged one way, the
+    label line is read as a job called "role" at a company called "company";
+    the other way, a real row is taken for table furniture.
+
+    Every test here reads the baked fallback table unless it pins another, so
+    none depends on whether ./career-ops is checked out."""
+
+    @pytest.fixture(autouse=True)
+    def _fallback_table(self, alias_table):
+        alias_table()
+
+    def test_the_workers_label_row_is_a_header(self):
+        row = headed_addition_row(
+            ADDITION_LABEL_LINE + "\n" + _tracker_row(score="4.2") + "\thttps://x/j/7\n")
+        assert (row["company"], row["role"]) == ("Initech", "SRE")
+        assert (row["status"], row["score"]) == ("Evaluated", "4.2")
+        assert row["report"] == "[003](reports/003-x.md)"
+
+    def test_a_legacy_row_is_not_a_header(self):
+        # None, not {}: the caller's cue to read it positionally, as before.
+        assert headed_addition_row(_tracker_row() + "\n") is None
+
+    def test_two_recognised_labels_are_not_enough(self):
+        """Three is merge-tracker's threshold. One short of it, merge-tracker
+        reads the file positionally, and so must every reader here — or the
+        two would disagree about which cell is the role."""
+        assert headed_addition_row("Company\tRole\tRemote\n" + _tracker_row() + "\n") is None
+
+    def test_a_row_leading_with_a_number_is_data_whatever_its_cells_say(self):
+        """A company called Company hiring for a Role, status Status: three
+        header words in three cells, enough for the label count. The leading
+        tracker number is what keeps it a row — a data row always has one."""
+        row = "12\t2026-09-01\tCompany\tRole\tStatus\t4.2/5\tnull\t[12](reports/12-x.md)\tnote"
+        assert headed_addition_row(row + "\n") is None
+
+    def test_labels_come_from_career_ops_own_table(self, alias_table):
+        """career-ops ships localised labels (`fecha`, `empresa`, `puesto`) in
+        tracker-aliases.json and detects a header against that table. A
+        hand-mirrored label list would read a file merge-tracker resolves by
+        name as a positional row."""
+        headed = "fecha\tempresa\tpuesto\n2026-09-01\tAcme Corp\tPlatform Engineer\n"
+        assert headed_addition_row(headed) is None        # the fallback knows none of them
+        alias_table({"fecha": "date", "empresa": "company", "puesto": "role"})
+        assert headed_addition_row(headed) == {
+            "date": "2026-09-01", "company": "Acme Corp", "role": "Platform Engineer"}
+
+    def test_the_first_column_carrying_a_label_wins(self):
+        """merge-tracker's `resolveTsvColumns` maps a repeated label to its
+        FIRST column (and then refuses the file). The loss guard is what
+        reports that refusal, so it must name the company that map reads, not
+        the repeat's."""
+        text = (ADDITION_LABEL_LINE + "\tcompany\n"
+                + _tracker_row() + "\thttps://x/j/7\tOther Co\n")
+        assert headed_addition_row(text)["company"] == "Initech"
+
+    def test_headed_without_one_data_row_is_empty_not_headerless(self):
+        """`{}` is "headed, but not the one data row a reader can take" — no
+        row, or more than the one merge-tracker accepts. It is falsy, so a
+        caller that tests truthiness instead of `is None` falls through to the
+        positional read, which takes a lone label line for a job called "role"
+        at a company called "company"."""
+        assert headed_addition_row(ADDITION_LABEL_LINE + "\n") == {}
+        assert headed_addition_row(
+            ADDITION_LABEL_LINE + "\n" + _tracker_row() + "\n" + _tracker_row() + "\n") == {}
+
+    def test_a_lone_cr_in_a_cell_does_not_split_the_row(self, tmp_path):
+        """merge-tracker splits lines on `\\r?\\n`, so a stray `\\r` inside a
+        cell stays in that cell. `read_text` turns it into a line break, and a
+        headed file read that way has two data rows — `{}`, which the loss
+        guard, the sanitizer and the UI all pass over, while merge-tracker
+        merges or refuses the one row it sees."""
+        path = tmp_path / "7.tsv"
+        path.write_bytes((ADDITION_LABEL_LINE + "\n" + _tracker_row(notes="one\rtwo")
+                          + "\thttps://x/j/7\n").encode("utf-8"))
+        row = headed_addition_row(read_addition(path))
+        assert (row["role"], row["notes"]) == ("SRE", "one\rtwo")
+
+    def test_a_bom_does_not_hide_the_first_label(self, tmp_path):
+        """merge-tracker's `trim()` drops a leading BOM from the first label;
+        Python's `strip()` keeps it, and `\\ufeffnum` is no label — so the
+        header map lost `num`, the file no longer read as in place, and a bare
+        score was neither repaired nor recovered."""
+        path = tmp_path / "7.tsv"
+        path.write_bytes(b"\xef\xbb\xbf" + (ADDITION_LABEL_LINE + "\n" + _tracker_row()
+                                            + "\n").encode("utf-8"))
+        row = headed_addition_row(read_addition(path))
+        assert row["num"] == _tracker_row().split("\t")[0]
+
+
 class TestLostAdditionGuard:
     """`run_merge_tracker`'s loss guard asks the filesystem "did this evaluation
     reach applications.md", because merge-tracker archives a row it refused and
@@ -928,6 +1025,60 @@ class TestLostAdditionGuard:
             "| [229](../reports/229-x-2026-09-01.md) | note |\n"))
         self._addition(tracker_dir, "7.tsv", "Acme Corp", "Platform Engineer")
         assert self._run(career_ops, tracker_dir, capsys) == ""
+
+    def test_a_headed_addition_is_read_by_its_labels(self, tmp_path):
+        """career-ops' own worker writes a label row above its data row
+        (career-ops#3706). Read positionally the two lines are one row at a
+        company called "company" for a role called "role" — neither reading of
+        "did it land" can find that, so every such evaluation, landed or not,
+        was reported lost under a name that is not a job. By NAME, so a header
+        in any order reads the same (the sanitizer declines that one; this
+        guard is what still sees it)."""
+        _, tracker_dir = self._setup(tmp_path)
+        (tracker_dir / "7.tsv").write_text(
+            ADDITION_LABEL_LINE + "\n" + "\t".join([
+                "11", "2026-09-01", "Acme Corp", "Platform Engineer", "Evaluated", "4.7/5",
+                "null", "[229](reports/229-x-2026-09-01.md)", "APPLY — note", "https://x/j/7"]) + "\n",
+            encoding="utf-8")
+        (tracker_dir / "8.tsv").write_text(
+            "company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+            "Globex\tSRE\t12\t2026-09-01\t4.2/5\tEvaluated\tnull\t[230](reports/230-x.md)\tnote\n",
+            encoding="utf-8")
+        assert _pending_additions(tracker_dir) == [
+            {"name": "7.tsv", "company": "Acme Corp", "role": "Platform Engineer", "report": "229"},
+            {"name": "8.tsv", "company": "Globex", "role": "SRE", "report": "230"},
+        ]
+
+    def test_a_headed_file_with_no_single_row_is_still_reported(self, tmp_path, capsys):
+        """merge-tracker refuses a headed file with two data rows ("one addition
+        per file") and archives it with exit 0, so both evaluations are gone.
+        Passed over as unreadable, the guard said nothing about it at all —
+        where the positional misreading had at least warned, under a job
+        called "role"."""
+        career_ops, tracker_dir = self._setup(tmp_path)
+        (tracker_dir / "7.tsv").write_text(
+            ADDITION_LABEL_LINE + "\n" + _tracker_row() + "\n" + _tracker_row(role="PM") + "\n",
+            encoding="utf-8")
+        out = self._run(career_ops, tracker_dir, capsys)
+        assert "WARNING: 1 evaluation(s)" in out
+        assert "7.tsv (no readable row)" in out
+
+    def test_a_row_with_a_company_but_no_role_still_names_the_company(self, tmp_path, capsys):
+        """"no readable row" is for a file with no identity at all. A row that
+        lost only its role still says whose evaluation went missing."""
+        career_ops, tracker_dir = self._setup(tmp_path)
+        self._addition(tracker_dir, "7.tsv", "Acme Corp", "")
+        assert "7.tsv (Acme Corp — )" in self._run(career_ops, tracker_dir, capsys)
+
+    def test_an_undecodable_addition_does_not_stop_the_guard(self, tmp_path, capsys):
+        """An agent CLI on Windows can write cp1252. merge-tracker reads it with
+        replacement characters and archives it; a UnicodeDecodeError here then
+        stopped every later merge at recovery, which reads merged/ first."""
+        career_ops, tracker_dir = self._setup(tmp_path)
+        (tracker_dir / "7.tsv").write_bytes("\t".join([
+            "11", "2026-09-01", "Société Générale", "Analyst", "Evaluated", "4.7/5", "null",
+            "[229](reports/229-x-2026-09-01.md)", "note"]).encode("cp1252"))
+        assert "WARNING: 1 evaluation(s)" in self._run(career_ops, tracker_dir, capsys)
 
 
 class TestExtractReqId:
@@ -1239,6 +1390,99 @@ class TestSanitizePendingAdditions:
         _sanitize_pending_additions(co, additions)                  # no reports/ at all
         assert self._cells(additions)[7] == "[003](reports/003-x.md)"
 
+    def test_a_headed_row_is_repaired_under_its_label_line(self, tmp_path):
+        """career-ops' own worker is the writer this pass exists for, and since
+        career-ops#3706 it writes a label row above its data row. The chain
+        repairs the data row; the label line goes back byte-for-byte, because
+        it is what merge-tracker resolves the row's fields by."""
+        co, additions = self._tree(tmp_path, rows={
+            "7.tsv": ADDITION_LABEL_LINE + "\n" + self.CLI_ROW + "\thttps://x/j/7"})
+        _sanitize_pending_additions(co, additions)
+        text = (additions / "7.tsv").read_text(encoding="utf-8")
+        assert text.startswith(ADDITION_LABEL_LINE + "\n")
+        assert text.count("\n") == 2                    # still two lines, not one
+        cells = text.split("\n")[1].split("\t")
+        assert cells[3] == "Platform Engineer"
+        assert cells[5] == "4.2/5"
+        assert cells[8] == "req 88214 — https://x/j/7 — APPLY strong match"
+
+    def test_a_repaired_headed_file_is_left_alone_on_the_next_pass(self, tmp_path, capsys):
+        """The chain runs at two points and must not be two mechanisms — with a
+        label line in the file too. A second pass that re-joined the lines
+        differently, or counted the file, would rewrite it on every merge."""
+        co, additions = self._tree(tmp_path, rows={"7.tsv": ADDITION_LABEL_LINE + "\n" + self.CLI_ROW})
+        _sanitize_pending_additions(co, additions)
+        once = (additions / "7.tsv").read_bytes()
+        # The first pass DID repair it, under its label line — or two identical
+        # passes over a file nothing ever touched would pass this too.
+        #
+        # `splitlines()`, not a `\n` split, and the bytes kept for the pass-two
+        # comparison only: `atomic_write_text` translates newlines, so on Windows
+        # this file lands CRLF, which every reader here takes in its stride (they
+        # split on `\r?\n`, as merge-tracker does) and a byte-exact expectation
+        # here does not.
+        lines = once.decode("utf-8").splitlines()
+        assert lines[0] == ADDITION_LABEL_LINE
+        assert lines[1].split("\t")[5] == "4.2/5"
+        capsys.readouterr()
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_bytes() == once
+        assert capsys.readouterr().out == ""
+
+    def test_a_headed_row_short_of_its_url_cell_gets_one(self, tmp_path):
+        """merge-tracker lets a headed row stop before its optional cells, but
+        refuses one where a URL sits under `notes` while the `url` cell is
+        absent — it reads that as every optional value shifted left. Injecting
+        the queued URL into an empty Notes cell makes exactly that shape, so the
+        repaired row is padded to the label line's width (the contract test
+        drives the refusal it prevents)."""
+        co, additions = self._tree(tmp_path, rows={
+            "7.tsv": ADDITION_LABEL_LINE + "\n" + _tracker_row(score="4.2/5", notes="")})
+        _sanitize_pending_additions(co, additions)
+        cells = (additions / "7.tsv").read_text(encoding="utf-8").split("\n")[1].split("\t")
+        assert len(cells) == len(ADDITION_LABEL_LINE.split("\t"))
+        assert "https://x/j/7" in cells[8] and cells[9] == ""
+
+    def test_a_headed_row_with_a_sentinel_report_is_still_repaired(self, tmp_path):
+        """`—` is a Report value merge-tracker documents. `_row_parts` takes a
+        nine-cell row as it stands but anchors a longer one on a `[N](path)`
+        Report cell — so padding the row to its label line's width BEFORE the
+        chain declined every repair on it, and its bare score was refused."""
+        sentinel = "\t".join(["3", "2026-08-25", "Initech", "SRE", "Evaluated", "4.2",
+                              "null", "—", "note"])
+        co, additions = self._tree(tmp_path, rows={"7.tsv": ADDITION_LABEL_LINE + "\n" + sentinel})
+        _sanitize_pending_additions(co, additions)
+        cells = (additions / "7.tsv").read_text(encoding="utf-8").split("\n")[1].split("\t")
+        assert cells[5] == "4.2/5" and len(cells) == len(ADDITION_LABEL_LINE.split("\t"))
+
+    def test_a_headed_row_in_another_order_is_left_as_written(self, tmp_path, capsys):
+        """merge-tracker reads a headed file by NAME, in any order; the chain
+        rewrites cells by INDEX. In this order index 5 is the status, so the
+        score repair would write N/A over `Evaluated` and leave the bare `4.2`
+        it was for — and the Report cell, still at index 7, gets that row past
+        every shape guard. A file the chain cannot address is left for
+        merge-tracker to judge by name."""
+        reordered = ("company\trole\tnum\tdate\tscore\tstatus\tpdf\treport\tnotes\n"
+                     "Initech\tPlatform Engineer\t3\t2026-08-25\t4.2\tEvaluated\tnull\t"
+                     "[003](reports/003-x.md)\tAPPLY")
+        co, additions = self._tree(tmp_path, rows={"7.tsv": reordered})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == reordered + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
+    def test_a_blank_line_under_the_labels_is_not_a_repair(self, tmp_path, capsys):
+        """merge-tracker drops blank lines before it looks, so a blank line
+        between the label row and the data row is nothing. Writing the file
+        back drops it here too — so comparing the re-joined FILE rather than
+        the row would count a row that needed nothing as repaired, and rewrite
+        it on every merge."""
+        done = _tracker_row(score="4.2/5", notes="req 88214 — https://x/j/7 — APPLY strong match")
+        text = ADDITION_LABEL_LINE + "\n\n" + done + "\thttps://x/j/7"
+        co, additions = self._tree(tmp_path, rows={"7.tsv": text})
+        _sanitize_pending_additions(co, additions)
+        assert (additions / "7.tsv").read_text(encoding="utf-8") == text + "\n"
+        assert "sanitized" not in capsys.readouterr().out
+
     def test_run_merge_tracker_wires_it_in(self, tmp_path, mocker):
         """The one test that goes through the merge: sanitizing must happen, and
         must happen BEFORE the loss guard's snapshot, since stripping a role's
@@ -1468,6 +1712,31 @@ class TestRecoverRefusedAdditions:
         (additions / "7.tsv").write_text("in progress", encoding="utf-8")
         _recover_refused_additions(co, additions)
         assert (additions / "7.tsv").read_text(encoding="utf-8") == "in progress"
+
+    def test_a_refused_headed_row_comes_back_under_its_label_line(self, tmp_path, capsys):
+        """career-ops' worker writes a label row above its data row since
+        career-ops#3706, and merge-tracker refuses a headed row whose `score`
+        cell reads `4.2` exactly as it refuses a headerless one — then
+        archives it. The score rule has to read the DATA row: asked of the
+        whole two-line file it sees no score to fix, and nothing headed would
+        ever come back. The label line is kept, since merge-tracker resolves
+        the row's fields by it."""
+        co, additions = self._tree(
+            tmp_path, {"7.tsv": ADDITION_LABEL_LINE + "\n" + _tracker_row(score="4.2")})
+        _recover_refused_additions(co, additions)
+        lines = (additions / "7.tsv").read_text(encoding="utf-8").split("\n")
+        assert lines[0] == ADDITION_LABEL_LINE
+        assert lines[1].split("\t")[5] == "4.2/5"
+        assert "recovered 1 evaluation" in capsys.readouterr().out
+
+    def test_a_headed_row_with_a_readable_score_is_not_retried(self, tmp_path, capsys):
+        # The readable-score rule holds through a label line too: refused with
+        # a score merge-tracker can read is refused for a reason we cannot fix.
+        co, additions = self._tree(
+            tmp_path, {"7.tsv": ADDITION_LABEL_LINE + "\n" + _tracker_row(score="4.2/5")})
+        _recover_refused_additions(co, additions)
+        assert not (additions / "7.tsv").exists()
+        assert "recovered" not in capsys.readouterr().out
 
     def test_no_archive_is_fine(self, tmp_path):
         co = tmp_path / "career-ops"

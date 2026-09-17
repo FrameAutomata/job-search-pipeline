@@ -13,7 +13,8 @@ from pipeline.work_location import (
     WORK_LOCATION_RE, location_mark, parse_work_location,
 )
 from pipeline.tracker_layout import (
-    SCORE_SENTINELS, data_rows, header_columns, is_score_cell, split_row,
+    SCORE_SENTINELS, data_rows, header_aliases, header_columns, is_score_cell,
+    split_row,
     # Aliased: `report_num` is also the name of the number itself in
     # write_job_result and below, and a local shadowing a callable is a
     # TypeError waiting for whoever adds the next call.
@@ -585,6 +586,141 @@ _NOTES_IDX = ADDITION_COLUMNS.index("notes")
 # the same reason.
 _REPORT_CELL_RE = re.compile(r"^\[\w+\]\([^)]+\)$")
 
+# Labels a first line needs before it is READ as a header row at all — the
+# threshold merge-tracker's `looksLikeTsvHeaderRow` uses.
+_ADDITION_HEADER_MIN_LABELS = 3
+
+
+def read_addition(path: Path) -> str:
+    """An addition file's text as merge-tracker reads it — for every reader here.
+
+    Bytes decoded, not `read_text`: that translates a lone `\\r` inside a cell
+    into a line break, which splits a headed row in two, so a row merge-tracker
+    reads whole (and merges, or refuses) read here as a headed file with no
+    single data row and vanished from the loss guard, the sanitizer and the UI.
+    And `utf-8-sig`, because merge-tracker's `trim()` drops a leading BOM from
+    the first label where Python's `strip()` keeps it, which hid that label from
+    the header map. Bytes that are not UTF-8 decode to U+FFFD, as Node's decoder
+    makes them, rather than raising: the file is one merge-tracker has already
+    read, merged or refused, and archived, and a raise here stopped every later
+    merge at recovery. A file already gone reads as empty, as `read_text` does."""
+    try:
+        return path.read_bytes().decode("utf-8-sig", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _split_addition_line(line: str) -> list[str]:
+    """One addition line's trimmed cells, split the way merge-tracker's
+    `splitAdditionCells` splits it: a markdown pipe row when the line STARTS
+    with a pipe (unindented, as there), else a tab row."""
+    if line.startswith("|"):
+        return split_row(line)
+    return [c.strip() for c in line.split("\t")]
+
+
+def _addition_lines(text: str) -> tuple[list[str], dict[str, int] | None]:
+    """An addition file's non-blank lines, and `{field: column}` when the first
+    of them is a HEADER row, else None.
+
+    career-ops' batch worker has written a row of column labels above its one
+    data row since career-ops#3706 (merged 2026-09-04), and merge-tracker reads
+    that form by NAME — the one form in which a discarded, never-scored row,
+    `—` in both score and status, has an order at all (#3517). The headerless
+    row is still accepted, so both arrive. Detected by merge-tracker's own rule
+    (`looksLikeTsvHeaderRow`) against the alias table career-ops ships
+    (`header_aliases`) and resolved by its first-occurrence rule
+    (`resolveTsvColumns`): the first cell is not all digits (a data row leads
+    with its tracker number) and at least three DISTINCT fields are recognised,
+    so a data row would need three header words in three cells to be taken for
+    one. Lines split on `\\r?\\n`, as merge-tracker splits them. Read as a
+    headerless row instead, the label line is a job called "role" at a company
+    called "company"."""
+    lines = [line for line in re.split(r"\r?\n", text) if line.strip()]
+    if not lines:
+        return lines, None
+    cells = _split_addition_line(lines[0])
+    if len(cells) < _ADDITION_HEADER_MIN_LABELS or re.fullmatch(r"[0-9]+", cells[0]):
+        return lines, None
+    aliases = header_aliases()
+    fields: dict[str, int] = {}
+    for i, cell in enumerate(cells):
+        key = aliases.get(cell.lower())
+        if key is not None:
+            fields.setdefault(key, i)
+    return lines, (fields if len(fields) >= _ADDITION_HEADER_MIN_LABELS else None)
+
+
+def headed_addition_row(text: str) -> dict[str, str] | None:
+    """A headed addition's data row keyed by field name; `{}` when the file is
+    headed but has no single data row (merge-tracker refuses that file too);
+    None when it is not headed, for the caller's positional reading. Test the
+    result with `is None` — `{}` is falsy, and falling through on it reads the
+    label row as a job."""
+    lines, fields = _addition_lines(text)
+    if fields is None:
+        return None
+    if len(lines) != 2:
+        return {}
+    cells = _split_addition_line(lines[1])
+    return {name: cells[i] if i < len(cells) else "" for name, i in fields.items()}
+
+
+def _positional_addition(text: str) -> tuple[str, str] | None:
+    """`(header, row)` for the positional sanitize chain: `header` is "" for a
+    headerless addition, or the label line and its newline — to be written back
+    untouched — when the labels are in `ADDITION_COLUMNS` order. That is the
+    order career-ops' batch prompt tells the worker to write, so its data row IS
+    the positional row every step already reads. None for a headed file in any
+    other layout: merge-tracker reads it by name, while this chain rewrites
+    cells by index and would rewrite the wrong ones, so it is left as written.
+    A repaired row goes back out through `_rejoin_addition`."""
+    lines, fields = _addition_lines(text)
+    if fields is None:
+        return "", text
+    in_place = all(fields.get(name) == i for i, name in enumerate(ADDITION_COLUMNS))
+    if len(lines) != 2 or not in_place:
+        return None
+    return lines[0] + "\n", lines[1]
+
+
+def _rejoin_addition(header: str, row: str) -> str:
+    """The file text for a repaired `row` under the `header` that
+    `_positional_addition` split off — a headed row that reaches its Report cell
+    padded with empty cells to the label line's width.
+
+    merge-tracker lets a row stop before its optional trailing cells, but it
+    refuses one where a URL sits under a label other than `url` while the `url`
+    cell is ABSENT — it reads that as every optional value shifted one column
+    left — and a bare URL written into an empty Notes cell, which is exactly
+    what the chain's URL injection does, is that shape: a row that merged as the
+    worker wrote it was refused once repaired. Only the optional tail is padded,
+    so a row short of a required cell stays short, and refused. And it is padded
+    here, on the way out, not before the chain: `_row_parts` takes a nine-cell
+    row as it stands but anchors a longer one on a `[N](path)` Report cell, so a
+    padded row carrying the `—` sentinel there lost every repair."""
+    if header:
+        width = len(_split_addition_line(header.rstrip("\r\n")))
+        have = row.count("\t") + 1
+        if _REPORT_IDX < have < width:
+            row += "\t" * (width - have)
+    return header + row + "\n"
+
+
+def _read_positional(path: Path) -> tuple[str, str] | None:
+    """`_positional_addition` of an addition file on disk — None when it cannot
+    be read or addressed by position, both of which its callers skip.
+
+    Line endings only are stripped — NOT `read_text`'s strip(), which eats the
+    trailing tab of an empty Notes cell. Read that way, an 8-cell row is padded
+    back to 9, differs from what was read, and is rewritten and counted as
+    repaired on every merge, forever."""
+    try:
+        text = read_addition(path).strip("\r\n")
+    except OSError:
+        return None
+    return _positional_addition(text)
+
 
 def _row_parts(tracker_tsv: str) -> list[str] | None:
     """The cells of an addition row whose nine columns are IN PLACE, else None.
@@ -772,10 +908,28 @@ def _prepend_to_notes(tracker_tsv: str, text: str, already_present) -> str:
     if parts is None:
         return tracker_tsv
     notes = parts[_NOTES_IDX].strip()
-    if already_present(notes):
+    composed = compose_notes(notes, text, already_present)
+    if composed == notes:
         return tracker_tsv
-    parts[_NOTES_IDX] = f"{text} — {notes}" if notes else text
+    parts[_NOTES_IDX] = composed
     return "\t".join(parts)
+
+
+def compose_notes(notes: str, text: str, already_present) -> str:
+    """`_prepend_to_notes`' rule for a Notes cell held on its own: `text` in
+    front, joined by ` — `, unless `already_present(notes)`. The UI's
+    tracker-additions fallback composes a headed row's `url` column in with it,
+    so the cell it shows has the shape merge-time sanitizing gives that row."""
+    notes = notes.strip()
+    if not text or already_present(notes):
+        return notes
+    return f"{text} — {notes}" if notes else text
+
+
+def has_notes_url(notes: str) -> bool:
+    """The `already_present` test for a posting URL: any URL at all, which
+    defers to one a model wrote into the cell itself."""
+    return bool(_NOTES_URL_RE.search(notes))
 
 
 def _inject_work_location_into_notes(tracker_tsv: str, mark: str) -> str:
@@ -807,8 +961,7 @@ def _inject_url_into_notes(tracker_tsv: str, url: str) -> str:
     and works for every provider / model.
 
     If the LLM already put a URL in notes, leave it alone."""
-    return _prepend_to_notes(tracker_tsv, url,
-                             lambda notes: bool(_NOTES_URL_RE.search(notes)))
+    return _prepend_to_notes(tracker_tsv, url, has_notes_url)
 
 
 # Markdown decoration, normalized before matching rather than matched around.
@@ -1178,8 +1331,9 @@ def _batch_input_urls(batch_input: Path) -> dict[str, str]:
 def _trailing_url(tracker_tsv: str) -> str:
     """The posting URL a row carries in its own optional trailing fields.
 
-    career-ops' batch worker is told to write "9 columns plus an optional
-    trailing `url`", so a foreign row often carries its URL with it. Detected by
+    career-ops' batch worker writes a `url` field after the nine (a labelled
+    column since career-ops#3706, the "optional trailing `url`" before it), so a
+    foreign row often carries its URL with it. Detected by
     shape as merge-tracker's `parseTsvExtras` does, so it stays order-independent
     with the optional location and `via=` extras — and with the SAME pattern the
     notes injector uses to ask "already present", or a `HTTPS://` cell would be
@@ -1273,11 +1427,12 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     this can see them. Recovering those means going after `tracker-additions/
     merged/` once the runner has finished; see #156.
 
-    Recovery of what a foreign row is missing prefers the row's OWN trailing URL
-    (career-ops' documented 10th field) and falls back to `batch-input.tsv` keyed
-    on the addition's filename — which is a job id for our writers and for
+    Recovery of what a foreign row is missing prefers `batch-input.tsv` keyed on
+    the addition's filename — the URL the pipeline queued, which is what handoff
+    routes by — and falls back to the row's OWN `url` field (career-ops'
+    documented 10th). The filename is a job id for our writers and for
     career-ops' batch prompt, but not for its other writers, whose
-    `{num}-{slug}.tsv` names simply find nothing and keep the score repair.
+    `{num}-{slug}.tsv` names find nothing in the queue and keep the score repair.
 
     A dead Report link — the model's slug, not the writer's (#162) — is pointed
     at the report in `reports/` that carries its number, via the same lookup the
@@ -1285,30 +1440,33 @@ def _sanitize_pending_additions(career_ops: Path, tracker_dir: Path) -> None:
     two relative shapes it has: it is the one cell that knows which of two
     same-numbered files the row meant.
 
+    A headed addition (career-ops#3706) is sanitized through its data row, its
+    label line written back, on `_positional_addition`'s terms.
+
     A pipe-delimited row is left alone. merge-tracker parses that shape natively,
     while every step here splits on tabs and no-ops on it — rewriting it would
     change which of upstream's two parsers reads the row, for no gain."""
     urls = _batch_input_urls(career_ops / "batch" / "batch-input.tsv")
     changed = 0
     for f in sorted(tracker_dir.glob("*.tsv")):
-        try:
-            # Line endings only — NOT read_text's strip(), which eats the trailing
-            # tab of an empty Notes cell. Read that way, an 8-cell row is padded
-            # back to 9, differs from what was read, and is rewritten and
-            # counted as repaired on every merge, forever.
-            raw = f.read_text(encoding="utf-8").strip("\r\n")
-        except (OSError, UnicodeDecodeError):
-            continue        # one unreadable row must not hold up the other nine
+        # None: unreadable (one such row must not hold up the other nine), or
+        # headed in a layout the chain cannot address by index.
+        split = _read_positional(f)
+        if split is None:
+            continue
+        header, row = split
         # One resolution per addition, shared by the two passes that need it.
-        report = _row_report(career_ops, raw)
-        fixed = sanitize_addition(raw, urls.get(f.stem, ""),
+        report = _row_report(career_ops, row)
+        fixed = sanitize_addition(row, urls.get(f.stem, ""),
                                   read_text(jd_cache_path(career_ops, f.stem)),
-                                  report_file=_dead_link_repair(career_ops, raw, report),
-                                  work_location=_pending_location_mark(raw, report))
-        if fixed == raw:
+                                  report_file=_dead_link_repair(career_ops, row, report),
+                                  work_location=_pending_location_mark(row, report))
+        # The ROW, not the rejoined file: rejoining drops a blank line between a
+        # header and its row, which would count an unchanged row as repaired.
+        if fixed == row:
             continue
         try:
-            atomic_write_text(f, fixed + "\n")
+            atomic_write_text(f, _rejoin_addition(header, fixed))
         except OSError:
             continue        # a row we cannot repair still merges as it stands
         changed += 1
@@ -1530,8 +1688,10 @@ def _report_key(company: str, num: str) -> str:
 def _addition_cells(text: str) -> list[str]:
     """The cells of one addition row, in ADDITION_COLUMNS order.
 
-    Both shapes merge-tracker accepts, because a row it can read is a row it can
-    also REFUSE and archive, and a shape this function cannot parse is an
+    Both HEADERLESS shapes merge-tracker accepts (a headed addition is read by
+    name before this is reached — `headed_addition_row`), because a row it can
+    read is a row it can also REFUSE and archive, and a shape this function
+    cannot parse is an
     evaluation that vanishes without even being counted — the one outcome the
     guard exists to prevent. A model that ignores the prompt's tab rule and emits
     a markdown table row is the case `_strip_role_pipe` already tells us happens;
@@ -1547,12 +1707,7 @@ def _addition_cells(text: str) -> list[str]:
     same file: a tab inside the free-text notes must not become a tenth cell."""
     text = text.strip()
     if text.startswith("|"):
-        cells = [c.strip() for c in text.split("|")]
-        if cells and not cells[0]:
-            cells.pop(0)
-        if cells and not cells[-1]:
-            cells.pop()
-        return cells
+        return split_row(text)
     return [c.strip() for c in text.split("\t", len(ADDITION_COLUMNS) - 1)]
 
 
@@ -1569,17 +1724,26 @@ def _pending_additions(tracker_dir: Path) -> list[dict]:
     file answers "was this addition processed at all" exactly, where a shared key
     answers it for whichever TSV moved first.
 
-    Short of `role` the row is unreadable and skipped; short of `notes` it is
-    not, since a lost trailing tab is routine (see `_restore_trailing_cells`)."""
+    A headerless row short of `role` is unreadable and skipped (a headed file
+    is counted regardless — see below); short of `notes` it is not, since a
+    lost trailing tab is routine (see `_restore_trailing_cells`)."""
     additions: list[dict] = []
     for f in sorted(tracker_dir.glob("*.tsv")):
-        row = dict(zip(ADDITION_COLUMNS, _addition_cells(read_text(f))))
-        if "role" not in row:
-            continue
+        text = read_addition(f)
+        row = headed_addition_row(text)
+        if row is None:
+            row = dict(zip(ADDITION_COLUMNS, _addition_cells(text)))
+            if "role" not in row:
+                continue
+        # A headed file with no single readable row is still counted, with no
+        # identity, which `_classify_landing` reads as lost: merge-tracker
+        # refuses it and archives it all the same, so skipping it the way an
+        # unreadable headerless row is skipped dropped a two-row file's
+        # evaluations without a line in the log.
         additions.append({
             "name": f.name,
-            "company": row["company"],
-            "role": row["role"],
+            "company": row.get("company", ""),
+            "role": row.get("role", ""),
             "report": row_report_num(row.get("report", ""), row.get("notes", "")),
         })
     return additions
@@ -1598,7 +1762,10 @@ def _classify_landing(records: list[dict], career_ops: Path) -> tuple[list[dict]
     for add in records:
         # The two readings, side by side. Either one finding the row means the
         # evaluation is in the tracker.
-        if _addition_key(add["company"], add["role"]) in landed:
+        # No identity at all (an unreadable headed file): only the report number
+        # can find it.
+        if (add["company"] or add["role"]) and \
+                _addition_key(add["company"], add["role"]) in landed:
             continue
         key = _report_key(add["company"], add["report"]) if add["report"] else None
         # `in`, not truthiness of the title: a tracker row with a blank Role cell
@@ -1642,7 +1809,9 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
     and doomed gets one retry: after it, the archived copy is the repaired one,
     and the score no longer changes.)
 
-    A row already back in the queue is left to the merge in progress."""
+    A headed addition comes back through its data row with its label line kept,
+    on `_sanitize_pending_additions`' terms (`_positional_addition`). A row
+    already back in the queue is left to the merge in progress."""
     merged = tracker_dir / "merged"
     lost, _ = _classify_landing(_pending_additions(merged), career_ops)
     if not lost:
@@ -1653,16 +1822,17 @@ def _recover_refused_additions(career_ops: Path, tracker_dir: Path) -> None:
         src, dst = merged / add["name"], tracker_dir / add["name"]
         if dst.exists():
             continue
-        try:
-            raw = src.read_text(encoding="utf-8").strip("\r\n")
-        except (OSError, UnicodeDecodeError):
+        split = _read_positional(src)
+        if split is None:
             continue
-        if _normalize_score_cell(_restore_trailing_cells(raw)) == _restore_trailing_cells(raw):
+        header, row = split
+        full = _restore_trailing_cells(row)
+        if _normalize_score_cell(full) == full:
             continue                    # refused for a reason we cannot fix
-        fixed = sanitize_addition(raw, urls.get(Path(add["name"]).stem, ""),
+        fixed = sanitize_addition(row, urls.get(Path(add["name"]).stem, ""),
                                   read_text(jd_cache_path(career_ops, Path(add["name"]).stem)))
         try:
-            atomic_write_text(dst, fixed + "\n")
+            atomic_write_text(dst, _rejoin_addition(header, fixed))
         except OSError:
             continue
         restored += 1
@@ -1713,7 +1883,9 @@ def _warn_on_lost_additions(before: list[dict], career_ops: Path,
               "handoff, and no later run retries them. The TSVs are in "
               "batch/tracker-additions/merged/:")
         for add in lost:
-            print(f"[batch]   {add['name']} ({add['company']} — {add['role']})")
+            who = (f"{add['company']} — {add['role']}" if add["company"] or add["role"]
+                   else "no readable row")
+            print(f"[batch]   {add['name']} ({who})")
         # merge-tracker's output is captured, so the one line saying WHY it
         # refused each row would otherwise be unreachable — in a cloud run the
         # log is all the operator has. `merge_output` must therefore carry

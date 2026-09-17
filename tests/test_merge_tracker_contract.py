@@ -26,15 +26,18 @@ via merge-tracker's own env overrides.
 import os
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from pipeline._batch_common import (
-    _liveness_closed_rows, _pending_additions, _reopen_reposted,
-    _warn_on_lost_additions, closed_by_recheck, liveness_closed_mark,
+    _liveness_closed_rows, _pending_additions, _recover_refused_additions,
+    _reopen_reposted, _sanitize_pending_additions, _warn_on_lost_additions,
+    closed_by_recheck,
+    liveness_closed_mark,
 )
 from pipeline.tracker_layout import career_ops_dir
-from tests.conftest import tracker_row
+from tests.conftest import ADDITION_LABEL_LINE, ADDITION_LABELS, tracker_row
 
 HEADER = ("# Applications Tracker\n\n"
           "| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n"
@@ -84,26 +87,32 @@ def _merge_tracker_runnable() -> bool:
         return False
 
 
+_RUNNABLE = _merge_tracker_runnable()
+
 pytestmark = pytest.mark.skipif(
-    not _merge_tracker_runnable(),
+    not _RUNNABLE,
     reason="needs a career-ops checkout with npm deps (local install; CI does neither)")
 
 
-def _merge(tmp_path, tracker_text, additions, batch_state=""):
-    """Run the real merge-tracker over `additions` ({filename: row}), entirely
-    inside tmp_path. Returns (tracker_text_after, career_ops_root, additions_dir,
-    completed_process)."""
+def _stage(tmp_path, tracker_text, additions, batch_state=""):
+    """Lay out a tracker, an additions dir ({filename: row}) and a batch-state
+    file inside tmp_path. Returns (career_ops_root, additions_dir, batch_state)."""
     career_ops = tmp_path / "co"
     (career_ops / "data").mkdir(parents=True)
-    tracker = career_ops / "data" / "applications.md"
-    tracker.write_text(tracker_text, encoding="utf-8")
+    (career_ops / "data" / "applications.md").write_text(tracker_text, encoding="utf-8")
     additions_dir = tmp_path / "adds"
     additions_dir.mkdir()
     for name, row in additions.items():
         (additions_dir / name).write_text(row, encoding="utf-8")
     state = tmp_path / "batch-state.tsv"
     state.write_text(batch_state, encoding="utf-8")
+    return career_ops, additions_dir, state
 
+
+def _node_merge(career_ops, additions_dir, state):
+    """One run of the real merge-tracker over a `_stage`d layout, which it
+    reads and writes through its own env overrides — the checkout is only its
+    cwd. Returns the completed process."""
     r = subprocess.run(
         ["node", "merge-tracker.mjs"], cwd=str(career_ops_dir()),
         capture_output=True, text=True, timeout=120,
@@ -112,12 +121,25 @@ def _merge(tmp_path, tracker_text, additions, batch_state=""):
         # this repo's primary platform, and a stripped env would turn a
         # local-only test into a hard failure rather than the skip above.
         env={**os.environ,
-             "CAREER_OPS_TRACKER": str(tracker),
+             "CAREER_OPS_TRACKER": str(career_ops / "data" / "applications.md"),
              "CAREER_OPS_ADDITIONS": str(additions_dir),
              "CAREER_OPS_BATCH_STATE": str(state)},
     )
     assert r.returncode == 0, r.stderr
-    return tracker.read_text(encoding="utf-8"), career_ops, additions_dir, r
+    return r
+
+
+def _tracker_after(career_ops):
+    return (career_ops / "data" / "applications.md").read_text(encoding="utf-8")
+
+
+def _merge(tmp_path, tracker_text, additions, batch_state=""):
+    """Run the real merge-tracker over `additions` ({filename: row}), entirely
+    inside tmp_path. Returns (tracker_text_after, career_ops_root, additions_dir,
+    completed_process)."""
+    career_ops, additions_dir, state = _stage(tmp_path, tracker_text, additions, batch_state)
+    r = _node_merge(career_ops, additions_dir, state)
+    return _tracker_after(career_ops), career_ops, additions_dir, r
 
 
 @pytest.fixture(scope="module")
@@ -271,6 +293,15 @@ CLI_ROW = ("11\t2026-09-01\tAcme Corp\tPlatform Engineer\tEvaluated\t{score}\tnu
            "[229](reports/229-acme.md)\tAPPLY strong match\n")
 
 
+def _queue_url(career_ops):
+    """A batch-input.tsv queuing job 7 at https://x/j/7 — where the merges this
+    repo runs find the URL a queued job's row did not carry."""
+    (career_ops / "batch").mkdir(exist_ok=True)
+    (career_ops / "batch" / "batch-input.tsv").write_text(
+        "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
+        encoding="utf-8")
+
+
 @pytest.fixture(scope="module")
 def unsanitized(tmp_path_factory):
     return _merge(tmp_path_factory.mktemp("raw"), HEADER,
@@ -317,7 +348,6 @@ def recovered(tmp_path_factory):
     own merge refuses a bare-score row and archives it; `run_merge_tracker` —
     which the wrappers now run after the runner — pulls it back, repairs it,
     and the second merge lands it."""
-    from pipeline._batch_common import _recover_refused_additions
     tmp_path = tmp_path_factory.mktemp("recover")
     # First merge: exactly what batch-runner.sh's last step does.
     tracker, career_ops, additions, first = _merge(
@@ -326,22 +356,12 @@ def recovered(tmp_path_factory):
     assert (additions / "merged" / "7.tsv").exists()     # … and archived
     # What the wrapper runs next. batch-input.tsv supplies the URL, as it
     # would for a queued job.
-    (career_ops / "batch").mkdir(exist_ok=True)
-    (career_ops / "batch" / "batch-input.tsv").write_text(
-        "id\turl\tsource\tnotes\n7\thttps://x/j/7\tAcme Corp\tPlatform Engineer\n",
-        encoding="utf-8")
+    _queue_url(career_ops)
     _recover_refused_additions(career_ops, additions)
     assert (additions / "7.tsv").exists()                # back in the queue
     # Second merge, same tracker and additions dir.
-    second = subprocess.run(
-        ["node", "merge-tracker.mjs"], cwd=str(career_ops_dir()),
-        capture_output=True, text=True, timeout=120,
-        env={**os.environ,
-             "CAREER_OPS_TRACKER": str(career_ops / "data" / "applications.md"),
-             "CAREER_OPS_ADDITIONS": str(additions),
-             "CAREER_OPS_BATCH_STATE": str(tmp_path / "batch-state.tsv")})
-    assert second.returncode == 0, second.stderr
-    return (career_ops / "data" / "applications.md").read_text(encoding="utf-8"), second
+    second = _node_merge(career_ops, additions, tmp_path / "batch-state.tsv")
+    return _tracker_after(career_ops), second
 
 class TestRecoveryAfterTheRunnersOwnMerge:
     def test_the_evaluation_lands_on_the_second_merge(self, recovered):
@@ -352,6 +372,193 @@ class TestRecoveryAfterTheRunnersOwnMerge:
     def test_with_the_url_it_was_missing(self, recovered):
         tracker, _ = recovered
         assert "https://x/j/7" in tracker
+
+
+# ── Headed additions (career-ops#3706) ───────────────────────────────────────
+#
+# Since #3706 (merged 2026-09-04) career-ops' batch worker writes a row of column
+# LABELS above its one data row, and merge-tracker resolves that file by name.
+# Our readers took the two-line file for one malformed row: the loss guard read
+# the label line as a job called "role" at a company called "company", found no
+# such row in the tracker and warned about an evaluation that had landed intact —
+# the #152 false alarm by a new route — and recovery could not put a refused one
+# back. So the two scenarios above are re-proven here on the form the worker now
+# writes, against the script that reads it.
+#
+# The label line is `ADDITION_LABEL_LINE` (tests/conftest.py), verbatim from Step 5
+# of career-ops' batch/batch-prompt.md, which tells the worker to write it "exactly
+# as shown". Every row below is built from it by label, so a relabelling upstream
+# is one edit there and the rows follow.
+#
+# No alias-table pin is needed, unlike the unit tests: merge-tracker and our
+# readers both resolve these labels through the same checkout's
+# tracker-aliases.json — the pairing a real merge has — and every label in the
+# worker's line is in `_FALLBACK_ALIASES` too, so the Python reading is the same
+# either way.
+def _headed_cells(score):
+    """`CLI_ROW`'s cells by label, plus the URL a headed row carries in a column
+    of its own — the same job, so each headed scenario below differs from its
+    headerless twin only in the form."""
+    values = CLI_ROW.format(score=score).rstrip("\n").split("\t") + ["https://x/j/7"]
+    assert len(values) == len(ADDITION_LABELS), "a label with no value, or a value with no label"
+    return dict(zip(ADDITION_LABELS, values))
+
+
+def _headed_addition(score):
+    """A worker-written headed addition of `_headed_cells`."""
+    return f"{ADDITION_LABEL_LINE}\n" + "\t".join(_headed_cells(score).values()) + "\n"
+
+
+def _merge_tracker_reads_headed() -> bool:
+    """True when the checkout's merge-tracker.mjs carries #3706's headed parser.
+
+    A text probe, and it gates a SKIP only — it asserts nothing; the tests below
+    ask the running script. A merge-tracker from before #3706 misreads a headed
+    file entirely: it takes the label line for the data row and refuses the whole
+    file as a score/status swap (`"status" | "score"`), whatever the data row
+    holds, so neither case below has a meaning there. Broad `except` for
+    `_merge_tracker_runnable`'s reason: this runs at import to build a mark."""
+    try:
+        return "parseHeadedAddition" in (
+            career_ops_dir() / "merge-tracker.mjs").read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+
+# `_RUNNABLE and`: pytest reports the NEAREST skip mark's reason, so without it a
+# machine with no checkout at all — CI — would be told its checkout is too old.
+needs_headed_additions = pytest.mark.skipif(
+    _RUNNABLE and not _merge_tracker_reads_headed(),
+    reason="this career-ops checkout's merge-tracker.mjs predates headed additions "
+           "(career-ops#3706, no parseHeadedAddition) — point CAREER_OPS_PATH at a "
+           "newer checkout to run these")
+
+
+@pytest.fixture(scope="module")
+def headed_merged(tmp_path_factory):
+    """A headed addition with a readable score. The guard's snapshot is taken
+    BEFORE the merge, where `run_merge_tracker` takes it: the guard's question is
+    what became of the queue as it stood."""
+    career_ops, additions, state = _stage(tmp_path_factory.mktemp("headed"), HEADER,
+                                          {"7.tsv": _headed_addition("4.7/5")})
+    before = _pending_additions(additions)
+    r = _node_merge(career_ops, additions, state)
+    return SimpleNamespace(tracker=_tracker_after(career_ops), career_ops=career_ops,
+                           additions=additions, before=before, proc=r)
+
+
+@needs_headed_additions
+class TestHeadedAdditionLands:
+    def test_it_merges_and_is_archived(self, headed_merged):
+        h = headed_merged
+        row = tracker_row(h.tracker, "11")
+        assert (row["company"], row["role"], row["score"]) == (
+            "Acme Corp", "Platform Engineer", "4.7/5")
+        assert "➕ Add" in h.proc.stdout
+        assert not list(h.additions.glob("*.tsv"))
+        assert (h.additions / "merged" / "7.tsv").exists()
+
+    def test_the_guard_does_not_report_it_lost(self, headed_merged, capsys):
+        """The #152 false alarm this fix removes, over the real merge. The first
+        assertion is what keeps the second from being vacuous: a snapshot that
+        dropped the headed file warns about nothing too, and one that read its
+        label line as a job warns about a role called "role"."""
+        h = headed_merged
+        assert [(a["company"], a["role"], a["report"]) for a in h.before] == [
+            ("Acme Corp", "Platform Engineer", "229")]
+        _warn_on_lost_additions(h.before, h.career_ops, h.additions,
+                                f"{h.proc.stdout}\n{h.proc.stderr}")
+        assert "WARNING" not in capsys.readouterr().out
+
+
+@pytest.fixture(scope="module")
+def headed_recovered(tmp_path_factory):
+    """`recovered` on the headed form: the runner's own merge refuses a
+    bare-score headed row and archives it, recovery re-queues it, a second merge
+    lands it. Each stage's evidence is kept rather than asserted here, so a
+    failure names the stage. No batch-input.tsv: the headed row brings its URL
+    in its own column."""
+    tmp_path = tmp_path_factory.mktemp("headed-recover")
+    career_ops, additions, state = _stage(tmp_path, HEADER,
+                                          {"7.tsv": _headed_addition("4.2")})
+    first = _node_merge(career_ops, additions, state)
+    after_first = _tracker_after(career_ops)
+    archived = (additions / "merged" / "7.tsv").exists()
+    _recover_refused_additions(career_ops, additions)
+    queued = additions / "7.tsv"
+    requeued = queued.read_text(encoding="utf-8") if queued.exists() else None
+    second = _node_merge(career_ops, additions, state)
+    return SimpleNamespace(first=first, after_first=after_first, archived=archived,
+                           requeued=requeued, second=second,
+                           tracker=_tracker_after(career_ops))
+
+
+@needs_headed_additions
+class TestHeadedRecoveryAfterTheRunnersOwnMerge:
+    def test_a_bare_score_is_refused_by_label_and_archived(self, headed_recovered):
+        """The refusal has to name the column LABELLED score. A pre-#3706 script
+        refuses this file too, on the label line, so a bare "Skipping" would pass
+        even if the header were never read as one."""
+        h = headed_recovered
+        assert "Platform Engineer" not in h.after_first
+        assert 'the column labelled "score" reads "4.2"' in h.first.stderr
+        assert h.archived
+
+    def test_recovery_keeps_the_label_line_and_the_second_merge_lands_it(
+            self, headed_recovered):
+        """Re-queued as a headed file, not flattened into a headerless row —
+        merge-tracker takes a labelled file by name, and that is the one form
+        in which a never-scored `—`/`—` row has an order at all (#3517)."""
+        h = headed_recovered
+        assert h.requeued is not None                        # back in the queue
+        label, data = h.requeued.rstrip("\n").split("\n")    # one data row
+        assert label == ADDITION_LABEL_LINE
+        assert dict(zip(ADDITION_LABELS, data.split("\t")))["score"] == "4.2/5"
+        assert "➕ Add" in h.second.stdout
+        row = tracker_row(h.tracker, "11")
+        assert (row["role"], row["score"]) == ("Platform Engineer", "4.2/5")
+
+
+@pytest.fixture(scope="module")
+def headed_short(tmp_path_factory):
+    """A headed row that stops before its `url` cell with its Notes empty — both
+    of which merge-tracker allows — and a queued URL for the sanitizer to write
+    into Notes. A bare URL in Notes with no `url` cell is the shape merge-tracker
+    refuses as every optional cell shifted one left."""
+    tmp_path = tmp_path_factory.mktemp("headed-short")
+    cells = _headed_cells("4.7/5")
+    row = "\t".join(cells[label] for label in ADDITION_LABELS[:-2]) + "\t"   # empty notes, no url
+    career_ops, additions, state = _stage(tmp_path, HEADER,
+                                          {"7.tsv": f"{ADDITION_LABEL_LINE}\n{row}\n"})
+    _queue_url(career_ops)
+    _sanitize_pending_additions(career_ops, additions)
+    return SimpleNamespace(proc=_node_merge(career_ops, additions, state),
+                           tracker=_tracker_after(career_ops))
+
+
+@needs_headed_additions
+class TestHeadedRowShortOfItsUrlCell:
+    def test_the_repaired_row_still_merges_with_its_url(self, headed_short):
+        """Unpadded, the sanitizer turned a row merge-tracker accepts into one it
+        refuses — `a URL sits under "notes" while the "url" cell is absent` —
+        and, its score being readable, recovery never retried it."""
+        h = headed_short
+        assert "Skipping" not in h.proc.stderr, h.proc.stderr
+        row = tracker_row(h.tracker, "11")
+        assert row["role"] == "Platform Engineer" and "https://x/j/7" in row["notes"]
+
+
+@needs_headed_additions
+def test_the_label_line_is_the_one_the_prompt_prescribes():
+    """`ADDITION_LABEL_LINE` is a copy — CI has no checkout to read it from — so
+    here, where the checkout is, it is held to the line career-ops' batch prompt
+    tells the worker to write "exactly as shown". A relabelling upstream fails
+    this, rather than leaving every headed test driving a line no worker writes."""
+    prompt = (career_ops_dir() / "batch" / "batch-prompt.md").read_text(encoding="utf-8")
+    shown = [line.strip() for line in prompt.splitlines()
+             if line.strip().startswith("num\\tdate\\t")]
+    assert shown, "batch-prompt.md no longer shows a `num\\tdate\\t…` label line"
+    assert shown[0].replace("\\t", "\t") == ADDITION_LABEL_LINE
 
 
 class TestRecheckDiscardIsReopenedOnRepost:
