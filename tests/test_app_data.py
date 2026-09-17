@@ -908,15 +908,15 @@ class TestHeaderAliasesComeFromCareerOps:
 
 class TestExtractUrl:
     """The posting URL of a Notes cell is the first URL of its NEWEST
-    evaluation (#163). merge-tracker's fork keeps a row's existing Notes first
-    and appends `Re-eval DATE (a→b): {new notes}`; the older script led with
-    the marker. Under both, the live posting after a re-post sits after the
-    last marker — the first URL sent the re-check back to the dead one."""
+    evaluation (#163). merge-tracker keeps a row's existing Notes first and
+    appends `Re-eval DATE (a→b): {new notes}`; the older script led with the
+    marker. Under both, the live posting after a re-post sits after the last
+    marker — the first URL sent the re-check back to the dead one."""
 
     def test_first_url_when_never_re_evaluated(self):
         assert data.extract_url("req 5 — https://a/1 — APPLY. see https://b/2") == "https://a/1"
 
-    def test_newest_evaluations_url_under_the_forks_notes_merge(self):
+    def test_newest_evaluations_url_under_merge_trackers_notes_merge(self):
         notes = ("https://a/old — APPLY — Closed 2026-09-06 (liveness re-check: HTTP 404). "
                  "Re-eval 2026-09-08 (4.1→4.7): req 5 — https://a/new — APPLY")
         assert data.extract_url(notes) == "https://a/new"

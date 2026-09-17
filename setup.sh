@@ -20,9 +20,23 @@ echo "==> Installing local UI deps (triage + onboarding app)"
 
 echo "==> Cloning career-ops (if missing)"
 if [ ! -d "$root/career-ops" ]; then
-  git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops "$root/career-ops"
+  git clone --branch main https://github.com/career-ops-hq/career-ops "$root/career-ops"
 else
   echo "    career-ops already present, skipping clone"
+  # career-ops used to be cloned from a fork, for two features upstream has
+  # since merged. A checkout's git state is the person's, so setup never rewrites
+  # a remote — it prints the move instead. The bare path, not a URL, so an ssh
+  # remote matches too; inside `if`, a failed get-url is just "no". `checkout -b`,
+  # not `-B`: a local main of the person's own is refused, loudly, not reset.
+  if [ -e "$root/career-ops/.git" ] && \
+     git -C "$root/career-ops" remote get-url origin 2>/dev/null | grep -qi 'FrameAutomata/career-ops'; then
+    echo "    NOTE: career-ops/ still tracks the retired fork. To move it to upstream main"
+    echo "    (cv.md, data/, reports/ and config/profile.yml are untracked and stay put):"
+    echo "      git -C career-ops remote set-url origin https://github.com/career-ops-hq/career-ops"
+    echo "      git -C career-ops fetch origin --prune"
+    echo "      git -C career-ops checkout -b main origin/main"
+    echo "      (cd career-ops && npm install --ignore-scripts)"
+  fi
 fi
 
 echo "==> Installing career-ops node deps"

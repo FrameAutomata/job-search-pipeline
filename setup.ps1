@@ -20,9 +20,29 @@ Write-Host "==> Installing local UI deps (triage + onboarding app)"
 Write-Host "==> Cloning career-ops (if missing)"
 $careerOps = "$root\career-ops"
 if (-not (Test-Path $careerOps)) {
-    git clone --branch dev/batch-local-llm https://github.com/FrameAutomata/career-ops "$careerOps"
+    git clone --branch main https://github.com/career-ops-hq/career-ops "$careerOps"
 } else {
     Write-Host "    career-ops already present, skipping clone"
+    # career-ops used to be cloned from a fork, for two features upstream has
+    # since merged. A checkout's git state is the person's, so setup never
+    # rewrites a remote — it prints the move instead. The bare path, not a URL,
+    # so an ssh remote matches too. try/catch, not just 2>$null: under
+    # ErrorActionPreference Stop, Windows PowerShell turns a redirected native
+    # stderr line into a terminating error, and a missing origin writes one.
+    # `checkout -b`, not `-B`: a local main of the person's own is refused,
+    # loudly, not reset.
+    $origin = ""
+    if (Test-Path "$careerOps\.git") {
+        try { $origin = "$(git -C "$careerOps" remote get-url origin 2>$null)" } catch { }
+    }
+    if ($origin -match 'FrameAutomata/career-ops') {
+        Write-Host "    NOTE: career-ops/ still tracks the retired fork. To move it to upstream main" -ForegroundColor Yellow
+        Write-Host "    (cv.md, data/, reports/ and config/profile.yml are untracked and stay put):" -ForegroundColor Yellow
+        Write-Host "      git -C career-ops remote set-url origin https://github.com/career-ops-hq/career-ops"
+        Write-Host "      git -C career-ops fetch origin --prune"
+        Write-Host "      git -C career-ops checkout -b main origin/main"
+        Write-Host "      Push-Location career-ops; npm install --ignore-scripts; Pop-Location"
+    }
 }
 
 Write-Host "==> Installing career-ops node deps"

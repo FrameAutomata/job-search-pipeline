@@ -1777,7 +1777,7 @@ class TestLivenessMarks:
         assert closed_by_recheck(notes)
 
     def test_mark_survives_upstreams_notes_merge(self):
-        # The fork keeps existing Notes first and appends the re-eval clause.
+        # merge-tracker keeps existing Notes first and appends the re-eval clause.
         notes = ("https://old — APPLY — " + liveness_closed_mark("2026-09-06", "HTTP 404")
                  + ". Re-eval 2026-09-08 (4.1→4.7): https://new — APPLY")
         assert closed_by_recheck(notes)
@@ -1847,7 +1847,7 @@ class TestReopenRepostedDiscards:
     def _row(co, num):
         return tracker_row(co / "data" / "applications.md", num)
 
-    def _fork_update(self, text):
+    def _merge_update(self, text):
         # Score/report/date through, status kept, existing notes first + re-eval clause.
         return (text.replace("[050](../reports/050-acme.md)", "[070](../reports/070-acme.md)")
                     .replace("4.0/5", "4.7/5")
@@ -1856,7 +1856,7 @@ class TestReopenRepostedDiscards:
     def test_reopens_a_recheck_discard_whose_report_changed(self, tmp_path, mocker, capsys):
         from pipeline.app import data
         co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", f"https://old — APPLY — {self.CLOSED}")])
-        self._merge_that(mocker, co, self._fork_update)
+        self._merge_that(mocker, co, self._merge_update)
         assert run_merge_tracker(co)
         row = self._row(co, "5")
         assert row["status_canonical"] == "Evaluated"
@@ -1868,7 +1868,7 @@ class TestReopenRepostedDiscards:
         assert "reopened 1 role" in capsys.readouterr().out
 
     def test_reopens_under_the_older_notes_replacing_merge(self, tmp_path, mocker):
-        """The vendored merge-tracker REPLACES Notes on an update, so the mark
+        """The older merge-tracker REPLACES Notes on an update, so the mark
         is gone afterwards — which is why the snapshot is taken before."""
         co = self._co(tmp_path, [_apps_row(5, "Discarded", "050", f"https://old — APPLY — {self.CLOSED}")])
         self._merge_that(mocker, co, lambda t: (

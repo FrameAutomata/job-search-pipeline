@@ -1630,9 +1630,10 @@ def _reopen_reposted(closed_before: dict[str, dict], career_ops: Path) -> None:
 
     What this cannot reach: the OLDER merge-tracker skips a re-eval that scored
     lower than the dead posting's evaluation, so under it that re-post is lost
-    and the row stays Discarded. The fork the cloud runs writes through in both
-    directions (its #2411), and `tests/test_merge_tracker_contract.py` drives
-    the higher-score case that both accept."""
+    and the row stays Discarded. Upstream's merge-tracker has written a re-eval
+    through in both directions since its fix for career-ops#2411, and
+    `tests/test_merge_tracker_contract.py` drives the higher-score case that
+    both accept."""
     if not closed_before:
         return
     from pipeline.app.data import record_status_changes   # lazy, as above

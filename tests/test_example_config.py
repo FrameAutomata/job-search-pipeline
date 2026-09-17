@@ -153,8 +153,12 @@ class TestCareerOpsInstallFlags:
 
     # Every place the repo installs career-ops' node deps, by file. Two in
     # setup.sh: the main install, and the NixOS Playwright pin — which also runs
-    # inside career-ops, so it triggers the same postinstall.
-    EXPECTED_SITES = ["setup.sh", "setup.sh", "setup.ps1", "daily-pipeline.yml"]
+    # inside career-ops, so it triggers the same postinstall. And one more in
+    # each setup script that nothing executes: the retired-fork migration recipe
+    # it prints for a person to paste. Scanned all the same, on purpose — a
+    # pasted install is still an install, so the recipe must carry the flag too.
+    EXPECTED_SITES = ["setup.sh", "setup.sh", "setup.sh", "setup.ps1", "setup.ps1",
+                      "daily-pipeline.yml"]
 
     def _career_ops_installs(self, text):
         lines = text.splitlines()

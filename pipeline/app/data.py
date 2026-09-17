@@ -525,11 +525,11 @@ def _realign_cells(cells: list[str], columns: list[str]) -> list[str]:
 _NOTES_URL_RE = re.compile(r"https?://\S+")
 
 
-# merge-tracker's re-evaluation marker. The fork the cloud runs keeps a row's
-# existing Notes verbatim and FIRST and appends `Re-eval DATE (a→b)[ — …]: {new
-# notes}` after them; the older script replaced the cell with the marker
-# leading. Under both, the posting the row's NEWEST evaluation looked at is the
-# first URL after the last marker.
+# merge-tracker's re-evaluation marker. merge-tracker keeps a row's existing
+# Notes verbatim and FIRST and appends `Re-eval DATE (a→b)[ — …]: {new notes}`
+# after them; the older script replaced the cell with the marker leading. Under
+# both, the posting the row's NEWEST evaluation looked at is the first URL
+# after the last marker.
 _REEVAL_MARK_RE = re.compile(r"\bRe-eval \d{4}-\d{2}-\d{2}")
 
 
@@ -540,11 +540,12 @@ def extract_url(notes: str) -> str:
 
     "Newest evaluation", not "first in the cell" (#163): when a posting dies
     and the opening is re-posted, the re-eval lands on the same row and the
-    live posting's URL sits AFTER the old one under the fork's Notes merge. The
-    first URL sent the re-check back to the dead posting (re-Discarding a role
-    the merge had just reopened) and the browser agent to a 404. A re-eval
-    clause with no URL of its own — upstream elides notes that repeat an
-    existing clause — falls back to the first URL, which is then the same one."""
+    live posting's URL sits AFTER the old one under merge-tracker's Notes
+    merge. The first URL sent the re-check back to the dead posting
+    (re-Discarding a role the merge had just reopened) and the browser agent
+    to a 404. A re-eval clause with no URL of its own — upstream elides notes
+    that repeat an existing clause — falls back to the first URL, which is
+    then the same one."""
     notes = notes or ""
     start = max((m.end() for m in _REEVAL_MARK_RE.finditer(notes)), default=0)
     m = _NOTES_URL_RE.search(notes, start) or _NOTES_URL_RE.search(notes)
