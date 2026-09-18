@@ -1,3 +1,7 @@
 # Shell scripts must stay LF even when checked out on Windows — the GHA runner
 # is Linux and CRLF in a shebanged script causes "bad interpreter" errors.
 *.sh text eol=lf
+# Same reason, and it is not a `.sh`: the daily sources career-ops.ref, so a CRLF
+# copy makes every line a command ending in `$'\r'` — a red run every morning on
+# the one path the pin exists to make deterministic.
+career-ops.ref text eol=lf

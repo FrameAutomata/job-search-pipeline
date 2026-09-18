@@ -1,0 +1,33 @@
+# Where career-ops comes from, for every site that fetches it.
+#
+# Shell-sourceable `KEY=value` — the daily workflow sources this file verbatim,
+# and tests/test_career_ops_source.py holds each of those sites to these values.
+#
+# Bumping the pin below is one line here, and it is a deliberate act. Run it
+# against this file's OWN values — a recipe that spells the URL and branch out
+# again is a copy no guard can see go stale:
+#   . ./career-ops.ref
+#   git clone --branch "$CAREER_OPS_BRANCH" "$CAREER_OPS_URL" /tmp/co
+#   (cd /tmp/co && npm install --ignore-scripts)
+#   CAREER_OPS_PATH=/tmp/co .venv/bin/python -m pytest \
+#       tests/test_merge_tracker_contract.py tests/test_batch_runner_contract.py
+#   sha=$(git -C /tmp/co rev-parse HEAD)          # the new CAREER_OPS_COMMIT
+#   git -C /tmp/co fetch --depth 1 --no-tags "$CAREER_OPS_URL" "$sha"
+# That last line is the daily's own mechanism, rehearsed before the value ships:
+# a commit being on the branch today is not the same property as a bare fetch
+# being served it, and the fetch is the only way the cloud ever gets this tree.
+CAREER_OPS_URL=https://github.com/career-ops-hq/career-ops
+
+# What a PERSON's checkout tracks: setup clones this branch, and the migration
+# recipe it prints moves a checkout still on the retired fork onto it. A branch,
+# not the pin, because that checkout is updated in place — by `git pull`, or by
+# career-ops' own update-system.mjs — and neither works on a detached commit.
+CAREER_OPS_BRANCH=main
+
+# What the CLOUD daily fetches, exactly. It runs unattended every morning
+# against real queues, and an upstream merge-tracker that starts refusing our
+# rows still exits 0: the evaluations are lost with a warning only in that run's
+# log, and the digest cannot show a row that never reached the tracker. So the
+# daily runs a commit someone has checked, not whatever main is at 12:00 UTC.
+# Moving it: the procedure at the top of this file, which is the whole of it.
+CAREER_OPS_COMMIT=aac998c7ed7248ea853b720ceeb1fdbeb322fc5d

@@ -6,7 +6,7 @@
 
 ## What this does
 
-Scrapes job boards, filters results against your resume, optionally pre-screens for liveness + dedup + LinkedIn description backfill, then feeds surviving jobs into [career-ops](https://github.com/santifer/career-ops) for AI-powered evaluation. Everything after setup is a single command.
+Scrapes job boards, filters results against your resume, optionally pre-screens for liveness + dedup + LinkedIn description backfill, then feeds surviving jobs into [career-ops](https://github.com/career-ops-hq/career-ops) for AI-powered evaluation. Everything after setup is a single command.
 
 ---
 

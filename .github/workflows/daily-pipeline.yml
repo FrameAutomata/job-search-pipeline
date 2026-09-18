@@ -178,10 +178,29 @@ jobs:
           pip install -r requirements.txt
           pip install google-genai openai 2>/dev/null || true
 
-      - name: Clone career-ops fork
+      # An EXACT commit (career-ops.ref), not a branch tip. This job runs
+      # unattended against real queues, and an upstream merge-tracker that
+      # starts refusing our rows exits 0 — the loss shows up as a warning in
+      # this log and nowhere a person looks — so it runs a commit someone has
+      # put the contract tests through. That file says how to bump it, and a
+      # person's own checkout tracks the branch instead (setup clones something
+      # they update in place; a detached commit cannot be pulled).
+      #
+      # `git init` + `fetch --depth 1 <sha>`, because `git clone --branch` takes
+      # a ref NAME; GitHub serves any reachable commit to a bare fetch.
+      - name: Fetch career-ops at the pinned commit
         run: |
-          git clone --depth 1 --branch dev/batch-local-llm \
-            https://github.com/FrameAutomata/career-ops career-ops
+          . ./career-ops.ref
+          # `${VAR:?}`, because an EMPTY pin is the one malformed value that is
+          # not loud: `git fetch <url> ""` fetches the remote's default branch
+          # into FETCH_HEAD and exits 0, so the day would run whatever main is
+          # at 12:00 UTC — the outcome this pin exists to prevent. (`set -u`
+          # does not help: the variable is set, just empty.)
+          : "${CAREER_OPS_URL:?career-ops.ref names no URL}"
+          : "${CAREER_OPS_COMMIT:?career-ops.ref names no pinned commit}"
+          git init -q career-ops
+          git -C career-ops fetch -q --depth 1 --no-tags "$CAREER_OPS_URL" "$CAREER_OPS_COMMIT"
+          git -C career-ops checkout -q FETCH_HEAD
 
       - name: Install career-ops Node deps
         # --ignore-scripts: career-ops' postinstall runs

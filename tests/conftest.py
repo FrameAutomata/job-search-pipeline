@@ -1,5 +1,6 @@
 """Shared fixtures for job-search-pipeline tests."""
 
+import json
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -390,6 +391,46 @@ def tracker_row(source, num) -> dict:
     rows = (data.parse_applications_text(source) if isinstance(source, str)
             else data.parse_applications(source))
     return {r["num"]: r for r in rows}[str(num)]
+
+
+# career-ops' batch worker's label row, verbatim from its batch/batch-prompt.md
+# (Step 5) since career-ops#3706: a header row, then exactly one data row, which
+# merge-tracker resolves by NAME. Its first nine labels are in ADDITION_COLUMNS
+# order — the only reason the positional sanitize chain can address the data
+# row at all. One copy for every test that writes a headed addition, so an
+# upstream relabelling is one edit.
+ADDITION_LABELS = ("num", "date", "company", "role", "status", "score", "pdf",
+                   "report", "notes", "url")
+ADDITION_LABEL_LINE = "\t".join(ADDITION_LABELS)
+
+
+@pytest.fixture
+def alias_table(tmp_path, monkeypatch):
+    """Pin the alias table header detection reads: `pin()` for no checkout at
+    all (CI, `run-ui.sh --data`: the baked fallback), `pin({...})` for a
+    checkout shipping that tracker-aliases.json.
+
+    `header_aliases` reads career-ops' own table whenever CAREER_OPS_PATH
+    resolves to a checkout, and ./career-ops is one locally and absent in CI —
+    so a detection test that does not choose asks a different table on each,
+    and a label only one of them knows passes on exactly one. The contract
+    cache keys on (path, mtime), so it is cleared on the way in and out."""
+    from pipeline import tracker_layout
+
+    def reset():
+        tracker_layout._contract_cache.clear()
+        tracker_layout._dir_cache.clear()
+
+    def pin(table=None):
+        checkout = tmp_path / ("no-checkout" if table is None else "alias-checkout")
+        if table is not None:
+            checkout.mkdir(exist_ok=True)
+            (checkout / "tracker-aliases.json").write_text(json.dumps(table), encoding="utf-8")
+        monkeypatch.setenv("CAREER_OPS_PATH", str(checkout))
+        reset()
+
+    yield pin
+    reset()
 
 
 @pytest.fixture

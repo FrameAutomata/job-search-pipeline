@@ -65,6 +65,9 @@ _FALLBACK_ALIASES = {
     "pdf": "pdf",
     "report": "report",
     "notes": "notes",
+    # Not a column of our tracker, but one of a headed addition's
+    # (career-ops#3706), read by name from it even with no checkout's table.
+    "url": "url",
 }
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -142,8 +145,7 @@ def _parse_aliases(text: str):
     if not isinstance(loaded, dict) or not loaded:
         return None
     # Union, not replacement: upstream's table is authoritative for what it
-    # covers, and ours keeps `url`, which the pipeline writes and upstream has
-    # no reason to name.
+    # covers, and the fallback's entries still answer for anything it does not.
     return {**_FALLBACK_ALIASES, **{str(k).lower(): str(v) for k, v in loaded.items()}}
 
 
