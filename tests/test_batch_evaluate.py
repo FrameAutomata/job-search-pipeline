@@ -4,6 +4,7 @@ import csv
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -285,7 +286,7 @@ class TestModelResolution:
         assert self._resolve(monkeypatch, env_value="", provider="gemini") == "gemini-2.5-flash"
 
     def test_empty_string_env_falls_back_for_anthropic(self, monkeypatch):
-        assert self._resolve(monkeypatch, env_value="", provider="anthropic") == "claude-sonnet-4-6"
+        assert self._resolve(monkeypatch, env_value="", provider="anthropic") == "claude-haiku-5-5"
 
     def test_whitespace_only_env_is_NOT_treated_as_empty(self, monkeypatch):
         # `"   " or default` evaluates to "   " (truthy). This is intentional
@@ -536,6 +537,81 @@ class TestClientHardening:
         # http_options.timeout is in milliseconds (180s → 180000ms).
         assert captured.get("http_options") is not None
         assert int(captured["http_options"].timeout) == 180000
+
+
+class TestAnthropicCaller:
+    """The Claude call as current models answer it: thinking first, then text."""
+
+    THINKING = SimpleNamespace(type="thinking")      # the SDK's ThinkingBlock has no .text
+
+    @staticmethod
+    def _text(t):
+        return SimpleNamespace(type="text", text=t)
+
+    def _caller(self, monkeypatch, content, stop_reason="end_turn", effort=None):
+        anthropic = pytest.importorskip("anthropic")
+        sent = {}
+
+        def create(**kw):
+            sent.update(kw)
+            return SimpleNamespace(content=content, stop_reason=stop_reason)
+
+        monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: SimpleNamespace(
+            messages=SimpleNamespace(create=create)))
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+        if effort is not None:
+            monkeypatch.setenv(eval_mod.ANTHROPIC_EFFORT_ENV, effort)
+        return eval_mod._build_anthropic_caller("claude-x"), sent
+
+    def test_joins_the_text_blocks_after_a_thinking_block(self, monkeypatch):
+        call, _ = self._caller(monkeypatch, [self.THINKING, self._text("a"), self._text("b")])
+        assert call("s", "u") == "ab"
+
+    def test_request_shape(self, monkeypatch):
+        call, sent = self._caller(monkeypatch, [self._text("ok")])
+        call("PROFILE", "JD")
+        # The profile is cached; the per-job JD is not.
+        assert sent["system"] == [{"type": "text", "text": "PROFILE",
+                                   "cache_control": {"type": "ephemeral"}}]
+        assert sent["messages"] == [{"role": "user", "content": "JD"}]
+        # Thinking counts toward max_tokens, so Claude gets more than the shared cap.
+        assert sent["max_tokens"] == eval_mod.ANTHROPIC_MAX_TOKENS > eval_mod.MAX_TOKENS
+
+    def test_effort_is_sent_when_set(self, monkeypatch):
+        call, sent = self._caller(monkeypatch, [self._text("ok")], effort=" High ")
+        call("s", "u")
+        assert sent["extra_body"] == {"output_config": {"effort": "high"}}
+
+    @pytest.mark.parametrize("effort", [None, ""])
+    def test_no_effort_means_the_models_default(self, monkeypatch, effort):
+        call, sent = self._caller(monkeypatch, [self._text("ok")], effort=effort)
+        call("s", "u")
+        assert "extra_body" not in sent
+
+    @pytest.mark.parametrize("effort", ["extreme", "max"])
+    def test_unusable_effort_warns_once_and_uses_the_default(self, monkeypatch, capsys, effort):
+        # `max` is a real API value, but its thinking outruns the non-streamed cap.
+        monkeypatch.setattr(eval_mod, "_warned_efforts", set())
+        for _ in range(2):
+            call, sent = self._caller(monkeypatch, [self._text("ok")], effort=effort)
+            call("s", "u")
+            assert "extra_body" not in sent
+        assert capsys.readouterr().out.count(f"ANTHROPIC_EFFORT={effort!r}") == 1
+
+    @pytest.mark.parametrize("content,stop_reason", [
+        ([THINKING, SimpleNamespace(type="text", text="<report>half")], "max_tokens"),
+        ([THINKING, SimpleNamespace(type="text", text="<report>half")], "refusal"),
+        ([THINKING, SimpleNamespace(type="text", text="<report>half")], "a_future_reason"),
+        ([THINKING], "end_turn"),
+    ])
+    def test_an_incomplete_answer_is_empty_content(self, monkeypatch, content, stop_reason):
+        # Partial text must never reach write_job_result (#204), so it gets the
+        # empty-content treatment: failover, and at most one retry.
+        call, _ = self._caller(monkeypatch, content, stop_reason=stop_reason)
+        with pytest.raises(RuntimeError, match=f"empty content.*{stop_reason}") as exc:
+            call("s", "u")
+        assert eval_mod._is_empty_content_error(exc.value)
+        assert eval_mod._is_transient_provider_error(exc.value)
 
 
 class TestMergeAndConcurrency:

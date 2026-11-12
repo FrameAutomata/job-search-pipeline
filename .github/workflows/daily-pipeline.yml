@@ -36,12 +36,15 @@ name: Daily Job Pipeline
 #   (optional) DIGEST_EMAIL_TO + DIGEST_SMTP_HOST/PORT/USER/PASS (+ DIGEST_EMAIL_FROM)
 #              — the same digest by email over STARTTLS
 # Repository VARIABLES (Settings → Secrets and variables → Actions → Variables)
-# tune the run without a code change; every one has a default and the Setup
-# wizard writes them: BATCH_PROVIDER / BATCH_MODEL / BATCH_CONCURRENCY,
+# tune the run without a code change, and every one has a default:
+# BATCH_PROVIDER / BATCH_MODEL / BATCH_CONCURRENCY, ANTHROPIC_EFFORT (how much
+# a Claude model thinks: low / medium / high),
 # GEMINI_FREE_TIER + GEMINI_LIMITS_JSON (free-tier conformance),
 # RECHECK_BUDGET / RECHECK_MIN_AGE_HOURS (the liveness re-check),
 # DIGEST_MIN_SCORE / DIGEST_LIMIT / DIGEST_ALWAYS / DIGEST_ATTACH_REPORTS /
-# DIGEST_NEXT_STEP (the digest).
+# DIGEST_NEXT_STEP (the digest). The Setup wizard writes the provider and
+# model, the Gemini pair, DIGEST_MIN_SCORE / DIGEST_LIMIT and
+# AUTO_UPDATE_FROM_TEMPLATE; the rest are set by hand.
 
 on:
   schedule:
@@ -324,6 +327,8 @@ jobs:
           BATCH_PROVIDER:    ${{ vars.BATCH_PROVIDER || '' }}
           BATCH_MODEL:       ${{ vars.BATCH_MODEL || '' }}
           BATCH_CONCURRENCY: ${{ vars.BATCH_CONCURRENCY || '3' }}
+          # Empty means the model's own default effort, the same as unset locally.
+          ANTHROPIC_EFFORT:  ${{ vars.ANTHROPIC_EFFORT || '' }}
           # Free-tier conformance in the cloud, the same two knobs a local run
           # reads: an empty GEMINI_FREE_TIER is "off", and the limits file is
           # the one the step above wrote (absent when the variable is unset,
