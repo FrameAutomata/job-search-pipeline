@@ -180,6 +180,15 @@ class TestRunStepEnv:
         assert _expr("vars", "GEMINI_FREE_TIER", "").match(env["GEMINI_FREE_TIER"]), env["GEMINI_FREE_TIER"]
         assert re.fullmatch(r"\$\{\{\s*runner\.temp\s*\}\}/gemini-limits\.json", env["GEMINI_LIMITS_FILE"])
 
+    def test_anthropic_effort_reaches_the_eval_step(self, monkeypatch):
+        """`|| ''` for the same reason as the recheck vars: an empty value is
+        the model's own default to the reader, so the workflow names none."""
+        from pipeline import batch_evaluate
+        name, env = batch_evaluate.ANTHROPIC_EFFORT_ENV, self._env()
+        assert _expr("vars", name, "").match(env[name]), env[name]
+        monkeypatch.setenv(name, "")
+        assert batch_evaluate._anthropic_effort() is None
+
     def test_gemini_limits_are_written_under_runner_temp_before_the_run(self):
         steps = _job_steps()
         write = _step_index(steps, lambda s: "gemini-limits.json" in str(s.get("run") or ""))

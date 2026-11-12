@@ -5,7 +5,7 @@ workers. Results are written as they complete.
 
 Supported providers
 -------------------
-  anthropic    claude-sonnet-4-6 (default)             ANTHROPIC_API_KEY
+  anthropic    claude-haiku-5-5  (default)             ANTHROPIC_API_KEY (+ ANTHROPIC_EFFORT)
   gemini       gemini-2.5-flash  (default)             GEMINI_API_KEY
   openai       gpt-4o-mini       (default)             OPENAI_API_KEY
   groq         llama-3.3-70b-versatile (default)       GROQ_API_KEY
@@ -80,7 +80,11 @@ _pid_alive = pid_alive
 ROOT = Path(__file__).resolve().parent.parent
 
 PROVIDER_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-sonnet-4-6",
+    # Haiku 5.5, not Sonnet: on Artificial Analysis' index (Nov 2026) it
+    # outscores every free or low-cost model here at well under a cent an
+    # evaluation, and Sonnet 5.5 — 20x the price per token — overtakes it only
+    # at high effort or above, where its thinking is billed at that price too.
+    "anthropic": "claude-haiku-5-5",
     # gemini-2.5-flash, NOT gemini-2.0-flash: the 2.0 model was deprecated by
     # Google (shutdown 2026-06-01) and its free-tier quota collapsed months
     # ahead of that. 2.5-flash is supported — but its free-tier RPD is only
@@ -332,6 +336,49 @@ def _call_with_retry(
     raise RuntimeError("retry loop exited without return or raise")  # pragma: no cover
 
 
+# Current Claude models think before they answer, and thinking counts toward
+# max_tokens, so the visible-output budget every other provider gets
+# (MAX_TOKENS) is too small: measured on real evaluations (2026-11), Haiku 5.5
+# at high effort wrote up to 13.4K tokens, thinking plus a ~5K-token report.
+# The ceiling is set by the call not being streamed: at the measured ~220
+# tokens/s (Haiku 5.5) and ~145 (Sonnet 5.5), 20K finishes well inside
+# LLM_TIMEOUT's 180s on both, so a runaway ends as a max_tokens stop (empty
+# content: retried at most once) rather than a timeout (retried until the job
+# budget runs out). A slower model (Opus, Fable) needs LLM_TIMEOUT raised to
+# match, since a non-streamed answer arrives all at once or not at all.
+ANTHROPIC_MAX_TOKENS = 20_000
+
+# `output_config.effort`: how much the model thinks. Thinking is billed as
+# output, so this is the main cost control on Claude; unset is the model's own
+# default. `xhigh` and `max` are left out on purpose — their thinking outruns
+# the non-streamed ceiling above, so every job would pay for two cut-off
+# attempts and fail.
+ANTHROPIC_EFFORT_ENV = "ANTHROPIC_EFFORT"
+ANTHROPIC_EFFORTS = ("low", "medium", "high")
+_warned_efforts: set[str] = set()
+
+# A response that ended any other way (max_tokens, refusal, or a stop reason
+# added later) is incomplete: returned, a truncated report missing its closing
+# tags would be recorded as completed and the role lost — #204's failure, here
+# caught where only the caller can see why the answer ended.
+_COMPLETE_STOPS = ("end_turn", "stop_sequence")
+
+
+def _anthropic_effort() -> str | None:
+    """ANTHROPIC_EFFORT, or None for the model's default. An unknown value warns
+    once per process and falls back to the default rather than 400-ing every
+    job of the run."""
+    raw = os.environ.get(ANTHROPIC_EFFORT_ENV, "")
+    effort = raw.strip().lower()
+    if not effort or effort in ANTHROPIC_EFFORTS:
+        return effort or None
+    if effort not in _warned_efforts:
+        _warned_efforts.add(effort)
+        print(f"[config] ignoring invalid {ANTHROPIC_EFFORT_ENV}={raw!r} "
+              f"(using the model's default; choose {', '.join(ANTHROPIC_EFFORTS)})")
+    return None
+
+
 def _build_anthropic_caller(model: str) -> Caller:
     import anthropic as _a
     # Same hardening as the openai-compat client: an explicit timeout (the SDK
@@ -340,17 +387,33 @@ def _build_anthropic_caller(model: str) -> Caller:
     # built-in 2 retries.
     client = _a.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"],
                           timeout=_llm_timeout(), max_retries=0)
+    effort = _anthropic_effort()
+    # Through extra_body rather than the typed `output_config=` keyword: setup
+    # never upgrades an existing venv and requirements.txt leaves anthropic
+    # unpinned, so on an SDK that predates the keyword every call would raise
+    # TypeError. The request body is the same either way.
+    extra = {"extra_body": {"output_config": {"effort": effort}}} if effort else {}
 
     def call(system: str, user: str) -> str:
         msg = client.messages.create(
             model=model,
-            max_tokens=MAX_TOKENS,
-            system=system,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            # The system prompt is the candidate profile — identical for every
+            # job in a run — so it is cached and each later job reads it at a
+            # tenth of the input price. A prompt under the model's cacheable
+            # minimum is simply not cached; nothing errors.
+            system=[{"type": "text", "text": system,
+                     "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user}],
+            **extra,
         )
-        text = msg.content[0].text if msg.content else None
-        if not text:
-            raise RuntimeError("anthropic returned empty content")
+        # The answer is the TEXT blocks. A thinking model usually leads with a
+        # thinking block, which has no .text, so reading content[0] crashed
+        # whenever the model thought first.
+        text = "".join(b.text for b in msg.content if b.type == "text")
+        if not text or msg.stop_reason not in _COMPLETE_STOPS:
+            raise RuntimeError(
+                f"anthropic returned empty content (stop_reason={msg.stop_reason})")
         return text
 
     return call

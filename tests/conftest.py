@@ -278,7 +278,7 @@ def _isolate_provider_env(monkeypatch):
     from pipeline.agent_cli import (AGENT_MODEL_ENV, BATCH_CLI_ENV,
                                     BROWSERS_PATH_ENV, CHROMIUM_PATH_ENV,
                                     XDG_CONFIG_HOME_ENV)
-    from pipeline.batch_evaluate import _PROVIDER_KEYS
+    from pipeline.batch_evaluate import ANTHROPIC_EFFORT_ENV, _PROVIDER_KEYS
     # BATCH_CLI too: the agent-CLI registry resolves it on every request, and a
     # developer's `.env` naming claude would flip every default-CLI assertion.
     # AGENT_MODEL: the model the CLI is launched with; a developer's `.env`
@@ -290,7 +290,8 @@ def _isolate_provider_env(monkeypatch):
     # would otherwise make a test post to a real Discord channel.
     from pipeline import daily_digest
     for var in ("BATCH_PROVIDER", "BATCH_MODEL", "COVER_MODEL",
-                "TAILOR_PROVIDER", "TAILOR_MODEL", BATCH_CLI_ENV, AGENT_MODEL_ENV,
+                "TAILOR_PROVIDER", "TAILOR_MODEL", ANTHROPIC_EFFORT_ENV,
+                BATCH_CLI_ENV, AGENT_MODEL_ENV,
                 XDG_CONFIG_HOME_ENV,
                 # Playwright's browser resolution reads these, so a developer
                 # inside `nix develop` (which sets PLAYWRIGHT_BROWSERS_PATH)
